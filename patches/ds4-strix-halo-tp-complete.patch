@@ -12,10 +12,59 @@ index 81d4881..1619c45 100644
  		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
  
 diff --git a/ds4.c b/ds4.c
-index 2496319..5a4453c 100644
+index 2496319..78309fc 100644
 --- a/ds4.c
 +++ b/ds4.c
-@@ -56478,7 +56478,7 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
+@@ -26985,7 +26985,13 @@ static bool metal_graph_encode_layer_attention_batch(
+      * tensors (batch_q_half is F16, so its view is built directly). */
+     ds4_gpu_tensor *tp_q = tp_row_split_attn ?
+         metal_graph_tensor_row_range_view(metal_graph_batch_q(g), tp_row0, tp_rows, q_dim) : NULL;
+-    ds4_gpu_tensor *tp_q_half = tp_row_split_attn ?
++    /* DS4-TP-gfx1151 (patch 19): g->batch_q_half only exists when
++     * DS4_GPU_ATTN_COMP_CACHE_F16 is set, which is `#if defined(__APPLE__)`
++     * (ds4.c:14885). On ROCm it is always NULL, so this view was always NULL and
++     * the guard below always failed - making the TP row split, and therefore
++     * EVERY prompt of 32+ tokens, impossible on ROCm. The non-TP path already
++     * passes this same NULL through happily. */
++    ds4_gpu_tensor *tp_q_half = (tp_row_split_attn && g->batch_q_half) ?
+         ds4_gpu_tensor_view(g->batch_q_half,
+                             (uint64_t)tp_row0 * q_dim * sizeof(uint16_t),
+                             (uint64_t)tp_rows * q_dim * sizeof(uint16_t)) : NULL;
+@@ -26996,8 +27002,19 @@ static bool metal_graph_encode_layer_attention_batch(
+     ds4_gpu_tensor *tp_attn_out = tp_row_split_attn ?
+         metal_graph_tensor_row_range_view(metal_graph_batch_attn_out(g), tp_row0, tp_rows,
+                                           DS4_N_EMBD) : NULL;
++    /* patch 19: only demand the q_half view when the buffer it views exists. */
+     if (tp_row_split_attn &&
+-        (!tp_q || !tp_q_half || !tp_qr_norm || !tp_heads || !tp_attn_out)) {
++        (!tp_q || (g->batch_q_half && !tp_q_half) ||
++         !tp_qr_norm || !tp_heads || !tp_attn_out)) {
++        /* DS4-TP-gfx1151 (diag): this used to go false SILENTLY, and the next
++         * `if (!ok)` downstream blamed "raw KV batch store failed" - a call that
++         * never ran. Name the view that is actually missing. */
++        fprintf(stderr, "ds4: TP row-split view NULL: q=%d q_half=%d qr_norm=%d heads=%d attn_out=%d "
++                "[row0=%u rows=%u q_dim=%llu q_rank=%llu n_tokens=%u batch_q_half=%p]\n",
++                tp_q ? 1 : 0, tp_q_half ? 1 : 0, tp_qr_norm ? 1 : 0,
++                tp_heads ? 1 : 0, tp_attn_out ? 1 : 0,
++                tp_row0, tp_rows, (unsigned long long)q_dim, (unsigned long long)q_rank,
++                n_tokens, (void *)g->batch_q_half);
+         ok = false;
+     }
+     bool q_b_f16_out = false;
+@@ -27150,7 +27167,11 @@ static bool metal_graph_encode_layer_attention_batch(
+                                                                     n_tokens,
+                                                                     DS4_N_HEAD_DIM) != 0;
+     if (!ok) {
+-        fprintf(stderr, "ds4: gpu layer %u raw KV batch store failed\n", il);
++        /* diag: this message blames the store even when the store never ran
++         * (ok was already false, or zero_prefix is 0). Report the real state. */
++        fprintf(stderr, "ds4: gpu layer %u raw KV batch store failed "
++                "[zero_prefix=%d n_tokens=%u pos0=%u raw_cap=%u compressed=%d]\n",
++                il, (int)zero_prefix, n_tokens, pos0, g->raw_cap, (int)compressed);
+     }
+     const bool raw_batch_attention = zero_prefix && ratio == 0;
+     bool batch_attention_done = false;
+@@ -56478,7 +56499,7 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
      return e && e->tp.active && e->tp.vocab_split;
  }
  
@@ -24,7 +73,7 @@ index 2496319..5a4453c 100644
  static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
      ds4_tp *tp = ud;
      const int ok = ds4_tp_gate_exchange(tp, layer, gate, seq);
-@@ -56514,15 +56514,26 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
+@@ -56514,15 +56535,26 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
  #endif
  
  int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
@@ -52,7 +101,7 @@ index 2496319..5a4453c 100644
      if (e->tp.active) {
          snprintf(err, errlen, "tensor parallelism already bound");
          return 0;
-@@ -56601,7 +56612,7 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
+@@ -56601,7 +56633,7 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
  
  void ds4_engine_close(ds4_engine *e) {
      if (!e) return;
@@ -61,7 +110,7 @@ index 2496319..5a4453c 100644
      if (e->tp.active) {
          ds4_gpu_tp_shutdown();
          const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
-@@ -56845,7 +56856,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+@@ -56845,7 +56877,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          s->glm_graph.quality = e->quality;
          s->glm_graph.ssd_streaming = e->ssd_streaming;
          s->glm_graph.ssd_streaming_cold = e->ssd_streaming_cold;
@@ -70,7 +119,7 @@ index 2496319..5a4453c 100644
          if (e->tp.active) {
              s->glm_graph.tp_world = 2;
              s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
-@@ -59899,7 +59910,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
+@@ -59899,7 +59931,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
          ds4_session_invalidate(s);
          return rc;
      }
@@ -80,10 +129,10 @@ index 2496319..5a4453c 100644
          snprintf(err, errlen, "tp: gate transport failed");
          if (ds4_session_tp_leader(s)) ds4_session_invalidate(s);
 diff --git a/ds4_rocm.cu b/ds4_rocm.cu
-index 46ba223..b0e7584 100644
+index 46ba223..326150a 100644
 --- a/ds4_rocm.cu
 +++ b/ds4_rocm.cu
-@@ -132,85 +132,485 @@ typedef struct {
+@@ -132,85 +132,498 @@ typedef struct {
  
  #include "rocm/ds4_rocm_current_api_compat.cuh"
  
@@ -338,6 +387,19 @@ index 46ba223..b0e7584 100644
 +    void *sig = NULL;
 +    g_tp_sig_is_host = 0;
 +    if (hipExtMallocWithFlags(&sig, 64, hipMallocSignalMemory) != hipSuccess || !sig) {
++        /* DS4-TP-gfx1151 (patch 18): CLEAR the latched error.
++         *
++         * hipMallocSignalMemory is unavailable on this build, so this call
++         * fails every run and leaves hipErrorInvalidValue latched. cudaGetLastError()
++         * returns the last error from ANYWHERE, so the next unrelated
++         * `cuda_ok(cudaGetLastError(), ...)` in the engine reports a spurious
++         * "invalid argument" and its caller fails for no reason.
++         *
++         * This is not hypothetical: it made ds4_gpu_tensor_fill_f32 look broken,
++         * and it made the batch prefill path fail with "raw KV batch store
++         * failed" for any prompt large enough to use it - i.e. every prompt over
++         * ~32 tokens - while the store itself had launched fine. */
++        (void)hipGetLastError();
 +        if (hipHostMalloc(&sig, 64, hipHostMallocMapped) != hipSuccess || !sig) {
 +            fprintf(stderr, DS4_GPU_LOG_PREFIX "tp_init: release-word alloc failed\n");
 +            return 0;
@@ -784,6 +846,43 @@ index 34ec68b..411032e 100644
          const float *o = (const float *)out, *i = (const float *)in;
          fprintf(stderr,
                  "ds4-tp: big gate l=%u seq=%llu out[0..3]=%g %g %g %g in[0..3]=%g %g %g %g\n",
+diff --git a/rocm/ds4_rocm_attention_launch.cuh b/rocm/ds4_rocm_attention_launch.cuh
+index 56563b4..02e1329 100644
+--- a/rocm/ds4_rocm_attention_launch.cuh
++++ b/rocm/ds4_rocm_attention_launch.cuh
+@@ -19,10 +19,29 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
+ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
+     if (!raw_cache || !kv || raw_cap == 0 ||
+         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+-        kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) return 0;
++        kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) {
++        /* diag: which bound tripped? */
++        fprintf(stderr, DS4_GPU_LOG_PREFIX "store_raw_kv_batch reject: raw_cache=%p bytes=%llu need=%llu | "
++                "kv=%p bytes=%llu need=%llu | raw_cap=%u pos0=%u n_tokens=%u head_dim=%u\n",
++                (void *)raw_cache, raw_cache ? (unsigned long long)raw_cache->bytes : 0ull,
++                (unsigned long long)((uint64_t)raw_cap * head_dim * sizeof(float)),
++                (void *)kv, kv ? (unsigned long long)kv->bytes : 0ull,
++                (unsigned long long)((uint64_t)n_tokens * head_dim * sizeof(float)),
++                raw_cap, pos0, n_tokens, head_dim);
++        return 0;
++    }
+     uint64_t n = (uint64_t)n_tokens * head_dim;
+-    store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
+-    return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
++    /* diag: separate a STALE latched error from this launch's own. */
++    const cudaError_t stale = cudaGetLastError();
++    store_raw_kv_batch_kernel<<<(unsigned)((n + 255) / 256), 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
++    const cudaError_t mine = cudaGetLastError();
++    if (stale != cudaSuccess || mine != cudaSuccess) {
++        fprintf(stderr, DS4_GPU_LOG_PREFIX "store_raw_kv_batch diag: stale=%d(%s) mine=%d(%s) "
++                "n=%llu grid=%llu n_tokens=%u head_dim=%u\n",
++                (int)stale, cudaGetErrorString(stale), (int)mine, cudaGetErrorString(mine),
++                (unsigned long long)n, (unsigned long long)((n + 255) / 256), n_tokens, head_dim);
++    }
++    return cuda_ok(mine, "store_raw_kv_batch launch");
+ }
+ extern "C" int ds4_gpu_attention_decode_heads_tensor(
+         ds4_gpu_tensor       *heads,
 diff --git a/rocm/ds4_rocm_hc_output_launch.cuh b/rocm/ds4_rocm_hc_output_launch.cuh
 index d19a799..4f48189 100644
 --- a/rocm/ds4_rocm_hc_output_launch.cuh

@@ -54,8 +54,18 @@ Start the **worker first**, then the coordinator.
         --role coordinator --listen 10.4.0.1 5599 --transport tcp -c 4096 \
         --temp 0 -p "..."
 
-`DS4_CUDA_NO_Q8_F16_CACHE=1` is **required**: without it the q8->f16 accelerator
-cache takes ~9.9 GiB and the MoE arena OOMs mid-prefill.
+Two environment variables are **required**, not tuning knobs:
+
+- `DS4_CUDA_NO_Q8_F16_CACHE=1` — without it the q8->f16 accelerator cache takes
+  ~9.9 GiB and the MoE arena OOMs mid-prefill.
+- `DS4_TP_PREFILL_SPLIT_MIN=999999` — disables the TP prefill row split, which
+  cannot work on ROCm yet (it needs
+  `ds4_gpu_attention_prefill_raw_heads_range_tensor`, an unimplemented kernel).
+  **Without this, every prompt of 32 or more tokens fails outright.** Decode is
+  unaffected. See docs/LONG-PROMPT-BUG.md.
+
+Verified with a 3306-token prompt: prefill 29.18 t/s, generation 10.49 t/s, and
+the model correctly comprehends the long context.
 
 For RDMA add `--transport rdma` and point ds4 at an OdinLink verbs shim:
 
