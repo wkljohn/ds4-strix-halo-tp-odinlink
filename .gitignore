@@ -1,0 +1,5 @@
+*.orig-ds4tp
+__pycache__/
+*.pyc
+build/
+evidence/*.log
