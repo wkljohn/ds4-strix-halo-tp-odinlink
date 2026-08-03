@@ -524,6 +524,97 @@ def patch_qp_type_fallback(tree, check):
              "create_qp retries with IBV_QPT_RC when UC is rejected")
 
 
+# ---------------------------------------------------------------------------
+# Patch 9: apply the expert-shard weight mask in routed_moe_one.
+#
+# The mask lives in the TP runtime (patch 4/6), but ds4_rocm.cu includes
+# rocm/ds4_rocm_moe_launch.cuh BEFORE that runtime, so the call site needs a
+# forward declaration.
+#
+# n_tok is 1 at this entry point, so the scratch buffer is n_expert floats - 6
+# for DS4-Flash. The masked tensor is a struct copy with a swapped ptr, the
+# same pattern ds4_cuda.cu:27498-27501 uses for x_slice.
+#
+# Only routed_moe_ONE is patched. The BATCH entry point serves prefill/verify;
+# the mask there is the same one-liner but n_tok varies, and prefill is
+# separately blocked by unavailable-stub kernels, so it is deferred rather than
+# written blind.
+# ---------------------------------------------------------------------------
+P9_ANCHOR = "".join([
+    "    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,\n",
+    "                             gate_offset, up_offset, down_offset,\n",
+    "                             gate_type, down_type,\n",
+    "                             gate_expert_bytes, gate_row_bytes,\n",
+    "                             down_expert_bytes, down_row_bytes,\n",
+    "                             expert_in_dim, expert_mid_dim, out_dim,\n",
+    "                             selected, weights, n_total_expert, n_expert, clamp, x, layer_index, 1,\n",
+    "                             force_resident);\n}",
+])
+
+P9_NEW = "".join([
+    "    /* DS4-TP-gfx1151 (patch 9): zero the routing weight of experts this rank\n",
+    "     * does not own, so the two ranks' partial sums recombine to exactly the\n",
+    "     * unsharded result instead of double-counting. The runtime explains why\n",
+    "     * this is exact, and what it does NOT buy (no memory/compute saving). */\n",
+    "    ds4_gpu_tensor masked_weights;\n",
+    "    const ds4_gpu_tensor *use_weights = weights;\n",
+    "    if (ds4_gpu_tp_expert_shard_active() && weights && selected && n_expert) {\n",
+    "        float *scratch = (float *)cuda_tmp_alloc((uint64_t)n_expert * sizeof(float),\n",
+    "                                                 \"tp expert weight mask\");\n",
+    "        if (!scratch) return 0;\n",
+    "        const float *m = ds4_gpu_tp_mask_router_weights(\n",
+    "                (const float *)weights->ptr, (const int32_t *)selected->ptr,\n",
+    "                scratch, n_expert, n_total_expert);\n",
+    "        if (m != (const float *)weights->ptr) {\n",
+    "            masked_weights = *weights;\n",
+    "            masked_weights.ptr = (void *)m;\n",
+    "            masked_weights.owner = 0;\n",
+    "            use_weights = &masked_weights;\n",
+    "        }\n",
+    "    }\n",
+    "    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,\n",
+    "                             gate_offset, up_offset, down_offset,\n",
+    "                             gate_type, down_type,\n",
+    "                             gate_expert_bytes, gate_row_bytes,\n",
+    "                             down_expert_bytes, down_row_bytes,\n",
+    "                             expert_in_dim, expert_mid_dim, out_dim,\n",
+    "                             selected, use_weights, n_total_expert, n_expert, clamp, x, layer_index, 1,\n",
+    "                             force_resident);\n}",
+])
+
+# The forward declarations must precede the function; put them at file scope.
+P9_DECL_ANCHOR = "extern \"C\" int ds4_gpu_routed_moe_one_tensor("
+P9_DECL = "".join([
+    "/* DS4-TP-gfx1151 (patch 9): defined in the TP runtime, which ds4_rocm.cu\n",
+    " * includes AFTER this header. */\n",
+    "extern \"C\" int ds4_gpu_tp_expert_shard_active(void);\n",
+    "extern \"C\" const float *ds4_gpu_tp_mask_router_weights(\n",
+    "        const float *weights, const int32_t *selected, float *scratch,\n",
+    "        uint32_t n_pairs, uint32_t n_total_expert);\n",
+    "extern \"C\" int ds4_gpu_routed_moe_one_tensor(",
+])
+
+
+def patch_moe_expert_mask(tree, check):
+    name = "apply expert-shard weight mask in routed_moe_one"
+    path = os.path.join(tree, "rocm", "ds4_rocm_moe_launch.cuh")
+    if not os.path.exists(path):
+        _log(name, FAIL, "missing " + path)
+        return
+    src = _read(path)
+    if MARKER + " (patch 9)" in src:
+        _log(name, ALREADY, "mask already applied")
+        return
+    na, nd = src.count(P9_ANCHOR), src.count(P9_DECL_ANCHOR)
+    if na != 1 or nd != 1:
+        _log(name, FAIL, "anchor counts body=%d decl=%d (want 1,1) - refusing" % (na, nd))
+        return
+    out = src.replace(P9_DECL_ANCHOR, P9_DECL).replace(P9_ANCHOR, P9_NEW)
+    if _write_checked(path, src, out, check):
+        _log(name, WOULD if check else APPLIED,
+             "routed_moe_one masks non-owned experts under TP=2")
+
+
 PATCHES = [
     patch_verbs_platform,
     patch_verbs_dlopen,
@@ -532,6 +623,7 @@ PATCHES = [
     patch_rocm_tp_runtime,
     patch_makefile_tp_flag,
     patch_qp_type_fallback,
+    patch_moe_expert_mask,
 ]
 
 
