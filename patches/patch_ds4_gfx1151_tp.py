@@ -226,10 +226,222 @@ def patch_tp_backend_gate(tree, check):
              "Metal-only -> Metal|CUDA(=ROCm build), only under DS4_ROCM_TP_READY")
 
 
+# ---------------------------------------------------------------------------
+# Patch 5: compile the TP ENGINE for non-Apple builds.
+#
+# THIS IS THE PATCH THAT MAKES PATCH 4 MATTER, and it was nearly missed.
+# ds4_gpu_tp_init() is neither defined nor even REFERENCED in a ROCm build:
+# `nm ds4.o` shows only `U ds4_gpu_tp_gate_encode`. The reason is that the whole
+# TP engine - the exchange callbacks, the bind path, the failure check - sits
+# behind `#if !defined(DS4_NO_GPU) && defined(__APPLE__)` in ds4.c.
+#
+# So implementing the ROCm gate runtime (patch 4) would have compiled cleanly
+# and done NOTHING: nothing would ever call tp_init, and the runtime would never
+# start. That is precisely the "healthy but silently degraded" failure this
+# project has been bitten by, and reading the call site at ds4.c:56575 does not
+# reveal it - only checking linkage does.
+#
+# Four identical guards wrap TP code (tp_exchange callbacks, two `e->tp.active`
+# blocks, and the ds4_gpu_tp_failed() check). All four are widened together;
+# the count is asserted so a change upstream fails the patch instead of
+# half-applying it.
+# ---------------------------------------------------------------------------
+P5A_ANCHOR = "#if !defined(DS4_NO_GPU) && defined(__APPLE__)"
+P5A_NEW = "#if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_TP_READY))"
+P5A_COUNT = 4
+
+P5B_ANCHOR = "#if defined(DS4_NO_GPU) || !defined(__APPLE__)"
+P5B_NEW = "#if defined(DS4_NO_GPU) || (!defined(__APPLE__) && !defined(DS4_ROCM_TP_READY))"
+
+P5C_ANCHOR = """    if (e->backend != DS4_BACKEND_METAL) {
+        snprintf(err, errlen, "tensor parallelism requires the Metal backend");
+        return 0;
+    }"""
+
+P5C_NEW = """    /* DS4-TP-gfx1151 (patch 5): a ROCm build reports DS4_BACKEND_CUDA
+     * (ds4.h:20-22 has no ROCM enum - ROCm IS the CUDA backend, HIP-translated).
+     * Only widened under DS4_ROCM_TP_READY, so a stock CUDA build - which also
+     * stubs the gate encoders at ds4_cuda.cu:27319,27324 - still refuses. */
+#ifdef DS4_ROCM_TP_READY
+    if (e->backend != DS4_BACKEND_METAL && e->backend != DS4_BACKEND_CUDA) {
+        snprintf(err, errlen, "tensor parallelism requires the Metal or ROCm backend");
+        return 0;
+    }
+#else
+    if (e->backend != DS4_BACKEND_METAL) {
+        snprintf(err, errlen, "tensor parallelism requires the Metal backend");
+        return 0;
+    }
+#endif"""
+
+
+def patch_tp_engine_platform(tree, check):
+    name = "compile the TP engine on non-Apple (ds4.c guards)"
+    path = os.path.join(tree, "ds4.c")
+    if not os.path.exists(path):
+        _log(name, FAIL, f"missing {path}")
+        return
+    src = _read(path)
+    if MARKER + " (patch 5)" in src:
+        _log(name, ALREADY, "TP engine guards already widened")
+        return
+    na, nb, nc = src.count(P5A_ANCHOR), src.count(P5B_ANCHOR), src.count(P5C_ANCHOR)
+    if na != P5A_COUNT or nb != 1 or nc != 1:
+        _log(name, FAIL,
+             f"anchor counts A={na}(want {P5A_COUNT}) B={nb}(want 1) C={nc}(want 1)"
+             " - upstream moved, refusing")
+        return
+    out = src.replace(P5A_ANCHOR, P5A_NEW).replace(P5B_ANCHOR, P5B_NEW)
+    out = out.replace(P5C_ANCHOR, P5C_NEW)
+    if _write_checked(path, src, out, check):
+        _log(name, WOULD if check else APPLIED,
+             f"{P5A_COUNT} __APPLE__ TP guards + bind path widened under DS4_ROCM_TP_READY")
+
+
+# ---------------------------------------------------------------------------
+# Patch 6: install the ROCm TP gate runtime, replacing the Metal-only stubs.
+#
+# The implementation lives in patches/rocm_tp_runtime.inc next to this script
+# so it stays readable as C rather than as a Python string. It replaces the
+# stub block at ds4_rocm.cu:135-180 wholesale.
+#
+# It defines DS4_ROCM_TP_READY, which is what un-gates patches 3 and 5. Nothing
+# before this point can enable TP, by construction.
+#
+# NOTE ds4_gpu_model_residency_skip is deliberately NOT in the .inc - it is
+# already defined in ds4_rocm.cu outside the stub block, and redefining it
+# would be a duplicate symbol.
+# ---------------------------------------------------------------------------
+# NOTE r""" - the anchor contains the two characters backslash-n inside a C
+# string literal. A normal triple-quoted string would turn that into a real
+# newline and the anchor would never match (it silently counted 0 first try).
+P6_ANCHOR = r"""/* Tensor-parallel gates are Metal-only; stubs keep shared graph code
+ * linkable (TP option validation rejects non-Metal backends). */
+extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
+    (void)layer; (void)gate;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}
+
+extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
+    (void)fn;
+}
+
+extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
+    (void)suspend;
+}
+
+extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
+    (void)paused;
+}
+
+extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
+    (void)enabled;
+}"""
+
+
+# The remaining three stubs sit AFTER ds4_gpu_model_residency_skip (which must be
+# preserved - it is unrelated to TP and defined only here), so the first anchor
+# cannot span them contiguously. Remove them separately; the .inc supplies all
+# three. Discovered by the build: 3 redefinition errors, 0 undefined symbols.
+P6B_ANCHOR = r"""extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
+    (void)fn;
+}
+
+extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
+                                          const ds4_gpu_tensor *out_t,
+                                          ds4_gpu_tensor *in_t,
+                                          uint64_t bytes) {
+    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+    (void)layer; (void)rows;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+    return 0;
+}"""
+
+P6B_NEW = "/* DS4-TP-gfx1151 (patch 4): these three now live in the TP runtime above. */"
+
+
+def patch_rocm_tp_runtime(tree, check):
+    name = "ROCm TP gate runtime (replaces Metal-only stubs)"
+    path = os.path.join(tree, "ds4_rocm.cu")
+    inc = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "rocm_tp_runtime.inc")
+    if not os.path.exists(path):
+        _log(name, FAIL, f"missing {path}")
+        return
+    if not os.path.exists(inc):
+        _log(name, FAIL, f"missing {inc}")
+        return
+    src = _read(path)
+    if MARKER + " (patch 4)" in src:
+        _log(name, ALREADY, "ROCm TP runtime already installed")
+        return
+    n = src.count(P6_ANCHOR)
+    if n != 1:
+        _log(name, FAIL, f"anchor count {n} != 1 - upstream moved, refusing")
+        return
+    nb = src.count(P6B_ANCHOR)
+    if nb != 1:
+        _log(name, FAIL, f"second anchor count {nb} != 1 - upstream moved, refusing")
+        return
+    body = _read(inc)
+    out = src.replace(P6_ANCHOR, "#define DS4_ROCM_TP_READY 1\n" + body)
+    out = out.replace(P6B_ANCHOR, P6B_NEW)
+    if _write_checked(path, src, out, check):
+        _log(name, WOULD if check else APPLIED,
+             "stubs -> hipStreamWaitValue64 gate runtime; defines DS4_ROCM_TP_READY")
+
+
+# ---------------------------------------------------------------------------
+# Patch 7: define DS4_ROCM_TP_READY for the WHOLE BUILD, not one file.
+#
+# Patch 6 defines it inside ds4_rocm.cu - which is a single translation unit.
+# ds4.c (the TP engine guards, patch 5) and ds4_tp.c (the option gate, patch 3)
+# are separate TUs and never saw it, so they kept compiling their Metal-only
+# branches. The build succeeded and the runtime was in the binary, yet TP would
+# still have been refused at option-parse: "compiles clean, does nothing".
+#
+# Caught by checking the binary rather than the exit code:
+#   strings ds4 | grep 'Metal or ROCm backend'  -> 0
+#   nm ds4.o    | grep ds4_gpu_tp_init          -> 0
+#
+# Both patch 6's local define and this one are kept: the local one documents
+# the dependency at the point of use, this one actually reaches every TU.
+# ---------------------------------------------------------------------------
+P7_ANCHOR = 'CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD"'
+P7_NEW = 'CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1"'
+
+
+def patch_makefile_tp_flag(tree, check):
+    name = "define DS4_ROCM_TP_READY build-wide (Makefile)"
+    path = os.path.join(tree, "Makefile")
+    if not os.path.exists(path):
+        _log(name, FAIL, f"missing {path}")
+        return
+    src = _read(path)
+    if "DS4_ROCM_TP_READY" in src:
+        _log(name, ALREADY, "flag already in the strix-halo CFLAGS")
+        return
+    n = src.count(P7_ANCHOR)
+    if n != 1:
+        _log(name, FAIL, f"anchor count {n} != 1 - upstream moved, refusing")
+        return
+    if _write_checked(path, src, src.replace(P7_ANCHOR, P7_NEW), check):
+        _log(name, WOULD if check else APPLIED,
+             "strix-halo CFLAGS now carry -DDS4_ROCM_TP_READY=1")
+
+
 PATCHES = [
     patch_verbs_platform,
     patch_verbs_dlopen,
     patch_tp_backend_gate,
+    patch_tp_engine_platform,
+    patch_rocm_tp_runtime,
+    patch_makefile_tp_flag,
 ]
 
 
