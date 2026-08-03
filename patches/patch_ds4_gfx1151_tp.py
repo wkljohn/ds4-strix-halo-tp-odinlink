@@ -120,22 +120,42 @@ def patch_verbs_platform(tree, check):
 # .dylib being present, then fall through to the macOS names so this patch is
 # a no-op on Apple hardware.
 #
-# NOTE deliberately using the SYSTEM libibverbs, not OdinLink's shim
-# (libodl_tb5_verbs.so). The shim exports 42 of 187 symbols and is missing
-# ibv_get_device_list and ibv_query_gid - both of which tp_rdma_probe() calls.
-# The correct integration is the rdma-core PROVIDER
-# (libodl_tb5-rdmav34.so, registered in /etc/libibverbs.d/), which lets the
-# real libibverbs handle enumeration and GID lookup while dispatching device
-# operations into OdinLink.
+# WHICH verbs library to load - this was WRONG in the first version.
+#
+# I originally loaded the SYSTEM libibverbs, reasoning that OdinLink's shim was
+# incomplete. Two things falsified that:
+#
+#  1. The rdma-core PROVIDER path cannot work at all here. The provider only
+#     calls verbs_register_driver_34 with no match_table/match_device, so its
+#     callbacks fire only after libibverbs has already discovered a KERNEL
+#     device. odl_tb5.ko registers a char device and never calls
+#     ib_register_device, so /sys/class/infiniband is empty and enumeration
+#     yields nothing. Verified: `IBV_CONFIG_DIR=... ibv_devices` -> empty.
+#
+#  2. The shim is NOT incomplete - the copy I inspected was two days STALE.
+#     The current build exports ibv_get_device_list and ibv_query_gid (it
+#     synthesises the device list and forwards everything else via RTLD_NEXT),
+#     and covers 100% of the symbols this function resolves. With it preloaded,
+#     `ibv_devices` lists odl_tb5_0 and `ibv_devinfo` reports PORT_ACTIVE.
+#
+# And critically: dlsym() against a handle from dlopen("libibverbs.so.1")
+# resolves in the SYSTEM library, so LD_PRELOAD interposition is BYPASSED. The
+# shim must be opened explicitly. DS4_TP_VERBS_LIB overrides the path.
 # ---------------------------------------------------------------------------
 P2_ANCHOR = """    void *h = dlopen("/usr/lib/librdma.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("librdma.dylib", RTLD_NOW | RTLD_LOCAL);"""
 
-P2_NEW = """    /* DS4-TP-gfx1151 (patch 2): prefer the Linux verbs library. Use the
-     * SYSTEM libibverbs, never OdinLink's partial shim - the shim lacks
-     * ibv_get_device_list and ibv_query_gid, which tp_rdma_probe() needs.
-     * OdinLink plugs in underneath as an rdma-core provider instead. */
+P2_NEW = """    /* DS4-TP-gfx1151 (patch 2): pick the verbs library explicitly.
+     * dlsym() on a handle from dlopen("libibverbs.so.1") resolves inside the
+     * SYSTEM library, so an LD_PRELOAD'd interposing shim would be bypassed -
+     * the OdinLink shim must be opened by name. It synthesises the device list
+     * for Thunderbolt RDMA and forwards everything else via RTLD_NEXT, so it is
+     * a superset, not a replacement. Falls through to the system library, then
+     * to macOS names, so this is a no-op off Linux/OdinLink. */
     void *h = NULL;
+    const char *tp_verbs_lib = getenv("DS4_TP_VERBS_LIB");
+    if (tp_verbs_lib) h = dlopen(tp_verbs_lib, RTLD_NOW | RTLD_LOCAL);
+    if (!h) h = dlopen("libodl_tb5_verbs.so", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("libibverbs.so", RTLD_NOW | RTLD_LOCAL);
     if (!h) h = dlopen("/usr/lib/librdma.dylib", RTLD_NOW | RTLD_LOCAL);
