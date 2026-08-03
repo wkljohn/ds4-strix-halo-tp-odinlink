@@ -22,10 +22,19 @@
  * memory - on this UMA APU that is still host-reachable. On a discrete GPU it
  * would NOT be, and this runtime would need a hipHostMalloc slab instead.
  *
- * STILL OPEN: whether a PAYLOAD written by preceding kernels is visible when
- * the flag arrives. Metal measured stale rows here and switched big-gate
- * arrival to a shared event for exactly that reason (ds4_metal.m:8776-8783).
- * The T2 loop test must settle this before any correctness claim.
+ * PAYLOAD VISIBILITY - SETTLED BY MEASUREMENT (T2 probe,
+ * scripts/t2_payload_visibility_probe.cpp): 20,000 iterations of
+ * [producing kernel -> hipStreamWriteValue64 -> host spin -> validate 4096
+ * floats] gave ZERO stale reads. So on gfx1151/ROCm 7.2 flag arrival DOES
+ * imply the producing kernel's stores are host-visible.
+ *
+ * This is the failure Metal measured and designed around ("a flag write
+ * carries no memory-visibility guarantee for the payload buffer ... measured:
+ * stale rows in the first sub-kick", ds4_metal.m:8776-8783). It is real on
+ * Apple's hardware; HIP's stream-ordered barrier packet behaves differently
+ * here. Re-run the probe on any new ROCm or silicon rather than assuming it
+ * carries over - and note it exercised ONE producing kernel on ONE stream,
+ * which is the gate's shape but not the whole engine's.
  *
  * TWO INDEPENDENT CHANNELS, mirroring Metal. Metal keeps g_tp_seq for row
  * gates (ds4_metal.m:8377) and g_tp_batch_seq for batch/big (8312), with two
