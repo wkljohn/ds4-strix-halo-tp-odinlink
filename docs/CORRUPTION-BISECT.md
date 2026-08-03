@@ -61,3 +61,33 @@ Note `tp_shard` requires `!ssd_streaming`, so these are mutually exclusive by
 construction - which is exactly why this is a clean control.
 Also re-test without `DS4_CUDA_NO_Q8_F16_CACHE=1`, which I introduced as a
 memory workaround and have never validated for numerics.
+
+## Update: the --ssd-streaming control does NOT exist
+
+Tried it. Fails at layer 3 (the first MoE layer; 0-2 are dense):
+
+    ds4: ROCm SSD streaming routed MoE missing compact selected experts
+         (layer=3 tokens=1 total_experts=256 selected=6); full expert table is not mapped
+    ds4: ROCm routed_moe_ONE failed: layer=3 shard=0 n_total=256 n_exp=6
+         gate_type=12 down_type=12 in=4096 mid=2048 out=4096
+
+SSD streaming and the generic Q4_K routed-MoE path are mutually incompatible on
+ROCm: streaming requires a compact selected-expert mapping that this path does
+not provide. Note `shard=0` - no TP involved - so this is an upstream ROCm
+limitation, not one of my patches.
+
+Consequence: there is NO single-node reference run of this checkpoint on this
+hardware. It does not fit resident (153 GiB vs 96 GiB) and it cannot stream.
+That is precisely why TP exists here, and it means "compare against a
+known-good ds4 run" is unavailable as a technique.
+
+## The reference that DOES exist: llama.cpp
+
+llama.cpp runs this exact Q4_K checkpoint on this exact hardware at 15 t/s
+(and 16.6 t/s with DSpark two-node). It is ground truth for:
+- the expected greedy continuation of a given prompt, and
+- the throughput bar.
+
+Use it for output comparison instead of chasing a ds4 baseline that cannot be
+built. It does NOT localise the fault to a layer, so it complements rather than
+replaces per-stage instrumentation.
