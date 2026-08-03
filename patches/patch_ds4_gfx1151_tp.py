@@ -674,6 +674,83 @@ def patch_kslice_matmul(tree, check):
              "kslice_rows + kslice implemented; 2 stubs removed")
 
 
+# ---------------------------------------------------------------------------
+# Patch 11: the LAST two "Metal-only" TP stubs.
+#
+#   ds4_gpu_attention_output_q8_tp_tensor - grouped attention output under a
+#       head split. Pure composition over attention_output_low_q8_tensor
+#       (already real on ROCm) + matmul_q8_0_kslice_rows_tensor (patch 10).
+#   ds4_gpu_hc_expand_add_tensor - hyper-connection expand+add. Reuses ROCm's
+#       existing hc_expand_kernel with has_add = 1.
+#
+# Body lives in patches/rocm_tp_compute.inc. It is appended to
+# rocm/ds4_rocm_hc_output_launch.cuh (include #131) because that is the only
+# point where ALL dependencies are in scope: cuda_hc_hc_token_count and
+# hc_expand_kernel from that file's own chain, attention_output_low_q8_tensor
+# from attention_launch (#118), kslice_rows from matmul (#112).
+# ---------------------------------------------------------------------------
+P11_STUB_ATTN = "".join([
+    'extern "C" int ds4_gpu_attention_output_q8_tp_tensor(\n',
+    "        ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,\n",
+    "        uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,\n",
+    "        uint64_t group_dim, uint64_t rank, uint32_t n_groups_total,\n",
+    "        uint32_t group0, uint32_t group_cnt, uint64_t out_dim,\n",
+    "        const ds4_gpu_tensor *heads) {\n",
+    "    (void)out; (void)low; (void)model_map; (void)model_size;\n",
+    "    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;\n",
+    "    (void)n_groups_total; (void)group0; (void)group_cnt; (void)out_dim;\n",
+    "    (void)heads;\n",
+    '    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\\n");\n',
+    "    return 0;\n}\n",
+])
+
+P11_STUB_HC = "".join([
+    'extern "C" int ds4_gpu_hc_expand_add_tensor(\n',
+    "        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,\n",
+    "        const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc,\n",
+    "        const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb,\n",
+    "        uint32_t n_embd, uint32_t n_hc) {\n",
+    "    (void)out_hc; (void)block_out; (void)block_add; (void)residual_hc;\n",
+    "    (void)post; (void)comb; (void)n_embd; (void)n_hc;\n",
+    '    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\\n");\n',
+    "    return 0;\n}\n",
+])
+
+
+def patch_tp_compute_tail(tree, check):
+    name = "attention_output_q8_tp + hc_expand_add (last Metal-only stubs)"
+    inc = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "rocm_tp_compute.inc")
+    hc = os.path.join(tree, "rocm", "ds4_rocm_hc_output_launch.cuh")
+    cu = os.path.join(tree, "ds4_rocm.cu")
+    for f in (inc, hc, cu):
+        if not os.path.exists(f):
+            _log(name, FAIL, "missing " + f)
+            return
+    hc_src, cu_src = _read(hc), _read(cu)
+    if MARKER + " (patch 11)" in hc_src:
+        _log(name, ALREADY, "TP compute tail already implemented")
+        return
+    if cu_src.count(P11_STUB_ATTN) != 1 or cu_src.count(P11_STUB_HC) != 1:
+        _log(name, FAIL, "stub anchors attn=%d hc=%d (want 1,1) - refusing"
+             % (cu_src.count(P11_STUB_ATTN), cu_src.count(P11_STUB_HC)))
+        return
+    body = _read(inc)
+    w = _write_checked(hc, hc_src, hc_src + body, check)
+    cu_new = cu_src.replace(
+        P11_STUB_ATTN,
+        "/* DS4-TP-gfx1151 (patch 11): implemented in "
+        "rocm/ds4_rocm_hc_output_launch.cuh */\n").replace(
+        P11_STUB_HC,
+        "/* DS4-TP-gfx1151 (patch 11): implemented in "
+        "rocm/ds4_rocm_hc_output_launch.cuh */\n")
+    w |= _write_checked(cu, cu_src, cu_new, check)
+    if w:
+        _log(name, WOULD if check else APPLIED,
+             "attention_output_q8_tp + hc_expand_add implemented; "
+             "last 2 Metal-only stubs removed")
+
+
 PATCHES = [
     patch_verbs_platform,
     patch_verbs_dlopen,
@@ -684,6 +761,7 @@ PATCHES = [
     patch_qp_type_fallback,
     patch_moe_expert_mask,
     patch_kslice_matmul,
+    patch_tp_compute_tail,
 ]
 
 
