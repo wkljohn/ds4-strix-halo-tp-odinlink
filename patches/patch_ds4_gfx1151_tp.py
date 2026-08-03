@@ -615,6 +615,65 @@ def patch_moe_expert_mask(tree, check):
              "routed_moe_one masks non-owned experts under TP=2")
 
 
+# ---------------------------------------------------------------------------
+# Patch 10: implement the K-sliced Q8_0 matmul.
+#
+# ds4_gpu_matmul_q8_0_kslice_rows_tensor is the ROOT primitive of the TP
+# compute path: ds4_gpu_attention_output_q8_tp_tensor calls it, and that fires
+# at layer 0 of the first token. Upstream ships it as a silent `return 0` in
+# ds4_rocm_unavailable.cu, and kslice_tensor as a "Metal-only" stub.
+#
+# The body lives in patches/rocm_kslice.inc. It needs NO new kernel - see the
+# header there for why the existing shared-x kernel slices correctly given an
+# offset pointer, a reduced block count, and an unchanged row stride.
+# ---------------------------------------------------------------------------
+P10_STUB_ROWS = "ROCM_UNAVAILABLE_INT(ds4_gpu_matmul_q8_0_kslice_rows_tensor)\n"
+
+P10_STUB_KSLICE = "".join([
+    'extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(\n',
+    "        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,\n",
+    "        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,\n",
+    "        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,\n",
+    "        uint64_t x_elem_off) {\n",
+    "    (void)out; (void)model_map; (void)model_size; (void)weight_offset;\n",
+    "    (void)full_in_dim; (void)k_off; (void)k_cnt; (void)out_dim; (void)x;\n",
+    "    (void)x_elem_off;\n",
+    '    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\\n");\n',
+    "    return 0;\n}\n",
+])
+
+
+def patch_kslice_matmul(tree, check):
+    name = "K-sliced Q8_0 matmul (root of the TP compute path)"
+    inc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rocm_kslice.inc")
+    mm = os.path.join(tree, "rocm", "ds4_rocm_matmul.cuh")
+    un = os.path.join(tree, "ds4_rocm_unavailable.cu")
+    cu = os.path.join(tree, "ds4_rocm.cu")
+    for f in (inc, mm, un, cu):
+        if not os.path.exists(f):
+            _log(name, FAIL, "missing " + f)
+            return
+    mm_src, un_src, cu_src = _read(mm), _read(un), _read(cu)
+    if MARKER + " (patch 10)" in mm_src:
+        _log(name, ALREADY, "kslice matmul already implemented")
+        return
+    if un_src.count(P10_STUB_ROWS) != 1 or cu_src.count(P10_STUB_KSLICE) != 1:
+        _log(name, FAIL, "stub anchors rows=%d kslice=%d (want 1,1) - refusing"
+             % (un_src.count(P10_STUB_ROWS), cu_src.count(P10_STUB_KSLICE)))
+        return
+    body = _read(inc)
+    w = _write_checked(mm, mm_src, mm_src + body, check)
+    w |= _write_checked(un, un_src, un_src.replace(
+        P10_STUB_ROWS,
+        "/* DS4-TP-gfx1151 (patch 10): implemented in rocm/ds4_rocm_matmul.cuh */\n"), check)
+    w |= _write_checked(cu, cu_src, cu_src.replace(
+        P10_STUB_KSLICE,
+        "/* DS4-TP-gfx1151 (patch 10): implemented in rocm/ds4_rocm_matmul.cuh */\n"), check)
+    if w:
+        _log(name, WOULD if check else APPLIED,
+             "kslice_rows + kslice implemented; 2 stubs removed")
+
+
 PATCHES = [
     patch_verbs_platform,
     patch_verbs_dlopen,
@@ -624,6 +683,7 @@ PATCHES = [
     patch_makefile_tp_flag,
     patch_qp_type_fallback,
     patch_moe_expert_mask,
+    patch_kslice_matmul,
 ]
 
 
