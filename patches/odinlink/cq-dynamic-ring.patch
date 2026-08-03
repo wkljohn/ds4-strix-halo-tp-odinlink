@@ -1,0 +1,102 @@
+diff --git a/verbs/src/odl_tb5_verbs.h b/verbs/src/odl_tb5_verbs.h
+index fc9f268..272f8fc 100644
+--- a/verbs/src/odl_tb5_verbs.h
++++ b/verbs/src/odl_tb5_verbs.h
+@@ -75,7 +75,8 @@
+  * cases), small enough that the copy_from_user cost stays under a microsecond
+  * and bulk transfers still go through the worker's pipelined path. */
+ #define ODL_VERBS_INLINE_MAX            4096
+-#define ODL_VERBS_COMP_CHANNEL_BACKLOG   64
++#define ODL_VERBS_COMP_CHANNEL_BACKLOG   64      /* floor, not the cap */
++#define ODL_VERBS_COMP_CHANNEL_MAX       65536   /* sanity ceiling */
+ #define ODL_VERBS_SQ_DEPTH              64
+ 
+ /* ── Forward declarations ───────────────────────────────────────────── */
+@@ -128,8 +129,17 @@ struct odl_verbs_cq {
+     pthread_mutex_t           lock;
+     uint32_t                  cq_handle;
+ 
+-    /* Completion ring buffer */
+-    struct ibv_wc             ring[ODL_VERBS_COMP_CHANNEL_BACKLOG];
++    /* Completion ring buffer.
++     *
++     * Sized from the cqe the caller asked ibv_create_cq for, NOT a fixed
++     * constant. It used to be ring[ODL_VERBS_COMP_CHANNEL_BACKLOG] (=64, so 63
++     * usable) while base.cqe reported back whatever was requested - the
++     * provider advertised a depth it did not have. ds4 asks for 512 and a bulk
++     * round can post 65 completions (64 recv + 1 signalled send); odl_cq_post
++     * drops on overflow, so the consumer waits forever for a completion that
++     * was discarded. */
++    struct ibv_wc            *ring;
++    int                       ring_cap;
+     int                       head;
+     int                       tail;
+ 
+diff --git a/verbs/src/odl_tb5_verbs_cq.c b/verbs/src/odl_tb5_verbs_cq.c
+index 9c5446c..04feb86 100644
+--- a/verbs/src/odl_tb5_verbs_cq.c
++++ b/verbs/src/odl_tb5_verbs_cq.c
+@@ -37,6 +37,24 @@ struct ibv_cq *odl_create_cq(struct ibv_context *context, int cqe,
+     cq->ctx = ctx;
+     pthread_mutex_init(&cq->lock, NULL);
+ 
++    /* One slot is always sacrificed to distinguish full from empty, so
++     * allocate cqe+1 to make the ADVERTISED depth actually usable. */
++    cq->ring_cap = cq->base.cqe + 1;
++    if (cq->ring_cap < ODL_VERBS_COMP_CHANNEL_BACKLOG)
++        cq->ring_cap = ODL_VERBS_COMP_CHANNEL_BACKLOG;
++    if (cq->ring_cap > ODL_VERBS_COMP_CHANNEL_MAX)
++        cq->ring_cap = ODL_VERBS_COMP_CHANNEL_MAX;
++    cq->ring = calloc((size_t)cq->ring_cap, sizeof(*cq->ring));
++    if (!cq->ring) {
++        pthread_mutex_destroy(&cq->lock);
++        free(cq);
++        errno = ENOMEM;
++        return NULL;
++    }
++    /* Report what we can actually hold, so a consumer that reads back cqe is
++     * not lied to. */
++    cq->base.cqe = cq->ring_cap - 1;
++
+     /* Create eventfd for async notification */
+     cq->eventfd_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+     if (cq->eventfd_fd >= 0) {
+@@ -95,6 +113,7 @@ int odl_destroy_cq(struct ibv_cq *cq)
+ 
+     if (ocq->eventfd_fd >= 0) close(ocq->eventfd_fd);
+     pthread_mutex_destroy(&ocq->lock);
++    free(ocq->ring);
+     free(ocq);
+ 
+     ODL_TRACE_EXIT_VAL(0);
+@@ -117,7 +136,7 @@ int odl_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc)
+ 
+     while (polled < num_entries && ocq->head != ocq->tail) {
+         wc[polled] = ocq->ring[ocq->head];
+-        ocq->head = (ocq->head + 1) % ODL_VERBS_COMP_CHANNEL_BACKLOG;
++        ocq->head = (ocq->head + 1) % ocq->ring_cap;
+         polled++;
+     }
+ 
+@@ -174,7 +193,7 @@ int odl_cq_post(struct odl_verbs_cq *cq, struct ibv_wc *wc)
+ {
+     pthread_mutex_lock(&cq->lock);
+ 
+-    int next = (cq->tail + 1) % ODL_VERBS_COMP_CHANNEL_BACKLOG;
++    int next = (cq->tail + 1) % cq->ring_cap;
+     if (next == cq->head) {
+         /* CQ full — drop completion */
+         odl_logerr("CQ %p ring full! dropping completion", (void*)cq);
+diff --git a/verbs/src/odl_tb5_verbs_ops.c b/verbs/src/odl_tb5_verbs_ops.c
+index 04e517d..b60ee4a 100644
+--- a/verbs/src/odl_tb5_verbs_ops.c
++++ b/verbs/src/odl_tb5_verbs_ops.c
+@@ -57,7 +57,7 @@ static int odl_compat_query_device(struct ibv_context *context,
+     attr->max_qp_wr        = ODL_VERBS_SQ_DEPTH;
+     attr->max_sge          = 1;
+     attr->max_cq           = ODL_VERBS_MAX_CQS;
+-    attr->max_cqe          = ODL_VERBS_COMP_CHANNEL_BACKLOG;
++    attr->max_cqe          = ODL_VERBS_COMP_CHANNEL_MAX - 1;
+     attr->max_mr           = ODL_VERBS_MAX_MRS;
+     attr->max_pd           = ODL_VERBS_MAX_PDS;
+     attr->max_mr_size      = SIZE_MAX;
