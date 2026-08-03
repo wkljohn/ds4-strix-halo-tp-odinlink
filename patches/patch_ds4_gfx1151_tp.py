@@ -455,6 +455,75 @@ def patch_makefile_tp_flag(tree, check):
              "strix-halo CFLAGS now carry -DDS4_ROCM_TP_READY=1")
 
 
+# ---------------------------------------------------------------------------
+# Patch 8: fall back from UC to RC queue pairs.
+#
+# HARD INCOMPATIBILITY, found before first connect rather than during it:
+#   ds4_tp.c:750                 qia.qp_type = IBV_QPT_UC;
+#   odl_tb5_verbs_qp.c:250-251   if (attr->qp_type != IBV_QPT_RC) {
+#                                    odl_logerr("unsupported QP type: %d", ...)
+#
+# ds4 asks for Unreliable Connected; OdinLink's provider accepts only Reliable
+# Connected. create_qp would simply fail and TP would never connect.
+#
+# RC is safe here: ds4 relies on the QP being CONNECTED and IN-ORDER (see the
+# "UC is in-order" comment near the completion reaper), and RC provides both,
+# plus acks and retransmission. The cost is a little per-message overhead, not
+# a semantic change. UC is still attempted FIRST so this is a no-op against
+# Apple's provider, which does support it.
+# ---------------------------------------------------------------------------
+P8_ANCHOR = """    qia.qp_type = IBV_QPT_UC;"""
+
+P8_NEW = """    /* DS4-TP-gfx1151 (patch 8): try UC, fall back to RC. OdinLink's verbs
+     * provider rejects everything except IBV_QPT_RC
+     * (odl_tb5_verbs_qp.c:250). RC keeps the connected, in-order semantics
+     * this transport depends on and merely adds reliability. */
+    qia.qp_type = IBV_QPT_UC;"""
+
+P8B_ANCHOR = """    r->qp = r->api.create_qp(r->pd, &qia);
+    if (!r->qp) {
+        tp_set_err(err, errlen, "tp rdma: create_qp(UC): %s", strerror(errno));
+        return 0;
+    }"""
+
+# r""" again: the fprintf carries the two characters backslash-n. A plain
+# triple-quoted string turns that into a real newline and breaks the C
+# string literal - the same mistake made with P6_ANCHOR.
+P8B_NEW = r"""    r->qp = r->api.create_qp(r->pd, &qia);
+    if (!r->qp) {
+        /* DS4-TP-gfx1151 (patch 8): providers that support only RC. */
+        qia.qp_type = IBV_QPT_RC;
+        r->qp = r->api.create_qp(r->pd, &qia);
+        if (r->qp) {
+            fprintf(stderr, "ds4: tp rdma: provider rejected UC, using RC\n");
+        }
+    }
+    if (!r->qp) {
+        tp_set_err(err, errlen, "tp rdma: create_qp(UC and RC): %s", strerror(errno));
+        return 0;
+    }"""
+
+
+def patch_qp_type_fallback(tree, check):
+    name = "QP type UC -> RC fallback (OdinLink accepts RC only)"
+    path = os.path.join(tree, "ds4_tp.c")
+    if not os.path.exists(path):
+        _log(name, FAIL, f"missing {path}")
+        return
+    src = _read(path)
+    if MARKER + " (patch 8)" in src:
+        _log(name, ALREADY, "RC fallback already present")
+        return
+    na, nb = src.count(P8_ANCHOR), src.count(P8B_ANCHOR)
+    if na != 1 or nb != 1:
+        _log(name, FAIL, f"anchor counts A={na} B={nb} (want 1,1) - refusing")
+        return
+    out = src.replace(P8_ANCHOR, P8_NEW).replace(P8B_ANCHOR, P8B_NEW)
+    if _write_checked(path, src, out, check):
+        _log(name, WOULD if check else APPLIED,
+             "create_qp retries with IBV_QPT_RC when UC is rejected")
+
+
 PATCHES = [
     patch_verbs_platform,
     patch_verbs_dlopen,
@@ -462,6 +531,7 @@ PATCHES = [
     patch_tp_engine_platform,
     patch_rocm_tp_runtime,
     patch_makefile_tp_flag,
+    patch_qp_type_fallback,
 ]
 
 
