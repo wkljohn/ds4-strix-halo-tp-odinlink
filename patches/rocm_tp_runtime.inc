@@ -77,6 +77,8 @@ static int                      g_tp_session_batch = 0;
 static int                      g_tp_expert_shard_suspended = 0;
 static int                      g_tp_keepalive_paused = 0;
 static int                      g_tp_attn_head_split = 0;
+static uint32_t                 g_tp_split_rank = 0;
+static uint32_t                 g_tp_split_world = 1;
 static void                    *g_tp_sig_alloc = NULL;
 static int                      g_tp_sig_is_host = 0;
 
@@ -159,7 +161,6 @@ static void *ds4_tp_service_thread(void *arg) {
 extern "C" int ds4_gpu_tp_init(uint32_t rank,
                                ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                                ds4_gpu_tp_exchange_fn fn, void *ud) {
-    (void)rank;
     if (!slab || !slab->ptr || !fn) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tp_init: bad arguments\n");
         return 0;
@@ -173,6 +174,9 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
                 dev, can_wait);
         return 0;
     }
+
+    g_tp_split_rank = rank;
+    g_tp_split_world = 2;   /* ds4 TP is always a two-way split */
 
     unsigned char *base = (unsigned char *)slab->ptr;
     /* Two arrival words. ds4_tp.c sizes this region as slots*4; we use the
@@ -301,3 +305,81 @@ extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled)                    {
 /* Latched failure, polled by the engine at command-buffer boundaries
  * (ds4.c:59903). */
 extern "C" int ds4_gpu_tp_failed(void) { return ds4_tp_fail_get(); }
+
+
+/* ------------------------------------------------------------------------
+ * Expert sharding, correctness-first.
+ *
+ * THE BUG THIS FIXES. Metal shards experts inside routed_moe_one via
+ * ds4_gpu_tp_expert_range (ds4_metal.m:8327-8342) and offsets the gate/up/down
+ * weight bases by first_expert. ROCm has NO such concept - `grep tp_rank|
+ * tp_world rocm/` returns nothing, and 33 kernel sites index selected[] as a
+ * GLOBAL expert id. Under TP=2 both ranks therefore compute the FULL expert
+ * set and the gate exchange adds the peer's identical partial: the FFN
+ * contribution DOUBLES, silently, with no error anywhere.
+ *
+ * WHY MASK INSTEAD OF REBASE. Metal's base-offset scheme also halves the
+ * weights mapped and the work done - it is an optimisation as well as a
+ * correctness mechanism. Reproducing it means threading a tp_expert_base
+ * parameter through 33 kernels in 5 files. Zeroing the ROUTING WEIGHT of
+ * experts this rank does not own achieves correctness alone with one small
+ * kernel, because the weight is a per-(tok,slot) multiplier applied before
+ * accumulation (rocm/ds4_rocm_moe.cuh:587 and 5 siblings).
+ *
+ * IT IS EXACT, NOT AN APPROXIMATION.
+ *     full  = SUM over the 6 selected e of  w_e * f_e(x)
+ *     rank0 = SUM over selected e <  half of w_e * f_e(x)
+ *     rank1 = SUM over selected e >= half of w_e * f_e(x)
+ *     rank0 + rank1 = full
+ * DS4 sets norm_topk_prob, but the normalisation survives because the two
+ * partial sums recombine; neither rank renormalises.
+ *
+ * COST: no memory saving and no compute saving - both ranks still map all
+ * experts and evaluate all six. Phase C's ~73 GB/node footprint does NOT
+ * follow from this, and decode does not get faster. This buys a CORRECT TP=2
+ * run, which is the prerequisite for judging whether the optimisation is worth
+ * building.
+ * ------------------------------------------------------------------------ */
+__global__ void ds4_tp_mask_weights_kernel(float *dst, const float *src,
+                                           const int32_t *selected,
+                                           uint32_t n, int32_t lo, int32_t hi) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int32_t e = selected[i];
+    dst[i] = (e >= lo && e < hi) ? src[i] : 0.0f;
+}
+
+/* Owned half of the expert range. Mirrors ds4_metal.m:8327-8342, including
+ * rank 1 taking the odd remainder. */
+static void ds4_tp_expert_range(uint32_t n_total, int32_t *lo, int32_t *hi) {
+    *lo = 0; *hi = (int32_t)n_total;
+    if (g_tp_split_world != 2 || g_tp_expert_shard_suspended) return;
+    const uint32_t low = n_total / 2u;
+    if (g_tp_split_rank == 1) { *lo = (int32_t)low; }
+    else                      { *hi = (int32_t)low; }
+}
+
+/* Mask the router weights in place-of: writes a masked copy into `scratch`
+ * (caller-allocated, n floats) and returns it. Called from
+ * ds4_gpu_routed_moe_one_tensor / _batch_tensor before the launch. Returns
+ * `weights` unchanged when TP is inactive or the shard is suspended (Metal
+ * suspends around the DSpark support model, ds4_metal.m:8646-8649). */
+extern "C" const float *ds4_gpu_tp_mask_router_weights(
+        const float *weights, const int32_t *selected, float *scratch,
+        uint32_t n_pairs, uint32_t n_total_expert) {
+    if (g_tp_split_world != 2 || g_tp_expert_shard_suspended) return weights;
+    if (!weights || !selected || !scratch || n_pairs == 0) return weights;
+    int32_t lo = 0, hi = 0;
+    ds4_tp_expert_range(n_total_expert, &lo, &hi);
+    if (lo == 0 && hi == (int32_t)n_total_expert) return weights;
+    const uint32_t threads = 256u;
+    const uint32_t blocks = (n_pairs + threads - 1u) / threads;
+    hipLaunchKernelGGL(ds4_tp_mask_weights_kernel, dim3(blocks), dim3(threads), 0, 0,
+                       scratch, weights, selected, n_pairs, lo, hi);
+    return scratch;
+}
+
+/* Exposed so callers can size the scratch buffer and know whether to bother. */
+extern "C" int ds4_gpu_tp_expert_shard_active(void) {
+    return (g_tp_split_world == 2 && !g_tp_expert_shard_suspended) ? 1 : 0;
+}
