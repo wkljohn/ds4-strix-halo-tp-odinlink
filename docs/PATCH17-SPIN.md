@@ -40,3 +40,18 @@ and is ~42% of our own 25.1 t/s bandwidth ceiling (was ~30%).
 Prefill across the same three runs: 8.93, 11.38, 22.87 t/s - a 2.5x spread on
 identical settings. The prompt is ~13 tokens, so prefill throughput is dominated
 by fixed costs and is meaningless here. Any prefill claim needs a long prompt.
+
+
+## Stable baseline (500-token runs)
+
+The 100-token samples spread 9.81-11.09 (+-12%). At 500 tokens:
+
+    run a: generation 10.46 t/s
+    run b: generation 10.62 t/s
+
+**~10.5 t/s is the trustworthy figure.** Use >=500-token runs for any future
+comparison; 100-token runs are too noisy to distinguish changes below ~15%.
+
+Prefill on the same two runs: 24.00 and 10.37 t/s - still a 2.3x spread even at
+500 generated tokens, because prefill is set by the (short) prompt, not by -n.
+Prefill needs a long PROMPT to be measurable at all.
