@@ -1,3 +1,61 @@
+# CORRECTED - read the correction block first
+
+The original version of this document used active-byte figures measured for the
+**UD-Q8_K_XL** checkpoint (161.9 GB) and applied them to the **Q4_K** checkpoint
+we actually run. Different quantisation, different byte counts, different
+conclusion. Recomputed directly from our own GGUF header below; the components
+sum exactly to the 153.32 GiB file total, so they are self-consistent.
+
+## Corrected numbers - Huihui-DeepSeek-V4-Flash-0731-abliterated Q4_K
+
+| component | total | streamed per token |
+|---|---|---|
+| routed experts | 145.12 GiB | 3.40 GiB (6 of 256) |
+| attention + indexer + compressor | 5.49 GiB | 5.49 GiB (all) |
+| other dense (shexp, norms, hc) | 1.20 GiB | 1.20 GiB (all) |
+| embeddings / output | 1.51 GiB | partial |
+| **active per token** | | **10.09 GiB** |
+
+At 195.6 GiB/s effective per node:
+
+| config | bytes/node | ceiling |
+|---|---|---|
+| no TP, one node | 10.09 GiB | 19.4 t/s |
+| **experts sharded only (today)** | 8.39 GiB | **23.3 t/s** |
+| experts + attention split | 5.64 GiB | 34.7 t/s |
+
+## What this changes
+
+**Measured 6.5 t/s is 28% of our own ceiling, not 51%.**
+
+- The gap to the CURRENT ceiling is **3.6x**. The attention split is worth
+  **1.5x**. The inefficiency is the bigger prize by more than a factor of two.
+- **Our current configuration already ceilings at 23.3 t/s, above llama.cpp's
+  measured 15.** We do NOT need the attention split to beat the reference. It
+  remains a genuine latent correctness bug and a later performance lever, but it
+  is NOT the priority.
+- The previous version of this file concluded the opposite and said "the
+  attention split is the whole game". That was wrong, and wrong for an avoidable
+  reason: transferring a measured decomposition across checkpoints without
+  re-deriving it.
+
+## Revised priority
+
+1. **Correctness.** 6.5 t/s of wrong tokens is worth zero.
+2. **Find the 3.6x.** We are leaving ~17 t/s on the table inside the current
+   design. Measure where the decode step actually goes - transport vs GPU
+   kernels vs host dispatch - before changing anything. 86 synchronous gates per
+   token is the obvious suspect, but suspicion is not measurement.
+3. Attention head split (1.5x, ceiling 34.7) - also fixes a latent correctness
+   bug, so worth doing eventually, but not first.
+4. DSpark/MTP - multiplicative on top, blocked by an unavailable-stub kernel.
+
+Transport is still not the barrier: point-to-point gates, no collectives.
+
+---
+
+# (original, superseded - retained for the record)
+
 # What actually limits this, and why the attention split is the whole game
 
 Derived from a measured decomposition of active bytes per decoded token for
