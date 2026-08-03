@@ -60,3 +60,39 @@ against a 153.33 GiB file - a 0.005 GiB gap that is metadata and padding.
   strided/quantised and will achieve less.
 - Per-node figures assume the expert shard halves the expert bytes exactly,
   which the 80.76 GiB residency measurement supports.
+
+## Where the t/s numbers come from - and why they are weaker than they look
+
+They are **ds4's own self-report**, the final line of each run:
+
+    ds4: prefill: 30.89 t/s, generation: 6.56 t/s
+
+Not measured independently. Three caveats that matter:
+
+1. **Tiny sample.** ~15-20 generated tokens per run. Observed generation values:
+   6.18, 3.95, 6.56, 6.92 - a 1.75x spread. Quoting "~6.5" drops the 3.95 and
+   treats a noisy figure as settled. Any real comparison needs a longer run.
+2. **It is the throughput of a WRONG computation.** Output was corrupt in every
+   run that produced these numbers. Correctness fixes will move it, probably down.
+3. **The llama.cpp comparison was apples-to-oranges.** "llama.cpp does 15 t/s"
+   is WITH DSpark speculative decoding. Without a draft model it measured
+   **9.42 t/s**, and on the larger UD-Q8_K_XL checkpoint, not our Q4_K.
+
+## The comparison that is actually meaningful: efficiency vs each engine's own ceiling
+
+| | bytes/node/token | measured | own ceiling | efficiency |
+|---|---|---|---|---|
+| llama.cpp no draft (Q8_K_XL, PIPELINE split) | 16.9 GiB | 9.42 t/s | 13.2 t/s | **71%** |
+| ds4 TP=2 (Q4_K, real TP) | 8.91 GiB | ~6.5 t/s | 25.1 t/s | **26%** |
+
+(llama.cpp's ceiling uses one node's bandwidth because `-ts` is pipeline
+parallelism - node A runs its layers, then node B - so bandwidth is not
+additive. ds4's uses the per-node shard because real TP runs both concurrently.)
+
+**The target is not "beat 15 t/s". It is the 2.7x efficiency gap.** llama.cpp
+gets 71% of its bandwidth ceiling on this same silicon; we get 26%. Closing that
+alone would put us at ~17 t/s without speculation, without the attention split,
+and without touching the transport.
+
+That reframing also says what NOT to do first: adding DSpark or splitting
+attention on top of a 26%-efficient engine multiplies a bad constant.
