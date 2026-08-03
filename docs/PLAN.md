@@ -25,6 +25,48 @@ if upstream moves.
 Contrast llama.cpp, which hard-excludes `LLM_ARCH_DEEPSEEK4` from `-sm tensor`
 and throws at load. ds4 was built around this model.
 
+## Verdict: GO for a staged proof-of-concept (revised 2026-08-03)
+
+An initial review returned NO-GO on the premise that GPU<->RDMA memory ordering
+on gfx1151 was unproven. **That premise is false and our own deployment
+disproves it**: vLLM TP=2 ran across both nodes over this transport with
+`Using network ODL_TB5` on both ranks, serving DeepSeek-V4-Flash through
+answer-key 100/100 and needle 12/12. Cross-node tensor parallelism on this
+hardware is demonstrated, not speculative.
+
+Re-reviewed against the OdinLink source, the verdict is **GO for a staged PoC,
+5-9 engineer-days**, with the caveat - which we adopt - that no throughput claim
+is made before measurement.
+
+### The design fact that shapes everything: HOST-STAGED, not zero-copy
+
+    rccl/src/odl_tb5_net_v7.c:182   props->ptrSupport    = NCCL_PTR_HOST;
+    rccl/src/odl_tb5_net_v7.c:188   props->netDeviceType = NCCL_NET_DEVICE_HOST;
+    rccl/src/odl_tb5_net_v7.c:237   if (type != NCCL_PTR_HOST) return ncclInternalError;
+    rccl/src/odl_tb5_net_v7.c:246   dma-buf reg -> ncclInternalError  (stub)
+    rccl/src/odl_tb5_net_v7.c:258   memcpy(tx, data, size); odl_tb5_send(...)
+
+OdinLink registers **host memory only** and stages with a memcpy each way. The
+production-proven path therefore never registers GPU memory - so "gfx1151
+peer-memory registration" is not a prerequisite, it is simply **not used**.
+
+**On this APU that is cheap.** Strix Halo is UMA: host memory and GPU memory are
+the same physical LPDDR5X. A host-visible slab is GPU-accessible without a PCIe
+round trip, which is what makes host staging viable here where it would be
+costly on a discrete GPU.
+
+Zero-copy remains a LATER option, not a blocker: dma-buf ioctls exist
+(`lib/src/odl_tb5_xfer.c:92`), the verbs provider has a dma-buf MR object
+(`verbs/src/odl_tb5_verbs_mr.c:60`) and the QP selects dma-buf sends by key
+(`verbs/src/odl_tb5_verbs_qp.c:172`). The RCCL plugin just never uses them.
+
+### Integration surface: OdinLink VERBS + a host-visible slab
+
+ds4 already posts ordinary verbs operations (`ds4_tp.c:743`, `:945`), so the
+verbs provider is the better-shaped interface than the NCCL-net plugin (which is
+a collective-library ABI, host-staged, limited to one receive at
+`rccl/src/odl_tb5_net_v7.c:284`).
+
 ## The blocker
 
 `ds4_rocm.cu:135` — *"Tensor-parallel gates are Metal-only; stubs keep shared

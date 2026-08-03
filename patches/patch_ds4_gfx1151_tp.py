@@ -161,9 +161,75 @@ def patch_verbs_dlopen(tree, check):
              "librdma.dylib -> libibverbs.so.1 first, .dylib retained as fallback")
 
 
+# ---------------------------------------------------------------------------
+# Patch 3: let a ROCm build accept TP options - but ONLY when the ROCm TP
+# runtime is actually compiled in.
+#
+# Upstream hard-gates TP to Metal (ds4_tp.c:504-507). Simply deleting that
+# check is UNSAFE: the ROCm gate entry points are still stubs that print
+# "tensor parallelism is Metal-only" and return 0 (ds4_rocm.cu:137-215), so
+# TP would be accepted at the CLI and then silently do nothing at runtime -
+# the exact "healthy but silently degraded" failure this project has been
+# bitten by before.
+#
+# So the gate is widened only under DS4_ROCM_TP_READY, which patch 4 (the
+# ROCm gate runtime) defines. Until then a ROCm build still refuses TP, loudly
+# and at option-parse time, which is the correct fail-closed behaviour.
+# ---------------------------------------------------------------------------
+P3_ANCHOR = """    if (opt->backend != DS4_BACKEND_METAL) {
+        tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
+        return 0;
+    }"""
+
+P3_NEW = """    /* DS4-TP-gfx1151 (patch 3): allow ROCm once its TP runtime exists.
+     * Deliberately gated on DS4_ROCM_TP_READY (defined by the ROCm gate-runtime
+     * patch), NOT on the backend alone: the ROCm gate entry points ship as
+     * stubs, so accepting TP before they are real would give a CLI that says
+     * yes and a runtime that does nothing. Fail closed until proven. */
+#ifdef DS4_ROCM_TP_READY
+    /* NOTE there is no DS4_BACKEND_ROCM. ds4.h:20-22 defines only METAL, CUDA
+     * and CPU - a ROCm build IS the CUDA backend, HIP-translated (hence the
+     * cuda*->hip* macro wall in ds4_rocm.h). So the widened test names
+     * DS4_BACKEND_CUDA. That is still fail-closed for a genuine CUDA build,
+     * because stock CUDA also stubs the gate encoders
+     * (ds4_cuda.cu:27319,27324 "CUDA stub called") and therefore never
+     * defines DS4_ROCM_TP_READY. */
+    if (opt->backend != DS4_BACKEND_METAL && opt->backend != DS4_BACKEND_CUDA) {
+        tp_set_err(err, errlen,
+                   "tensor parallelism requires the Metal or ROCm backend");
+        return 0;
+    }
+#else
+    if (opt->backend != DS4_BACKEND_METAL) {
+        tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
+        return 0;
+    }
+#endif"""
+
+
+def patch_tp_backend_gate(tree, check):
+    name = "accept ROCm backend for TP (gated on DS4_ROCM_TP_READY)"
+    path = os.path.join(tree, "ds4_tp.c")
+    if not os.path.exists(path):
+        _log(name, FAIL, f"missing {path}")
+        return
+    src = _read(path)
+    if MARKER + " (patch 3)" in src:
+        _log(name, ALREADY, "ROCm gate already present")
+        return
+    n = src.count(P3_ANCHOR)
+    if n != 1:
+        _log(name, FAIL, f"anchor count {n} != 1 - upstream moved, refusing")
+        return
+    if _write_checked(path, src, src.replace(P3_ANCHOR, P3_NEW), check):
+        _log(name, WOULD if check else APPLIED,
+             "Metal-only -> Metal|CUDA(=ROCm build), only under DS4_ROCM_TP_READY")
+
+
 PATCHES = [
     patch_verbs_platform,
     patch_verbs_dlopen,
+    patch_tp_backend_gate,
 ]
 
 
