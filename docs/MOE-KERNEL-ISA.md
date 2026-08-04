@@ -60,3 +60,41 @@ the ceiling. Neither is an occupancy problem.
 40 CU @ 2.9 GHz = **59.4 TOPS**. Against that, 925 GFLOP/s is **1.56%**.
 (An earlier note in this repo compared against fp32 peak, 14.8 TFLOP/s, and
 reported 6% - wrong denominator, too generous.)
+
+## Patch 23 (templating the p loop) — IMPLEMENTED, MEASURED, REVERTED
+
+The recommended first fix was to make the pair count a template parameter so the
+`p` loop unrolls and the dynamic indexing disappears. Verified bit-identical by
+construction (all callers declare `xqb[8]` all-NULL, fill `[0,np)`, and both
+loops skip NULL, so a compile-time 8 visits the same slots in the same order).
+
+The ISA moved exactly as predicted:
+
+| metric | before | after |
+|---|---|---|
+| total body | 2686 | 7680 |
+| `v_dot4` (real work) | 128 | **1024** |
+| `v_movrel*` | 116 | **16** (-86%) |
+| `v_and` + `v_lshrrev` | 195 | **1541** |
+| `scratch_store*` | 30 | **0** |
+| useful-instruction share | 4.8% | **13.3%** |
+
+**And prefill got SLOWER: 27.91 t/s vs 29.91 baseline (-7%).** Output stayed
+coherent, so the change is correct - just worse.
+
+Why: unrolling traded 116 `v_movrel` for **1346 extra and/lshr**. The Q4_K
+nibble unpack (`dev_dot_q4_32`, moe.cuh:264) sits INSIDE the `p` loop, so
+unrolling replicated it 8x. Total ALU work rose even though the *ratio* of
+useful instructions improved, and the body grew 2.9x (I-cache pressure).
+
+**Lesson: the unpack hoist is a PREREQUISITE for templating, not a follow-up.**
+The estimate of "+2.5x for half a day, low risk" was wrong because it treated
+the two as independent and separable. They are not: unrolling without hoisting
+is strictly negative.
+
+Reverted. Any retry must hoist the weight unpack out of the `p` loop in the same
+change - load and unpack `x->qs + byte_off` ONCE per `j`, then dot it against
+each of the N activations - so the unpack count stays ~193 while `v_dot4`
+reaches 1024. That is a real restructuring of `dev_dot_q4_K_q8_K_block8`, not a
+signature change, and it should be verified bit-identical against the greedy
+reproducers before being trusted.

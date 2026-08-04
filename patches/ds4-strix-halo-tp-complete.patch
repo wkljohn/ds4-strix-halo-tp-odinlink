@@ -1364,10 +1364,34 @@ index 8c05433..7fdbf70 100644
 +    return 0;
 +}
 diff --git a/rocm/ds4_rocm_moe_launch.cuh b/rocm/ds4_rocm_moe_launch.cuh
-index 51fafe3..0a315f9 100644
+index 51fafe3..4efdcf7 100644
 --- a/rocm/ds4_rocm_moe_launch.cuh
 +++ b/rocm/ds4_rocm_moe_launch.cuh
-@@ -2342,28 +2342,181 @@ static int routed_moe_launch(
+@@ -750,7 +750,22 @@ static int routed_moe_launch(
+             (!q4k_path || n_tokens >= 32u) &&
+             !disable_resident_iq2_sorted;
+         const uint32_t use_expert_tiles = use_sorted_pairs;
+-        const uint32_t expert_tile_m = 8u;
++        /* DS4-TP-gfx1151 (patch 22): expert tile width, env-selectable for A/B.
++         *
++         * tile8 stages the ENTIRE K dimension for 8 tokens in LDS
++         * (8*16*sizeof(block_q8_K) = 37376 B), which caps occupancy at 37.5%
++         * in WGP mode (128 KB LDS / 37376 = 3 workgroups = 24 of 64 wave32).
++         * tile4 needs 18688 B -> 75% occupancy, at the cost of 2x weight
++         * re-reads (largely absorbed by the 32 MB MALL). Both kernels exist;
++         * the branch below is compile-time today so only one is instantiated.
++         * Bit-identical either way - same math, different tiling. */
++        static int tile_m_env = -1;
++        if (tile_m_env < 0) {
++            const char *e = getenv("DS4_ROCM_EXPERT_TILE_M");
++            tile_m_env = (e && e[0]) ? atoi(e) : 8;
++            if (tile_m_env != 4 && tile_m_env != 8) tile_m_env = 8;
++        }
++        const uint32_t expert_tile_m = (uint32_t)tile_m_env;
+         const uint32_t write_gate_up = 0u;
+         const uint32_t use_p2_sorted = 0u;
+         const uint32_t use_atomic_down = use_expert_tiles && n_tokens >= 128u;
+@@ -2342,28 +2357,181 @@ static int routed_moe_launch(
      return ok;
  }
  
