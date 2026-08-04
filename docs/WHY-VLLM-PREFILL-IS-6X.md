@@ -20,11 +20,18 @@ identified bottlenecks explain.
           = 660 GFLOP
     achieved = 660 GFLOP / 714 ms = 925 GFLOP/s
 
-gfx1151 fp32 peak is ~14.8 TFLOP/s at 40 CU / 2.9 GHz (~7.4 if the probe's
-`multiProcessorCount = 20` is CUs rather than WGPs - the uncertainty does not
-change the conclusion).
+**CORRECTED**: I first compared against fp32 peak (~14.8 TFLOP/s). Wrong
+denominator - the kernel uses `v_dot4_i32_iu8`, whose peak on gfx1151 is
+**59.4 TOPS** (full-rate VALU, 64 lanes/CU/clk x 4 MAC x 2, 40 CU @ 2.9 GHz).
 
-    -> ds4's MoE achieves 6% (40 CU) to 12% (20 CU) of fp32 peak.
+    -> ds4's MoE achieves 925 GFLOP/s = 1.56% of DP4A peak, i.e. ~64x off.
+
+Independent ISA analysis decomposes that into two ~8x factors: the 8-token tile
+gives an arithmetic intensity of only 26.4 flop/byte (a 5.9 TFLOP/s ceiling for
+that shape, of which the kernel reaches 16%), and the inner loop runs ~21
+instructions per dot4 - 116 `v_movrel` from a non-unrolled runtime-trip-count
+loop, 195 and/lshr from re-doing the Q4_K nibble unpack per token, and 0
+`ds_read` despite 37 KB of LDS (a generic pointer forces flat loads).
 
 And it is not bandwidth-bound either: touching all 128 owned experts is
 1.8 GB per layer = **2.5 GB/s** against the 240 GB/s measured device read
@@ -57,3 +64,31 @@ is exactly what makes its DECODE the best of the three engines (10.5 t/s vs
 llama.cpp's 9.42 and vLLM's 3.28). A dequantise-to-f16-then-batched-GEMM prefill
 strategy may be incompatible with that residency design, or may simply be
 absent. That is the question to answer before investing in MoE kernel work.
+
+
+## The vLLM comparison is VALID (checked)
+
+`V026-DECISION.md:287` records "Everything here was sequential and idle", so
+198.8 tok/s (5.03 ms/prompt-token) is single-stream prefill, directly comparable
+to our ~30. It is NOT the batched-concurrency number - that is a separate
+162-181 tok/s figure from a different benchmark.
+
+## MEASURED: narrowing the tile makes it WORSE
+
+`DS4_ROCM_EXPERT_TILE_M` (patch 22) makes the width selectable. Both kernels
+already exist in-tree; the launch branch is compile-time so only one is
+instantiated.
+
+| tile_m | LDS | occupancy | prefill |
+|---|---|---|---|
+| 4 | 18688 B | 75% | **27.10 t/s** |
+| 8 (default) | 37376 B | 37.5% | **30.00 t/s** |
+
+**Occupancy is not the binding constraint.** tile4 doubles the weight
+re-streaming and that cost exceeds the occupancy gain. The kernel is
+weight-streaming bound at the tile level.
+
+Consequence: the fix is to go **wider**, not narrower - more tokens amortised
+per weight read - which requires K-tiling to keep LDS bounded (staging the whole
+K=4096 for the tile is what forces 37 KB today). Going wider without K-tiling
+would blow LDS entirely.
