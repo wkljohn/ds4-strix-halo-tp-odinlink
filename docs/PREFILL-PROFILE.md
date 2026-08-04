@@ -55,3 +55,34 @@ The real targets, in order:
 (2048), 27.41 (1024) t/s.** No win. This also refutes the hypothesis that chunk
 4096 falls into a hipBLAS path needing ~5.4 GB of scratch - if it did, chunk 2048
 would have been dramatically faster.
+
+
+## Patch 20: the workaround was disabling two things, not one
+
+`DS4_TP_PREFILL_SPLIT_MIN` gated BOTH `tp_row_split_attn` (ds4.c:26778) and
+`tp_row_split_ffn` (ds4.c:28822). Only attention needs the missing range
+kernels; the FFN split row-splits the replicated shared expert and every
+`ds4_gpu_*` it touches is already implemented on ROCm. So the workaround for
+attention was silently costing the FFN split too.
+
+Patch 20 gives them independent knobs:
+- `DS4_TP_PREFILL_SPLIT_MIN_ATTN` (must stay high until the range kernels exist)
+- `DS4_TP_PREFILL_SPLIT_MIN_FFN` (can be 32)
+- `DS4_TP_PREFILL_SPLIT_MIN` still works as the fallback for both.
+
+Measured, 3306-token prompt, 3 samples each:
+
+| config | prefill samples | mean |
+|---|---|---|
+| FFN split ON | 29.56, 29.56, 29.50 | **29.54 t/s** |
+| both splits off | 28.96, 29.18, 28.82 | 28.99 t/s |
+
+**+1.9%**, reproducible (the three ON samples span 0.06 t/s) and the
+distributions do not overlap. Output stays coherent. Predicted was ~+7%; the
+prediction was a FLOP-share estimate and the profile shows why it was optimistic
+- the shared expert is `shared_gate_up` + `shared_down` = well under 1% of
+prefill by measurement, not the ~13% of a layer the FLOP count suggested.
+
+Useful side result: **prefill t/s on a long prompt is highly reproducible**
+(spread <1%), unlike the 13-token prompt where it spanned 2.5x. Long-prompt
+prefill is now a usable measurement instrument.

@@ -12,10 +12,52 @@ index 81d4881..1619c45 100644
  		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
  
 diff --git a/ds4.c b/ds4.c
-index 2496319..78309fc 100644
+index 2496319..09e9684 100644
 --- a/ds4.c
 +++ b/ds4.c
-@@ -26985,7 +26985,13 @@ static bool metal_graph_encode_layer_attention_batch(
+@@ -26704,11 +26704,31 @@ static ds4_gpu_tensor *metal_graph_tensor_row_range_view(
+ 
+ /* TP prefill threshold for row-splitting the replicated shared expert.
+  * Routed experts remain ownership-split at every batch size. */
++/* DS4-TP-gfx1151 (patch 20): the ATTENTION row split needs
++ * ds4_gpu_attention_prefill_raw_heads_range_tensor and
++ * ..._static_mixed_heads_range_tensor, both unimplemented on ROCm, so it must be
++ * disabled here. The FFN row split needs NO missing kernel - every ds4_gpu_* it
++ * touches is implemented - and it row-splits the replicated shared expert.
++ * They shared one threshold, so disabling attention silently disabled the FFN
++ * split too and we were paying for the workaround twice. Give attention its own
++ * knob; DS4_TP_PREFILL_SPLIT_MIN keeps its meaning for the FFN split. */
++static uint32_t metal_graph_tp_prefill_split_min_attn(void) {
++    static int cached = -1;
++    if (cached < 0) {
++        const char *env = getenv("DS4_TP_PREFILL_SPLIT_MIN_ATTN");
++        if (!env || !env[0]) env = getenv("DS4_TP_PREFILL_SPLIT_MIN");
++        cached = (env && env[0]) ? atoi(env) : 32;
++        if (cached < 2) cached = 2;
++    }
++    return (uint32_t)cached;
++}
++
+ static uint32_t metal_graph_tp_prefill_split_min(void) {
+     static int cached = -1;
+     if (cached < 0) {
+         cached = 32;
+-        const char *env = getenv("DS4_TP_PREFILL_SPLIT_MIN");
++        const char *env = getenv("DS4_TP_PREFILL_SPLIT_MIN_FFN");
++        if (!env || !env[0]) env = getenv("DS4_TP_PREFILL_SPLIT_MIN");
+         if (env && env[0]) cached = atoi(env);
+         if (cached < 2) cached = 2;
+     }
+@@ -26775,7 +26795,7 @@ static bool metal_graph_encode_layer_attention_batch(
+         g->tp_batch_rows != n_tokens &&
+         (tp_attn_full_raw || tp_attn_static_mixed || tp_attn_indexed) &&
+         !metal_graph_directional_steering_attn_enabled(g) &&
+-        n_tokens >= metal_graph_tp_prefill_split_min();
++        n_tokens >= metal_graph_tp_prefill_split_min_attn();
+     const uint32_t tp_half_rows = (n_tokens + 1u) / 2u;
+     const uint32_t tp_row0 = (tp_row_split_attn && g->tp_rank != 0) ? tp_half_rows : 0;
+     const uint32_t tp_rows = tp_row_split_attn ?
+@@ -26985,7 +27005,13 @@ static bool metal_graph_encode_layer_attention_batch(
       * tensors (batch_q_half is F16, so its view is built directly). */
      ds4_gpu_tensor *tp_q = tp_row_split_attn ?
          metal_graph_tensor_row_range_view(metal_graph_batch_q(g), tp_row0, tp_rows, q_dim) : NULL;
@@ -30,7 +72,7 @@ index 2496319..78309fc 100644
          ds4_gpu_tensor_view(g->batch_q_half,
                              (uint64_t)tp_row0 * q_dim * sizeof(uint16_t),
                              (uint64_t)tp_rows * q_dim * sizeof(uint16_t)) : NULL;
-@@ -26996,8 +27002,19 @@ static bool metal_graph_encode_layer_attention_batch(
+@@ -26996,8 +27022,19 @@ static bool metal_graph_encode_layer_attention_batch(
      ds4_gpu_tensor *tp_attn_out = tp_row_split_attn ?
          metal_graph_tensor_row_range_view(metal_graph_batch_attn_out(g), tp_row0, tp_rows,
                                            DS4_N_EMBD) : NULL;
@@ -51,7 +93,7 @@ index 2496319..78309fc 100644
          ok = false;
      }
      bool q_b_f16_out = false;
-@@ -27150,7 +27167,11 @@ static bool metal_graph_encode_layer_attention_batch(
+@@ -27150,7 +27187,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                      n_tokens,
                                                                      DS4_N_HEAD_DIM) != 0;
      if (!ok) {
@@ -64,7 +106,7 @@ index 2496319..78309fc 100644
      }
      const bool raw_batch_attention = zero_prefix && ratio == 0;
      bool batch_attention_done = false;
-@@ -56478,7 +56499,7 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
+@@ -56478,7 +56519,7 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
      return e && e->tp.active && e->tp.vocab_split;
  }
  
@@ -73,7 +115,7 @@ index 2496319..78309fc 100644
  static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
      ds4_tp *tp = ud;
      const int ok = ds4_tp_gate_exchange(tp, layer, gate, seq);
-@@ -56514,15 +56535,26 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
+@@ -56514,15 +56555,26 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
  #endif
  
  int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
@@ -101,7 +143,7 @@ index 2496319..78309fc 100644
      if (e->tp.active) {
          snprintf(err, errlen, "tensor parallelism already bound");
          return 0;
-@@ -56601,7 +56633,7 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
+@@ -56601,7 +56653,7 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
  
  void ds4_engine_close(ds4_engine *e) {
      if (!e) return;
@@ -110,7 +152,7 @@ index 2496319..78309fc 100644
      if (e->tp.active) {
          ds4_gpu_tp_shutdown();
          const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
-@@ -56845,7 +56877,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
+@@ -56845,7 +56897,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
          s->glm_graph.quality = e->quality;
          s->glm_graph.ssd_streaming = e->ssd_streaming;
          s->glm_graph.ssd_streaming_cold = e->ssd_streaming_cold;
@@ -119,7 +161,7 @@ index 2496319..78309fc 100644
          if (e->tp.active) {
              s->glm_graph.tp_world = 2;
              s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
-@@ -59899,7 +59931,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
+@@ -59899,7 +59951,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
          ds4_session_invalidate(s);
          return rc;
      }
