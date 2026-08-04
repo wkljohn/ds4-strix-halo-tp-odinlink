@@ -171,10 +171,10 @@ index 2496319..09e9684 100644
          snprintf(err, errlen, "tp: gate transport failed");
          if (ds4_session_tp_leader(s)) ds4_session_invalidate(s);
 diff --git a/ds4_rocm.cu b/ds4_rocm.cu
-index 46ba223..326150a 100644
+index 46ba223..f700e2e 100644
 --- a/ds4_rocm.cu
 +++ b/ds4_rocm.cu
-@@ -132,85 +132,498 @@ typedef struct {
+@@ -132,85 +132,556 @@ typedef struct {
  
  #include "rocm/ds4_rocm_current_api_compat.cuh"
  
@@ -286,8 +286,39 @@ index 46ba223..326150a 100644
 + * null-stream compute kernels (legacy null-stream implicit sync), so the
 + * gate's blocking semantics are preserved. */
 +static hipStream_t              g_tp_stream = NULL;
-+static int                      g_tp_sig_is_host = 0;
++/* ds4_tp.c is plain C; declare the hook setter with C linkage rather than
++ * including ds4_tp.h into this .cu. Must match ds4_tp.h exactly. */
++extern "C" {
++typedef int (*ds4_tp_devcopy_fn)(void *dst, const void *src, uint64_t bytes);
++void ds4_tp_set_devcopy(ds4_tp_devcopy_fn fn);
+ }
+ 
+-extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
+-    (void)fn;
++static hipStream_t              g_tp_copy_stream = NULL;
 +
++/* Device DMA instead of a CPU read of write-combining device memory.
++ * Both ends are hipMalloc'd (the slab and the graph tensor), so this is a
++ * device-to-device copy the DMA engine can do while the GPU is parked in
++ * WaitValue. Synchronous from the caller's view: ds4_tp.c expects the bytes to
++ * be in place on return. */
++static int ds4_tp_devcopy_hip(void *dst, const void *src, uint64_t bytes) {
++    if (!g_tp_copy_stream || !dst || !src || bytes == 0) return 0;
++    if (hipMemcpyAsync(dst, src, (size_t)bytes, hipMemcpyDeviceToDevice,
++                       g_tp_copy_stream) != hipSuccess) {
++        (void)hipGetLastError();
++        return 0;
++    }
++    if (hipStreamSynchronize(g_tp_copy_stream) != hipSuccess) {
++        (void)hipGetLastError();
++        return 0;
++    }
++    return 1;
+ }
++static int                      g_tp_sig_is_host = 0;
+ 
+-extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
+-    (void)suspend;
 +static int ds4_tp_fail_get(void) { return __atomic_load_n(&g_tp_failed, __ATOMIC_ACQUIRE); }
 +static void ds4_tp_fail_set(void) { __atomic_store_n(&g_tp_failed, 1, __ATOMIC_RELEASE); }
 +
@@ -299,8 +330,8 @@ index 46ba223..326150a 100644
 +    return g_tp_trace;
  }
  
--extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) {
--    (void)fn;
+-extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
+-    (void)paused;
 +static int ds4_tp_pump(int ch, uint64_t *next) {
 +    struct ds4_tp_chan *c = &g_tp_chan[ch];
 +    uint64_t arrived = __atomic_load_n(c->gpu_flag, __ATOMIC_ACQUIRE);
@@ -347,8 +378,8 @@ index 46ba223..326150a 100644
 +    return 1;
  }
  
--extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
--    (void)suspend;
+-extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
+-    (void)enabled;
 +static void *ds4_tp_service_thread(void *arg) {
 +    (void)arg;
 +    uint64_t next[2] = { 1, 1 };
@@ -394,8 +425,8 @@ index 46ba223..326150a 100644
 +    return NULL;
  }
  
--extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {
--    (void)paused;
+-extern "C" void ds4_gpu_model_residency_skip(int skip) {
+-    (void)skip;
 +extern "C" int ds4_gpu_tp_init(uint32_t rank,
 +                               ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
 +                               ds4_gpu_tp_exchange_fn fn, void *ud) {
@@ -463,6 +494,35 @@ index 46ba223..326150a 100644
 +    g_tp_fn = fn; g_tp_ud = ud;
 +    __atomic_store_n(&g_tp_failed, 0, __ATOMIC_RELEASE);
 +
++    /* DS4-TP-gfx1151 (patch 21): device-side staging copy for the big gate.
++     *
++     * MUST be a NON-BLOCKING stream. A copy on the null stream would, under
++     * legacy implicit-sync semantics, wait for g_tp_stream - which is parked on
++     * the very gate this copy is servicing. That deadlocks. */
++    /* OPT-IN ONLY (DS4_TP_DEVCOPY=1). Enabling this by default BREAKS the
++     * transfer: "timeout waiting for bulk RDMA round (33/64 recvs)". The GPU's
++     * DMA writes into the ibv-registered slab are not reliably visible to the
++     * OdinLink NIC - a coherence problem between the GPU copy engine and the
++     * device's view of registered memory, which hipStreamSynchronize does not
++     * address (it orders the copy, it does not make it externally visible).
++     *
++     * The measurement that motivated this stands: staging is 64% of big-gate
++     * time at 200 MB/s. Fixing it needs either a system-scope release fence
++     * after the copy, fine-grained/host-coherent slab memory, or the
++     * slab-direct approach (make `direct` true so no staging copy happens at
++     * all), which is the cleaner fix and avoids the coherence question. */
++    if (getenv("DS4_TP_DEVCOPY")) {
++        if (!g_tp_copy_stream &&
++            hipStreamCreateWithFlags(&g_tp_copy_stream, hipStreamNonBlocking) != hipSuccess) {
++            g_tp_copy_stream = NULL;
++        }
++        if (g_tp_copy_stream) {
++            fprintf(stderr, DS4_GPU_LOG_PREFIX
++                    "tp: DS4_TP_DEVCOPY enabled - EXPERIMENTAL, known to fail bulk RDMA rounds\n");
++            ds4_tp_set_devcopy(ds4_tp_devcopy_hip);
++        }
++    }
++
 +    if (hipStreamCreate(&g_tp_stream) != hipSuccess || !g_tp_stream) {
 +        fprintf(stderr, DS4_GPU_LOG_PREFIX "tp_init: gate stream create failed\n");
 +        if (g_tp_sig_is_host) hipHostFree(sig); else hipFree(sig);
@@ -481,16 +541,16 @@ index 46ba223..326150a 100644
 +    fprintf(stderr, DS4_GPU_LOG_PREFIX
 +            "ROCm TP rank %u ready (2 channels, HIP stream wait-value)\n", rank);
 +    return 1;
- }
- 
--extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled) {
--    (void)enabled;
++}
++
 +extern "C" void ds4_gpu_tp_shutdown(void) {
 +    if (!g_tp_thread_live) return;
 +    g_tp_run = 0;
 +    pthread_join(g_tp_thread, NULL);        /* drains before returning */
 +    hipDeviceSynchronize();                 /* no pending WaitValue on the word */
 +    g_tp_thread_live = 0;
++    ds4_tp_set_devcopy(NULL);
++    if (g_tp_copy_stream) { (void)hipStreamDestroy(g_tp_copy_stream); g_tp_copy_stream = NULL; }
 +    if (g_tp_stream) { (void)hipStreamDestroy(g_tp_stream); g_tp_stream = NULL; }
 +    if (g_tp_sig_alloc) {
 +        if (g_tp_sig_is_host) hipHostFree(g_tp_sig_alloc); else hipFree(g_tp_sig_alloc);
@@ -499,8 +559,8 @@ index 46ba223..326150a 100644
 +    g_tp_fn = NULL; g_tp_ud = NULL;
  }
  
--extern "C" void ds4_gpu_model_residency_skip(int skip) {
--    (void)skip;
+-extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
+-    (void)fn;
 +/* Publish arrival on `ch`, then block the null stream until release. */
 +static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
 +    if (!g_tp_thread_live) {
@@ -536,10 +596,8 @@ index 46ba223..326150a 100644
 +extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
 +    struct ds4_tp_req r = {}; r.kind = DS4_TP_ROW; r.layer = layer; r.gate = gate;
 +    return ds4_tp_encode(0, &r);
- }
- 
--extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn) {
--    (void)fn;
++}
++
 +extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 +    struct ds4_tp_req r = {}; r.kind = DS4_TP_BATCH; r.layer = layer; r.rows = rows;
 +    return ds4_tp_encode(1, &r);
@@ -565,6 +623,43 @@ index 46ba223..326150a 100644
  
 -extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 -    (void)layer; (void)rows;
+-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+-    return 0;
+-}
+-
+-extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
+-        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+-        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
+-        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
+-        uint64_t x_elem_off) {
+-    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+-    (void)full_in_dim; (void)k_off; (void)k_cnt; (void)out_dim; (void)x;
+-    (void)x_elem_off;
+-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+-    return 0;
+-}
+-
+-extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
+-        ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,
+-        uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
+-        uint64_t group_dim, uint64_t rank, uint32_t n_groups_total,
+-        uint32_t group0, uint32_t group_cnt, uint64_t out_dim,
+-        const ds4_gpu_tensor *heads) {
+-    (void)out; (void)low; (void)model_map; (void)model_size;
+-    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;
+-    (void)n_groups_total; (void)group0; (void)group_cnt; (void)out_dim;
+-    (void)heads;
+-    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
+-    return 0;
+-}
+-
+-extern "C" int ds4_gpu_hc_expand_add_tensor(
+-        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
+-        const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc,
+-        const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb,
+-        uint32_t n_embd, uint32_t n_hc) {
+-    (void)out_hc; (void)block_out; (void)block_add; (void)residual_hc;
+-    (void)post; (void)comb; (void)n_embd; (void)n_hc;
 -    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
 -    return 0;
 +extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) { g_tp_batch_fn = fn; }
@@ -626,18 +721,8 @@ index 46ba223..326150a 100644
 +     * recombine to exactly the unsharded result. */
 +    sel_dst[i] = own ? (e - lo) : 0;
 +    w_dst[i]   = own ? w_src[i] : 0.0f;
- }
- 
--extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
--        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
--        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
--        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
--        uint64_t x_elem_off) {
--    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
--    (void)full_in_dim; (void)k_off; (void)k_cnt; (void)out_dim; (void)x;
--    (void)x_elem_off;
--    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
--    return 0;
++}
++
 +/* Owned half of the expert range. Mirrors ds4_metal.m:8327-8342, including
 + * rank 1 taking the odd remainder. */
 +static void ds4_tp_expert_range(uint32_t n_total, int32_t *lo, int32_t *hi) {
@@ -646,20 +731,8 @@ index 46ba223..326150a 100644
 +    const uint32_t low = n_total / 2u;
 +    if (g_tp_split_rank == 1) { *lo = (int32_t)low; }
 +    else                      { *hi = (int32_t)low; }
- }
- 
--extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
--        ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,
--        uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
--        uint64_t group_dim, uint64_t rank, uint32_t n_groups_total,
--        uint32_t group0, uint32_t group_cnt, uint64_t out_dim,
--        const ds4_gpu_tensor *heads) {
--    (void)out; (void)low; (void)model_map; (void)model_size;
--    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;
--    (void)n_groups_total; (void)group0; (void)group_cnt; (void)out_dim;
--    (void)heads;
--    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
--    return 0;
++}
++
 +/* Rebase the routing selection onto this rank's expert shard.
 + *
 + * REPLACES the earlier weight-masking approach, which was incompatible with TP
@@ -700,17 +773,8 @@ index 46ba223..326150a 100644
 +    if (out_base)     *out_base     = (uint32_t)lo;
 +    if (out_count)    *out_count    = (uint32_t)(hi - lo);
 +    return 1;
- }
- 
--extern "C" int ds4_gpu_hc_expand_add_tensor(
--        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out,
--        const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc,
--        const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb,
--        uint32_t n_embd, uint32_t n_hc) {
--    (void)out_hc; (void)block_out; (void)block_add; (void)residual_hc;
--    (void)post; (void)comb; (void)n_embd; (void)n_hc;
--    fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor parallelism is Metal-only\n");
--    return 0;
++}
++
 +/* Exposed so callers can size the scratch buffer and know whether to bother. */
 +extern "C" int ds4_gpu_tp_expert_shard_active(void) {
 +    return (g_tp_split_world == 2 && !g_tp_expert_shard_suspended) ? 1 : 0;
@@ -765,7 +829,7 @@ index 7169eab..c05f5f5 100644
  ROCM_UNAVAILABLE_INT(ds4_gpu_register_model_map_no_copy)
  ROCM_UNAVAILABLE_INT(ds4_gpu_register_support_map)
 diff --git a/ds4_tp.c b/ds4_tp.c
-index 34ec68b..411032e 100644
+index 34ec68b..2aca514 100644
 --- a/ds4_tp.c
 +++ b/ds4_tp.c
 @@ -29,7 +29,13 @@
@@ -783,7 +847,24 @@ index 34ec68b..411032e 100644
  #if __has_include(<infiniband/verbs.h>)
  #include <infiniband/verbs.h>
  #include <dlfcn.h>
-@@ -495,10 +501,30 @@ int ds4_tp_validate_engine_options(
+@@ -193,6 +199,16 @@ static double tp_now_sec(void) {
+     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+ }
+ 
++static ds4_tp_devcopy_fn g_tp_devcopy;
++
++void ds4_tp_set_devcopy(ds4_tp_devcopy_fn fn) { g_tp_devcopy = fn; }
++
++/* Staging copy: device DMA when the backend registered one, else memcpy. */
++static inline void tp_stage_copy(void *dst, const void *src, uint64_t bytes) {
++    if (g_tp_devcopy && g_tp_devcopy(dst, src, bytes)) return;
++    memcpy(dst, src, (size_t)bytes);
++}
++
+ static void tp_set_err(char *err, size_t errlen, const char *fmt, ...) {
+     if (!err || !errlen) return;
+     va_list ap;
+@@ -495,10 +511,30 @@ int ds4_tp_validate_engine_options(
          }
          return 1;
      }
@@ -814,7 +895,7 @@ index 34ec68b..411032e 100644
      if (opt->ssd_streaming) {
          tp_set_err(err, errlen, "tensor parallelism requires resident weights (no --ssd-streaming)");
          return 0;
-@@ -582,7 +608,20 @@ uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
+@@ -582,7 +618,20 @@ uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
  
  static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
      if (api->handle) return 1;
@@ -836,7 +917,7 @@ index 34ec68b..411032e 100644
      if (!h) h = dlopen("librdma.dylib", RTLD_NOW | RTLD_LOCAL);
      if (!h) return 0;
  #define TP_SYM(field, name) \
-@@ -708,6 +747,10 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
+@@ -708,6 +757,10 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
      struct ibv_qp_init_attr qia = {0};
      qia.send_cq = r->cq;
      qia.recv_cq = r->cq;
@@ -847,7 +928,7 @@ index 34ec68b..411032e 100644
      qia.qp_type = IBV_QPT_UC;
      qia.cap.max_send_wr = 256;
      qia.cap.max_recv_wr = 64;
-@@ -716,7 +759,15 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
+@@ -716,7 +769,15 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
      qia.cap.max_inline_data = 0;
      r->qp = r->api.create_qp(r->pd, &qia);
      if (!r->qp) {
@@ -864,7 +945,7 @@ index 34ec68b..411032e 100644
          return 0;
      }
      r->max_inline = qia.cap.max_inline_data;
-@@ -908,7 +959,11 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
+@@ -908,7 +969,11 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
  static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
      ds4_tp_rdma *r = &tp->rdma;
      const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
@@ -877,7 +958,75 @@ index 34ec68b..411032e 100644
          fprintf(stderr, "ds4-tp: gate trace l=%u g=%u seq=%llu want_slot=%u\n",
                  layer, gate, (unsigned long long)seq, tp_gate_slot(tp, seq));
      }
-@@ -1571,7 +1626,9 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
+@@ -1086,6 +1151,16 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
+      * directly. Ordinary prefill tensors use the idle verify regions as
+      * registered staging because their standalone MTLBuffers are not in the
+      * NIC memory region. */
++    /* DS4-TP-gfx1151 (diag): split the big-gate cost into staging-copy vs wire.
++     * The staging memcpys are CPU reads of hipMalloc device memory (uncached on
++     * this APU); if `direct` is false they dominate. Printed every 64 gates. */
++    static double g_bg_copy_s, g_bg_wire_s, g_bg_bytes;
++    static uint64_t g_bg_gates;
++    static int g_bg_trace = -1;
++    if (g_bg_trace < 0) g_bg_trace = getenv("DS4_TP_BIGGATE_PROFILE") ? 1 : 0;
++    const double bg_t0 = g_bg_trace ? tp_now_sec() : 0.0;
++    double bg_copy = 0.0;
++
+     const uintptr_t slab_lo = (uintptr_t)tp->slab;
+     const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
+     const uintptr_t out_lo = (uintptr_t)out;
+@@ -1113,8 +1188,10 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
+             chunk_off[i] = direct ? round_bytes :
+                 (uint64_t)i * DS4_TP_RDMA_MAX_MSG;
+             if (!direct) {
+-                memcpy(stage_send + chunk_off[i],
+-                       (const uint8_t *)out + off + round_bytes, lens[i]);
++                const double c0 = g_bg_trace ? tp_now_sec() : 0.0;
++                tp_stage_copy(stage_send + chunk_off[i],
++                              (const uint8_t *)out + off + round_bytes, lens[i]);
++                if (g_bg_trace) bg_copy += tp_now_sec() - c0;
+             }
+             round_bytes += lens[i];
+         }
+@@ -1210,15 +1287,35 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
+         }
+         atomic_thread_fence(memory_order_acquire);
+         if (!direct) {
++            const double c1 = g_bg_trace ? tp_now_sec() : 0.0;
+             round_bytes = 0;
+             for (uint32_t i = 0; i < chunks; i++) {
+-                memcpy((uint8_t *)in + off + round_bytes,
+-                       stage_recv + chunk_off[i], lens[i]);
++                tp_stage_copy((uint8_t *)in + off + round_bytes,
++                              stage_recv + chunk_off[i], lens[i]);
+                 round_bytes += lens[i];
+             }
++            if (g_bg_trace) bg_copy += tp_now_sec() - c1;
+         }
+         off += round_bytes;
+     }
++    if (g_bg_trace) {
++        const double total = tp_now_sec() - bg_t0;
++        g_bg_copy_s += bg_copy;
++        g_bg_wire_s += total - bg_copy;
++        g_bg_bytes  += (double)bytes;
++        if (++g_bg_gates % 16u == 0u) {
++            const double tot = g_bg_copy_s + g_bg_wire_s;
++            fprintf(stderr,
++                    "ds4-tp: big-gate %llu gates direct=%d | staging-copy %.1f ms (%.0f%%) "
++                    "| wire+wait %.1f ms (%.0f%%) | %.1f MB moved -> copy %.0f MB/s, effective %.0f MB/s\n",
++                    (unsigned long long)g_bg_gates, (int)direct,
++                    g_bg_copy_s * 1e3, tot > 0 ? 100.0 * g_bg_copy_s / tot : 0.0,
++                    g_bg_wire_s * 1e3, tot > 0 ? 100.0 * g_bg_wire_s / tot : 0.0,
++                    g_bg_bytes / 1e6,
++                    g_bg_copy_s > 0 ? (g_bg_bytes * 2.0) / g_bg_copy_s / 1e6 : 0.0,
++                    tot > 0 ? g_bg_bytes / tot / 1e6 : 0.0);
++        }
++    }
+     return 1;
+ }
+ 
+@@ -1571,7 +1668,9 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
          if (!tp_read_full(tp->data_fd, (char *)in + off, n)) return 0;
          off += n;
      }
@@ -888,6 +1037,32 @@ index 34ec68b..411032e 100644
          const float *o = (const float *)out, *i = (const float *)in;
          fprintf(stderr,
                  "ds4-tp: big gate l=%u seq=%llu out[0..3]=%g %g %g %g in[0..3]=%g %g %g %g\n",
+diff --git a/ds4_tp.h b/ds4_tp.h
+index ddc2e34..dbd6fe7 100644
+--- a/ds4_tp.h
++++ b/ds4_tp.h
+@@ -55,6 +55,21 @@ typedef struct {
+     uint32_t gates_per_token;
+ } ds4_tp_identity;
+ 
++/* DS4-TP-gfx1151 (patch 21): device-copy hook for big-gate staging.
++ *
++ * The big gate stages through the registered slab with memcpy when the caller's
++ * buffers are outside it (`direct == 0`, which is ALWAYS the case for prefill:
++ * batch_routed_out is an ordinary graph tensor). Those memcpys are CPU reads of
++ * hipMalloc device memory, which on this UMA APU is host-reachable but
++ * write-combining. MEASURED: 200 MB/s, 64% of all big-gate time.
++ *
++ * The backend registers a device-side copy here so the GPU's DMA engines do it
++ * instead - they are idle, since the GPU is parked in hipStreamWaitValue64.
++ * Returns non-zero on success; ds4_tp.c falls back to memcpy when unset or on
++ * failure, so this stays optional and platform-free. */
++typedef int (*ds4_tp_devcopy_fn)(void *dst, const void *src, uint64_t bytes);
++void ds4_tp_set_devcopy(ds4_tp_devcopy_fn fn);
++
+ bool ds4_tp_enabled(const ds4_tp_options *opt);
+ 
+ typedef enum {
 diff --git a/rocm/ds4_rocm_attention_launch.cuh b/rocm/ds4_rocm_attention_launch.cuh
 index 56563b4..02e1329 100644
 --- a/rocm/ds4_rocm_attention_launch.cuh
