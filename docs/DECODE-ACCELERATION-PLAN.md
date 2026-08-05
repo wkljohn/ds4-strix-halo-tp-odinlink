@@ -425,3 +425,38 @@ sub-stage), not further attention-output work.
 Next step: implement and validate the workgroup-size sweep first (the safe
 one), on live hardware, with exact-output-equivalence + real timing
 comparison, before considering the split-K generalization.
+
+## Workgroup-size sweep RESULT: no measured win (2026-08-05)
+
+Implemented (`ds4-upstream` commit `6c15c68`):
+`DS4_ROCM_ATTN_OUT_LOW_THREADS` / `DS4_ROCM_ATTN_OUT_EXPAND_THREADS`
+(1024 default / 512 / 256), pure launch-configuration change, zero effect
+on math - both kernels already derive rows-per-block from `blockDim.x`.
+Default reproduces current behavior exactly.
+
+**Measured on both live nodes: no measurable decode speedup.** All four
+configs tested (low512, low256, expand512, expand256) landed at
+10.42-10.70 t/s generation, indistinguishable from the (corrected)
+baseline of 10.89/10.93 t/s across two reruns. (One initial baseline
+reading of 6.72 t/s was investigated and confirmed to be a one-off fluke -
+rerunning the identical unset-env-var config twice gave 10.89 and 10.93
+t/s, matching this project's established historical baseline; always
+rerun an anomalous baseline before trusting it as the comparison point.)
+
+Honest result: the occupancy theory (64 workgroups is too few for 40 CUs)
+did not translate into a measured win here. Either the kernel isn't
+occupancy-bound at this shape, or the actual bottleneck is elsewhere
+(memory bandwidth already saturated, or launch/sync overhead dominates
+regardless of block size). Not pursuing further variations of this
+specific lever.
+
+**Remaining candidate**: the split-K generalization to the TP-local
+`n_groups==4` shape (medium confidence, real correctness risk - changes FP
+accumulation order, code comments warn this can cross downstream FP8
+midpoints). This is the last promising lever specific to the attention-
+output kernels before falling back to `compressor_proj` (~131us) as the
+next target. Requires mandatory exact-greedy-output equivalence
+validation given the explicit numerical-change risk, and given this
+project's prior experience with a silent-corruption bug in an adjacent
+kernel family (the down-projection WMMA tile-width bug) - "numerically
+close" is not an acceptable bar here.
