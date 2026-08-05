@@ -46,18 +46,24 @@ fail-closed anchors and `--check`; the consolidated patch is the whole tree.
 Start the **worker first**, then the coordinator.
 
     # worker (peer)
-    DS4_CUDA_NO_Q8_F16_CACHE=1 DS4_TP_BIG_DIRECT=1 ./ds4 -m <model.gguf> --rocm --tensor-parallel \
+    DS4_TP_BIG_DIRECT=1 ./ds4 -m <model.gguf> --rocm --tensor-parallel \
         --role worker --coordinator 10.4.0.1 5599 --transport tcp -c 4096
 
     # coordinator (head)
-    DS4_CUDA_NO_Q8_F16_CACHE=1 DS4_TP_BIG_DIRECT=1 ./ds4 -m <model.gguf> --rocm --tensor-parallel \
+    DS4_TP_BIG_DIRECT=1 ./ds4 -m <model.gguf> --rocm --tensor-parallel \
         --role coordinator --listen 10.4.0.1 5599 --transport tcp -c 4096 \
         --temp 0 -p "..."
 
-Three environment variables are **required**, not tuning knobs:
+**UPDATE (2026-08-05): do NOT set `DS4_CUDA_NO_Q8_F16_CACHE=1`.** It used to
+be listed as required below - it is not, and setting it actively costs
+~20-30% prefill throughput. See `docs/PREFILL-PROFILE.md`'s "CONFIRMED WIN"
+section: the q8->f16 cache has its own graceful budget cap and does not OOM
+in practice (validated across 5 runs including a 500-token stress test), and
+leaving it enabled recovers the attention output projection's fast
+cuBLAS-f16 path, which this flag was silently killing every prefill call.
 
-- `DS4_CUDA_NO_Q8_F16_CACHE=1` — without it the q8->f16 accelerator cache takes
-  ~9.9 GiB and the MoE arena OOMs mid-prefill.
+Two environment variables are **required**, not tuning knobs:
+
 - `DS4_TP_PREFILL_SPLIT_MIN=999999` — disables the TP prefill row split, which
   cannot work on ROCm yet (it needs
   `ds4_gpu_attention_prefill_raw_heads_range_tensor`, an unimplemented kernel).
