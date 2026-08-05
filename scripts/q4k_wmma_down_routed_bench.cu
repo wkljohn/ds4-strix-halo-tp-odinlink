@@ -110,7 +110,16 @@ struct Timing{uint32_t bucket,threshold;double candidate,shipping;};static std::
 // map to the identical acc[0] slot and code path in BOTH J=16 and J=32, so
 // ANY difference there is a genuine correctness signal, not floating-point
 // noise - checked separately from positions 16-31 below.
-struct J32Timing{uint32_t bucket;double j32,j16;};static std::vector<J32Timing> j32_timings;
+// pair_count/n_total_expert are carried per-case (not derived from `bucket`)
+// so the selector filter below works correctly for non-uniform (skewed/Zipf)
+// distributions, where pair_count is not simply 6*bucket.
+struct J32Timing{uint32_t bucket,pair_count,n_total_expert;double j32,j16;};static std::vector<J32Timing> j32_timings;
+// ds4's production dispatch picks ONE tile width for the whole routed-MoE
+// call (down_q4k_wmma<16> or <32>, never a per-expert mix), so the timing
+// filter must use this same case-level aggregate condition even when a
+// skewed/Zipf case has some experts individually far above 16 pairs and
+// others far below - the aggregate is what production would actually decide.
+static bool j32_selector_selects(const J32Timing&t){return (uint64_t)t.pair_count>16ull*(uint64_t)t.n_total_expert;}
 static bool run_down_case_j32(const char*name,uint32_t nt,uint32_t ne,const std::vector<int32_t>&sel,uint32_t pc,uint32_t ne_unused,const uint32_t*dw_ignored,uint32_t timing_bucket,
  const cuda_block_q4_K*dw,const q8_1_mmq_block*dq81,const uint32_t*dsp,const uint32_t*doo,const uint32_t*dc,
  const uint32_t*dtt16,const uint32_t*dte16,const uint32_t*dts16,uint32_t tiles16,const float*cand16,const std::vector<float>&cpu_q81_pair,const std::vector<double>&cpu_q81_sabs,const std::vector<float>&cpu_q81_sum,
@@ -172,7 +181,7 @@ static bool run_down_case_j32(const char*name,uint32_t nt,uint32_t ne,const std:
   auto run32=[&](){down_q4k_wmma<32><<<wg32,256,sh32>>>(dw,dq81,cand32,dsp,doo,dc,dtt32,dte32,dts32,pc,kQ8KBlocks,kN,ne,0,NULL,NULL);};
   auto run16=[&](){down_q4k_wmma<16><<<dim3(kN/64,tiles16),256,(16*36+64*76)*sizeof(int32_t)>>>(dw,dq81,const_cast<float*>(cand16),dsp,doo,dc,dtt16,dte16,dts16,pc,kQ8KBlocks,kN,ne,0,NULL,NULL);};
   BenchResult t32=time_launch(run32),t16=time_launch(run16);
-  j32_timings.push_back({timing_bucket,t32.median_us,t16.median_us});
+  j32_timings.push_back({timing_bucket,pc,ne,t32.median_us,t16.median_us});
   printf("  [%s] J32-timing bucket=%u j32_us=%.3f j16_us=%.3f speedup(j32/j16)=%.4fx\n",name,timing_bucket,t32.median_us,t16.median_us,t16.median_us/t32.median_us);
  }
  (void)hipFree(dto32);(void)hipFree(dtt32);(void)hipFree(dte32);(void)hipFree(dts32);(void)hipFree(cand32);(void)hipFree(toksum32);
@@ -184,13 +193,17 @@ static bool run_down_case_j32(const char*name,uint32_t nt,uint32_t ne,const std:
 // actually pick J=32 - a blanket average across all tested buckets is
 // misleading because most of them are deliberately below that threshold to
 // characterize the (expected, and confirmed) small-bucket regression.
-static void report_j32_sweep(){if(j32_timings.empty())return;printf("\nJ32-vs-J16 DOWN TIMING SWEEP (all buckets)\n");double logs=0;uint32_t n=0;bool regress=false;for(const auto&t:j32_timings){double s=t.j16/t.j32;logs+=log(s);++n;regress|=t.j32>1.05*t.j16;}printf("  retained=%u geomean(j32-speedup)=%.4fx regression_gt_5pct=%s (includes buckets below the selector threshold - expected to regress there)\n",n,n?exp(logs/n):0.0,regress?"YES":"no");
- // Selector-filtered: bucket m with 6 experts of m pairs each -> pair_count
- // = 6*m, n_total_expert = 6 for these synthetic timing cases, so the
- // production condition pair_count > 16*n_total_expert reduces to m > 16.
- double flogs=0;uint32_t fn=0;bool fregress=false;for(const auto&t:j32_timings){if(t.bucket<=16)continue;double s=t.j16/t.j32;flogs+=log(s);++fn;fregress|=t.j32>1.05*t.j16;}
- if(fn)printf("  selector-filtered (bucket>16, matches pair_count>16*n_total_expert): retained=%u geomean(j32-speedup)=%.4fx regression_gt_5pct=%s\n",fn,exp(flogs/fn),fregress?"YES":"no");
- else printf("  selector-filtered: no timing buckets exceeded the threshold - add larger buckets to validate the selector's win region\n");
+static void report_j32_sweep(){if(j32_timings.empty())return;printf("\nJ32-vs-J16 DOWN TIMING SWEEP (all buckets)\n");double logs=0;uint32_t n=0;bool regress=false;for(const auto&t:j32_timings){double s=t.j16/t.j32;logs+=log(s);++n;regress|=t.j32>1.05*t.j16;printf("  bucket=%-4u pair_count=%-6u n_total_expert=%-4u selector=%s j32_us=%.3f j16_us=%.3f speedup=%.4fx\n",t.bucket,t.pair_count,t.n_total_expert,j32_selector_selects(t)?"J32":"j16",t.j32,t.j16,s);}printf("  retained=%u geomean(j32-speedup)=%.4fx regression_gt_5pct=%s (includes cases below the selector threshold - expected to regress there)\n",n,n?exp(logs/n):0.0,regress?"YES":"no");
+ // Selector-filtered: use each case's REAL pair_count/n_total_expert against
+ // the actual production condition (pair_count > 16*n_total_expert), not a
+ // bucket-number proxy - required for skewed/Zipf cases where pair_count is
+ // not a simple multiple of the bucket value. ds4's dispatch picks one tile
+ // width for the WHOLE routed-MoE call (never a per-expert mix), so this
+ // case-level aggregate is exactly what production would decide, even when
+ // some experts in a skewed case are individually far above/below 16 pairs.
+ double flogs=0;uint32_t fn=0;bool fregress=false;for(const auto&t:j32_timings){if(!j32_selector_selects(t))continue;double s=t.j16/t.j32;flogs+=log(s);++fn;fregress|=t.j32>1.05*t.j16;}
+ if(fn)printf("  selector-filtered (pair_count>16*n_total_expert, real production condition): retained=%u geomean(j32-speedup)=%.4fx regression_gt_5pct=%s\n",fn,exp(flogs/fn),fregress?"YES":"no");
+ else printf("  selector-filtered: no timing cases exceeded the threshold - add larger/denser cases to validate the selector's win region\n");
 }
 static bool run_down_case(const char*name,uint32_t nt,uint32_t ne,const std::vector<int32_t>&sel,const std::vector<uint32_t>&thresholds,uint32_t timing_bucket=0){uint32_t pc=nt*kUsed;if(sel.size()!=pc){fprintf(stderr,"bad case size %s\n",name);return false;}std::mt19937 rng(0xd04e0000u+nt+ne);std::vector<float>mid((size_t)pc*kK);std::normal_distribution<float>md(0,.20f);for(auto&v:mid)v=std::max(-3.0f,std::min(3.0f,md(rng)));std::vector<cuda_block_q8_K>hq;host_quant_q8k(mid,hq,pc);std::vector<cuda_block_q4_K>hw((size_t)ne*kN*kQ8KBlocks);for(auto&b:hw)fill_q4_K_block(&b,rng);std::vector<float>cpu_q8_pair,cpu_q81_pair,cpu_q81_sum;std::vector<double>cpu_q81_sabs;
  int32_t*ds;uint32_t *dc,*doo,*dcur,*dsp,*dto,*dtt,*dte,*dts,*marks,*disp;float *dm,*ref,*cand,*toksum;cuda_block_q8_K*dq8;q8_1_mmq_block*dq81;cuda_block_q4_K*dw;size_t ps=(size_t)pc*kN*4,ms=(size_t)pc*kN*4;
@@ -206,4 +219,28 @@ static bool run_down_case(const char*name,uint32_t nt,uint32_t ne,const std::vec
 
 static void report_sweep(const std::vector<uint32_t>&ths){printf("\nDOWN CROSSOVER SWEEP (starting guess=%u; measurements decide)\n",kDefaultDownWmmaMinCount);for(uint32_t th:ths){double logs=0;uint32_t n=0;bool regress=false;for(const auto&t:timings)if(t.threshold==th&&t.bucket>=th){double s=t.shipping/t.candidate;logs+=log(s);++n;regress|=t.candidate>1.05*t.shipping;}printf("  threshold=%2u retained=%u geomean=%s",th,n,n?"":"UNMEASURED\n");if(n)printf("%.4fx regression_gt_5pct=%s gate=%s\n",exp(logs/n),regress?"YES":"no",exp(logs/n)>=1.20&&!regress?"PASS":"FAIL");}}
 
-int main(int argc,char**argv){uint32_t guess=kDefaultDownWmmaMinCount;if(argc>1)guess=(uint32_t)strtoul(argv[1],NULL,10);std::vector<uint32_t>ths={1,2,4,6,8,12,16,24,32};if(std::find(ths.begin(),ths.end(),guess)==ths.end())ths.push_back(guess);std::sort(ths.begin(),ths.end());bool ok=true;ok&=run_down_case("balanced",17,256,formula(17,256,false),{guess});ok&=run_down_case("skewed",23,256,formula(23,256,true),{guess});ok&=run_down_case("tile-edges",14,16,from_counts({1,7,8,9,15,16,17,11}),{guess});ok&=run_down_case("interleaved-empty",8,16,from_counts({6,0,6,0,6,0,6,0,6,0,6,0,6,0,6,0}),{guess});ok&=run_down_case("all-256-active",256,256,from_counts(std::vector<uint32_t>(256,6)),{guess});ok&=run_down_case("zipf-s1.2-proxy",256,256,zipf(1536,256),{guess});std::vector<int32_t>rep(24,1);for(uint32_t p=0;p<17;++p)rep[p]=0;ok&=run_down_case("repeated-boundary",4,8,rep,{guess});for(uint32_t m:std::vector<uint32_t>{1,4,6,8,12,16,24,32,64}){char n[48];snprintf(n,sizeof(n),"timing-bucket-%u",m);ok&=run_down_case(n,m,6,from_counts(std::vector<uint32_t>(6,m)),ths,m);}report_sweep(ths);report_j32_sweep();printf("down routed validation (not a timing gate until run on gfx1151): %s\n",ok?"PASS":"FAIL");return ok?0:1;}
+int main(int argc,char**argv){uint32_t guess=kDefaultDownWmmaMinCount;if(argc>1)guess=(uint32_t)strtoul(argv[1],NULL,10);std::vector<uint32_t>ths={1,2,4,6,8,12,16,24,32};if(std::find(ths.begin(),ths.end(),guess)==ths.end())ths.push_back(guess);std::sort(ths.begin(),ths.end());bool ok=true;ok&=run_down_case("balanced",17,256,formula(17,256,false),{guess});ok&=run_down_case("skewed",23,256,formula(23,256,true),{guess});ok&=run_down_case("tile-edges",14,16,from_counts({1,7,8,9,15,16,17,11}),{guess});ok&=run_down_case("interleaved-empty",8,16,from_counts({6,0,6,0,6,0,6,0,6,0,6,0,6,0,6,0}),{guess});ok&=run_down_case("all-256-active",256,256,from_counts(std::vector<uint32_t>(256,6)),{guess});ok&=run_down_case("zipf-s1.2-proxy",256,256,zipf(1536,256),{guess});std::vector<int32_t>rep(24,1);for(uint32_t p=0;p<17;++p)rep[p]=0;ok&=run_down_case("repeated-boundary",4,8,rep,{guess});for(uint32_t m:std::vector<uint32_t>{1,4,6,8,12,16,24,32,64}){char n[48];snprintf(n,sizeof(n),"timing-bucket-%u",m);ok&=run_down_case(n,m,6,from_counts(std::vector<uint32_t>(6,m)),ths,m);}
+ // Non-uniform (skewed/Zipf) timing cases, per Codex's design: realistic
+ // 256-expert distributions where the aggregate pair_count>16*n_total_expert
+ // condition (not any per-expert threshold) decides J16 vs J32, since ds4's
+ // production dispatch picks one tile width for the whole routed-MoE call.
+ // Thresholds passed as {} (not `ths`): these cases' timing_bucket is a
+ // TOKEN COUNT, not a per-expert pair count like the uniform buckets above,
+ // so feeding it through the original DP4A-vs-J16 threshold crossover sweep
+ // (report_sweep, which assumes bucket==per-expert-count) would silently
+ // corrupt that unrelated report. The J32-vs-J16 timing block below does not
+ // depend on `thresholds` at all, so {} costs nothing here.
+ // Case A: concentrated skew (formula's skew=true clusters onto ~7 experts).
+ // 256*6=1536 pairs over 256 experts: 1536 <= 16*256=4096 -> selector picks
+ // J16 despite the ~7 active experts individually holding far more than 16
+ // pairs each - this is the "some experts way over, aggregate still under"
+ // case the selector must handle correctly.
+ ok&=run_down_case("timing-skew-formula-256",256,256,formula(256,256,true),{},256);
+ // Case B: Zipf(s=1.2) at a token count just BELOW the aggregate threshold.
+ // 512*6=3072 pairs over 256 experts: 3072 <= 4096 -> still J16.
+ ok&=run_down_case("timing-zipf-s1.2-512",512,256,zipf(6u*512u,256),{},512);
+ // Case C: Zipf(s=1.2) at a token count just ABOVE the aggregate threshold.
+ // 768*6=4608 pairs over 256 experts: 4608 > 4096 -> selector picks J32.
+ // This is the case that must show up in the selector-filtered aggregate.
+ ok&=run_down_case("timing-zipf-s1.2-768",768,256,zipf(6u*768u,256),{},768);
+ report_sweep(ths);report_j32_sweep();printf("down routed validation (not a timing gate until run on gfx1151): %s\n",ok?"PASS":"FAIL");return ok?0:1;}
