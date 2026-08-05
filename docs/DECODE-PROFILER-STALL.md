@@ -98,10 +98,59 @@ Gives MoE decomposition only (not the broad attn/router/FFN split Stage 0
 wants), and may still hit the same stall if the MoE-side syncs alone are
 sufficient to trigger it - untested at time of writing.
 
+## Root cause investigation, round 2 (2026-08-05): gate tracing done, single-rank, non-deterministic
+
+Stage 0b (separate service-thread instrumentation, avoids this stall
+entirely) shipped and is documented in `DECODE-ACCELERATION-PLAN.md`. This
+section is the follow-up gate-tracing diagnostic mentioned above, run
+against the actual stage profiler stall.
+
+**Symmetric `DS4_TP_TRACE=1 DS4_TP_GATE_TRACE=1` added to the known repro**
+gave a decisive, single-rank result: at the failing seq=128 (layer 20 FFN
+gate, second decode token), one rank's log ends with `[tp] encode ch=0
+seq=128 ... -> enqueue` and NOTHING after - not even that rank's own
+service thread observing `arrived>=128` on its own `gpu_flag`. This is
+entirely single-rank: no RDMA/transport callback is even reached for that
+sequence number on the stuck rank. It rules out cross-rank sequencing skew
+as the primary mechanism - the stuck rank's own `hipStreamWriteValue64()`
+enqueue (which returns `hipSuccess`, immediately after a burst of ~9
+back-to-back `hipDeviceSynchronize()` calls from the profiler's stage
+boundaries) appears to never execute or never become visible to that same
+rank's own polling thread.
+
+**Gate-kick diagnostic tested, NOT reliable.** Hypothesis: the write
+packet needs an explicit queue "kick" after the device-wide drain, so a
+trivial no-op kernel was added on `g_tp_stream` between the write and the
+wait (`DS4_TP_GATE_KICK=1`, opt-in, `ds4-upstream` commit `1f349ef`). One
+run with the kick enabled progressed past the previously-fatal seq=128 gate
+on both ranks (reached pos=44, third decode token, before an external test
+timeout ended it - no internal stall). A second run with IDENTICAL
+settings stalled at the exact same spot again (this time the worker rank,
+not the coordinator - which rank gets stuck is not fixed either) with the
+exact same signature: encode printed, no corresponding arrival ever
+observed. **The kick is not a fix - the underlying mechanism is either not
+fully understood or is itself non-deterministic** (a genuine race, not a
+deterministic ordering bug a simple kick reliably closes).
+
+**Decision: deprioritizing further pursuit of this specific stall.** It
+only affects the OPT-IN `DS4_ROCM_DECODE_STAGE_PROFILE` diagnostic path,
+not production TP=2 decode. Stage 0b already extracted the actionable
+aggregate answer (release_to_arrival ~88% of per-token time, transport
+~11%) without needing this profiler fixed. If finer per-substage
+attribution (which of attention/router/routed_moe/shared_ffn dominates
+within that ~958us/gate) becomes necessary for Stage 1, prefer extending
+Stage 0b's own non-synchronizing approach (GPU-event timestamps read back
+asynchronously, batched like Stage 0b's periodic print) over continuing to
+chase this specific `hipDeviceSynchronize()`/`hipStreamWriteValue64`
+interaction - a race that two rounds of Codex research plus two hardware
+experiments have not pinned down with enough confidence to fix reliably.
+
 ## Status
 
-Blocking: Stage 0's mandated >=500-token symmetric decode profile has not
-been obtained. Filed 2026-08-05 per Codex root-cause investigation (see
-memory for the full analysis). Next diagnostic: gate tracing on both ranks to
-see which side actually stalls (encode-side never publishing vs
-consume-side never returning), or implement Stage 0b.
+Not blocking further decode acceleration work. Stage 0's aggregate
+measurement was obtained via Stage 0b's workaround instead of fixing this
+stall directly (see `DECODE-ACCELERATION-PLAN.md`'s "Stage 0b RESULT"
+section). The stall itself remains unresolved and is now considered a
+separate, lower-priority side investigation - revisit only if per-substage
+attribution becomes necessary and the non-synchronizing GPU-event
+alternative proves insufficient.
