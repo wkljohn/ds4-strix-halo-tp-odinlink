@@ -643,11 +643,101 @@ correctness check (exact output match against forced-DP4A, not just "does it
 run") passes. The kill switch (`DS4_ROCM_DISABLE_Q4K_WMMA=1`) is confirmed
 present and is the safe state until this is resolved.
 
-Next diagnostic: the WMMA kernel likely has a real numerics/fragment-layout
-bug independent of transport - check the standalone Stage 2 correctness
-harness (`q4k_correctness_test.cu` per docs history) still passes in
-isolation; if it does, the bug is specifically in the Stage 3 production
-integration (routing/scratch/dispatch wiring), not the kernel itself.
+## ROOT CAUSE FOUND (Fable, independent code read, 2026-08-05)
+
+**Tile-width mismatch between gate/up's routing and down's launch, silently
+dropping 36-50% of down contributions per layer.** Verified by reading the
+tile builder, descriptor construction, and down kernel body directly:
+
+- `use_q4k_wmma=true` sets `routing_tile_m = 16` (`ds4_rocm_moe_launch.cuh:864`)
+  and descriptors are built at that width - `moe_build_expert_tile_offsets_kernel`
+  and `moe_build_expert_tiles_kernel` both take `routing_tile_m`
+  (`ds4_rocm_moe_launch.cuh:1089,1094`); the builder emits tile starts at
+  `t*block_m` = 0, 16, 32... (`ds4_rocm_moe.cuh:1080`).
+- The down launch still branches on the **env var's** tile width, not the
+  routing width actually used: `if (expert_tile_m == 8u)` selects
+  `moe_down_q4K_expert_tile8_row32_kernel` (`ds4_rocm_moe_launch.cuh:1661`).
+  `use_down_tile16` is `!q4k_path && ...` (:869) - **false** for Q4_K, so this
+  mismatch is not caught anywhere.
+- That 8-wide kernel walks only 8 pairs per tile start: `for (; np < 8u; np++)
+  { local_pair = local_start + np; if (local_pair >= counts[expert]) break; }`
+  (`ds4_rocm_moe.cuh:2399-2405`). With 16-wide tiles, **pairs 8-15 of every
+  tile are never processed.** At production bucket sizes: 36% of down
+  contributions dropped at bucket 22, 50% at bucket 48. Buckets <=8 are
+  unaffected - why this would not show up in a small/isolated test.
+- No down WMMA kernel exists in the tree at all (`down=0` in the startup log
+  is a correct, hardcoded report - Stage 3 shipped gate/up only, as intended).
+  This is not a "wrong WMMA kernel" bug - it's the DP4A down path receiving
+  descriptors sized for a routing scheme it was never updated to match.
+
+**Failure mode is the dangerous kind by design, not by accident.** At
+production prefill chunk sizes `use_atomic_down` accumulates into
+zeroed output, so missing pairs contribute silent zero, not garbage - fluent
+output, wrong numerics, and prefill measuring *faster* than legitimate because
+a third-to-half of the down work is simply skipped. Compounded across all 43
+layers (every layer's FFN loses 36-50% of its down contribution, including
+during prefill on the prompt itself, before any token is generated), this is
+sufficient to explain the total corruption observed from the first generated
+token, not just a quality dip - a systematic, per-layer, per-token collapse
+rather than an occasional wrong token.
+
+**Consequence for every WMMA-on number measured today: partially invalid.**
+The measured prefill throughput (36-39 t/s) is inflated by skipped work, not
+legitimate speedup. Do not use today's WMMA-on t/s figures as a Stage 4
+end-to-end result for anything.
+
+**Fix identified, and it's also the highest-leverage remaining lever, not
+just a bug patch:** port the down-projection WMMA kernel at the SAME 16-wide
+geometry the descriptors already use, from the already-written
+`scripts/q4k_wmma_down_routed_bench.cu` (uses `down_q4k_wmma<16>` +
+`down_q4k_dp4a_cold` fallback - this exact geometry, already benchmarked).
+This fixes the mismatch structurally (down finally matches gate/up's tile
+width) AND lands real acceleration: post-BIG_DIRECT, routed_moe's prefill
+share recalculates to ~60% (was 46.6% pre-BIG_DIRECT; BIG_DIRECT cut total
+prefill wall by 0.778x while leaving routed_moe's absolute time unchanged, so
+its *share* of the smaller whole grew) - gate/up ~40% of prefill, down ~20%.
+Using the plan's own share*(1-1/speedup) gate math: down WMMA projects **+22%
+e2e prefill** (discounted from the raw 10.72x geomean given Stage 2's own
+~30.5us fixed-overhead floor at small buckets), roughly double gate/up's
+already-shipped +12%. Down is the bigger lever AND the one that was never
+built.
+
+Until the down-projection fix lands: minimal correctness fix is a second,
+8-wide-consistent descriptor set for down specifically when `use_q4k_wmma`,
+mirroring the existing `tile16_*` machinery in reverse (~15 lines, reuses
+existing kernels) - OR simply do not enable `DS4_ROCM_Q4K_WMMA=1` until the
+down WMMA port lands and the whole path uses one consistent tile width.
+
+## Also found: no positive confirmation that WMMA fired, only that it didn't abort
+
+The startup log (`Q4_K WMMA startup rank=... negotiated=0x1 gate=1 up=1`) is
+necessary but **not sufficient** proof WMMA actually launched on any given
+call. It reports the *negotiated* bit from `ds4_engine_tp_runtime_features`
+(`ds4.c:49400-49422`), computed from **host mmap pointers**; the real
+per-call gate `routed_moe_q4k_wmma_enabled` (`moe_launch.cuh:82-102`)
+re-checks 16-byte alignment on **device** pointers, which can diverge
+unlogged. Additional silent-fallback paths the startup line does not cover:
+`use_sorted_pairs`/`use_q4k_wmma` require `n_tokens>=32` (`:839-842,860` -
+prefill chunks below 32 tokens never use WMMA at all); `routed_moe_q4k_wmma_config()`
+caches gfx1151 detection on the first-ever call (`:26-44`) and can stick at 0
+if that call precedes device init; `ds4_engine_tp_runtime_features` returns 0
+if `!e->metal_ready`. The hello-abort mechanism is **symmetric-silent**: if
+both ranks independently compute 0, the masks match, nothing aborts, and the
+run quietly falls back to DP4A everywhere with no error. "No abort" is not
+evidence WMMA engaged. Cheapest positive check without a code change: A/B
+against `DS4_ROCM_DISABLE_Q4K_WMMA=1` - identical prefill t/s means it never
+fired. A `rocprofv3` kernel trace checking for `moe_q4K_routed_wmma_kernel`
+presence is the ground-truth check.
+
+## Decode: WMMA structurally cannot engage there, settled
+
+`use_sorted_pairs` requires `n_tokens > 1` and `>= 32` for Q4_K
+(`moe_launch.cuh:839-842`); `use_q4k_wmma` requires `use_sorted_pairs` (:860).
+Decode is `n_tokens==1` always, routes through
+`use_decode_lut_gate`/`use_direct_down_sum6` instead. Consistent with Stage
+2's own measurement that WMMA is 0.42x (2.4x SLOWER) than DP4A at 1
+pair/expert. WMMA is a no-regression constraint for decode, never an
+opportunity - do not spend further effort looking for a decode-side WMMA win.
 
 ### Stage 4 - opt-in end-to-end prefill
 Branch `q4k-wmma-stage4-prefill-optin`. Run only with the negotiated opt-in
