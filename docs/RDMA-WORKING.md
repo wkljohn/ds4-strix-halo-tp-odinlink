@@ -56,10 +56,24 @@ claiming "RDMA makes prefill 3x worse" compared mismatched runs and was wrong.
 
     DS4_TP_VERBS_LIB=$HOME/odl-ds4/libodl_tb5_verbs.so.0.1.0 \
     LD_LIBRARY_PATH=$HOME/odl-ds4 \
-    DS4_CUDA_NO_Q8_F16_CACHE=1 \
+    DS4_TP_BIG_DIRECT=1 \
     ./ds4 -m <Q4_K.gguf> --rocm --tensor-parallel --role {coordinator|worker} \
           {--listen 10.4.0.1 5599 | --coordinator 10.4.0.1 5599} \
           --transport rdma -c 4096 --temp 0
 
-Start the worker first. `DS4_CUDA_NO_Q8_F16_CACHE=1` is required: without it the
-q8->f16 cache takes ~9.9 GiB and the MoE arena OOMs.
+Start the worker first.
+
+**UPDATE (2026-08-05): do NOT set `DS4_CUDA_NO_Q8_F16_CACHE=1` anymore.**
+It was believed required because the cache takes ~9.9 GiB and the MoE arena
+OOMs without it - re-tested directly and this is no longer true (or never
+was, under today's code): the cache has its own graceful budget cap
+(`cuda_q8_f16_cache_has_budget`) that stops at ~9.85-9.91 GiB and falls back
+cleanly, always leaving ~4.8 GiB free. Leaving the cache enabled recovers
+output_proj's fast cuBLAS-f16 path (silently dead this whole session under
+the old flag) and measured **94-99 t/s prefill, up from 74.80-75.65 t/s** -
+validated correct via an exact `--dump-logprobs` diff (0/30 greedy tokens
+differ) and safe over a 500-token decode run (no OOM on either rank). See
+`PREFILL-PROFILE.md`'s "CONFIRMED WIN" section and
+[[ds4-q8f16-cache-prefill-win-2026-08-05]] for full detail. If a future
+model/config genuinely needs the old flag again, re-derive why before
+reaching for it - don't copy it forward as boilerplate.

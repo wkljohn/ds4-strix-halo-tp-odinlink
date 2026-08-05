@@ -136,26 +136,87 @@ per-layer, non-gate stage time ≈ 333.5 ms, split:
 | router, inv_rope, norm, kv_path, hc_post(attn) | <1% each |
 
 **This flips the priority order.** Before the WMMA fix, routed_moe was 46.6%
-and dominant. After it, **output_proj (the attention output projection,
-`metal_graph_attention_output_dense_quant_tp` and friends) is now the single
-largest measured prefill stage**, not routed_moe and not SDPA itself (still
-tiny, consistent with the original 1.2% figure). Extrapolating the clean-stage
-sum across 61 layers gives ≈20.3s of "real" compute for 1702 tokens (≈84 t/s
-if the FFN gate exchange were fully hidden/overlapped) against the actual
-measured 72-75 t/s - implying the **un-measurable-cleanly TP FFN gate costs
-roughly 10-14% of prefill time** that isn't currently overlapped with
-adjacent compute. Both are legitimate, Codex-independent next levers:
+and dominant. After it, **output_proj (the attention output projection) is
+now the single largest measured prefill stage**, not routed_moe and not SDPA
+itself (still tiny, consistent with the original 1.2% figure). Extrapolating
+the clean-stage sum across this GGUF's real 43 layers (`deepseek4.block_count`,
+confirmed by parsing the GGUF header directly - DO NOT reuse "61 layers" from
+earlier drafts of this doc, that number was never real) gives ≈14.3s of "real"
+compute for 1702 tokens (≈119 t/s if the FFN gate exchange were fully hidden/
+overlapped) against the actual measured 72-75 t/s - implying the
+**un-measurable-cleanly TP FFN gate currently costs on the order of 35-40% of
+prefill time**, much larger than a first pass with the wrong layer count
+suggested. Treat this as a rough, indirect estimate (n=4 layers, extrapolated)
+until corroborated with a full 43-layer run.
 
-1. **output_proj** - now the top single-stage target. Worth checking whether
-   it's already using WMMA/matrix cores for its dense GEMM the same way
-   routed_moe now does, or still on a slower quantized path.
-2. **Overlapping the FFN all-reduce gate with compute** - a real ~10-14%
-   architectural opportunity, independent of (and safer than) the still-unsafe
-   attention row split ([[ds4-attn-rowsplit-crash-2026-08-05]]).
+**Root cause of output_proj's cost, found by reading the code (not just
+profiling): the mandatory `DS4_CUDA_NO_Q8_F16_CACHE=1` flag silently disables
+output_proj's fast path too.** `cuda_q8_f16_cache_allowed()`
+(`rocm/ds4_rocm_runtime.cuh:4972`) explicitly special-cases attn_output_a/b to
+always be cache-eligible (line 4978-4983) - but checks
+`getenv("DS4_CUDA_NO_Q8_F16_CACHE")` FIRST (line 4976) and returns 0
+regardless if set. Every recipe this project has used requires that env var
+to avoid the documented ~9.9 GiB OOM from the FULL cache (attn_output, q_lora,
+ffn shared-expert weights, and more - see `cuda_q8_f16_cache_allowed`'s full
+condition list). Side effect: `ds4_gpu_attention_output_q8_batch_f16_tensor`
+(`rocm/ds4_rocm_attention_launch.cuh:940`, a cuBLAS f16 GEMM path, tried FIRST
+for prefill's output_proj) always fails at its `cuda_q8_f16_ptr` call and
+falls through to the slower `metal_graph_attention_output_dense_quant_batch`
+fallback - on every single prefill call, this entire session. This was masked
+before by routed_moe's even bigger pre-fix bottleneck; the WMMA fix exposed it.
 
-Only 4 layers of clean data (profiler timeout cut the run short) - directionally
-strong (the model's layers are architecturally homogeneous and all 4 samples
-agreed closely) but should be corroborated with a full 61-layer run once the
-hc_post/gate profiler-interaction bug is fixed or worked around (e.g. an
-instrumentation point that profiles the gate call itself instead of the
-boundary immediately after it).
+## CONFIRMED WIN (2026-08-05): just dropping DS4_CUDA_NO_Q8_F16_CACHE=1 gets 94-99 t/s prefill
+
+Tested the obvious experiment directly: what happens if the mandatory
+NO_Q8_F16_CACHE flag is simply not set? This project already has a graceful
+budget cap (`cuda_q8_f16_cache_has_budget`) that was either added since the
+2026-08-03 OOM was documented or simply never exercised the same way before -
+either way, the outcome today is clean, not a crash:
+
+    ds4: ROCm q8 fp16 cache budget exhausted; using q8 kernels
+         (request=64.00 MiB cached=9.85-9.91 GiB free=4.81-4.86 GiB
+          reserve=4.80 GiB total=96.00 GiB)
+
+The cache fills to ~9.85-9.91 GiB (matching the old "~9.9 GiB" figure
+exactly), then gracefully stops and falls back to the original Q8 kernels
+for anything that doesn't fit, always leaving its ~4.8 GiB reserve free.
+**No OOM, no crash, on either rank, across 5 separate runs** (three
+short -n 20/30 samples, one -n 500 long-decode stress test, one
+--dump-logprobs correctness run).
+
+**Prefill result: 94.97, 98.75, 94.59, 98.82 t/s (mean ~96.8, 4 samples)** -
+up from the existing 74.80-75.65 t/s golden number, and now AT OR ABOVE the
+top of the llama.cpp golden-evidence range (80-95 t/s,
+[[llamacpp-prefill-golden-evidence-resolved]] /
+`WHY-VLLM-PREFILL-IS-6X.md`) rather than approaching it from below. Decode
+unaffected (10.36-11.07 t/s, consistent with the existing range).
+
+**Correctness confirmed, not assumed:** `--dump-logprobs` diff of 30 greedy
+steps against the established-good NO_Q8_F16_CACHE=1 baseline, same prompt,
+`--temp 0`: **0/30 selected tokens differ, generated text byte-identical.**
+Per-step logit values differ by up to ~1.6 (logprob up to ~0.21) - expected
+floating-point variation between the F16 cuBLAS GEMM path and the on-the-fly
+Q8_0 kernel path, not a correctness issue (the decision never changes).
+
+**Root cause recap:** `cuda_q8_f16_cache_allowed()` special-cases
+attn_output_a/b to always want caching (`ds4_rocm_runtime.cuh:4978-4983`),
+but the env-var check earlier in the same function (line 4976) blocked
+this unconditionally whenever `DS4_CUDA_NO_Q8_F16_CACHE=1` was set - which
+every recipe in this project has always set, to avoid the documented OOM.
+That silently killed the existing, already-correct fast path
+(`ds4_gpu_attention_output_q8_batch_f16_tensor`,
+`rocm/ds4_rocm_attention_launch.cuh:940`) for the ENTIRE session, on every
+prefill call, with no error - just a silent fallback to a slower kernel.
+
+**This changes the project's baseline recipe.** `DS4_CUDA_NO_Q8_F16_CACHE=1`
+should no longer be treated as mandatory - see
+[[ds4-tp-rocm-two-node]] and [[ds4-q8f16-cache-prefill-win-2026-08-05]] for
+the corrected recipe. Not yet tested: contexts much longer than `-c 4096`
+(this project's usual test size) or heavier concurrent memory pressure -
+the ~4.8 GiB reserve margin should be re-checked before assuming this holds
+at every deployment context length.
+
+This closes out this iteration's remaining open levers - "overlapping the
+FFN gate" (~35-40%, estimated above) is still open but unvalidated, and
+output_proj's own remaining share should be re-measured now that its real
+fast path is active.
