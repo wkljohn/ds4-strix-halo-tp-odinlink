@@ -344,3 +344,26 @@ in each case. Do this before attempting any actual kernel change here;
 picking the wrong one wastes effort and risks a correctness bug in dense
 TP+quantization code, exactly the kind of thing that already went wrong
 once this project (the down-projection WMMA tile-width bug).
+
+## Stage 0d: resolved - it's real compute, not the gate wait (2026-08-05)
+
+Added the one more event the previous section called for
+(`ds4-upstream` commit `a1f4b6a`): `DS4_GPU_DECODE_ATTN_EVENT_ATTN_GATE`,
+recorded immediately after `ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN)`
+returns, splitting the `attn_output` window into a pre-gate and post-gate
+half. Reuses the existing event-pool/harvest mechanism unchanged - trivial,
+low-risk 3-line diff (enum entry, name-array entry, one macro call).
+
+**Validated on both live nodes, symmetric**: pre-gate (`attn_inv_rope` ->
+`attn_gate`) is ~566us; post-gate (`attn_gate` -> `attn_output`) is only
+~6us. Nearly all of the previously-measured 582us is accounted for BEFORE
+the gate is even encoded.
+
+**Resolved: this is real compute in the TP-sliced attention-output
+projection, not gate-exchange wait or rank-skew.** Stage 1's actual next
+step is examining and tuning that specific kernel path - the code around
+`ds4.c:22624-22674` dispatches to one of several attention-output
+implementations depending on tensor type/fusion flags
+(`metal_graph_attention_output_dense_quant_tp` for the TP=2 group-sliced
+case that applies here, per `ds4.c:22624-22640`). This is now a concrete,
+narrowly-scoped kernel investigation, not another profiling round.
