@@ -345,28 +345,54 @@ picking the wrong one wastes effort and risks a correctness bug in dense
 TP+quantization code, exactly the kind of thing that already went wrong
 once this project (the down-projection WMMA tile-width bug).
 
-## Stage 0d: resolved - it's real compute, not the gate wait (2026-08-05)
+## Stage 0d: initial method was unsound - CORRECTED below (2026-08-05)
 
-Added the one more event the previous section called for
-(`ds4-upstream` commit `a1f4b6a`): `DS4_GPU_DECODE_ATTN_EVENT_ATTN_GATE`,
-recorded immediately after `ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN)`
-returns, splitting the `attn_output` window into a pre-gate and post-gate
-half. Reuses the existing event-pool/harvest mechanism unchanged - trivial,
-low-risk 3-line diff (enum entry, name-array entry, one macro call).
+**This section originally claimed a clean pre-gate/post-gate split using a
+GPU event recorded right after `ds4_gpu_tp_gate_encode()` (commit
+`a1f4b6a`: pre-gate ~566us, post-gate ~6us, concluding "real compute, not
+gate-wait"). That specific split was methodologically unsound and its
+exact numbers should not be trusted** - `g_tp_stream` is created via plain
+`hipStreamCreate` (a *blocking* stream, `ds4_rocm.cu:622`), and this
+project's TP design intentionally relies on legacy default-stream
+synchronization for correctness (`ds4_rocm.cu:239`'s own prior comment).
+Under that semantics, a stream-0 event recorded right after the gate
+encode call absorbs the ENTIRE wait for `g_tp_stream`'s pending
+`WaitValue` to clear - the "pre-gate" number was contaminated with hidden
+gate-wait time, and "post-gate" only looked clean because by the time that
+first stream-0 event fires, the wait is already satisfied and nothing
+downstream needs to wait again. Caught via direct user question ("did you
+measure the bottleneck properly") - a good reminder to interrogate stream-
+ordering assumptions before trusting a GPU-event split across any boundary
+that involves a second stream.
 
-**Validated on both live nodes, symmetric**: pre-gate (`attn_inv_rope` ->
-`attn_gate`) is ~566us; post-gate (`attn_gate` -> `attn_output`) is only
-~6us. Nearly all of the previously-measured 582us is accounted for BEFORE
-the gate is even encoded.
+**Corrected measurement** (`ds4-upstream` commit `5561c3d`): extended the
+ALREADY-SOUND Stage 0b service-thread mechanism (pure `clock_gettime()` on
+the CPU side polling thread, no GPU stream semantics involved at all -
+this is what actually makes Stage 0b's original findings trustworthy) with
+gate-bucketing on the `callback` stat (the real wall-clock cost of a
+gate's cross-rank exchange), matching the bucketing already applied to
+`release_to_arrival`.
 
-**Resolved: this is real compute in the TP-sliced attention-output
-projection, not gate-exchange wait or rank-skew.** Stage 1's actual next
-step is examining and tuning that specific kernel path - the code around
-`ds4.c:22624-22674` dispatches to one of several attention-output
-implementations depending on tensor type/fusion flags
-(`metal_graph_attention_output_dense_quant_tp` for the TP=2 group-sliced
-case that applies here, per `ds4.c:22624-22640`). This is now a concrete,
-narrowly-scoped kernel investigation, not another profiling round.
+**Validated on both live nodes, symmetric - this time on solid ground**:
+
+| | rank 0 | rank 1 |
+|---|---|---|
+| `callback_gate=0_attn` (real ATTN-gate exchange cost) | 88.6us | 118.8us |
+| `release_to_arrival_gate=0_attn` (real compute before the gate publishes - NOT affected by the stream-ordering issue, since "arrival" = compute finishing, independent of any wait) | 1195.7us | 1176.6us |
+
+**Corrected conclusion: the real gate-exchange cost (~89-119us) is a clear
+minority against the ~1177-1196us of real compute preceding it.** The
+QUALITATIVE conclusion from the original (unsound) Stage 0d - that
+attention's cost is dominated by real compute, not gate-wait - turns out
+to still be directionally correct, but on the ORIGINAL evidence it was not
+reliably established. The downstream decision to pursue kernel-tuning
+(launch-config sweeps) over gate-exchange/overlap restructuring was the
+right call, just not for the reason originally given. `release_to_arrival`
+itself remains sound throughout (it was never measured via the
+cross-stream GPU-event mechanism) - only the FINER `attn_output` pre/post
+split from this specific section was affected. Stage 0c's other sub-stage
+boundaries (`kv_path` through `attn_inv_rope`) are unaffected too, since no
+`g_tp_stream` operation is interposed among them.
 
 ## Stage 1 kernel analysis (2026-08-05): TP=2 silently bypasses the existing split-K tuning
 
