@@ -164,3 +164,72 @@ accumulator design; the cold (<6 pairs/expert) population is likely small
 at realistic prompt lengths anyway, consistent with the ~75 t/s long-prompt
 result above already looking close to the llama.cpp reference without any
 tile-width change).
+
+## IMPLEMENTED but UNSAFE - real memory-corruption bug found, unresolved (2026-08-05)
+
+Implementation attempted (`ds4-upstream@3b120e0`). Both range functions
+are now real (not stubs), builds clean, `make test-tp-hello` passes, and
+a full structural review confirmed every dispatch path (raw: fast/cuBLAS/
+scalar; static-mixed: fast/cuBLAS/cuBLAS-tiled/scalar) threads `q_row0`/
+`n_q` consistently.
+
+**Process note**: Codex wrote the initial version but its account hit a
+usage quota mid-task (`try again at Aug 11th, 2026`), before it could
+build or test anything. The left-behind code did not compile: some
+inconsistent variable renaming, one kernel signature not updated to match
+its call site's new argument count, and two ENTIRELY OUT-OF-SCOPE kernels
+(`attention_decode_mixed_kernel`, `attention_indexed_mixed_heads8_online_kernel`
+- both already correctly designed for the range case via their own
+existing `pos0` parameter, shared with decode, and neither needed any
+change) were incorrectly touched and left broken. All fixed directly by
+Sonnet: reverted the two out-of-scope kernels to their original form,
+added the missing parameter to the one incomplete signature, and reverted
+an unnecessary parameter addition to a KV-packing kernel that never
+needed it (it packs the full, unsliced KV set, not query rows).
+
+**Hardware validation (mandatory per this project's own established bar -
+tensor/logprob comparison, not just coherent text) found a real crash,
+not a subtle numerical bug.** Forcing `DS4_TP_PREFILL_SPLIT_MIN_ATTN=2`
+against a forced-replicated baseline (`=999999`) segfaults on every
+attempt, both a long (~1694-token) and short (~35-token) prompt. Two
+separate gdb backtraces were captured on different runs:
+
+1. `hipBLAS f16 matmul failed: status 2` in the ratio-4 COMPRESSOR tail
+   projection (unrelated code, never touched by this change) → graceful
+   `ok=false` cascade → then a SEPARATE thread segfaults inside
+   `libhsa-runtime64.so.1` during what looks like async cleanup.
+2. A direct SIGSEGV inside `moe_q4K_routed_wmma_kernel` - this session's
+   completely separate down-projection MoE WMMA work
+   (`routed_moe_launch`, `rocm/ds4_rocm_moe_launch.cuh:1292`) - at layer
+   11, `n_tokens=42`, called from the ordinary FFN batch path.
+
+**Two different crash sites, both in code this change never directly
+touches, is the signature of memory corruption (a buffer overrun or a
+race), not one deterministic logic bug in the new attention kernels
+themselves.** One scoped hypothesis was tested and did NOT resolve it:
+`cuda_tmp_alloc` (`rocm/ds4_rocm_runtime.cuh:567`) is a single GLOBAL
+scratch buffer shared by every caller in this file and beyond (attention,
+compressor, MoE, ...), reused only if a new request fits, otherwise freed
+and reallocated with **no synchronization** against in-flight async GPU
+work still reading the old buffer. The new range functions request
+`n_q`-sized (smaller, rank-dependent) scratch instead of the square
+path's stable `n_tokens`-sized scratch, which seemed likely to churn this
+unsynchronized shared buffer more than before. Stabilizing the request
+size to always match `n_tokens` (see the fix in the same commit) did NOT
+stop the crash - so either this wasn't the (whole) mechanism, or there's
+a second contributing factor.
+
+**Status: DO NOT enable this feature.** The feature gate itself
+(`metal_graph_tp_prefill_split_min_attn()`, `ds4.c` - NOT touched by this
+commit) still defaults to 1,000,000 on ROCm, so none of this new code path
+is reachable with default settings - this is dead code in normal
+operation and does not affect any of this session's other validated
+results (the down-projection WMMA fix, the 74.8 t/s long-prompt
+measurement, Stage 0b/0c/0d decode diagnostics - none of these set
+`DS4_TP_PREFILL_SPLIT_MIN_ATTN` below its safe default). Root-causing this
+properly needs either deeper GPU-side debugging tooling than was
+available this session, or Codex's help once its quota resets
+(~2026-08-11) - do not attempt to re-enable or further stress-test this
+path without that, and do not treat "it didn't crash this run" as
+evidence of correctness given the intermittent, memory-corruption-shaped
+failure pattern already observed.
