@@ -46,15 +46,15 @@ fail-closed anchors and `--check`; the consolidated patch is the whole tree.
 Start the **worker first**, then the coordinator.
 
     # worker (peer)
-    DS4_CUDA_NO_Q8_F16_CACHE=1 ./ds4 -m <model.gguf> --rocm --tensor-parallel \
+    DS4_CUDA_NO_Q8_F16_CACHE=1 DS4_TP_BIG_DIRECT=1 ./ds4 -m <model.gguf> --rocm --tensor-parallel \
         --role worker --coordinator 10.4.0.1 5599 --transport tcp -c 4096
 
     # coordinator (head)
-    DS4_CUDA_NO_Q8_F16_CACHE=1 ./ds4 -m <model.gguf> --rocm --tensor-parallel \
+    DS4_CUDA_NO_Q8_F16_CACHE=1 DS4_TP_BIG_DIRECT=1 ./ds4 -m <model.gguf> --rocm --tensor-parallel \
         --role coordinator --listen 10.4.0.1 5599 --transport tcp -c 4096 \
         --temp 0 -p "..."
 
-Two environment variables are **required**, not tuning knobs:
+Three environment variables are **required**, not tuning knobs:
 
 - `DS4_CUDA_NO_Q8_F16_CACHE=1` — without it the q8->f16 accelerator cache takes
   ~9.9 GiB and the MoE arena OOMs mid-prefill.
@@ -63,6 +63,13 @@ Two environment variables are **required**, not tuning knobs:
   `ds4_gpu_attention_prefill_raw_heads_range_tensor`, an unimplemented kernel).
   **Without this, every prompt of 32 or more tokens fails outright.** Decode is
   unaffected. See docs/LONG-PROMPT-BUG.md.
+- `DS4_TP_BIG_DIRECT=1` — routes the prefill FFN all-reduce through a
+  dedicated registered-slab region instead of staging through a ~200 MB/s CPU
+  memcpy. Measured **+28.5% prefill** (29.29 -> 37.64 t/s), decode unchanged,
+  no correctness cost (verified against a same-config reproducibility control
+  and a clean low-entropy prompt). See docs/BIG-GATE-BOTTLENECK.md. Add
+  `DS4_TP_BIG_DIRECT_MAX_ROWS=N` if your `--prefill-chunk` exceeds the default
+  8192-row reservation.
 
 Verified with a 3306-token prompt: prefill 29.18 t/s, generation 10.49 t/s, and
 the model correctly comprehends the long context.
