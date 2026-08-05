@@ -192,3 +192,53 @@ already documented as not transferring well to this abliterated trunk
 any of that 11% carries over here. When this task starts, do it after
 Stage 0-1 above, since a faster greedy baseline makes any DSpark
 accept/reject economics easier to read.
+
+## Stage 0b RESULT: the missing time is GPU compute between gates, not RDMA (2026-08-05)
+
+`DECODE-PROFILER-STALL.md`'s stall blocked the full stage profiler
+indefinitely, so Stage 0b (ds4-upstream commit `ca99a31`) added separate,
+lighter instrumentation directly in the TP service thread
+(`ds4_rocm.cu:328-357`, `ds4_tp_pump`/`ds4_tp_service_thread`) - opt-in via
+`DS4_TP_SERVICE_INTERVAL_PROFILE=1`, `clock_gettime(CLOCK_MONOTONIC)` only,
+zero device synchronization, so it does not reproduce the stall. Implemented
+by Codex as a guarded background agent, reviewed and one correctness bug
+fixed (a stale-timestamp reuse on back-to-back gate hits) by Claude Sonnet 5
+before hardware validation.
+
+**Validated on both live nodes**: a 600-token run with profiling on
+completes cleanly (the old profiler died at token 2-3) with throughput
+matching the profiling-off baseline (10.87 vs 10.88 t/s generation) -
+confirms the instrumentation itself isn't perturbing the measurement.
+
+**Result, symmetric on both ranks** (channel 0 = row gates, the decode-
+relevant channel; 86 gates/token):
+
+| interval | rank 0 | rank 1 | share |
+|---|---|---|---|
+| detect_upper_bound (poll latency) | 12.1us | 5.8us | ~1% |
+| callback (RDMA transport round-trip) | 111.8us | 132.0us | ~11% |
+| release_to_arrival (this rank's own GPU compute between gates) | 958.4us | 937.6us | **~88%** |
+
+The three intervals sum to ~1069us/gate; times 86 gates/token = ~91.9ms,
+matching the measured ~92ms/token (10.88 t/s) almost exactly - a
+self-consistent measurement, not just plausible-looking numbers.
+
+**This overturns the plan's leading hypothesis.** The "86 lockstep gate
+exchanges... bubbles and rank skew" framing (top of this document) assumed
+transport/gate-wait time was the likely dominant cost. It is not - RDMA
+transport is only ~11% of per-token time on both ranks. ~88% is each rank's
+own GPU compute between successive gates. That directly promotes **Stage 1
+priority #2** ("tune the dominant one-token GEMV/DP4A stage Stage 0
+identifies") over priority #1 (rank-skew/gate-idle overlap) - there is
+little evidence of idle bubble time to reclaim; the GPU appears busy
+computing for the large majority of the token budget, not waiting.
+
+**Not yet done**: this measures aggregate per-gate compute time, not WHICH
+kernel/stage within that ~958us dominates (attention vs routed MoE vs
+shared FFN vs router - the boundaries the now-stalling stage profiler was
+supposed to resolve). The next step is identifying that breakdown without
+re-triggering the stall - either by root-causing the stage profiler's
+stall itself, or by adding similarly lightweight non-synchronizing
+per-stage timestamps (GPU event timestamps read back asynchronously,
+not `cudaDeviceSynchronize()`-gated) alongside this same service-thread
+instrumentation.
