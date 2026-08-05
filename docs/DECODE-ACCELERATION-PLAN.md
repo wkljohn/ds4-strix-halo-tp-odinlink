@@ -489,3 +489,42 @@ theoretical ceiling that these two candidates failed to reach). A genuinely
 new kernel design for attn_output (not just launch-config or split-K
 reuse) remains a possible larger-effort avenue, out of scope for quick
 iteration.
+
+## compressor_proj analysis and sweep RESULT: also no win (2026-08-05)
+
+Codex research pass on `compressor_proj` (read-only, applying explicit
+skepticism given the attn_output precedent) found one real correction to
+this document's earlier assumption: `ds4_gpu_matmul_f16_pair_compressor_store_tensor`
+(the function this project believed was the active "fused"
+projection+state-store path) is actually a stub on ROCm that discards its
+arguments and returns 0 - decode has always fallen back to
+`ds4_gpu_matmul_f16_pair_tensor` (projection only) plus a separate
+`compressor_store_kernel` launch. Metal has the real fusion; ROCm doesn't.
+Porting it is a genuine, concrete opportunity, but its savings fall under
+`compressor_update` (~16-17us measured), not the 131us `compressor_proj`
+boundary - a small ceiling either way.
+
+For `compressor_proj` itself: launch is narrow (32 or 16 blocks depending
+on compression ratio, on 40 CUs), circumstantially similar to
+attn_output's under-occupancy story, but Codex explicitly declined to
+treat this as evidence-backed, citing the attn_output sweep's failure as
+direct caution. Implemented and tested anyway as a cheap experiment
+(`ds4-upstream` commit `d2fe1c5`, `DS4_ROCM_COMPRESSOR_PROJ_ROWS`
+32default/16/8, same zero-math-effect launch-config pattern).
+
+**Measured on both live nodes: no measurable win**, exactly as predicted.
+rows16 (10.79 t/s) and rows8 (10.73 t/s) indistinguishable from baseline
+(10.47 t/s) - all within this project's established noise band.
+
+**Status: both of decode's two largest measured attention sub-stages
+(attn_output 566us, compressor_proj 131us) have had their quick, low-risk
+launch-config levers tested and neither shows a measurable win.** Decode
+throughput remains at baseline (~10.4-10.9 t/s) throughout this entire
+investigation thread. This is a genuine, hardware-validated result, not a
+gap in effort - three separate launch-config experiments (attn_output low,
+attn_output expand, compressor_proj) were implemented and measured on live
+TP=2 hardware, all negative. The remaining paths are qualitatively
+different in kind, not degree: a real kernel redesign for attn_output, or
+porting the missing Metal fusion for compressor_update's small ceiling -
+both larger-effort undertakings than the quick-iteration levers this
+thread has exhausted.
