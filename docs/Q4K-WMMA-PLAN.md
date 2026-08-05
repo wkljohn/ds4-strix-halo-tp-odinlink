@@ -1039,3 +1039,78 @@ of risk for each:
 
 Revise the first number after Stage -0A/-0B; revise the second only once
 Stage 2's pipeline-metric timing exists - Stage 0 alone cannot inform it.
+
+## FIXED and validated on hardware, 2026-08-05 (ds4-upstream commit 8b71a30)
+
+The bug documented above ("CRITICAL: DS4_ROCM_Q4K_WMMA=1 produced corrupted
+output") is fixed. Implementation by Codex (background agent, real code
+changes - not a plan-only consult), reviewed line-by-line against the
+validated bench kernel and against hardware runs by Claude Sonnet 5 before
+being accepted, per explicit user instruction to run Codex as an
+interactively-guarded implementer rather than a passive plan-then-relay
+consult.
+
+**What changed** (`ds4.c`, `ds4_gpu.h`, `rocm/ds4_rocm_moe.cuh`,
+`rocm/ds4_rocm_moe_launch.cuh`, 298 insertions):
+- Ported `down_q4k_wmma<16>` from `q4k_wmma_down_routed_bench.cu` into
+  production as `moe_down_q4K_routed_wmma_kernel<16, ATOMIC>` plus a cold-DP4A
+  complement (`moe_down_q4K_cold_tile16_kernel`) - traced line-for-line
+  against the bench during review, identical shared-memory layout, scale
+  unpacking, and WMMA fragment math.
+- Reuses gate/up's existing 16-wide routing descriptors for down (not a
+  second `tile16_*`-style set) - the lower-risk of the two options the
+  implementation brief posed, given the original bug was exactly a
+  reused-infra mistake.
+- Generalized the fix beyond the one broken call site: every down/gate/up
+  dispatch branch now reads `routing_tile_m` (the actual descriptor-build
+  width) instead of the raw `expert_tile_m`/env-var value. Gate/up's own
+  dispatch didn't have a live bug here (those variables were already equal
+  in that branch) but is now hardened against the same class of mistake.
+- The `DS4_TP_FEATURE_Q4K_WMMA` bit is redefined as one complete-pipeline
+  capability: gate, up, and down now negotiate and fail closed together
+  (`shape_ok` requires down's shape/alignment checks too), closing the
+  possibility of a partial gate/up-only negotiation shipping again.
+- New fail-closed contract check immediately before the down WMMA launch:
+  verifies `routing_tile_m==16`, that the down descriptor set equals the
+  primary (proving reuse, not divergence), `down_q81` scratch non-null,
+  `midq_blocks==8`, `out_dim==4096` - on any violation, logs which
+  condition failed and returns 0 rather than launching a mismatched
+  consumer.
+- New one-time dispatch-confirmation log line
+  (`Q4_K WMMA dispatch gate=1 up=1 down_hot=1 down_cold=1 fallback=1 ...`),
+  closing the "negotiated but never observed to fire" gap noted above -
+  this line firing on a real run is now positive proof WMMA actually
+  dispatched, not just that negotiation didn't abort.
+
+**Hardware validation** (both live Strix Halo nodes, rebuilt from synced
+source and re-verified via md5sum before testing):
+
+| Run | negotiated | dispatch confirmed | prefill | generation | output |
+|---|---|---|---|---|---|
+| baseline (WMMA off) | down=0 | - | 16.39 t/s | 10.76 t/s | coherent, degenerates to repeat loop (known model/prompt behavior, not corruption) |
+| RDMA+BIG_DIRECT, fixed | down=1 | yes | 40.84 t/s | 10.86 t/s | coherent, same failure-mode class as baseline, **no BOS-repeat** |
+| TCP only (no BIG_DIRECT), fixed | down=1 | yes | 20.99 t/s | 9.98 t/s | **byte-identical opening** to the RDMA run |
+| kill switch (`DS4_ROCM_DISABLE_Q4K_WMMA=1`) with opt-in also set | down=0, `kill_switch=1` logged | - | 16.37 t/s | 10.70 t/s | identical opening to baseline |
+
+`make strix-halo` clean on both nodes (no new warnings), `make
+test-tp-hello` 3/3 PASS. The TCP-only run isolates the fix from RDMA/
+BIG_DIRECT exactly the way the original bug's isolation did, and gets the
+same coherent result. The kill-switch run confirms `DS4_ROCM_DISABLE_Q4K_WMMA=1`
+still correctly forces the whole feature off even with the opt-in var set.
+
+**Residual, honestly caveated risk**: this is end-to-end coherence plus a
+faithful-port code review, not a dedicated in-binary numerical differential
+against forced-DP4A at production shape with tolerance bounds (the bench
+harness already did that differential, just standalone, not wired into the
+live binary). Greedy-decode text comparison is a weak tool for subtle
+per-element error (a real bug could still be masked by the repeat-loop
+degeneration this prompt already exhibits) - it is a strong tool for
+gross corruption, which is what the original bug was and is what's ruled
+out here. If a future accuracy regression is ever suspected on this path,
+build a proper in-binary layer-level dump-and-diff rather than relying on
+this text-level check again.
+
+Prefill went from 16.4 to 40.8 t/s under RDMA+BIG_DIRECT (2.49x, gate/up
+WMMA + down WMMA + BIG_DIRECT stacked) with decode unchanged, consistent
+with the down-projection lever being the single largest remaining piece of
+this effort as originally projected in the ROOT CAUSE section above.
