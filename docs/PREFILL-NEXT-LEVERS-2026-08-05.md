@@ -37,6 +37,40 @@ shows ~20% aggregate prefill improvement, though that bundles several
 changes (reduced VGPR pressure, different geometry, faster intrinsics), not
 an isolated geometry estimate.
 
+**CONCLUDED (2026-08-05, same day): NOT worth pursuing as an automatic
+production feature.** Full plan → Phase A harness proof → Codex review →
+corrective fix → skewed/Zipf stress test → final Codex assessment, all
+hardware-validated. See `ds4-upstream`'s down-projection harness work
+(commits `ba310ca`, `45a6cb8`, `1db4c9a` in `ds4-strix-halo-tp`) and
+[[ds4-wmma-geometry-phase-a-down]].
+
+Summary of the full arc: J=32 down-projection is numerically correct
+(bit-identical where the code path is shared, within-tolerance where it
+isn't) and, at UNIFORM 6-expert synthetic distributions, gives a clean
++9.1% speedup when selected by the proposed heuristic
+(`pair_count > 16*n_total_expert`). But once realistic, non-uniform
+(Zipf-distributed, 256-expert) timing cases were added, the selector-filtered
+result dropped to only +3.2% with a real regression: a Zipf(s=1.2) case
+whose AVERAGE pairs/expert clears the threshold (18, just 12.5% over 16)
+is actually ~11.9% SLOWER with J=32, because most of its 256 experts
+individually hold far fewer than 16 pairs each - a few "hot" experts drag
+the average up while production (which picks ONE tile width for the whole
+batch) wastes tile capacity applying J=32 to all the many small ones.
+Codex's assessment: no better selection statistic is derivable from the
+same cheap, sync-free information the plan required (`pair_count` and
+`n_total_expert` alone can't distinguish a uniform distribution from a
+skewed one with the same average) - a real fix would need per-expert
+histogram data, which requires the device-to-host synchronization the
+plan specifically wanted to avoid.
+
+**Final verdict: keep J=16 as the unconditional production default.**
+J=32 remains available as a validated, correct, opt-in experimental path
+for explicitly pre-confirmed workload shapes, but automatic selection is
+not safe to ship. This closes out the WMMA-geometry lever as the top
+priority - #2 below (OdinLink transport tuning) or the not-yet-implemented
+FFN-gate-overlap design are the next candidates if pursuing further
+prefill work.
+
 **Confidence:** medium-high some gain exists (routed_moe is still the
 single largest measured stage); medium on magnitude. **Complexity:**
 medium-high, kernel-level (multiple tile instantiations + a real
