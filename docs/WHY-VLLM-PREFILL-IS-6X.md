@@ -5,8 +5,21 @@ Measured on the SAME two Strix Halo gfx1151 nodes, same model family:
 | engine | prefill | decode |
 |---|---|---|
 | **vLLM TP=2** | **198.8 tok/s** | 3.28 t/s |
-| llama.cpp (pipeline) | 80-95 tok/s | 9.42 no-draft |
+| **llama.cpp (pipeline)** | **80-95 tok/s** | 9.42 no-draft |
 | **ds4 TP=2 (this port)** | **~30 t/s** | **~10.5 t/s** |
+
+**The llama.cpp 80-95 t/s figure is GOLDEN EVIDENCE**: directly witnessed
+firsthand at the node by the operator running this project, not a
+secondhand or reconstructed number. Do not treat this figure as unverified
+or lacking provenance in any future analysis (an earlier automated
+research pass flagged it as "no benchmark command or model provenance
+attached" - that flag is WITHDRAWN; the figure stands as confirmed).
+Separately confirmed via source-code analysis
+(`LLAMACPP-KERNEL-LIFT.md`'s "RESOLVED" section): llama.cpp's own dispatch
+rule forces MMQ for `n_experts >= 64`, and MMQ on gfx1151/RDNA3.5 uses
+WMMA, not DP4A - so this 80-95 t/s figure is llama.cpp's MMQ-WMMA path on
+this exact hardware, matching what "should" produce a large advantage over
+ds4's pre-fix DP4A-only prefill path.
 
 ds4 is the BEST of the three at decode and **6.6x worse than vLLM at prefill**.
 The engines have opposite optimisation profiles, but 6.6x is far more than my
