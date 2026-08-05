@@ -162,6 +162,21 @@ exists); this stage is validation, not new work. Low priority relative to
 Stages 0-1 since there's no specific reason to suspect it's broken, only
 that it was never isolated and measured on its own.
 
+**Quick check done 2026-08-05 (NOT the >=500-token validation above - a short,
+single-rep run, treat as a weak signal only):** `DS4_GLM_TP_HEAD_SPLIT_MIN`
+default (64, engaged - this model has exactly 64 heads) vs forced to
+99999999 (full replication), same short prompt, `--temp 0`:
+
+    split (default):  prefill 27.45 t/s, generation 10.60 t/s
+    replicated:        prefill 16.43 t/s, generation 10.78 t/s
+
+**Decode is within noise between the two (10.60 vs 10.78, ~2%) - no clear win
+or regression from the split on this quick pass.** Prefill numbers are not a
+clean comparison here (confounded by `DS4_TP_PREFILL_SPLIT_MIN=999999`
+forcing sequential prefill on an already-short/noisy prompt - prefill has
+ranged 16-38 t/s across unrelated runs this session on similar short prompts).
+Does not block or resolve the >=500-token validation above; still open.
+
 ## Explicitly deferred - DSpark/MTP (separate task, not in this plan)
 
 Tracked separately per direct instruction. One-line status for context:
