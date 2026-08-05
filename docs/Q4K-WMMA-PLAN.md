@@ -708,6 +708,39 @@ mirroring the existing `tile16_*` machinery in reverse (~15 lines, reuses
 existing kernels) - OR simply do not enable `DS4_ROCM_Q4K_WMMA=1` until the
 down WMMA port lands and the whole path uses one consistent tile width.
 
+## Was this already known? NO - genuinely new (Codex history check, 2026-08-05)
+
+`e906a14`'s own commit message reports only build success and
+`make -B test-tp-hello` passing three cases - it does NOT report completing
+the production correctness validation the plan itself required ("Validate
+one real Q4_K layer on each rank and after the TP sum... versus forced-DP4A",
+line 594 above). Stage 3 landed with that validation gap open, not closed.
+
+Stage 2's "PASS across 13 cases" was real but at SYNTHETIC dimensions smaller
+than production: `xb=2` (K=512, not production K=4096) and `nr=64` experts
+(not production's 256-expert / 2048-mid shape), hardcoded at
+`q4k_wmma_routed_bench.cu:200`. It structurally never exercised the shape
+where this bug lives. The older `q4k_correctness_test.cu` never tested WMMA
+at all - it has a literal `PLUG_IN_WMMA_HERE` placeholder
+(`q4k_correctness_test.cu:300`) and only compares the shipping DP4A path
+against a CPU reference.
+
+No commit after `e906a14` (8226c4a, f359858, 8eb84a8, 4b35010) mentions Q4_K
+WMMA, corruption, or a fix/disable/revert. The opt-in flag and kill switch
+were prudent staging discipline, not a response to known corruption - `4b35010`
+even reports "coherent generated output (no corruption...)" for its own
+(non-WMMA) testing, three commits after Stage 3 landed, with no indication
+anyone had tried `DS4_ROCM_Q4K_WMMA=1` since.
+
+The design intent was explicit that gate/up-only must be safely shippable on
+its own ("failure of down must leave the faster gate/up-only configuration
+shippable", line 560 above) - so this is a genuine implementation defect in
+the `routing_tile_m`/`expert_tile_m` interface, not a case of two features
+that were never meant to combine. `CORRUPTION-BISECT.md`'s similar "first
+token already wrong" signature is a coincidental resemblance from an older,
+unrelated ROCm/TP investigation predating Q4_K WMMA entirely, not a link to
+this bug.
+
 ## Also found: no positive confirmation that WMMA fired, only that it didn't abort
 
 The startup log (`Q4_K WMMA startup rank=... negotiated=0x1 gate=1 up=1`) is
