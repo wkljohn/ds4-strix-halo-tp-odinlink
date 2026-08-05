@@ -450,13 +450,42 @@ occupancy-bound at this shape, or the actual bottleneck is elsewhere
 regardless of block size). Not pursuing further variations of this
 specific lever.
 
-**Remaining candidate**: the split-K generalization to the TP-local
-`n_groups==4` shape (medium confidence, real correctness risk - changes FP
-accumulation order, code comments warn this can cross downstream FP8
-midpoints). This is the last promising lever specific to the attention-
-output kernels before falling back to `compressor_proj` (~131us) as the
-next target. Requires mandatory exact-greedy-output equivalence
-validation given the explicit numerical-change risk, and given this
-project's prior experience with a silent-corruption bug in an adjacent
-kernel family (the down-projection WMMA tile-width bug) - "numerically
-close" is not an acceptable bar here.
+**Remaining candidate, then DISQUALIFIED (2026-08-05): the split-K
+generalization to the TP-local `n_groups==4` shape.** Before dispatching
+an implementation, traced the kernel body directly and found it's already
+generic with respect to `n_groups` (the hardcoded `4096`/`16`/`8` values
+in `grouped_q8_0_a_partial16_w32_kernel` are tied to `group_dim`, which
+stays 4096 under TP=2, not to `n_groups`) - so the fix would have been a
+low-risk guard relaxation, not new kernel math. However, checking WHY the
+split-K path is gated (`rocm/ds4_rocm_attention_launch.cuh:1305`,
+`!cuda_runtime_config()->disable_splitk_attn_out_low`) found:
+`disable_splitk_attn_out_low = !g_quality_mode`
+(`rocm/ds4_rocm_runtime.cuh:4769`), and `g_quality_mode` is only ever true
+when the CLI's `--quality` flag is explicitly passed
+(`ds4_cli.c:1877`) - which this project has NEVER done in any benchmark
+run this entire session. **The split-K path has been completely inactive
+in every measurement so far, for both the full-model `n_groups==8` case
+and TP=2's `n_groups==4` case.** It is a quality-mode-only path (likely
+trading speed for numerical fidelity to "the old-HIP backend", per its own
+comments), not a speed path our default decode configuration has ever
+touched. Generalizing its guard condition to also accept `n_groups==4`
+would have had ZERO effect on our actual measured decode performance
+unless `--quality` is also passed - a different operating mode entirely,
+not comparable to anything benchmarked in this document. **Not pursuing
+this lever** - it doesn't apply to the configuration this project actually
+runs.
+
+**Both attn_output candidates are now exhausted for the default (non-
+quality) decode configuration.** The workgroup sweep measured no win: the
+launch config genuinely doesn't move the needle. Split-K doesn't even
+apply to our configuration. The generic `sharedx_rows_w32_2row` kernel
+currently in use appears to already be near-optimal for quick, low-risk
+levers at this shape. Falling back to the plan's own stated next target:
+`compressor_proj` (~131us, second-largest measured sub-stage) - though
+note its smaller absolute size (131us vs attn_output's 566us) means even a
+substantial relative improvement there yields a smaller absolute win
+(~2-3ms/token at best for a 50% improvement, vs attn_output's much larger
+theoretical ceiling that these two candidates failed to reach). A genuinely
+new kernel design for attn_output (not just launch-config or split-K
+reuse) remains a possible larger-effort avenue, out of scope for quick
+iteration.
