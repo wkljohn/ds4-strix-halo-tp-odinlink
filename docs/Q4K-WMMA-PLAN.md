@@ -629,13 +629,20 @@ Chinese/English loops seen elsewhere in this session's testing.
 **This is the dangerous case: if you only checked t/s, this reads as a clean
 win.** It is not. Do not trust throughput numbers alone for this feature.
 
-Not yet isolated: whether this is WMMA-specific regardless of transport, or an
-interaction with BIG_DIRECT/RDMA specifically - a plain-TCP run with the same
-DS4_ROCM_Q4K_WMMA=1 is the next test, in progress at time of writing. Do not
-enable DS4_ROCM_Q4K_WMMA=1 in any deployment until this is root-caused and a
+**Isolated: this is WMMA-specific, not a BIG_DIRECT/RDMA interaction.** Same
+test over plain `--transport tcp`, no BIG_DIRECT, same `DS4_ROCM_Q4K_WMMA=1`:
+identical corruption (`<｜begin▁of▁sentence｜>` repeated from the first
+generated token, same negotiated `gate=1 up=1`). Do not enable
+`DS4_ROCM_Q4K_WMMA=1` in any deployment until this is root-caused and a
 correctness check (exact output match against forced-DP4A, not just "does it
-run") passes. The kill switch (DS4_ROCM_DISABLE_Q4K_WMMA=1) is confirmed
-present and should be considered the safe state until this is resolved.
+run") passes. The kill switch (`DS4_ROCM_DISABLE_Q4K_WMMA=1`) is confirmed
+present and is the safe state until this is resolved.
+
+Next diagnostic: the WMMA kernel likely has a real numerics/fragment-layout
+bug independent of transport - check the standalone Stage 2 correctness
+harness (`q4k_correctness_test.cu` per docs history) still passes in
+isolation; if it does, the bug is specifically in the Stage 3 production
+integration (routing/scratch/dispatch wiring), not the kernel itself.
 
 ### Stage 4 - opt-in end-to-end prefill
 Branch `q4k-wmma-stage4-prefill-optin`. Run only with the negotiated opt-in
