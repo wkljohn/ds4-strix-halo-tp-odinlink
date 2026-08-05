@@ -278,3 +278,69 @@ does not go finer than the two gates the code already provides, so this
 would require either the stalling stage profiler (unresolved) or new
 non-synchronizing GPU-event instrumentation scoped just to the attention
 sub-stages.
+
+## Stage 0c: attention sub-stage breakdown - one concentrated hotspot, not spread thin (2026-08-05)
+
+Built the non-synchronizing GPU-event instrumentation the previous section
+called for (`ds4-upstream` commit `0938a0d`): `hipEvent_t` recorded at each
+existing decode stage boundary inside the attention half, a 16-slot reusable
+event pool, deferred `hipEventQuery`-gated readback - never
+`hipDeviceSynchronize`, so it cannot reproduce the stage-profiler stall.
+Implemented by Codex (two earlier dispatch attempts were blocked by a
+read-only sandbox from a direct CLI invocation; routing through the proper
+guarded-implementer channel fixed it). Reviewed and one correctness bug
+fixed before validation: `hipEventQuery` returning `hipErrorNotReady` (a
+normal, expected value) was never cleared via `hipGetLastError()` - this
+project already shipped that exact bug class once (the
+`hipMallocSignalMemory` latched-error issue), and left uncleared here it
+could have spuriously failed any of the hundreds of unrelated
+`cuda_ok(cudaGetLastError(), ...)` call sites throughout the exact
+compressor/indexer/attention kernels this profiler instruments.
+
+**Validated on both live nodes**: no spurious failures (despite frequent,
+by-design, harmless sample drops - roughly half of attempts get dropped
+when the 16-slot pool wraps before the oldest slot's events complete;
+n=11000-12692 samples over a 600-token run is still a large, stable
+sample), coherent output preserved, throughput unaffected (10.68 vs 10.80
+t/s decode).
+
+**Result** (rank 0, means over ~12700 samples):
+
+| sub-stage | mean | share of measured total |
+|---|---|---|
+| kv_path | 18us | 2% |
+| compressor_proj | 131us | 15% |
+| compressor_update | 17us | 2% |
+| compressor_indexer | 35us | 4% |
+| attn_inv_rope | 60us | 7% |
+| **attn_output** | **582us** | **68%** |
+| attn_hc_post | 14us | 2% |
+
+**One concentrated hotspot, not many small kernels.** `attn_output` is
+~4.4x the next-largest stage (`compressor_proj`). This is genuinely useful
+- it means Stage 1 doesn't need to fuse a long chain of small ops; it needs
+to understand and speed up one specific window.
+
+**Caveat, important**: the measured sum (~856us) is meaningfully less than
+the coarser gate-bucketed attention-half measurement from the previous
+section (~1.2ms). The gap is very likely q_path/RMSNorm time before the
+`start` event (not yet instrumented) plus, more importantly: **the
+`attn_output` window as coded (`ds4.c:22452-22695`) spans BOTH the
+TP-sliced attention-output projection matmul AND the ATTN TP-gate exchange
+itself** (`ds4_gpu_tp_gate_encode` is called partway through this window,
+`ds4.c:22681`, before the window's closing event). The 582us figure could
+be dominated by either the actual matmul compute, or by this rank waiting
+on its peer's gate send, or some mix - this instrumentation cannot yet
+tell those apart, since the gate wait happens on a different HIP stream
+(`g_tp_stream`) than the events recorded here (stream 0, matching where
+the compute kernels run).
+
+**Next step, not yet done**: split `attn_output` into (a) time up to the
+gate encode call and (b) time from the gate encode to the window's end, by
+adding one more GPU event immediately after `ds4_gpu_tp_gate_encode`
+returns. This determines whether Stage 1 should target the matmul kernel
+itself or the gate-exchange/overlap structure - a materially different fix
+in each case. Do this before attempting any actual kernel change here;
+picking the wrong one wastes effort and risks a correctness bug in dense
+TP+quantization code, exactly the kind of thing that already went wrong
+once this project (the down-projection WMMA tile-width bug).
