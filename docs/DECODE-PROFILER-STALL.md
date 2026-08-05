@@ -61,6 +61,25 @@ next FFN gate while the other has already sent and is waiting. Not confirmed:
 transport message loss and worker-side output/scheduler starvation are weaker
 alternative explanations neither confirmed nor ruled out by static reading.
 
+## Discriminator: stage profiler ALONE also stalls (2026-08-05)
+
+Ran `DS4_ROCM_DECODE_STAGE_PROFILE=1` + layer filter WITHOUT
+`DS4_ROCM_MOE_DECODE_PROFILE`. Same stall, same position (pos=42, last line
+`routed_moe_folded`), silently killed by the outer timeout with no explicit
+`ds4-tp: timeout` line reaching the log before the process died. Separately,
+`DS4_ROCM_MOE_DECODE_PROFILE=1` ALONE (no stage profiler) ran to completion
+normally (`generation: 10.80 t/s`, matching baseline) but emitted **zero**
+profiling lines - it appears to only produce output when the stage profiler
+is also active, so it is not a usable substitute on its own.
+
+**Conclusion: the stage profiler's per-boundary `cudaDeviceSynchronize()`
+alone is sufficient to trigger the stall; the MoE profiler's event waits are
+not a required co-factor.** There is no lighter existing-env-var combination
+that survives while still producing per-stage data. Stage 0b (new
+service-thread interval instrumentation) is not optional - it's the only
+route to real decode-timing data until this stall is separately root-caused
+and fixed.
+
 ## Workaround (use this, don't chase timeout/window tuning)
 
 **Stage 0b** (already in DECODE-ACCELERATION-PLAN.md as the "less invasive"
