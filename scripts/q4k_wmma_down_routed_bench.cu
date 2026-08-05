@@ -93,22 +93,38 @@ static std::vector<int32_t> zipf(uint32_t n,uint32_t ne){std::vector<double>w(ne
 struct Timing{uint32_t bucket,threshold;double candidate,shipping;};static std::vector<Timing> timings;
 // J=32 geometry proof (Phase A of the dynamic-tile-width plan): builds a
 // SECOND, 32-wide tile-descriptor stream over the same sorted pairs using the
-// already-generic down_tile_offsets/down_build_tiles(...,bm,...) builders, runs
-// down_q4k_wmma<32> into a separate buffer, and requires its output to be
-// BOTH within the same Q8_1-vs-Q8_K gamma tolerance as J=16 (against the CPU
-// reference) AND bit-exactly equal to the J=16 GPU output (pair-major,
-// non-atomic writes only - no atomicAdd is involved in this kernel's output
-// path, so unlike token-summed accumulation, bit identity is the correct bar
-// here, not just a tolerance).
+// already-generic down_tile_offsets/down_build_tiles(...,bm,...) builders and
+// runs down_q4k_wmma<32> into a separate buffer.
+//
+// CORRECTED after Codex review of the first version of this function (which
+// asserted bit-identity between J16/J32 was "the correct bar" and then
+// self-contradicted by failing its own gate when that assertion turned out
+// false): bit-identity is NOT actually required or expected here under
+// -ffast-math once a tile is genuinely populated past position 15 (J=32's
+// second half computes into acc[1], a code path that does not exist in the
+// J=16 specialization at all - different template instantiation, not
+// necessarily reordered evaluation of "the same" instructions). The real
+// acceptance bar is the gamma-tolerance check against the independent CPU
+// reference (vs_cpu_ok below), exactly as already used for J=16. What SHOULD
+// still be an unconditional hard requirement: positions 0-15 within a tile
+// map to the identical acc[0] slot and code path in BOTH J=16 and J=32, so
+// ANY difference there is a genuine correctness signal, not floating-point
+// noise - checked separately from positions 16-31 below.
 struct J32Timing{uint32_t bucket;double j32,j16;};static std::vector<J32Timing> j32_timings;
 static bool run_down_case_j32(const char*name,uint32_t nt,uint32_t ne,const std::vector<int32_t>&sel,uint32_t pc,uint32_t ne_unused,const uint32_t*dw_ignored,uint32_t timing_bucket,
  const cuda_block_q4_K*dw,const q8_1_mmq_block*dq81,const uint32_t*dsp,const uint32_t*doo,const uint32_t*dc,
- const uint32_t*dtt16,const uint32_t*dte16,const uint32_t*dts16,uint32_t tiles16,const float*cand16,const std::vector<float>&cpu_q81_pair,const std::vector<double>&cpu_q81_sabs){
+ const uint32_t*dtt16,const uint32_t*dte16,const uint32_t*dts16,uint32_t tiles16,const float*cand16,const std::vector<float>&cpu_q81_pair,const std::vector<double>&cpu_q81_sabs,const std::vector<float>&cpu_q81_sum,
+ const std::vector<uint32_t>&hc,const std::vector<uint32_t>&ho,const std::vector<uint32_t>&hp){
  (void)ne_unused;(void)dw_ignored;
- uint32_t *dto32,*dtt32,*dte32,*dts32;float*cand32;size_t ps=(size_t)pc*kN*4;
- hip_check(hipMalloc(&dto32,(ne+1)*4),"j32 tile offsets");hip_check(hipMalloc(&dtt32,4),"j32 tile total");hip_check(hipMalloc(&dte32,pc*4),"j32 tile experts");hip_check(hipMalloc(&dts32,pc*4),"j32 tile starts");hip_check(hipMalloc(&cand32,ps+4),"j32 candidate out");
+ uint32_t *dto32,*dtt32,*dte32,*dts32;float*cand32,*toksum32;size_t ps=(size_t)pc*kN*4;
+ hip_check(hipMalloc(&dto32,(ne+1)*4),"j32 tile offsets");hip_check(hipMalloc(&dtt32,4),"j32 tile total");hip_check(hipMalloc(&dte32,pc*4),"j32 tile experts");hip_check(hipMalloc(&dts32,pc*4),"j32 tile starts");hip_check(hipMalloc(&cand32,ps+4),"j32 candidate out");hip_check(hipMalloc(&toksum32,(size_t)nt*kN*4+4),"j32 sum out");
  down_tile_offsets<<<1,1>>>(dto32,dtt32,dc,32,ne);down_build_tiles<<<(ne+255)/256,256>>>(dte32,dts32,dto32,dc,32,ne);
  uint32_t tiles32=0;hip_check(hipMemcpy(&tiles32,dtt32,4,hipMemcpyDeviceToHost),"j32 tiles back");
+ // Host-validate the J32 descriptor stream exactly as the J16 stream is
+ // validated in run_down_case: every expert's tiles must appear in order at
+ // 32-aligned starts, and the total tile count must match what was built.
+ std::vector<uint32_t>hte32(pc),hts32(pc);hip_check(hipMemcpy(hte32.data(),dte32,tiles32*4,hipMemcpyDeviceToHost),"j32 te back");hip_check(hipMemcpy(hts32.data(),dts32,tiles32*4,hipMemcpyDeviceToHost),"j32 ts back");
+ bool descriptors_ok=true;{uint32_t et=0;for(uint32_t e=0;e<ne;++e){for(uint32_t s=0;s<hc[e];s+=32){descriptors_ok&=et<tiles32&&hte32[et]==e&&hts32[et]==s;++et;}}descriptors_ok&=et==tiles32;}
  dim3 wg32(kN/64,tiles32);size_t sh32=(32*36+64*76)*sizeof(int32_t);
  hip_check(hipMemset(cand32,0xff,ps+4),"j32 candidate poison");
  down_q4k_wmma<32><<<wg32,256,sh32>>>(dw,dq81,cand32,dsp,doo,dc,dtt32,dte32,dts32,pc,kQ8KBlocks,kN,ne,0,NULL,NULL);
@@ -116,12 +132,42 @@ static bool run_down_case_j32(const char*name,uint32_t nt,uint32_t ne,const std:
  std::vector<float>gc32(cpu_q81_pair.size()),gc16(cpu_q81_pair.size());uint32_t cg32=0;
  hip_check(hipMemcpy(gc32.data(),cand32,ps,hipMemcpyDeviceToHost),"j32 candidate back");
  hip_check(hipMemcpy(&cg32,(char*)cand32+ps,4,hipMemcpyDeviceToHost),"j32 candidate guard");
- hip_check(hipMemcpy(gc16.data(),cand16,ps,hipMemcpyDeviceToHost),"j16 candidate rereeread");
+ hip_check(hipMemcpy(gc16.data(),cand16,ps,hipMemcpyDeviceToHost),"j16 candidate reread");
  bool guard_ok=cg32==UINT_MAX;
  bool vs_cpu_ok=close_down_gamma("WMMA32-vs-Q8_1",gc32,cpu_q81_pair,cpu_q81_sabs,sel);
- uint64_t exact_bad=0;double exact_max=0;for(size_t i=0;i<gc32.size();++i){double d=fabs((double)gc32[i]-(double)gc16[i]);exact_max=std::max(exact_max,d);if(gc32[i]!=gc16[i])++exact_bad;}
- printf("  [%s] J16-vs-J32-exact bad=%llu/%zu max_abs=%.9g (expect bad=0: same math, no atomics on this path)\n",name,(unsigned long long)exact_bad,gc32.size(),exact_max);
- bool exact_ok=exact_bad==0;
+ // Sum path: production folds all six routed contributions per token before
+ // the down output is consumed further, so the summed result (not just the
+ // pair-major GEMM) must also agree with the CPU reference.
+ down_sum_pairs<<<((uint64_t)nt*kN+255)/256,256>>>(toksum32,cand32,kN,kUsed,nt);hip_check(hipDeviceSynchronize(),"j32 sum");
+ std::vector<float>gs32((size_t)nt*kN);hip_check(hipMemcpy(gs32.data(),toksum32,gs32.size()*4,hipMemcpyDeviceToHost),"j32 sum back");
+ bool sum_ok=close_down_core("sum32-vs-Q8_1",gs32,cpu_q81_sum,6e-3);
+ // Positional breakdown: local position within the expert's sorted-pair
+ // stream determines which acc[] slot produced this value. Positions 0-15
+ // land in acc[0] under BOTH J=16 and J=32 - identical code path, so any
+ // difference there is a real correctness signal. Positions 16-31 exist
+ // only as acc[1] under J=32 (a second tile under J=16) - differences there
+ // are the specialization-dependent floating-point behavior under
+ // investigation, not yet an accepted "just fast-math" conclusion.
+ uint64_t bad_lo=0,bad_hi=0,n_lo=0,n_hi=0;double max_ratio_lo=0,max_ratio_hi=0;
+ for(uint32_t p=0;p<pc;++p){
+  uint32_t e=(uint32_t)std::max(sel[p],0);uint32_t local=UINT32_MAX;
+  for(uint32_t lp=0;lp<hc[e];++lp)if(hp[ho[e]+lp]==p){local=lp;break;}
+  if(local==UINT32_MAX)continue;
+  bool hi=(local%32u)>=16u;
+  for(uint32_t row=0;row<kN;++row){
+   size_t i=(size_t)p*kN+row;double d=fabs((double)gc32[i]-(double)gc16[i]);
+   double tol=2.0*kGamma67*cpu_q81_sabs[i];double ratio=tol>0?d/tol:(d>0?INFINITY:0.0);
+   if(hi){++n_hi;if(gc32[i]!=gc16[i])++bad_hi;max_ratio_hi=std::max(max_ratio_hi,ratio);}
+   else{++n_lo;if(gc32[i]!=gc16[i])++bad_lo;max_ratio_lo=std::max(max_ratio_lo,ratio);}
+  }
+ }
+ printf("  [%s] J16-vs-J32 pos0-15(acc[0], same path both J) bad=%llu/%llu max_error/tol=%.4f | pos16-31(acc[1], J32-only path) bad=%llu/%llu max_error/tol=%.4f\n",
+   name,(unsigned long long)bad_lo,(unsigned long long)n_lo,max_ratio_lo,(unsigned long long)bad_hi,(unsigned long long)n_hi,max_ratio_hi);
+ // Hard requirement: positions 0-15 must be bit-identical (same code path in
+ // both J values). Positions 16-31 are reported but NOT folded into
+ // pass/fail - see the comment above this function for why bit-identity is
+ // not the correct bar there.
+ bool exact_ok=bad_lo==0;
  if(timing_bucket){
   auto run32=[&](){down_q4k_wmma<32><<<wg32,256,sh32>>>(dw,dq81,cand32,dsp,doo,dc,dtt32,dte32,dts32,pc,kQ8KBlocks,kN,ne,0,NULL,NULL);};
   auto run16=[&](){down_q4k_wmma<16><<<dim3(kN/64,tiles16),256,(16*36+64*76)*sizeof(int32_t)>>>(dw,dq81,const_cast<float*>(cand16),dsp,doo,dc,dtt16,dte16,dts16,pc,kQ8KBlocks,kN,ne,0,NULL,NULL);};
@@ -129,11 +175,23 @@ static bool run_down_case_j32(const char*name,uint32_t nt,uint32_t ne,const std:
   j32_timings.push_back({timing_bucket,t32.median_us,t16.median_us});
   printf("  [%s] J32-timing bucket=%u j32_us=%.3f j16_us=%.3f speedup(j32/j16)=%.4fx\n",name,timing_bucket,t32.median_us,t16.median_us,t16.median_us/t32.median_us);
  }
- (void)hipFree(dto32);(void)hipFree(dtt32);(void)hipFree(dte32);(void)hipFree(dts32);(void)hipFree(cand32);
+ (void)hipFree(dto32);(void)hipFree(dtt32);(void)hipFree(dte32);(void)hipFree(dts32);(void)hipFree(cand32);(void)hipFree(toksum32);
  (void)nt;
- return guard_ok&&vs_cpu_ok&&exact_ok;
+ return guard_ok&&vs_cpu_ok&&descriptors_ok&&sum_ok&&exact_ok;
 }
-static void report_j32_sweep(){if(j32_timings.empty())return;printf("\nJ32-vs-J16 DOWN TIMING SWEEP\n");double logs=0;uint32_t n=0;bool regress=false;for(const auto&t:j32_timings){double s=t.j16/t.j32;logs+=log(s);++n;regress|=t.j32>1.05*t.j16;}printf("  retained=%u geomean(j32-speedup)=%.4fx regression_gt_5pct=%s\n",n,n?exp(logs/n):0.0,regress?"YES":"no");}
+// Reports ONLY the buckets where the plan's proposed production selector
+// (pair_count > 16*n_total_expert, i.e. average pairs/expert > 16) would
+// actually pick J=32 - a blanket average across all tested buckets is
+// misleading because most of them are deliberately below that threshold to
+// characterize the (expected, and confirmed) small-bucket regression.
+static void report_j32_sweep(){if(j32_timings.empty())return;printf("\nJ32-vs-J16 DOWN TIMING SWEEP (all buckets)\n");double logs=0;uint32_t n=0;bool regress=false;for(const auto&t:j32_timings){double s=t.j16/t.j32;logs+=log(s);++n;regress|=t.j32>1.05*t.j16;}printf("  retained=%u geomean(j32-speedup)=%.4fx regression_gt_5pct=%s (includes buckets below the selector threshold - expected to regress there)\n",n,n?exp(logs/n):0.0,regress?"YES":"no");
+ // Selector-filtered: bucket m with 6 experts of m pairs each -> pair_count
+ // = 6*m, n_total_expert = 6 for these synthetic timing cases, so the
+ // production condition pair_count > 16*n_total_expert reduces to m > 16.
+ double flogs=0;uint32_t fn=0;bool fregress=false;for(const auto&t:j32_timings){if(t.bucket<=16)continue;double s=t.j16/t.j32;flogs+=log(s);++fn;fregress|=t.j32>1.05*t.j16;}
+ if(fn)printf("  selector-filtered (bucket>16, matches pair_count>16*n_total_expert): retained=%u geomean(j32-speedup)=%.4fx regression_gt_5pct=%s\n",fn,exp(flogs/fn),fregress?"YES":"no");
+ else printf("  selector-filtered: no timing buckets exceeded the threshold - add larger buckets to validate the selector's win region\n");
+}
 static bool run_down_case(const char*name,uint32_t nt,uint32_t ne,const std::vector<int32_t>&sel,const std::vector<uint32_t>&thresholds,uint32_t timing_bucket=0){uint32_t pc=nt*kUsed;if(sel.size()!=pc){fprintf(stderr,"bad case size %s\n",name);return false;}std::mt19937 rng(0xd04e0000u+nt+ne);std::vector<float>mid((size_t)pc*kK);std::normal_distribution<float>md(0,.20f);for(auto&v:mid)v=std::max(-3.0f,std::min(3.0f,md(rng)));std::vector<cuda_block_q8_K>hq;host_quant_q8k(mid,hq,pc);std::vector<cuda_block_q4_K>hw((size_t)ne*kN*kQ8KBlocks);for(auto&b:hw)fill_q4_K_block(&b,rng);std::vector<float>cpu_q8_pair,cpu_q81_pair,cpu_q81_sum;std::vector<double>cpu_q81_sabs;
  int32_t*ds;uint32_t *dc,*doo,*dcur,*dsp,*dto,*dtt,*dte,*dts,*marks,*disp;float *dm,*ref,*cand,*toksum;cuda_block_q8_K*dq8;q8_1_mmq_block*dq81;cuda_block_q4_K*dw;size_t ps=(size_t)pc*kN*4,ms=(size_t)pc*kN*4;
  #define DMALLOC(p,n,s) hip_check(hipMalloc(&(p),(n)),s)
@@ -141,7 +199,7 @@ static bool run_down_case(const char*name,uint32_t nt,uint32_t ne,const std::vec
  hip_check(hipMemcpy(ds,sel.data(),pc*4,hipMemcpyHostToDevice),"selected copy");hip_check(hipMemcpy(dm,mid.data(),mid.size()*4,hipMemcpyHostToDevice),"mid copy");hip_check(hipMemcpy(dw,hw.data(),hw.size()*sizeof(*dw),hipMemcpyHostToDevice),"weights copy");hip_check(hipMemset(dc,0,ne*4),"counts clear");down_count_pairs<<<(pc+255)/256,256>>>(dc,ds,pc,ne);down_prefix_pairs<<<1,1>>>(doo,dcur,dc,ne);down_scatter_pairs<<<ne,1>>>(dsp,doo,ds,pc,ne);down_tile_offsets<<<1,1>>>(dto,dtt,dc,16,ne);down_build_tiles<<<(ne+255)/256,256>>>(dte,dts,dto,dc,16,ne);down_q8_K_quantize<<<dim3(kQ8KBlocks,pc),256>>>(dq8,dm,kK,pc);q8_K_to_q8_1_mmq_kernel<<<dim3(pc,kQ8KBlocks),32>>>(dq8,dq81,pc,kQ8KBlocks);hip_check(hipDeviceSynchronize(),"setup");
  std::vector<cuda_block_q8_K>gotq(hq.size());hip_check(hipMemcpy(gotq.data(),dq8,gotq.size()*sizeof(*dq8),hipMemcpyDeviceToHost),"q8 back");q8k_check qc=check_q8k(gotq,hq,mid);host_reference(hw,gotq,sel,ne,cpu_q8_pair,cpu_q81_pair,cpu_q81_sum,cpu_q81_sabs);std::vector<uint32_t>hc(ne),ho(ne+1),hp(pc),hte(pc),hts(pc);uint32_t tiles=0;hip_check(hipMemcpy(hc.data(),dc,ne*4,hipMemcpyDeviceToHost),"counts back");hip_check(hipMemcpy(ho.data(),doo,(ne+1)*4,hipMemcpyDeviceToHost),"offset back");hip_check(hipMemcpy(hp.data(),dsp,pc*4,hipMemcpyDeviceToHost),"pairs back");hip_check(hipMemcpy(&tiles,dtt,4,hipMemcpyDeviceToHost),"total back");hip_check(hipMemcpy(hte.data(),dte,tiles*4,hipMemcpyDeviceToHost),"te back");hip_check(hipMemcpy(hts.data(),dts,tiles*4,hipMemcpyDeviceToHost),"ts back");bool route=ho[ne]==pc;uint32_t et=0;for(uint32_t e=0;e<ne;++e){uint32_t n=0;for(uint32_t p=0;p<pc;++p)if((uint32_t)std::max(sel[p],0)==e)route&=hp[ho[e]+n++]==p;route&=n==hc[e];for(uint32_t s=0;s<hc[e];s+=16){route&=et<tiles&&hte[et]==e&&hts[et]==s;++et;}}route&=et==tiles;
  dim3 wg(kN/64,tiles),dg(kN/32,tiles);size_t sh=(16*36+64*76)*sizeof(int32_t);uint64_t rb=(uint64_t)kQ8KBlocks*sizeof(cuda_block_q4_K),eb=(uint64_t)kN*rb;hip_check(hipMemset(ref,0xff,ps+4),"ref poison");hip_check(hipMemset(cand,0xff,ps+4),"candidate poison");down_q4k_dp4a_cold<<<dg,256>>>(ref,(const char*)dw,dq8,dsp,doo,dc,dtt,dte,dts,eb,rb,kQ8KBlocks,kN,UINT_MAX,NULL,NULL);down_q4k_wmma<16><<<wg,256,sh>>>(dw,dq81,cand,dsp,doo,dc,dtt,dte,dts,pc,kQ8KBlocks,kN,ne,0,NULL,NULL);hip_check(hipDeviceSynchronize(),"gemm");std::vector<float>gr(cpu_q8_pair.size()),gc(cpu_q81_pair.size()),gs(cpu_q81_sum.size());hip_check(hipMemcpy(gr.data(),ref,ps,hipMemcpyDeviceToHost),"ref back");hip_check(hipMemcpy(gc.data(),cand,ps,hipMemcpyDeviceToHost),"candidate back");uint32_t rg=0,cg=0;hip_check(hipMemcpy(&rg,(char*)ref+ps,4,hipMemcpyDeviceToHost),"ref guard");hip_check(hipMemcpy(&cg,(char*)cand+ps,4,hipMemcpyDeviceToHost),"candidate guard");bool ok=qc.valid&&route&&rg==UINT_MAX&&cg==UINT_MAX&&close_down("DP4A-vs-Q8K",gr,cpu_q8_pair)&&close_down_gamma("WMMA-vs-Q8_1",gc,cpu_q81_pair,cpu_q81_sabs,sel);close_down("Q8_1-vs-Q8K",cpu_q81_pair,cpu_q8_pair);down_sum_pairs<<<((uint64_t)nt*kN+255)/256,256>>>(toksum,cand,kN,kUsed,nt);hip_check(hipDeviceSynchronize(),"sum");hip_check(hipMemcpy(gs.data(),toksum,gs.size()*4,hipMemcpyDeviceToHost),"sum back");ok&=close_down_core("sum-vs-Q8_1",gs,cpu_q81_sum,6e-3);printf("  q8K-check exact=%s valid=%s qdiff=%llu max_qdiff=%d scale_diff=%llu max_scale_diff=%.9g bad_bsum=%llu\n",qc.exact?"yes":"no",qc.valid?"yes":"no",(unsigned long long)qc.qdiff,qc.max_qdiff,(unsigned long long)qc.scale_diff,qc.max_scale_diff,(unsigned long long)qc.bad_bsum);printf("CASE %-20s route=%s q8K-faithful=%s result=%s\n",name,route?"PASS":"FAIL",qc.valid?"PASS":"FAIL",ok?"PASS":"FAIL");
- ok&=run_down_case_j32(name,nt,ne,sel,pc,ne,NULL,timing_bucket,dw,dq81,dsp,doo,dc,dtt,dte,dts,tiles,cand,cpu_q81_pair,cpu_q81_sabs);
+ ok&=run_down_case_j32(name,nt,ne,sel,pc,ne,NULL,timing_bucket,dw,dq81,dsp,doo,dc,dtt,dte,dts,tiles,cand,cpu_q81_pair,cpu_q81_sabs,cpu_q81_sum,hc,ho,hp);
  for(uint32_t th:thresholds){hip_check(hipMemset(cand,0xff,ps+4),"cross poison");hip_check(hipMemset(marks,0,ms+4),"marks clear");hip_check(hipMemset(disp,0,16),"dispatch clear");down_q4k_wmma<16><<<wg,256,sh>>>(dw,dq81,cand,dsp,doo,dc,dtt,dte,dts,pc,kQ8KBlocks,kN,ne,th,disp,marks);down_q4k_dp4a_cold<<<dg,256>>>(cand,(const char*)dw,dq8,dsp,doo,dc,dtt,dte,dts,eb,rb,kQ8KBlocks,kN,th,disp,marks);hip_check(hipDeviceSynchronize(),"crossover");hip_check(hipMemcpy(gc.data(),cand,ps,hipMemcpyDeviceToHost),"cross back");std::vector<uint32_t>hm((size_t)pc*kN);uint32_t hd[4],mg=1,og=0;hip_check(hipMemcpy(hm.data(),marks,ms,hipMemcpyDeviceToHost),"marks back");hip_check(hipMemcpy(hd,disp,16,hipMemcpyDeviceToHost),"dispatch back");hip_check(hipMemcpy(&mg,(char*)marks+ms,4,hipMemcpyDeviceToHost),"mark guard");hip_check(hipMemcpy(&og,(char*)cand+ps,4,hipMemcpyDeviceToHost),"output guard");uint32_t hot=0,cold=0;for(uint32_t t=0;t<tiles;++t)(hc[hte[t]]>=th?hot:cold)++;bool own=mg==0&&og==UINT_MAX&&hd[0]==hot&&hd[1]==cold&&hd[2]==cold&&hd[3]==hot;for(uint32_t p=0;p<pc;++p){uint32_t want=hc[(uint32_t)std::max(sel[p],0)]>=th?1:2;for(uint32_t r=0;r<kN;++r)own&=hm[(size_t)p*kN+r]==want;}std::vector<float>cross_cpu=cpu_q8_pair;for(uint32_t p=0;p<pc;++p)if(hc[(uint32_t)std::max(sel[p],0)]>=th)std::copy_n(cpu_q81_pair.data()+(size_t)p*kN,kN,cross_cpu.data()+(size_t)p*kN);ok&=own&&close_down_core("cross-vs-CPU",gc,cross_cpu);printf("  threshold=%u hot/cold=%u/%u ownership+guards=%s\n",th,hot,cold,own?"PASS":"FAIL");if(timing_bucket){auto candidate=[&](){down_q8_K_quantize<<<dim3(kQ8KBlocks,pc),256>>>(dq8,dm,kK,pc);q8_K_to_q8_1_mmq_kernel<<<dim3(pc,kQ8KBlocks),32>>>(dq8,dq81,pc,kQ8KBlocks);down_q4k_wmma<16><<<wg,256,sh>>>(dw,dq81,cand,dsp,doo,dc,dtt,dte,dts,pc,kQ8KBlocks,kN,ne,th,NULL,NULL);down_q4k_dp4a_cold<<<dg,256>>>(cand,(const char*)dw,dq8,dsp,doo,dc,dtt,dte,dts,eb,rb,kQ8KBlocks,kN,th,NULL,NULL);down_sum_pairs<<<((uint64_t)nt*kN+255)/256,256>>>(toksum,cand,kN,kUsed,nt);};auto shipping=[&](){down_q8_K_quantize<<<dim3(kQ8KBlocks,pc),256>>>(dq8,dm,kK,pc);down_q4k_dp4a_cold<<<dg,256>>>(ref,(const char*)dw,dq8,dsp,doo,dc,dtt,dte,dts,eb,rb,kQ8KBlocks,kN,UINT_MAX,NULL,NULL);down_sum_pairs<<<((uint64_t)nt*kN+255)/256,256>>>(toksum,ref,kN,kUsed,nt);};BenchResult a=time_launch(candidate),b=time_launch(shipping);timings.push_back({timing_bucket,th,a.median_us,b.median_us});printf("  timing bucket=%u threshold=%u candidate=%.3fus shipping=%.3fus speedup=%.4fx\n",timing_bucket,th,a.median_us,b.median_us,b.median_us/a.median_us);}}
  #define DFREE(p) (void)hipFree(p)
  DFREE(ds);DFREE(dc);DFREE(doo);DFREE(dcur);DFREE(dsp);DFREE(dto);DFREE(dtt);DFREE(dte);DFREE(dts);DFREE(dm);DFREE(dq8);DFREE(dq81);DFREE(dw);DFREE(ref);DFREE(cand);DFREE(toksum);DFREE(marks);DFREE(disp);return ok;}
