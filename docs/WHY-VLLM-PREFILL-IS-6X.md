@@ -105,3 +105,39 @@ Consequence: the fix is to go **wider**, not narrower - more tokens amortised
 per weight read - which requires K-tiling to keep LDS bounded (staging the whole
 K=4096 for the tile is what forces 37 KB today). Going wider without K-tiling
 would blow LDS entirely.
+
+## MEASURED post-WMMA-fix at a realistic prompt length: gap mostly closed (2026-08-05)
+
+All the numbers above (and this project's usual quick A/B checks) used a
+short ~50-token test prompt. That length is structurally hostile to the
+routed-MoE WMMA path this session shipped
+(`ds4-upstream@8b71a30`/`e906a14`): with 6 experts selected/token across
+256 total, a 50-token prompt averages only ~1.17 routed pairs/expert -
+most experts can't reach the WMMA engagement threshold and fall back to
+the slow DP4A cold path regardless of the fix's existence.
+
+**Re-measured on both live nodes at a realistic ~1694-token prompt**
+(`DS4_ROCM_Q4K_WMMA=1`, `DS4_TP_BIG_DIRECT=1`, `DS4_TP_PREFILL_SPLIT_MIN=999999`,
+3 samples): **74.80, 75.02, 75.65 t/s** - remarkably stable (~1.1%
+spread, consistent with this project's own established finding that
+longer prompts give far more reliable measurements than short ones).
+Decode unaffected (~10.8 t/s, one noisy outlier sample aside).
+
+**This nearly closes the gap to the llama.cpp golden-evidence reference
+(80-95 t/s)** - remaining distance is roughly 5-21%, right in the range
+Codex's research (see `LONG-PROMPT-BUG.md`'s 2026-08-05 update) estimates
+the still-unimplemented TP=2 attention row-split fix would close (4-10%).
+**The original "40 vs 90" gap was mostly a measurement artifact of testing
+at too short a prompt length, not a large unexplained deficit** - the
+WMMA fix plus a fair prompt length already gets most of the way there; the
+attention-replication issue documented in `LONG-PROMPT-BUG.md` is the
+next concrete, estimated lever for the remainder, not WMMA tile-width
+work (which Codex's research found is unlikely to matter much at this
+prompt length - most experts already exceed the 6-pair hot threshold by
+~1694 tokens).
+
+Still open: no fair comparison against llama.cpp/vLLM using the SAME
+model/quant/node-count/prompt-length has been run (only ds4's own
+pre-fix and post-fix numbers, and the golden-evidence llama.cpp figure
+from a separate, earlier measurement session) - the 74.80-75.65 t/s
+figure is ds4's real current number, not yet a controlled side-by-side.

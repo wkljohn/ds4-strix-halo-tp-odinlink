@@ -102,3 +102,65 @@ is the only way to use prompts over 32 tokens. It costs prefill parallelism only
 Note this also means **patches 10/11 (attention_output_q8_tp, kslice) have still
 never executed on the prefill path** - the row split is where they would be
 exercised, and it has never run successfully.
+
+## Status update (2026-08-05): still unfixed, now more valuable, real gain estimated
+
+Confirmed still current via both code inspection and Codex research: ROCm
+now defaults `DS4_TP_PREFILL_SPLIT_MIN` to 1,000,000 automatically (no
+longer requires the operator to set it - see commit `f359858`), but the
+underlying missing kernels (`ds4_gpu_attention_prefill_raw_heads_range_tensor`
+AND a second, separately-missing static-mixed-attention range API) are
+still hard-fail stubs. Attention during prefill is still fully replicated
+across both TP ranks. FFN's split threshold is independent and unaffected
+(stays at 32).
+
+**Re-scoped, honest estimate of the real gain** (Codex research pass,
+2026-08-05): this is bigger than "half the measured 1.2% SDPA share." The
+row-split boundary is broader than just SDPA - it also covers most of the
+attention output projection (13.1% of profiled prefill time) and part of
+q_path (1.7%). Conservative realized gain estimate: **4-7%** after
+accounting for the TP exchange cost the split reintroduces; **7-9%**
+plausible if that exchange is cheap; **~10%** possible post-WMMA-fix,
+since accelerating routed MoE (this session's work) makes the unchanged
+attention cost a LARGER fraction of the new, smaller total prefill time.
+
+**This now lines up cleanly with a fresh, real hardware measurement**: at
+a realistic ~1694-token prompt (not this project's usual ~50-token smoke
+test), current post-WMMA-fix prefill measures **74.80-75.65 t/s** (3
+samples, ~1.1% spread - see `WHY-VLLM-PREFILL-IS-6X.md`'s update). Against
+the golden-evidence llama.cpp reference of 80-95 t/s, that's a remaining
+gap of roughly 5-21% - right in the range this row-split fix is estimated
+to close. The "40 vs 90" gap the operator originally asked about was
+mostly a short-prompt measurement artifact (most experts never reaching
+ds4's WMMA engagement threshold on such a short prompt) plus this
+still-open replicated-attention issue - not a mysterious, unexplained
+deficit.
+
+**Implementation is real work, not a quick patch** (Codex research,
+2026-08-05): the existing fast kernel conflates "local query row" and
+"absolute causal position" (both are `blockIdx.x`) throughout
+`ds4_gpu_attention_prefill_raw_heads_tensor()`'s every dispatch branch
+(heads8-online path, hipBLAS path, scalar fallback) AND a SEPARATE
+static-mixed-attention range API is also missing and must be implemented
+too - fixing only the raw-range symbol would leave ordinary compressed
+layers (the common case) still unable to split. Required validation is
+non-trivial: coherent-looking text is NOT sufficient (a silently-wrong
+causal window could still produce plausible output) - needs a tensor-level
+diff between forced-split and forced-replicated output at multiple
+boundary conditions (split threshold 31/32/33, window edges, compression
+emission boundaries, the indexer/static-mixed transition), not just a
+smoke test.
+
+**Priority order going forward** (Codex recommendation, consistent with
+the fresh measurement above): (1) implement + rigorously validate the
+attention range split - the clear next lever; (2) re-profile current
+post-WMMA long-prompt prefill on both ranks symmetrically to get accurate
+current stage shares (the old profile predates this session's complete
+WMMA path); (3) only then reconsider WMMA tile-width breadth, and if so,
+prioritize wider tiles (J=32) over narrower ones (J=8 was considered and
+is NOT actually what llama.cpp uses for RDNA3.5 Q4_K - its own config
+table starts at J=16 - nor a natural fit for ds4's 16-column-based WMMA
+accumulator design; the cold (<6 pairs/expert) population is likely small
+at realistic prompt lengths anyway, consistent with the ~75 t/s long-prompt
+result above already looking close to the llama.cpp reference without any
+tile-width change).
