@@ -219,7 +219,7 @@ size to always match `n_tokens` (see the fix in the same commit) did NOT
 stop the crash - so either this wasn't the (whole) mechanism, or there's
 a second contributing factor.
 
-**Status: DO NOT enable this feature.** The feature gate itself
+**Status at the time: DO NOT enable this feature.** The feature gate itself
 (`metal_graph_tp_prefill_split_min_attn()`, `ds4.c` - NOT touched by this
 commit) still defaults to 1,000,000 on ROCm, so none of this new code path
 is reachable with default settings - this is dead code in normal
@@ -233,3 +233,54 @@ available this session, or Codex's help once its quota resets
 path without that, and do not treat "it didn't crash this run" as
 evidence of correctness given the intermittent, memory-corruption-shaped
 failure pattern already observed.
+
+## FIXED (2026-08-05, later same day): use-after-free, root-caused by Codex once quota reset
+
+Codex's quota reset the same day, much earlier than the "~2026-08-11"
+estimate above turned out to be accurate for (see
+[[codex-quota-exhausted-2026-08-05]] - don't trust a stated reset date,
+just try a dispatch). Dispatched directly at the crash; Codex found TWO
+real bugs, both confirmed by Sonnet's own hardware validation afterward:
+
+1. **The actual root cause: a use-after-free, not a kernel logic bug.**
+   `ds4_gpu_tp_big_gate_encode()` (`ds4_rocm.cu`) queued pointers to
+   `ds4_gpu_tensor` VIEW descriptors for the async TP service thread to
+   dereference later - but every row-split caller frees those (small,
+   heap-allocated) view descriptors immediately after enqueueing. The
+   service thread then read a freed struct's `->ptr` field, handing a
+   stale/arbitrary address into the RDMA exchange. This explains the two
+   different, delayed, unrelated-code crash signatures far better than a
+   bug in the new attention kernels themselves - fixed by snapshotting the
+   raw device pointer at enqueue time instead of queueing the descriptor
+   pointer.
+2. A secondary bug: odd token counts split as `ceil(n/2)`/`floor(n/2)`,
+   but the symmetric gate exchange required equal row counts on both
+   ranks - rank 1 built an out-of-range view. Fixed by requiring an even
+   `n_tokens` to enable the split; odd chunks now stay on the existing,
+   safe replicated path.
+
+**Hardware-validated by Sonnet** (Codex cannot access the two-node RDMA
+hardware): built clean on both source and confirmed via matching md5sum on
+the peer's deployed binary, `make test-tp-hello` passes. Differential
+validation via `--dump-logprobs`, forced split-on
+(`DS4_TP_PREFILL_SPLIT_MIN_ATTN=2`) vs the safe baseline (`=999999`), on
+both an even-length long (~1696-token) and short (36-token) prompt: **0/30
+selected tokens differ on either prompt, generated text byte-identical, and
+per-step logits are BIT-IDENTICAL (max diff 0.000000)** - the strongest
+possible correctness signal, and exactly what should be expected since the
+row split is mathematically the same computation as the replicated path,
+just partitioned differently. **Zero crashes across 4 runs** that
+previously crashed every time.
+
+**Speed: honestly, NOT a clear win at this sample size.** off=100.09/98.41
+t/s (mean 99.25), on=99.01/98.49 t/s (mean 98.75) - within noise, possibly
+even slightly negative. The original ~4-10% estimated benefit for this
+feature was made BEFORE this session's other two fixes (WMMA down-proj,
+Q8_F16 cache) - both of which already shrank attention/output_proj's share
+of total prefill time, likely shrinking this feature's remaining
+opportunity too. Committed as `ds4-upstream@faa0c61`. **The feature gate
+default is UNCHANGED (still 1,000,000 on ROCm)** - this fix makes the
+feature correct and safe to opt into for further testing, it does not
+claim it's worth enabling by default. A larger-sample benchmark (5+ runs
+each config) would be needed to determine if there's a real small gain
+worth flipping the default for.
