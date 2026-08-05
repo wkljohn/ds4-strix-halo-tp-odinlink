@@ -367,3 +367,61 @@ implementations depending on tensor type/fusion flags
 (`metal_graph_attention_output_dense_quant_tp` for the TP=2 group-sliced
 case that applies here, per `ds4.c:22624-22640`). This is now a concrete,
 narrowly-scoped kernel investigation, not another profiling round.
+
+## Stage 1 kernel analysis (2026-08-05): TP=2 silently bypasses the existing split-K tuning
+
+Codex research pass (read-only, no changes) traced the exact production
+path for this model's shape. Confirmed: `attn_output_a`/`attn_output_b`
+are Q8_0 (verified directly from the GGUF header, not assumed), so decode
+dispatches to `ds4_gpu_attention_output_q8_tp_tensor`
+(`rocm/ds4_rocm_hc_output_launch.cuh:461`), composing:
+
+1. `ds4_gpu_attention_output_low_q8_tensor` - the down-projection to the
+   compressed rank dimension.
+2. `ds4_gpu_matmul_q8_0_kslice_rows_tensor` - the K-sliced expand back up.
+
+**Finding: the existing specialized split-K fast path in the low
+projection (`grouped_q8_0_a_partial16_w32_kernel`, explicitly commented as
+matching "the production HIP decode path") is hardcoded to
+`group_dim==4096 && rank==1024 && n_groups==8` - the FULL (non-TP-sliced)
+shape.** Under TP=2, each rank only sees its local `n_groups=4` (8 total
+groups split across 2 ranks), so this condition is false and the kernel
+silently falls through to a more generic path
+(`grouped_q8_0_a_f32_sharedx_rows_w32_2row_kernel`) with only 64
+workgroups on Strix Halo's 40 CUs (~1.6 workgroups/CU). This specialization
+predates the TP wrapper and was never updated to also match the TP-local
+shape - a real, concrete gap, not a vague "maybe slow" guess.
+
+**Two candidate fixes identified, different risk profiles:**
+
+1. **Workgroup-size sweep (near-zero correctness risk)** - both the
+   currently-firing low kernel and the expand kernel
+   (`matmul_q8_0_f32_sharedx_warp_rows_w32_kernel`) use maximum 1024-thread
+   workgroups (64 and 128 workgroups respectively on 40 CUs). This is pure
+   launch-configuration tuning - same math, same accumulation order, same
+   output bit-for-bit - just parallelism structure. Try this first.
+2. **Generalize split-K to `n_groups==4`** (medium confidence, real
+   correctness risk) - the kernel accepts arbitrary group counts in
+   principle, but split-K changes the accumulation order, which the
+   existing code comments explicitly warn can "cross FP8 KV midpoints in
+   downstream layers." Requires exact greedy-output equivalence
+   validation, not "numerically close."
+
+**Explicitly rejected, with real math**: fusing the low and expand kernels
+to avoid materializing the intermediate to global memory. The intermediate
+is only 16KiB against >35MB of unavoidable Q8_0 weight reads per layer -
+even ideal fusion saves single-digit microseconds against a measured 566us
+window. Also no block-local fusion is possible without replicating the
+full low-projection per output-row block. Not worth pursuing.
+
+**Also checked and ruled out**: no material redundant compute across TP
+ranks - each rank computes distinct groups and consumes the matching
+K-slice, already minimal.
+
+**If neither of the two candidates helps**: the next evidence-backed
+target is `compressor_proj` (~131us, the second-largest measured
+sub-stage), not further attention-output work.
+
+Next step: implement and validate the workgroup-size sweep first (the safe
+one), on live hardware, with exact-output-equivalence + real timing
+comparison, before considering the split-K generalization.
