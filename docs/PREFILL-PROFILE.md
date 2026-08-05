@@ -220,3 +220,38 @@ This closes out this iteration's remaining open levers - "overlapping the
 FFN gate" (~35-40%, estimated above) is still open but unvalidated, and
 output_proj's own remaining share should be re-measured now that its real
 fast path is active.
+
+## Clean, direct FFN gate-cost measurement (2026-08-05) - refines the estimate to ~39%
+
+A Codex research pass (dispatched to design the gate-overlap redesign) found
+an existing, previously-unused instrumentation point that avoids the
+`hc_post` profiler-sync corruption entirely: `DS4_TP_BIGGATE_PROFILE=1`
+(`ds4_tp.c:1227`), which times staging-copy vs wire+wait directly inside
+`ds4_gpu_tp_big_gate_encode`'s own call path and prints cumulative stats
+every 16 gates - no forced device sync at a stage boundary, so it doesn't
+have the earlier problem.
+
+Measured (same env as the "CONFIRMED WIN" run above, plus
+`DS4_TP_BIGGATE_PROFILE=1`, ~1700-token prompt, `DS4_TP_BIG_DIRECT=1`):
+
+    ds4-tp: big-gate 16 gates direct=1 | staging-copy 0.0 ms (0%) | wire+wait 2497.3 ms (100%) | ...
+    ds4-tp: big-gate 32 gates direct=1 | staging-copy 0.0 ms (0%) | wire+wait 5195.6 ms (100%) | ...
+
+Staging-copy is 0% as expected with direct mode. Per-gate rate over gates
+17-32: (5195.6-2497.3)/16 ≈ 168.6 ms/gate. Extrapolating that rate for the
+model's real 43 layers (11 more gates beyond 32, since the process ended
+before a 48-gate checkpoint printed): total gate cost ≈ 5195.6 + 11*168.6 ≈
+**7.05 s**. Measured end-to-end prefill was 94.96 t/s for ~1700 tokens ≈
+**17.9 s** wall time. **Gate cost ≈ 7.05/17.9 ≈ 39% of prefill** - a solid,
+directly-measured number, not an indirect stage-sum extrapolation, and it
+lands close to the earlier (output_proj-fix-era) ~35-40% estimate rather
+than the later, smaller-sample ~50%+ one. Treat ~39% as the current
+best-evidence figure for the gate-overlap redesign's real potential.
+
+This does NOT mean an overlap fix would recover the full 39% - some of that
+wire+wait time is genuine RDMA transfer that can't be hidden, only the
+portion where the GPU/CPU sit idle waiting instead of doing other useful
+work can be reclaimed by pipelining. See `FFN-GATE-OVERLAP-RESEARCH.md` and
+the Codex gate-overlap design writeup (row-chunk pipelining recommended,
+next-layer overlap ruled out as unsafe due to the residual-stream
+dependency) for the actual redesign plan.
