@@ -61,3 +61,57 @@ to retire first: whether OdinLink's `ibv_reg_mr` accepts a ~150 MB registration
 Expected if the copy disappears: gate 1080 ms -> ~50 ms per layer-chunk, i.e.
 roughly **30-35% of prefill wall**, correctness-neutral because it is pure byte
 transport. It would also speed decode's gates and any future attention split.
+
+## RESULT: DS4_TP_BIG_DIRECT=1, measured 2026-08-05
+
+`ibv_reg_mr` risk retired first, standalone (no ds4, no peer): the OdinLink
+provider reports `max_mr_size` UNLIMITED (0xFFFF...) and `max_mr=512`; registered
+25/68/128/150/200/268/300 MB all instantly OK. Not MR-limited.
+
+Then the real A/B, TP=2 over OdinLink RDMA, same host/prompt/`--temp 0`,
+`DS4_TP_BIGGATE_PROFILE=1`:
+
+    baseline (direct=0), 32 gates: staging-copy 9422.9 ms (65%) | wire+wait 5001.7 ms (35%) | 892.3 MB -> 189 MB/s
+    prefill: 29.29 t/s, generation: 10.57 t/s
+
+    DS4_TP_BIG_DIRECT=1, 32 gates: staging-copy    0.0 ms ( 0%) | wire+wait 5327.1 ms (100%) | 892.3 MB -> 0 MB/s (no copy)
+    prefill: 37.64 t/s, generation: 10.52 t/s
+
+**Staging-copy fully eliminated (65% -> 0%), big-gate total time 14.4s -> 5.3s
+(2.7x), prefill +28.5% (29.29 -> 37.64 t/s), decode unchanged within noise
+(10.57 -> 10.52).** Bigger than the ~29% strict-Amdahl estimate on the copy
+share alone predicted, because removing the copy also removed its
+serialization with the wire phase (they summed sequentially before; now it's
+wire-only). Matches this doc's 30-35% prediction.
+
+**Correctness: the naive A/B diff FAILED - do not trust that check in
+isolation.** Baseline and `BIG_DIRECT=1` produced different exact wording deep
+in a degenerate, highly-repetitive greedy continuation. Investigated with a
+same-config reproducibility control (`direct=0` run twice, identical prompt):
+**it also diverges**, at essentially the same position ("...one sentence." vs
+"...one sentence summarizing the key constraint."). This is pre-existing
+non-determinism in the two-node RDMA all-reduce (floating-point
+non-associativity: partial-sum arrival order can vary run-to-run, and in a
+low-entropy repetitive context the top-1/top-2 logits are close enough that
+tiny rounding differences eventually flip the argmax). **`BIG_DIRECT` is not
+the cause** - the same divergence exists at `direct=0` with nothing else
+changed. A byte-identical-output A/B check is therefore not meaningful on a
+repetitive/degenerate prompt for this system; use a short, high-confidence,
+low-entropy prompt (e.g. the France one-word answer from
+CORRUPTION-BISECT.md) for a correctness check that can actually discriminate,
+and/or compare aggregate behavior (coherent vs garbled) rather than exact
+tokens.
+
+**Low-entropy confirmation run (the remaining step above): DONE.** Same France
+one-word prompt from CORRUPTION-BISECT.md, `-c 512`, `--temp 0`, both configs:
+baseline answered "Paris", `BIG_DIRECT=1` answered "Paris". Full-log diff had
+exactly 3 lines, all model-loading telemetry (cache-hit line ordering, warm-up
+wall-clock seconds) - zero difference in generated content, and the sharded
+model checksum was identical (`2516722070`) in both runs, confirming
+bit-identical model state going into inference.
+
+**Verdict: adopt `DS4_TP_BIG_DIRECT=1`.** Clears the project's own Stage-4-style
+gate (>=5% end-to-end prefill, no decode regression) by a wide margin, and now
+has a clean (not just repetitive-prompt) correctness confirmation. Recorded
+2026-08-05. Remaining step: default-on wiring in the launch script/deploy
+config so it stops being opt-in-only.
