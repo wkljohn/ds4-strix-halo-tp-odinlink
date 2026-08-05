@@ -233,12 +233,48 @@ identifies") over priority #1 (rank-skew/gate-idle overlap) - there is
 little evidence of idle bubble time to reclaim; the GPU appears busy
 computing for the large majority of the token budget, not waiting.
 
-**Not yet done**: this measures aggregate per-gate compute time, not WHICH
-kernel/stage within that ~958us dominates (attention vs routed MoE vs
-shared FFN vs router - the boundaries the now-stalling stage profiler was
-supposed to resolve). The next step is identifying that breakdown without
-re-triggering the stall - either by root-causing the stage profiler's
-stall itself, or by adding similarly lightweight non-synchronizing
-per-stage timestamps (GPU event timestamps read back asynchronously,
-not `cudaDeviceSynchronize()`-gated) alongside this same service-thread
-instrumentation.
+**Not yet done** (at the time the above was written): this measured
+aggregate per-gate compute time, not WHICH kernel/stage within that ~958us
+dominates. Resolved below without needing the stalling full profiler.
+
+## Stage 0b extended RESULT: attention dominates, not routed MoE (2026-08-05)
+
+The stage-profiler-stall root-cause chase (`DECODE-PROFILER-STALL.md`) did
+not produce a reliable fix. Instead of continuing that path or building new
+GPU-event instrumentation, Stage 0b's own machinery was extended cheaply
+(`ds4-upstream` commit `8efef88`): row gates alternate ATTN (gate=0) / FFN
+(gate=1) within a layer, so `release_to_arrival` was bucketed by which gate
+is arriving. The interval ending at an FFN-gate arrival is
+router+routed_moe+shared_ffn compute; the interval ending at an ATTN-gate
+arrival is the next layer's attention compute. Zero new synchronization,
+zero new stall risk, same opt-in `DS4_TP_SERVICE_INTERVAL_PROFILE=1`.
+
+**Result, symmetric on both ranks, self-consistent** (average of the two
+matches the previously-measured aggregate ~958-961us almost exactly):
+
+| stage | rank 0 | rank 1 | share |
+|---|---|---|---|
+| attention (attn gate arrival) | 1202.7us | 1185.3us | **~63%** |
+| FFN/MoE (ffn gate arrival) | 719.4us | 696.2us | ~37% |
+
+**This reframes Stage 1's target.** All of this project's prior kernel
+work (the Q4_K integer-WMMA port, both gate/up and the down-projection fix)
+targeted the routed-MoE path, and only helped prefill - decode's routed-MoE
+work is GEMV-shaped (batch=1) and structurally cannot use WMMA (settled
+earlier, not revisited). But decode's actual dominant per-layer cost is
+**attention** (DeepSeek's MLA compressor/indexer chain - compressor_proj,
+compressor_update, compressor_quantize, indexer_compressor_proj/update/qat,
+q_path, kv_path, attn_output, per `ds4.c`'s decode stage names), not MoE.
+Stage 1 priority #2 ("tune the dominant one-token GEMV/DP4A stage") should
+now specifically target attention's decode path, not routed-MoE decode
+kernels - the latter's share (~37%) makes it a secondary target at best.
+
+**Not yet done**: this still only measures the two gate-delimited halves of
+each layer, not which SPECIFIC sub-stage within the attention half (MLA
+compression vs indexer vs RoPE vs the Q/K/V/output projections themselves)
+dominates that ~1.2ms. That finer breakdown would need per-substage timing
+within the attention half specifically - the same gate-bucketing trick
+does not go finer than the two gates the code already provides, so this
+would require either the stalling stage profiler (unresolved) or new
+non-synchronizing GPU-event instrumentation scoped just to the attention
+sub-stages.
