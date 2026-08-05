@@ -631,8 +631,13 @@ win.** It is not. Do not trust throughput numbers alone for this feature.
 
 **Isolated: this is WMMA-specific, not a BIG_DIRECT/RDMA interaction.** Same
 test over plain `--transport tcp`, no BIG_DIRECT, same `DS4_ROCM_Q4K_WMMA=1`:
-identical corruption (`<｜begin▁of▁sentence｜>` repeated from the first
-generated token, same negotiated `gate=1 up=1`). Do not enable
+
+    ds4: ROCm Q4_K WMMA startup rank=0 negotiated=0x00000001 gate=1 up=1 down=0 ...
+    ds4: prefill: 39.32 t/s, generation: 10.46 t/s
+
+Identical corruption (`<｜begin▁of▁sentence｜>` repeated from the first
+generated token, same negotiated `gate=1 up=1`), again with healthy-looking
+throughput on both axes. Do not enable
 `DS4_ROCM_Q4K_WMMA=1` in any deployment until this is root-caused and a
 correctness check (exact output match against forced-DP4A, not just "does it
 run") passes. The kill switch (`DS4_ROCM_DISABLE_Q4K_WMMA=1`) is confirmed
