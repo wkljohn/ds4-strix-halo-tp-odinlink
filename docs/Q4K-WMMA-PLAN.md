@@ -610,6 +610,33 @@ profiles show launch overhead or duplicate weight-side setup materially limits
 end-to-end gain; it must then beat the two-launch production path and pass the
 same correctness/ISA gates.
 
+## CRITICAL: DS4_ROCM_Q4K_WMMA=1 produced corrupted output, measured 2026-08-05
+
+First real end-to-end test since Stage 3 landed (`e906a14`). Full 2-node TP,
+OdinLink RDMA, `DS4_TP_BIG_DIRECT=1`, `DS4_ROCM_Q4K_WMMA=1`:
+
+    ds4: ROCm Q4_K WMMA startup rank=0 negotiated=0x00000001 gate=1 up=1 down=0 ...
+    ds4: prefill: 36.54 t/s, generation: 11.38 t/s
+
+**Both throughput numbers look healthy - prefill comparable to the best
+BIG_DIRECT-only run, decode even slightly above the ~10.5 baseline.** The
+actual generated text was `<｜begin▁of▁sentence｜>` repeated for the entire
+output, from the very first generated token - no coherent prefix at all. This
+is the historical corruption signature (`CORRUPTION-BISECT.md`: "first token
+already wrong"), not a degenerate-but-coherent repetition loop like the
+Chinese/English loops seen elsewhere in this session's testing.
+
+**This is the dangerous case: if you only checked t/s, this reads as a clean
+win.** It is not. Do not trust throughput numbers alone for this feature.
+
+Not yet isolated: whether this is WMMA-specific regardless of transport, or an
+interaction with BIG_DIRECT/RDMA specifically - a plain-TCP run with the same
+DS4_ROCM_Q4K_WMMA=1 is the next test, in progress at time of writing. Do not
+enable DS4_ROCM_Q4K_WMMA=1 in any deployment until this is root-caused and a
+correctness check (exact output match against forced-DP4A, not just "does it
+run") passes. The kill switch (DS4_ROCM_DISABLE_Q4K_WMMA=1) is confirmed
+present and should be considered the safe state until this is resolved.
+
 ### Stage 4 - opt-in end-to-end prefill
 Branch `q4k-wmma-stage4-prefill-optin`. Run only with the negotiated opt-in
 enabled on both ranks. Profile gate/up conversion, both WMMA launches,
