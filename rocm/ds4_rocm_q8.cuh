@@ -1425,6 +1425,76 @@ __global__ static void grouped_q8_0_a_f32_sharedx_rows_w32_2row_kernel(
     }
 }
 
+/* gfx1151 decode path: process four Q8_0 blocks per wave iteration.
+ * Each eight-lane subgroup owns one 32-value block; every lane loads four
+ * adjacent weights and activations.  The wave still computes two output rows
+ * and performs one final wave reduction per row, but loop/address generation
+ * executes 32 rather than 128 times for K=4096. */
+__global__ static void grouped_q8_0_a_f32_sharedx_rows_w32_2row_pack4_kernel(
+        float *low,
+        const unsigned char *w,
+        const float *heads,
+        uint32_t n_groups,
+        uint32_t n_blocks,
+        uint64_t rank,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t subgroup = lane >> 3u;
+    const uint32_t lane8 = lane & 7u;
+    const uint32_t rows_per_block = (blockDim.x >> 5u) << 1u;
+    const uint32_t group_dim = n_blocks << 5u;
+    const uint64_t total = (uint64_t)n_groups * rank;
+    const uint64_t base_idx = (uint64_t)blockIdx.x * rows_per_block;
+    if (base_idx >= total) return;
+    const uint32_t g = (uint32_t)((base_idx / rank) % n_groups);
+    const float *x = heads + (uint64_t)g * group_dim;
+    for (uint32_t i = tid; i < group_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t idx0 = base_idx + ((uint64_t)wave << 1u);
+    if (idx0 >= total) return;
+    const uint64_t row0 = idx0 % rank;
+    const uint64_t idx1 = idx0 + 1u;
+    const uint64_t tensor_row0 = (uint64_t)g * rank + row0;
+    const unsigned char *wr0 = w + tensor_row0 * row_bytes;
+    const unsigned char *wr1 = wr0 + row_bytes;
+    const int have_row1 = row0 + 1u < rank && idx1 < total;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    for (uint32_t b4 = 0; b4 < n_blocks; b4 += 4u) {
+        const uint32_t b = b4 + subgroup;
+        const uint32_t elem = (b << 5u) + (lane8 << 2u);
+        const float4 xv = *reinterpret_cast<const float4 *>(shx + elem);
+        const unsigned char *blk0 = wr0 + (uint64_t)b * 34u;
+        const float d0 = q8_0_scale_scalar(blk0);
+        const int8_t *q0 = (const int8_t *)(blk0 + 2u + (lane8 << 2u));
+        acc0 += d0 * (float)q0[0] * xv.x;
+        acc0 += d0 * (float)q0[1] * xv.y;
+        acc0 += d0 * (float)q0[2] * xv.z;
+        acc0 += d0 * (float)q0[3] * xv.w;
+
+        if (have_row1) {
+            const unsigned char *blk1 = wr1 + (uint64_t)b * 34u;
+            const float d1 = q8_0_scale_scalar(blk1);
+            const int8_t *q1 = (const int8_t *)(blk1 + 2u + (lane8 << 2u));
+            acc1 += d1 * (float)q1[0] * xv.x;
+            acc1 += d1 * (float)q1[1] * xv.y;
+            acc1 += d1 * (float)q1[2] * xv.z;
+            acc1 += d1 * (float)q1[3] * xv.w;
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0u) {
+        low[idx0] = acc0;
+        if (have_row1) low[idx1] = acc1;
+    }
+}
+
 __global__ static void grouped_q8_0_a_partial16_w32_kernel(
         float *partial,
         const unsigned char *w,

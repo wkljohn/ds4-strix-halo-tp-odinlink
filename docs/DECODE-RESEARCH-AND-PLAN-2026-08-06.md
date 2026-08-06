@@ -240,5 +240,43 @@ Every candidate follows the same sequence:
    switches must be transport-neutral; provider switches must leave Mellanox
    dispatch untouched.
 
-The immediate next action is Step 1, the same-stream low/expand timing split.
-No decode optimization should be implemented before that measurement.
+## First implementation result: packed Q8 low projection
+
+The same-stream event split measured the TP attention-output projections on
+both ranks at about 0.237 ms for low and 0.223-0.226 ms for expand. This made
+the low projection large enough to clear the 5% end-to-end threshold with a
+substantial kernel improvement.
+
+The implemented gfx1151 path keeps two output rows per wave but divides each
+wave into four eight-lane groups. Each group consumes one 32-value Q8_0 block,
+so the 4,096-wide dot product executes 32 block iterations instead of 128.
+The final hardened form uses aligned `float4` activation reads, explicit byte
+weight reads, and per-lane scale loads. It is selected only for the exact
+TP=2 shape (`group_dim=4096`, `rank=1024`, four local groups) on gfx1151.
+Other shapes and architectures retain the original kernel.
+
+Measured results:
+
+- low projection: 0.236-0.237 ms control versus 0.096 ms hardened candidate,
+  about 59% faster;
+- controlled production decode: 11.15 to 11.78 t/s, +5.7%;
+- hardened 1,000-token stability observation: 11.93 t/s, no stalls, and zero
+  OdinLink provider fallbacks;
+- long 9,881-byte prefill regression run: 139.61 t/s;
+- first-layer low tensor relative RMS error versus the reference accumulation:
+  2.78e-7, with 7.01e-7 maximum absolute error.
+
+An earlier version used width-8 shuffle scale broadcasts and unaligned
+`char4` weight loads. It passed math and code repeat tests but diverged on a
+multilingual greedy repeat, while the kill-switch control was stable. That
+version was rejected. Removing those operations made all three prompt pairs
+byte-identical. The production kernel intentionally reassociates FP32 sums and
+is therefore numerically validated, not described as bit-exact.
+
+The kernel defaults on only for the guarded gfx1151 shape and can be disabled
+with `DS4_ROCM_DISABLE_ATTN_OUT_LOW_PACK4=1`. It contains no transport or
+provider branching, so Mellanox RDMA and generic verbs behavior are unchanged.
+
+The next measured target is attention-output expand, now about 0.225 ms per
+layer invocation. Any expand redesign must repeat the same opt-in, numerical,
+long-run, prefill-regression, and transport-neutral promotion protocol.

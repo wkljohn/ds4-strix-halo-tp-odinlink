@@ -3,6 +3,13 @@
 > Continued by the three-pass upstream review and evidence-ranked plan in
 > [DECODE-RESEARCH-AND-PLAN-2026-08-06.md](DECODE-RESEARCH-AND-PLAN-2026-08-06.md).
 > Follow that plan before starting another decode implementation.
+>
+> **2026-08-06 result:** the subsequent packed gfx1151 Q8 low-projection
+> redesign cleared the promotion threshold: 0.236-0.237 ms to 0.096 ms for
+> the kernel and 11.15 to 11.78 t/s (+5.7%) in the paired production test.
+> See the linked plan for correctness, stability, and guard details. This
+> supersedes the older conclusion below that both attention-output directions
+> were exhausted; launch-only tuning was exhausted, not kernel redesign.
 
 Scope: decode throughput only, on the working two-node RDMA TP setup
 (DeepSeek-V4-Flash Q4_K, gfx1151 x2). Explicitly **excludes DSpark/MTP

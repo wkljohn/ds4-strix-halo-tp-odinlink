@@ -6103,7 +6103,8 @@ static uint64_t g_decode_attn_event_dropped;
 
 static const char *const g_decode_attn_event_names[DS4_GPU_DECODE_ATTN_EVENT_COUNT] = {
     "start", "kv_path", "compressor_proj", "compressor_update",
-    "compressor_indexer", "attn_inv_rope", "attn_gate", "attn_output", "attn_hc_post"
+    "compressor_indexer", "attn_inv_rope", "attn_output_low",
+    "attn_output_expand", "attn_gate", "attn_output", "attn_hc_post"
 };
 
 static void ds4_rocm_decode_attn_event_print(void) {

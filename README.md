@@ -3,8 +3,9 @@
 This fork adds production two-node tensor parallelism for AMD Strix Halo
 (`gfx1151`) over OdinLink Thunderbolt RDMA while retaining DS4's Metal, CUDA,
 generic verbs, and non-TP paths. The current validated configuration runs
-DeepSeek V4 Flash Q4_K at a median **138.78 prompt tokens/s** and **11.23
-generation tokens/s** on two Ryzen AI MAX+ 395 nodes.
+DeepSeek V4 Flash Q4_K at a median **138.78 prompt tokens/s**; the packed
+decode path reaches **11.78 generation tokens/s** on two Ryzen AI MAX+ 395
+nodes.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
@@ -17,10 +18,12 @@ generation tokens/s** on two Ryzen AI MAX+ 395 nodes.
 | Pre-Q4_K-WMMA ROCm (`4b35010`) | 1,023 tokens | 34.11 t/s | — | — | — |
 | Current fork, provider-copy baseline | 9,881 bytes | 95.89 t/s | +181.1% (raw) | 9.96 t/s | — |
 | Current fork, optimized OdinLink | 9,881 bytes | **138.78 t/s** | **+44.7%** | **11.23 t/s** | **+12.8%** |
+| + packed gfx1151 Q8 decode projection | 9,881-byte prefill / 1,000-token decode | **139.61 t/s** | no regression | **11.78 t/s** | **+5.7% paired** |
 
 The historical row used a different prompt, so the raw +181.1% ratio is context
-rather than a controlled attribution. The final row is a controlled four-run
-alternating A/B against the preceding row. This distribution includes the
+rather than a controlled attribution. The optimized-OdinLink row is a
+controlled four-run alternating A/B against the preceding row. This
+distribution includes the
 complete gfx1151 Q4_K integer-WMMA MoE implementation for gate, up, and down
 projections, with capability checks, TP negotiation, DP4A fallback, and a kill
 switch; no external WMMA patch is required.
@@ -30,6 +33,12 @@ tokens, DS4 TP=2, and OdinLink provider commit `8a77ccb`. Four alternating
 runs produced byte-identical generated output. The provider optimization is
 explicit and does not enter the Mellanox path: without `DS4_TP_VERBS_LIB`, DS4
 loads system `libibverbs` directly and keeps the generic message policy.
+
+The decode row is a separate direct kill-switch comparison: 11.15 t/s with
+the original low projection and 11.78 t/s with the packed kernel. The hardened
+default completed a further 1,000-token stability run at 11.93 t/s, but that
+unpaired observation is not used for the percentage. Its long-prompt prefill
+check confirms that the one-token-only dispatch does not regress prefill.
 
 ## Reproduce the Strix Halo setup
 
@@ -90,12 +99,14 @@ export LD_LIBRARY_PATH=/path/to/OdinLink-Five/build/lib:/path/to/OdinLink-Five/b
 The optimized Strix Halo TP settings are defaults in this fork: ROCm disables
 only the not-yet-production-safe attention row split, retains the useful FFN
 row split, uses registered-slab big gates, enables shape-checked gfx1151 Q4_K
-WMMA, and enables provider WC streaming when `DS4_TP_VERBS_LIB` explicitly
+WMMA, enables a shape-checked packed Q8 attention-output projection for TP=2
+decode, and enables provider WC streaming when `DS4_TP_VERBS_LIB` explicitly
 names OdinLink. Diagnostic kill switches remain available:
 
 ```sh
 export DS4_TP_BIG_DIRECT=0
 export DS4_ROCM_DISABLE_Q4K_WMMA=1
+export DS4_ROCM_DISABLE_ATTN_OUT_LOW_PACK4=1
 export ODL_VERBS_WC_STREAM_COPY=0
 ```
 

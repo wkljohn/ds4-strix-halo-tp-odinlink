@@ -508,6 +508,14 @@ extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attn_out_q8_tp: low_q8 stage failed\n");
         return 0;
     }
+    /* Both projection kernels use stream 0.  These opt-in boundaries therefore
+     * measure the low/expand split without crossing the TP stream or relying on
+     * legacy default-stream synchronization.  The enclosing decode path owns
+     * the active event slot; rank is only consumed by its START boundary. */
+    if (ds4_gpu_decode_attn_event_profile_enabled()) {
+        ds4_gpu_decode_attn_event_profile_record(
+                DS4_GPU_DECODE_ATTN_EVENT_ATTN_OUTPUT_LOW, 0u);
+    }
     if (!ds4_gpu_matmul_q8_0_kslice_rows_tensor(out, model_map, model_size,
                                                 out_b_offset, low_dim_total,
                                                 out_dim, k_off, k_cnt, low, 1u)) {
@@ -516,6 +524,10 @@ extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
                 (unsigned long long)low_dim_total,(unsigned long long)out_dim,
                 (unsigned long long)k_off,(unsigned long long)k_cnt);
         return 0;
+    }
+    if (ds4_gpu_decode_attn_event_profile_enabled()) {
+        ds4_gpu_decode_attn_event_profile_record(
+                DS4_GPU_DECODE_ATTN_EVENT_ATTN_OUTPUT_EXPAND, 0u);
     }
     return 1;
 }

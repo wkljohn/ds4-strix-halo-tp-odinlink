@@ -16,6 +16,27 @@ static unsigned attention_output_low_threads(void) {
     return threads;
 }
 
+static int attention_output_low_pack4_enabled(void) {
+    static int enabled = -1;
+    static int gfx1151;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_ROCM_ATTN_OUT_LOW_PACK4");
+        const char *disable = getenv("DS4_ROCM_DISABLE_ATTN_OUT_LOW_PACK4");
+        enabled = (value == NULL || strcmp(value, "0") != 0) &&
+                  !(disable != NULL && strcmp(disable, "1") == 0);
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+            gfx1151 = strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return enabled && gfx1151;
+}
+
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
@@ -1401,6 +1422,23 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     if ((group_dim & 31u) == 0u && group_dim <= 4096u && (rank % 64u) == 0u) {
         const unsigned threads = attention_output_low_threads();
         const unsigned rows_per_block = (threads / 32u) * 2u;
+        if (attention_output_low_pack4_enabled() &&
+            group_dim == 4096u && rank == 1024u && blocks_a == 128u &&
+            n_groups == 4u) {
+            grouped_q8_0_a_f32_sharedx_rows_w32_2row_pack4_kernel<<<
+                    (unsigned)((low_dim + rows_per_block - 1u) / rows_per_block),
+                    threads,
+                    (size_t)group_dim * sizeof(float)>>>(
+                    (float *)low->ptr,
+                    out_a,
+                    (const float *)heads->ptr,
+                    n_groups,
+                    (uint32_t)blocks_a,
+                    rank,
+                    blocks_a * 34u);
+            return cuda_ok(cudaGetLastError(),
+                           "attention_output_low_q8 f32 sharedx pack4 launch");
+        }
         grouped_q8_0_a_f32_sharedx_rows_w32_2row_kernel<<<
                 (unsigned)((low_dim + rows_per_block - 1u) / rows_per_block),
                 threads,
