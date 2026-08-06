@@ -6,10 +6,42 @@ generic verbs, and non-TP paths. The current validated configuration runs
 DeepSeek V4 Flash Q4_K at a median **138.78 prompt tokens/s** and **11.23
 generation tokens/s** on two Ryzen AI MAX+ 395 nodes.
 
+```text
+ Reference TP=2 topology (the node filesystems are independent)
+
+ +-----------------------------------+       +-----------------------------------+
+ | Node 1: coordinator / TP rank 0   |       | Node 2: worker / TP rank 1        |
+ | Ryzen AI MAX+ 395, gfx1151        |       | Ryzen AI MAX+ 395, gfx1151        |
+ | local ds4 + provider + GGUF copy  |       | local ds4 + provider + GGUF copy  |
+ | owns 50% of routed experts        |       | owns 50% of routed experts        |
+ | listens on 10.4.0.1:5599          |       | connects to 10.4.0.1:5599         |
+ +-----------------+-----------------+       +-----------------+-----------------+
+                   |    OdinLink over Thunderbolt RDMA         |
+                   +<==========================================>+
+                    TP reductions: prefill bulk + decode gates
+
+       Start both roles together; each node loads its local files in parallel.
+```
+
 | Two-node result | Baseline provider copy | Optimized OdinLink copy | Change |
 |---|---:|---:|---:|
 | Prefill | 95.89 t/s | **138.78 t/s** | **+44.7%** |
 | Decode | 9.96 t/s | **11.23 t/s** | **+12.8%** |
+
+For historical scale, the last archived pre-WMMA ROCm checkpoint measured
+**34.11 prefill t/s**:
+
+| Historical checkpoint | Prompt | Prefill | Evidence |
+|---|---:|---:|---|
+| TP=2 ROCm, before Q4_K WMMA | 1,023 tokens | 34.11 t/s | DS4 commit `4b35010` |
+| Current fork, optimized OdinLink | 9,881 bytes | **138.78 t/s median** | four-run alternating A/B |
+
+These rows use different prompts and are not a controlled percentage comparison;
+the older result documents the approximate pre-kernel starting point. This
+distribution includes the complete gfx1151 Q4_K integer-WMMA MoE implementation
+for gate, up, and down projections, its shape/capability checks, TP feature
+negotiation, DP4A fallback, and runtime kill switch. No external WMMA patch is
+required.
 
 The A/B used a 9,881-byte prompt, context 4,096, 30 deterministic generated
 tokens, DS4 TP=2, and OdinLink provider commit `8a77ccb`. Four alternating
@@ -74,10 +106,10 @@ export LD_LIBRARY_PATH=/path/to/OdinLink-Five/build/lib:/path/to/OdinLink-Five/b
 ```
 
 The optimized Strix Halo TP settings are defaults in this fork: ROCm disables
-only the unavailable attention row split, retains the useful FFN row split,
-uses registered-slab big gates, enables shape-checked gfx1151 Q4_K WMMA, and
-enables provider WC streaming when `DS4_TP_VERBS_LIB` explicitly names
-OdinLink. Diagnostic kill switches remain available:
+only the not-yet-production-safe attention row split, retains the useful FFN
+row split, uses registered-slab big gates, enables shape-checked gfx1151 Q4_K
+WMMA, and enables provider WC streaming when `DS4_TP_VERBS_LIB` explicitly
+names OdinLink. Diagnostic kill switches remain available:
 
 ```sh
 export DS4_TP_BIG_DIRECT=0
