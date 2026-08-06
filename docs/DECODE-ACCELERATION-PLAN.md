@@ -1,5 +1,9 @@
 # Decode acceleration plan (TP=2, no DSpark)
 
+> Continued by the three-pass upstream review and evidence-ranked plan in
+> [DECODE-RESEARCH-AND-PLAN-2026-08-06.md](DECODE-RESEARCH-AND-PLAN-2026-08-06.md).
+> Follow that plan before starting another decode implementation.
+
 Scope: decode throughput only, on the working two-node RDMA TP setup
 (DeepSeek-V4-Flash Q4_K, gfx1151 x2). Explicitly **excludes DSpark/MTP
 speculative decoding** — that is real, tractable work (a bounded CUDA->HIP

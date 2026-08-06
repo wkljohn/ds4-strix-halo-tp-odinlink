@@ -243,6 +243,9 @@ next sections.
 - [docs/ROCM-PREFILL-ATTENTION-REVIEW.md](docs/ROCM-PREFILL-ATTENTION-REVIEW.md):
   current upstream kernel survey, cost bounds, and rejected gfx1151 attention
   and FFN-wire prefill experiments.
+- [docs/DECODE-RESEARCH-AND-PLAN-2026-08-06.md](docs/DECODE-RESEARCH-AND-PLAN-2026-08-06.md):
+  three-pass vLLM, llama.cpp, and ROCm decode research with the ordered TP=2
+  implementation and validation plan.
 
 ## Model Weights
 
