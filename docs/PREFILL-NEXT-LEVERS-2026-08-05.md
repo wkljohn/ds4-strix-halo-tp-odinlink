@@ -167,6 +167,55 @@ this session's "bit-exact or don't ship it" pattern - treat differently.
 class. #5 is only worth doing alongside the existing gate-overlap design,
 not alone.
 
+## Post-optimization closeout (2026-08-06)
+
+This ranking was revisited after compact-Q8 token reuse and the coalesced
+Q4_K MoE epilogue raised the cache-free reference to 167.73 t/s. The new
+epilogue reduced its own 43-layer trace contribution from 18.42% to 0.32%,
+so the remaining Amdahl ceilings are materially smaller than those used in
+the original ranking.
+
+The generic attention projection-B WMMA kernel remained a plausible target
+at 9.75% of the follow-up trace. A standalone bit-exact harness now lives at
+`scripts/q8_batch_wmma_token_tile_bench.cu`. It compares the production
+64-token tile with a 128-token tile over the major model shapes before any
+production dispatch change:
+
+| 2,048-token Q8 projection | Tile 64 | Tile 128 | Change |
+|---|---:|---:|---:|
+| q_b, 1,536 -> 32,768 | 22.290 ms | 19.599 ms | -12.1% |
+| indexer q_b, 1,536 -> 8,192 | 5.024 ms | 4.854 ms | -3.4% |
+| q_a, 4,096 -> 1,536 | 2.778 ms | 3.336 ms | +20.1% |
+| compressor, 4,096 -> 1,024 | 2.213 ms | 1.916 ms | -13.4% |
+| KV, 4,096 -> 512 | 1.116 ms | 1.590 ms | +42.4% |
+
+The two tiles produced zero bit mismatches in 15,440 deliberately
+non-aligned outputs. Selective use on q_b/compressor has only about a 1%
+end-to-end ceiling because the 12--13% gains apply to a kernel family that
+is itself under 10% of the trace. A first repeat recorded a 360.97 ms q_b
+page/system outlier; the clean repeat above and the initial 19.38 ms result
+agree. Raw output preserves both rather than deleting the outlier.
+
+The other candidates do not clear the required credible 5% bar:
+
+- indexed plus static attention totals about 8.4%, requiring an implausible
+  >59% combined reduction merely to reach 5% end to end;
+- the already-validated J=32 Q4_K result remains unsafe for automatic use:
+  +9.1% on uniform routing became +3.2% on realistic skew and included an
+  11.9% regression;
+- chunking the exact FFN exchange after routed-MoE completes can overlap only
+  the sub-1% HC expansion; overlapping the transfer with down projection
+  would require new per-token producer-readiness and creates a silent partial-
+  sum correctness hazard;
+- a provider-only RDMA_WRITE wrapper does not bypass OdinLink's queued copy
+  or receive placement. A worthwhile version requires new driver-level direct
+  placement, not an inference-side verb substitution.
+
+Conclusion: no remaining exact, low-risk prefill change has a credible >=5%
+ceiling in the current profile. Prefill work should resume only with new
+profile evidence or a real OdinLink direct-placement primitive. The active
+optimization focus moves to decode.
+
 ## Sources consulted
 
 Local: `vllm-upstream` (git checkout, 2026-07-29, partial/promisor clone),
