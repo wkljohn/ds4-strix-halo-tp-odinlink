@@ -36,5 +36,6 @@
 __pycache__/
 *.pyc
 /misc/
+/research-results/
 .*.swp
 .DS_Store

@@ -121,6 +121,184 @@ static int routed_moe_q4k_wmma_enabled(
 }
 
 enum {
+    DS4_ROCM_Q4K_DECODE_EVENT_START = 0,
+    DS4_ROCM_Q4K_DECODE_EVENT_GATE_UP,
+    DS4_ROCM_Q4K_DECODE_EVENT_MID_QUANT,
+    DS4_ROCM_Q4K_DECODE_EVENT_DOWN,
+    DS4_ROCM_Q4K_DECODE_EVENT_COUNT,
+    DS4_ROCM_Q4K_DECODE_EVENT_POOL_SIZE = 16,
+    DS4_ROCM_Q4K_DECODE_EVENT_REPORT_SAMPLES = 500
+};
+
+typedef struct {
+    uint64_t count;
+    double sum_ms;
+    float min_ms;
+    float max_ms;
+} ds4_rocm_q4k_decode_event_stat;
+
+typedef struct {
+    cudaEvent_t events[DS4_ROCM_Q4K_DECODE_EVENT_COUNT];
+    uint32_t valid_mask;
+    int complete;
+} ds4_rocm_q4k_decode_event_slot;
+
+static ds4_rocm_q4k_decode_event_slot
+    g_q4k_decode_event_slots[DS4_ROCM_Q4K_DECODE_EVENT_POOL_SIZE];
+static ds4_rocm_q4k_decode_event_stat
+    g_q4k_decode_event_stats[DS4_ROCM_Q4K_DECODE_EVENT_COUNT];
+static int g_q4k_decode_event_enabled = -1;
+static int g_q4k_decode_event_events_ready;
+static int g_q4k_decode_event_atexit_registered;
+static int g_q4k_decode_event_active_slot = -1;
+static uint32_t g_q4k_decode_event_next_slot;
+static uint64_t g_q4k_decode_event_samples;
+static uint64_t g_q4k_decode_event_dropped;
+
+static const char *const
+g_q4k_decode_event_names[DS4_ROCM_Q4K_DECODE_EVENT_COUNT] = {
+    "start", "gate_up", "mid_quant", "down"
+};
+
+static void routed_moe_q4k_decode_event_print(void) {
+    if (g_q4k_decode_event_samples == 0u) return;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+            "Q4_K decode event profile samples=%llu dropped=%llu",
+            (unsigned long long)g_q4k_decode_event_samples,
+            (unsigned long long)g_q4k_decode_event_dropped);
+    for (uint32_t i = 1; i < DS4_ROCM_Q4K_DECODE_EVENT_COUNT; i++) {
+        const ds4_rocm_q4k_decode_event_stat *s = &g_q4k_decode_event_stats[i];
+        if (s->count == 0u) continue;
+        fprintf(stderr, " %s[n=%llu mean=%.3f min=%.3f max=%.3f]",
+                g_q4k_decode_event_names[i],
+                (unsigned long long)s->count,
+                s->sum_ms / (double)s->count,
+                (double)s->min_ms, (double)s->max_ms);
+    }
+    fputc('\n', stderr);
+}
+
+static int routed_moe_q4k_decode_event_enabled(void) {
+    if (g_q4k_decode_event_enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_DECODE_EVENT_PROFILE");
+        g_q4k_decode_event_enabled =
+            env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+        if (g_q4k_decode_event_enabled &&
+            !g_q4k_decode_event_atexit_registered) {
+            atexit(routed_moe_q4k_decode_event_print);
+            g_q4k_decode_event_atexit_registered = 1;
+        }
+    }
+    return g_q4k_decode_event_enabled;
+}
+
+static int routed_moe_q4k_decode_event_ensure_events(void) {
+    if (g_q4k_decode_event_events_ready) return 1;
+    for (uint32_t slot = 0; slot < DS4_ROCM_Q4K_DECODE_EVENT_POOL_SIZE; slot++) {
+        for (uint32_t stage = 0; stage < DS4_ROCM_Q4K_DECODE_EVENT_COUNT; stage++) {
+            cudaError_t err = cudaEventCreate(&g_q4k_decode_event_slots[slot].events[stage]);
+            if (err != cudaSuccess) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "Q4_K decode event profile create failed: %s\n",
+                        cudaGetErrorString(err));
+                g_q4k_decode_event_enabled = 0;
+                return 0;
+            }
+        }
+    }
+    g_q4k_decode_event_events_ready = 1;
+    return 1;
+}
+
+static int routed_moe_q4k_decode_event_harvest(
+        ds4_rocm_q4k_decode_event_slot *slot) {
+    if (!slot->complete) return 1;
+    hipError_t query = hipEventQuery(
+            slot->events[DS4_ROCM_Q4K_DECODE_EVENT_DOWN]);
+    if (query == hipErrorNotReady) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (query != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "Q4_K decode event profile query failed: %s\n",
+                cudaGetErrorString(query));
+        g_q4k_decode_event_enabled = 0;
+        return 0;
+    }
+    uint32_t previous = DS4_ROCM_Q4K_DECODE_EVENT_START;
+    for (uint32_t stage = 1; stage < DS4_ROCM_Q4K_DECODE_EVENT_COUNT; stage++) {
+        if ((slot->valid_mask & (1u << stage)) == 0u) continue;
+        float elapsed_ms = 0.0f;
+        cudaError_t err = cudaEventElapsedTime(&elapsed_ms,
+                                               slot->events[previous],
+                                               slot->events[stage]);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "Q4_K decode event profile elapsed failed: %s\n",
+                    cudaGetErrorString(err));
+            g_q4k_decode_event_enabled = 0;
+            return 0;
+        }
+        ds4_rocm_q4k_decode_event_stat *stat = &g_q4k_decode_event_stats[stage];
+        if (stat->count == 0u || elapsed_ms < stat->min_ms) stat->min_ms = elapsed_ms;
+        if (stat->count == 0u || elapsed_ms > stat->max_ms) stat->max_ms = elapsed_ms;
+        stat->count++;
+        stat->sum_ms += elapsed_ms;
+        previous = stage;
+    }
+    slot->complete = 0;
+    slot->valid_mask = 0u;
+    g_q4k_decode_event_samples++;
+    if (g_q4k_decode_event_samples %
+            DS4_ROCM_Q4K_DECODE_EVENT_REPORT_SAMPLES == 0u) {
+        routed_moe_q4k_decode_event_print();
+    }
+    return 1;
+}
+
+static void routed_moe_q4k_decode_event_record(uint32_t stage) {
+    if (!routed_moe_q4k_decode_event_enabled() ||
+        stage >= DS4_ROCM_Q4K_DECODE_EVENT_COUNT ||
+        !routed_moe_q4k_decode_event_ensure_events()) {
+        return;
+    }
+    if (stage == DS4_ROCM_Q4K_DECODE_EVENT_START) {
+        ds4_rocm_q4k_decode_event_slot *slot =
+            &g_q4k_decode_event_slots[g_q4k_decode_event_next_slot];
+        if (slot->complete && !routed_moe_q4k_decode_event_harvest(slot)) {
+            g_q4k_decode_event_dropped++;
+            g_q4k_decode_event_active_slot = -1;
+            return;
+        }
+        if (!g_q4k_decode_event_enabled) return;
+        slot->valid_mask = 0u;
+        slot->complete = 0;
+        g_q4k_decode_event_active_slot = (int)g_q4k_decode_event_next_slot;
+        g_q4k_decode_event_next_slot =
+            (g_q4k_decode_event_next_slot + 1u) %
+            DS4_ROCM_Q4K_DECODE_EVENT_POOL_SIZE;
+    }
+    if (g_q4k_decode_event_active_slot < 0) return;
+    ds4_rocm_q4k_decode_event_slot *slot =
+        &g_q4k_decode_event_slots[g_q4k_decode_event_active_slot];
+    cudaError_t err = cudaEventRecord(slot->events[stage], 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "Q4_K decode event profile record %s failed: %s\n",
+                g_q4k_decode_event_names[stage], cudaGetErrorString(err));
+        g_q4k_decode_event_enabled = 0;
+        g_q4k_decode_event_active_slot = -1;
+        return;
+    }
+    slot->valid_mask |= 1u << stage;
+    if (stage == DS4_ROCM_Q4K_DECODE_EVENT_DOWN) {
+        slot->complete = 1;
+        g_q4k_decode_event_active_slot = -1;
+    }
+}
+
+enum {
     DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_START = 0,
     DS4_ROCM_MOE_DECODE_PROFILE_GATE_RESIDENT_END,
     DS4_ROCM_MOE_DECODE_PROFILE_GATE_MISSING_START,
@@ -909,6 +1087,13 @@ static int routed_moe_launch(
         uint32_t *iq2_gate_hot_dev = NULL;
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
+        const int q4k_decode_event_profile =
+            q4k_path && n_tokens == 1u &&
+            routed_moe_q4k_decode_event_enabled();
+        if (q4k_decode_event_profile) {
+            routed_moe_q4k_decode_event_record(
+                    DS4_ROCM_Q4K_DECODE_EVENT_START);
+        }
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
@@ -1506,6 +1691,10 @@ static int routed_moe_launch(
                 }
             }
             ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
+            if (ok && q4k_decode_event_profile) {
+                routed_moe_q4k_decode_event_record(
+                        DS4_ROCM_Q4K_DECODE_EVENT_GATE_UP);
+            }
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
             if (ok && use_iq2_gate_wmma && iq2_gate_hot_count != 0u) {
                 constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
@@ -1594,6 +1783,10 @@ static int routed_moe_launch(
                         midq, down_q81, pair_count, midq_blocks);
                 ok = cuda_ok(cudaGetLastError(),
                              "routed_moe Q4_K down Q8_1 repack launch");
+            }
+            if (ok && q4k_decode_event_profile) {
+                routed_moe_q4k_decode_event_record(
+                        DS4_ROCM_Q4K_DECODE_EVENT_MID_QUANT);
             }
         }
         int direct_iq2_down_done = 0;
@@ -1887,6 +2080,10 @@ static int routed_moe_launch(
             uint64_t n = (uint64_t)n_tokens * out_dim;
             moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
+        }
+        if (ok && q4k_decode_event_profile) {
+            routed_moe_q4k_decode_event_record(
+                    DS4_ROCM_Q4K_DECODE_EVENT_DOWN);
         }
         if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
         return ok;
