@@ -4,8 +4,9 @@ This fork adds production two-node tensor parallelism for AMD Strix Halo
 (`gfx1151`) over OdinLink Thunderbolt RDMA while retaining DS4's Metal, CUDA,
 generic verbs, and non-TP paths. The low-memory default packed decode path
 reaches **13.83 generation tokens/s** on two Ryzen AI MAX+ 395 nodes, while a
-10,093-byte long-prompt run measured **138.97 prompt tokens/s**. Both results
-use the default direct-Q8 path with the Q8-to-F16 cache disabled.
+10,093-byte long-prompt run measured **167.73 prompt tokens/s**. Both results
+use the cache-free defaults; the prefill result includes compact-Q8 token
+reuse and a coalesced Q4_K MoE epilogue.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
@@ -13,14 +14,19 @@ use the default direct-Q8 path with the Q8-to-F16 cache disabled.
     TP rank 0                                           TP rank 1
 ```
 
-| TP=2, Q8-to-F16 cache disabled | Workload | Prefill | Decode | Prefill change |
-|---|---|---:|---:|---:|
-| Previous direct-Q8 default | 10,093-byte prompt, 30 generated tokens | 101.32 t/s | 13.33 t/s | baseline |
-| Current token-tiled direct Q8 | same prompt and generation | **138.97 t/s** | 13.32 t/s | **+37.2%** |
-| Current decode reference | 300 generated tokens | 86.89 t/s | **13.83 t/s** | independent workload |
+| Cache-free TP=2 generation | Workload | Prefill | Gain from previous generation |
+|---|---|---:|---:|
+| Before gfx1151 Q4_K WMMA | 1,023 prompt tokens | 34.11 t/s | baseline |
+| Previous direct-Q8 default | 10,093-byte prompt, 30 generated tokens | 101.32 t/s | different prompt; scale reference |
+| Compact-Q8 token reuse | same 10,093-byte prompt and generation | 138.97 t/s | +37.2% |
+| Current coalesced MoE epilogue | same prompt, 300-token validation | **167.73 t/s** | **+21.3% in matched 138.24 t/s rollback A/B** |
 
-The first two rows are a matched historical comparison; the decode-reference
-row is an independent workload. This distribution includes the
+The 34.11 t/s checkpoint predates Q4_K WMMA and uses a shorter prompt, so it is
+historical scale rather than a direct A/B. The current kernel was measured
+against its rollback using the same final binary; both 300-token outputs were
+byte-identical. Decode is deliberately excluded from this table: the new
+epilogue runs only when a batch has at least eight tokens, while the independent
+long-run decode reference remains **13.83 t/s**. This distribution includes the
 complete gfx1151 Q4_K integer-WMMA MoE implementation for gate, up, and down
 projections, with capability checks, TP negotiation, DP4A fallback, and a kill
 switch; no external WMMA patch is required.
@@ -30,6 +36,14 @@ and activations. It reuses each weight block across 16 prompt tokens and emits
 native `v_dot4_i32` instructions, eliminating the former per-token reread
 without creating an expanded weight copy. Set
 `DS4_ROCM_ATTN_OUT_Q8_A_PREQ_TOKTILE=0` only for a diagnostic rollback.
+
+The routed Q4_K gate/up epilogue assigns adjacent expert rows to adjacent GPU
+threads during prefill. This removed a serial, wave-strided memory walk and
+reduced that kernel from 3.779 s to 0.086 s in the 43-layer trace. It is gated
+out of decode, allocates no persistent memory, and can be rolled back with
+`DS4_ROCM_MOE_GATE_UP_EPILOGUE_COALESCED=0`. See
+[docs/MOE-EPILOGUE-PREFILL.md](docs/MOE-EPILOGUE-PREFILL.md) for the staged
+test and profiler evidence.
 
 Q4_K remains packed four-bit model storage. On gfx1151 the kernel unpacks only
 the active tile into INT8 lanes and emits the native
@@ -116,6 +130,7 @@ export DS4_ROCM_DISABLE_ATTN_OUT_LOW_PACK4=1
 export DS4_ROCM_DISABLE_ATTN_OUT_EXPAND_PACK4=1
 export DS4_ROCM_DISABLE_ATTN_Q_B_PACK4=1
 export DS4_ROCM_ATTN_OUT_Q8_A_PREQ_TOKTILE=0
+export DS4_ROCM_MOE_GATE_UP_EPILOGUE_COALESCED=0
 export ODL_VERBS_WC_STREAM_COPY=0
 ```
 

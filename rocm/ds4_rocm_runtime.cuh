@@ -4752,6 +4752,7 @@ struct ds4_rocm_runtime_config {
     int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
     int attention_output_q8_a_preq_toktile;
+    int moe_gate_up_epilogue_coalesced;
     int shared_down_cublas;
     int glm_grouped_value_project;
     int glm_grouped_qk_low;
@@ -4777,6 +4778,11 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.attention_output_q8_a_preq_toktile =
             attention_output_q8_a_preq_toktile_env == NULL ||
             cuda_env_present(attention_output_q8_a_preq_toktile_env);
+        const char *moe_gate_up_epilogue_coalesced_env =
+            getenv("DS4_ROCM_MOE_GATE_UP_EPILOGUE_COALESCED");
+        g_rocm_cfg.moe_gate_up_epilogue_coalesced =
+            moe_gate_up_epilogue_coalesced_env == NULL ||
+            cuda_env_present(moe_gate_up_epilogue_coalesced_env);
         g_rocm_cfg.shared_down_cublas = !g_quality_mode;
         const char *glm_grouped_value_project_env =
             getenv("DS4_ROCM_GLM_GROUPED_VALUE_PROJECT");

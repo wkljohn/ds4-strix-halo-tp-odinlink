@@ -4746,6 +4746,50 @@ __global__ static void moe_gate_up_mid_q4K_routed_epilogue_kernel(
     }
 }
 
+/* Row-parallel form of the routed gate/up epilogue.  Threads in a wave touch
+ * adjacent rows of one routed pair, instead of assigning one pair per thread
+ * and issuing strided wave accesses while each thread walks all rows. */
+__global__ static void moe_gate_up_mid_q4K_routed_epilogue_coalesced_kernel(
+        float *gate_in,
+        float *up_in,
+        float *mid_out,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        const float *weights,
+        uint32_t nrows,
+        uint32_t n_expert,
+        uint32_t write_gate_up,
+        float clamp) {
+    (void)n_expert;
+    const uint32_t tile = (uint32_t)blockIdx.y;
+    const uint32_t row = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tile >= *tile_total || row >= nrows) return;
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t start = tile_starts[tile];
+    const uint32_t count = counts[expert];
+    const uint32_t np = start < count ? min(16u, count - start) : 0u;
+    for (uint32_t p = 0; p < np; p++) {
+        const uint32_t pair = sorted_pairs[offsets[expert] + start + p];
+        const uint64_t off = (uint64_t)pair * nrows + row;
+        float gate = gate_in[off];
+        float up = up_in[off];
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        if (write_gate_up) {
+            gate_in[off] = gate;
+            up_in[off] = up;
+        }
+        mid_out[off] = moe_silu_oldhip(gate) * up * weights[pair];
+    }
+}
+
 template <int MTILES=8, int BM=16, int BN=16, int BK=16>
 __global__ static void moe_down_q2K_hotlist_wmma_kernel(
         float *down_out,

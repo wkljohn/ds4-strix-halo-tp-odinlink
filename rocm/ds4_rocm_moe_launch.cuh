@@ -1508,13 +1508,26 @@ static int routed_moe_launch(
                                          "routed_moe Q4_K DP4A cold launch");
                         }
                         if (ok) {
-                            dim3 egrid(1u, tile_capacity, 1u);
-                            moe_gate_up_mid_q4K_routed_epilogue_kernel<<<egrid, 16>>>(
-                                (float *)gate->ptr, (float *)up->ptr,
-                                (float *)mid->ptr, sorted_pairs, sorted_offsets,
-                                sorted_counts, tile_total, tile_experts, tile_starts,
-                                (const float *)weights->ptr, expert_mid_dim,
-                                n_expert, write_gate_up, clamp);
+                            if (cuda_runtime_config()->moe_gate_up_epilogue_coalesced &&
+                                n_tokens >= 8u) {
+                                dim3 egrid((expert_mid_dim + 255u) / 256u,
+                                           tile_capacity, 1u);
+                                moe_gate_up_mid_q4K_routed_epilogue_coalesced_kernel
+                                    <<<egrid, 256>>>(
+                                        (float *)gate->ptr, (float *)up->ptr,
+                                        (float *)mid->ptr, sorted_pairs, sorted_offsets,
+                                        sorted_counts, tile_total, tile_experts, tile_starts,
+                                        (const float *)weights->ptr, expert_mid_dim,
+                                        n_expert, write_gate_up, clamp);
+                            } else {
+                                dim3 egrid(1u, tile_capacity, 1u);
+                                moe_gate_up_mid_q4K_routed_epilogue_kernel<<<egrid, 16>>>(
+                                    (float *)gate->ptr, (float *)up->ptr,
+                                    (float *)mid->ptr, sorted_pairs, sorted_offsets,
+                                    sorted_counts, tile_total, tile_experts, tile_starts,
+                                    (const float *)weights->ptr, expert_mid_dim,
+                                    n_expert, write_gate_up, clamp);
+                            }
                             ok = cuda_ok(cudaGetLastError(),
                                          "routed_moe Q4_K WMMA epilogue launch");
                         }
