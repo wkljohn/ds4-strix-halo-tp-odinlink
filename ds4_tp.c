@@ -1054,11 +1054,14 @@ static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
 /* Reap completions: send CQEs free send-queue slots, recv CQEs advance the
  * arrival watermark (UC is in-order, so gate seq recv completions arrive
  * monotonically).  Returns 0 on any completion error. */
-static int tp_rdma_drain_cq(ds4_tp *tp) {
+static int tp_rdma_drain_cq_observe(ds4_tp *tp, uint64_t target_seq,
+                                    int *target_send, int *target_recv,
+                                    uint32_t *polled) {
     ds4_tp_rdma *r = &tp->rdma;
     struct ibv_wc wc[16];
     int n = ibv_poll_cq(r->cq, 16, wc);
     if (n < 0) return 0;
+    if (polled) *polled += (uint32_t)n;
     for (int i = 0; i < n; i++) {
         if (wc[i].status != IBV_WC_SUCCESS) {
             fprintf(stderr, "ds4-tp: rdma completion error: %s (wr_id %llu)\n",
@@ -1067,12 +1070,81 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
             return 0;
         }
         if (wc[i].opcode & IBV_WC_RECV) {
+            if (target_recv && wc[i].wr_id == target_seq) *target_recv = 1;
             if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
         } else if (r->send_outstanding > 0) {
+            if (target_send && wc[i].wr_id == target_seq) *target_send = 1;
             r->send_outstanding--;
         }
     }
     return 1;
+}
+
+static int tp_rdma_drain_cq(ds4_tp *tp) {
+    return tp_rdma_drain_cq_observe(tp, 0, NULL, NULL, NULL);
+}
+
+typedef struct {
+    uint64_t gates;
+    uint64_t send_cqe_seen;
+    uint64_t poll_calls;
+    uint64_t cqes;
+    double lock_s;
+    double post_send_s;
+    double send_cqe_s;
+    double peer_recv_s;
+    double replenish_s;
+    double total_s;
+} ds4_tp_rdma_gate_profile_stat;
+
+static ds4_tp_rdma_gate_profile_stat g_tp_rdma_gate_profile[2];
+static int g_tp_rdma_gate_profile_enabled = -1;
+static int g_tp_rdma_gate_profile_registered;
+static int g_tp_rdma_gate_profile_rank = -1;
+
+static void tp_rdma_gate_profile_print(void) {
+    for (uint32_t gate = 0; gate < 2; gate++) {
+        const ds4_tp_rdma_gate_profile_stat *s =
+            &g_tp_rdma_gate_profile[gate];
+        if (s->gates == 0) continue;
+        const double scale = 1e6 / (double)s->gates;
+        fprintf(stderr,
+                "{\"ds4_tp_rdma_gate_profile\":true,\"rank\":%d,"
+                "\"gate\":\"%s\",\"gates\":%llu,"
+                "\"send_cqe_seen\":%llu,\"poll_calls\":%llu,"
+                "\"cqes\":%llu,\"lock_us\":%.3f,"
+                "\"post_send_us\":%.3f,\"send_cqe_us\":%.3f,"
+                "\"peer_recv_us\":%.3f,\"replenish_us\":%.3f,"
+                "\"total_us\":%.3f}\n",
+                g_tp_rdma_gate_profile_rank,
+                gate == DS4_TP_GATE_ATTN ? "attention" : "ffn",
+                (unsigned long long)s->gates,
+                (unsigned long long)s->send_cqe_seen,
+                (unsigned long long)s->poll_calls,
+                (unsigned long long)s->cqes,
+                s->lock_s * scale,
+                s->post_send_s * scale,
+                s->send_cqe_seen ?
+                    s->send_cqe_s * 1e6 / (double)s->send_cqe_seen : 0.0,
+                s->peer_recv_s * scale,
+                s->replenish_s * scale,
+                s->total_s * scale);
+    }
+}
+
+static int tp_rdma_gate_profile_is_enabled(const ds4_tp *tp) {
+    if (g_tp_rdma_gate_profile_enabled < 0) {
+        const char *s = getenv("DS4_TP_RDMA_GATE_PROFILE");
+        g_tp_rdma_gate_profile_enabled =
+            s && s[0] != '\0' && strcmp(s, "0") != 0;
+        if (g_tp_rdma_gate_profile_enabled &&
+            !g_tp_rdma_gate_profile_registered) {
+            g_tp_rdma_gate_profile_rank = tp->rank;
+            atexit(tp_rdma_gate_profile_print);
+            g_tp_rdma_gate_profile_registered = 1;
+        }
+    }
+    return g_tp_rdma_gate_profile_enabled;
 }
 
 /* Arm the receive for gate seq: UC delivery order pairs the peer's seq'th
@@ -1118,6 +1190,8 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
+    const int gate_profile = gate < 2u && tp_rdma_gate_profile_is_enabled(tp);
+    const double profile_start = gate_profile ? tp_now_sec() : 0.0;
     /* DS4-TP-gfx1151 (patch 17): getenv is a linear scan of environ and this is
      * on the per-gate path. Cache it. */
     static int gate_trace = -1;
@@ -1133,13 +1207,16 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     }
     const uintptr_t send_base =
         (uintptr_t)(tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes);
+    const double lock_start = gate_profile ? tp_now_sec() : 0.0;
     pthread_mutex_lock(&r->post_lock);
+    const double lock_end = gate_profile ? tp_now_sec() : 0.0;
     int ok = 1;
     if (!r->recv_window_active) {
         for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
             ok = tp_rdma_post_gate_recv(tp, s);
         if (ok) r->recv_window_active = true;
     }
+    const double post_send_start = gate_profile ? tp_now_sec() : 0.0;
     for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
         const uint64_t len = tp->vec_bytes - off > r->decode_max_msg ?
             r->decode_max_msg : tp->vec_bytes - off;
@@ -1162,11 +1239,27 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         }
         off += len;
     }
+    const double post_send_end = gate_profile ? tp_now_sec() : 0.0;
 
     double deadline = 0.0;
     uint32_t peer_poll = 0;
+    uint32_t profile_cqes = 0;
+    uint64_t profile_poll_calls = 0;
+    int profile_send_seen = 0;
+    double profile_send_seen_at = 0.0;
     while (ok && r->recv_done < seq) {
-        ok = tp_rdma_drain_cq(tp);
+        int saw_send = 0;
+        if (gate_profile) {
+            profile_poll_calls++;
+            ok = tp_rdma_drain_cq_observe(tp, seq, &saw_send, NULL,
+                                          &profile_cqes);
+            if (saw_send && !profile_send_seen) {
+                profile_send_seen = 1;
+                profile_send_seen_at = tp_now_sec();
+            }
+        } else {
+            ok = tp_rdma_drain_cq(tp);
+        }
         if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
             fprintf(stderr, "ds4-tp: peer disconnected during RDMA gate\n");
             ok = 0;
@@ -1178,9 +1271,27 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             ok = 0;
         }
     }
+    const double peer_recv_end = gate_profile ? tp_now_sec() : 0.0;
+    const double replenish_start = gate_profile ? tp_now_sec() : 0.0;
     if (ok) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
+    const double replenish_end = gate_profile ? tp_now_sec() : 0.0;
     if (ok) r->last_gate_seq = seq;
     pthread_mutex_unlock(&r->post_lock);
+    if (gate_profile && ok) {
+        ds4_tp_rdma_gate_profile_stat *s = &g_tp_rdma_gate_profile[gate];
+        s->gates++;
+        s->poll_calls += profile_poll_calls;
+        s->cqes += profile_cqes;
+        s->lock_s += lock_end - lock_start;
+        s->post_send_s += post_send_end - post_send_start;
+        if (profile_send_seen) {
+            s->send_cqe_seen++;
+            s->send_cqe_s += profile_send_seen_at - post_send_end;
+        }
+        s->peer_recv_s += peer_recv_end - post_send_end;
+        s->replenish_s += replenish_end - replenish_start;
+        s->total_s += tp_now_sec() - profile_start;
+    }
     return ok;
 }
 

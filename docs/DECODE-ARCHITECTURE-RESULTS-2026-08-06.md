@@ -76,6 +76,22 @@ reassembly and the receive syscall. Such a path may expose `RDMA_WRITE` at the
 verbs layer later. It must be capability-negotiated and opt-in so the existing
 generic/Mellanox SEND/RECV path has no new hot-path cost.
 
+The default-off `DS4_TP_RDMA_GATE_PROFILE=1` phase profiler then measured the
+verbs gate directly. Rank 0 attention/FFN gates averaged 52.013/73.847 us;
+rank 1 averaged 61.795 us for attention after excluding one 1.0156-second
+system outlier, and 137.732 us for FFN because it arrived before its peer.
+Only 2.1--3.0 us was spent posting, about 0.2--0.4 us locking and replenishing,
+and local send CQEs appeared after 6--10 us. The rest was peer arrival or rank
+compute skew. This confirms that selective signaling, work-request reuse, or a
+software `RDMA_WRITE` envelope cannot plausibly recover 5% end to end.
+
+The profile also narrows the next transport design. Producer-ready half-vector
+chunking can start the first 8 KiB transfer while the GPU computes the second
+half of an attention output or MoE down projection. Across two gates and 43
+layers, hiding roughly 50 us/gate has a theoretical ceiling near 4.3 ms/token,
+which is large enough to test. It must use explicit GPU completion signaling;
+time-based observation of a buffer being written is not correct.
+
 ## Promotion rules
 
 - Prefer bytes, copies, fusion, ownership balance, overlap, and protocol
