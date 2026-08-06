@@ -10,6 +10,11 @@
 > See the linked plan for correctness, stability, and guard details. This
 > supersedes the older conclusion below that both attention-output directions
 > were exhausted; launch-only tuning was exhausted, not kernel redesign.
+>
+> **Second result:** the matching one-row packed Q8 expansion redesign reduced
+> that kernel from 0.225 to 0.102 ms and improved the same 1,000-token prompt
+> from 11.93 to 12.93 t/s (+8.4%). It uses a separate exact-shape gfx1151
+> guard and kill switch.
 
 Scope: decode throughput only, on the working two-node RDMA TP setup
 (DeepSeek-V4-Flash Q4_K, gfx1151 x2). Explicitly **excludes DSpark/MTP

@@ -277,6 +277,35 @@ The kernel defaults on only for the guarded gfx1151 shape and can be disabled
 with `DS4_ROCM_DISABLE_ATTN_OUT_LOW_PACK4=1`. It contains no transport or
 provider branching, so Mellanox RDMA and generic verbs behavior are unchanged.
 
-The next measured target is attention-output expand, now about 0.225 ms per
-layer invocation. Any expand redesign must repeat the same opt-in, numerical,
-long-run, prefill-regression, and transport-neutral promotion protocol.
+## Second implementation result: packed Q8 expansion
+
+The expansion redesign preserves one output row per wave and applies the same
+four eight-lane groups to the 4,096-element local K slice. This isolates block
+packing from the previously rejected two-row expansion geometry. It is guarded
+to gfx1151 and the exact Flash TP=2 shape: 8,192 full input elements, a 4,096
+element local slice beginning at 0 or 4,096, and 4,096 output rows.
+
+Measured results:
+
+- expansion projection: 0.225 ms control versus 0.102 ms candidate, about 55%
+  faster on both ranks;
+- same-prompt production decode: 11.93 to 12.93 t/s, +8.4%;
+- rank-0 local TP partial: 1.88e-7 relative RMS error, 9.54e-7 maximum
+  absolute error across 4,096 values;
+- 1,000-token run completed without stalls and with zero provider fallbacks;
+- the multilingual greedy trap was byte-identical across two independent
+  candidate runs;
+- a 10,093-byte long-prompt stability run completed at 136.38 t/s. It used a
+  different prompt and ran under accumulated page-warm pressure, so the
+  published 138.78 t/s median remains the reference prefill number.
+
+The default is shape- and architecture-gated and has the kill switch
+`DS4_ROCM_DISABLE_ATTN_OUT_EXPAND_PACK4=1`. Like the low kernel, it has no
+transport/provider dependency. A new `tp_attn_partial` diagnostic dump exposes
+the actual local TP projection buffer; the older `attn_out` hook is zero on the
+fused TP gate path because that canonical buffer is intentionally not
+materialized.
+
+With low and expansion reduced to roughly 0.096 and 0.102 ms, respectively,
+the next candidate must be chosen from a fresh end-to-end trace rather than the
+pre-change ranking.

@@ -492,6 +492,48 @@ __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+/* gfx1151 TP decode path for the attention-output expansion.
+ * Four eight-lane groups consume four Q8_0 blocks per wave iteration while
+ * retaining one output row per wave.  Explicit byte reads avoid relying on
+ * unaligned vector loads or sub-wave shuffle behavior. */
+__global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t subgroup = lane >> 3u;
+    const uint32_t lane8 = lane & 7u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * row_bytes;
+    float acc = 0.0f;
+    for (uint32_t b4 = 0; b4 < n_blocks; b4 += 4u) {
+        const uint32_t b = b4 + subgroup;
+        const uint32_t elem = (b << 5u) + (lane8 << 2u);
+        const float4 xv = *reinterpret_cast<const float4 *>(shx + elem);
+        const unsigned char *blk = wr + (uint64_t)b * 34u;
+        const float d = q8_0_scale_scalar(blk);
+        const int8_t *q = (const int8_t *)(blk + 2u + (lane8 << 2u));
+        acc += d * (float)q[0] * xv.x;
+        acc += d * (float)q[1] * xv.y;
+        acc += d * (float)q[2] * xv.z;
+        acc += d * (float)q[3] * xv.w;
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
 __global__ static void matmul_q8_0_f32_batch_warp8_kernel(
         float *out,
         const unsigned char *w,

@@ -22715,6 +22715,11 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_low", metal_graph_attn_low(g), (uint64_t)n_groups * rank, il, pos);
     }
+    if (ok && g->tp_world == 2) {
+        const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
+        metal_graph_debug_dump_tensor("tp_attn_partial", g->tp_out[slot],
+                                      DS4_N_EMBD, il, pos);
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("attn_out", metal_graph_attn_out(g), DS4_N_EMBD, il, pos);
     }

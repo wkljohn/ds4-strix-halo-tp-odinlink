@@ -40,6 +40,27 @@ static unsigned attention_output_expand_threads(void) {
     return threads;
 }
 
+static int attention_output_expand_pack4_enabled(void) {
+    static int enabled = -1;
+    static int gfx1151;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_ROCM_ATTN_OUT_EXPAND_PACK4");
+        const char *disable = getenv("DS4_ROCM_DISABLE_ATTN_OUT_EXPAND_PACK4");
+        enabled = (value == NULL || strcmp(value, "0") != 0) &&
+                  !(disable != NULL && strcmp(disable, "1") == 0);
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+            gfx1151 = strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return enabled && gfx1151;
+}
+
 /* Diagnostic-only sweep for the decode compressor_proj kernel
  * (matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel), which measured as
  * the second-largest decode attention sub-stage (~131us). Pure launch-
@@ -1016,6 +1037,22 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
 
     const unsigned threads = attention_output_expand_threads();
     const unsigned rows_per_block = threads / 32u;
+    if (attention_output_expand_pack4_enabled() &&
+        in_dim == 8192u && in_start <= 4096u &&
+        (in_start % 4096u) == 0u && in_count == 4096u &&
+        out_dim == 4096u && full_blocks == 256u && slice_blocks == 128u) {
+        matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_kernel<<<
+                (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+                threads,
+                (size_t)in_count * sizeof(float)>>>(
+                (float *)out->ptr,
+                reinterpret_cast<const unsigned char *>(wptr) + block_start * 34u,
+                (const float *)x->ptr,
+                (uint32_t)slice_blocks,
+                out_dim,
+                row_bytes);
+        return cuda_ok(cudaGetLastError(), "matmul_q8_0 kslice rows pack4 launch");
+    }
     matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
             (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
             threads,
