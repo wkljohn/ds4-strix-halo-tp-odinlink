@@ -309,3 +309,33 @@ materialized.
 With low and expansion reduced to roughly 0.096 and 0.102 ms, respectively,
 the next candidate must be chosen from a fresh end-to-end trace rather than the
 pre-change ranking.
+
+## Third implementation result: packed Q-B projection
+
+The nonblocking event profiler now begins before the Q path and separates
+Q/KV projection, fused Q/KV norm/RoPE, Q-B projection, and final Q norm/RoPE.
+On the post-expansion binary, Q-B was the largest newly exposed stage at 0.192
+ms on rank 0 and 0.186 ms on rank 1. Paired Q/KV projection followed at
+0.130/0.126 ms; the two norm/RoPE stages were only 0.013-0.021 ms.
+
+The new dispatch reuses the hardened four-Q8-blocks-per-wave kernel for the
+exact DeepSeek V4 TP=2 Q-B shape: one token, 1,024 input values, 16,384 local
+output rows, and 32 Q8 blocks. It defaults on only for gfx1151. All other
+shapes and architectures retain the generic Q8 path, and
+`DS4_ROCM_DISABLE_ATTN_Q_B_PACK4=1` disables it.
+
+Measured results:
+
+- Q-B projection: 0.192 to 0.092 ms on rank 0 and 0.186 to 0.092 ms on rank
+  1, about 52% and 51% faster;
+- same-binary profiled decode: 12.72 to 13.34 t/s, +4.9%;
+- unprofiled 1,000-token stability run: 13.48 t/s, both ranks completed with
+  identical 86,086-call / 1,428,034,816-byte provider summaries and zero
+  fallback copies;
+- layer-0 decode Q-B tensor relative RMS error: 1.17e-7 on rank 0 and 1.36e-7
+  on rank 1, with maximum absolute error at or below 5.96e-8;
+- the short control/candidate greedy output was byte-identical.
+
+This is a compute-only, one-token dispatch with no provider or transport
+branching. It cannot enter prefill and does not change the generic/Mellanox
+verbs path.

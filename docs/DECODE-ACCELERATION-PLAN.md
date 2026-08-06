@@ -15,6 +15,12 @@
 > that kernel from 0.225 to 0.102 ms and improved the same 1,000-token prompt
 > from 11.93 to 12.93 t/s (+8.4%). It uses a separate exact-shape gfx1151
 > guard and kill switch.
+>
+> **Third result:** extending the nonblocking event profiler over the omitted
+> Q path exposed Q-B projection as the next hotspot at 0.192/0.186 ms per
+> layer. The exact-shape packed Q8 dispatch reduced it to 0.092 ms on both
+> ranks. A same-binary profiled comparison improved 12.72 to 13.34 t/s
+> (+4.9%), and an unprofiled 1,000-token stability run reached 13.48 t/s.
 
 Scope: decode throughput only, on the working two-node RDMA TP setup
 (DeepSeek-V4-Flash Q4_K, gfx1151 x2). Explicitly **excludes DSpark/MTP

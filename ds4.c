@@ -21665,6 +21665,7 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     if (!resume_after_attn) {
     if (!resume_after_qkv) {
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_START);
     bool qkv_pair_projected = resume_after_qa_kv_raw;
     if (!resume_after_qa_kv_raw && ok && qkv_rms_fused &&
         g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj()) {
@@ -21695,6 +21696,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                          layer->attn_kv->abs_offset,
                                                                          DS4_N_EMBD, DS4_N_HEAD_DIM,
                                                                          metal_graph_attn_norm(g), 1) != 0;
+        DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_QKV_PROJ);
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", metal_graph_kv_raw(g), DS4_N_HEAD_DIM, il, pos);
         }
@@ -21751,6 +21753,7 @@ static bool metal_graph_encode_decode_layer_phase(
     if (qkv_rms_fused && ok && !kv_rope_fused) {
         metal_graph_debug_dump_tensor("KVnorm", metal_graph_kv(g), DS4_N_HEAD_DIM, il, pos);
     }
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_QKV_NORM_ROPE);
     /* Phase B head slice: under the real TP split this rank computes only
      * its heads [tp_head0, tp_head0 + tp_heads) end to end — q_b rows, the
      * per-head norm/rope, the attention core and its owned output groups.
@@ -21771,6 +21774,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                     (uint64_t)tp_heads * DS4_N_HEAD_DIM,
                                                     metal_graph_qr_norm(g),
                                                     1);
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_Q_B_PROJ);
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", metal_graph_q(g), q_dim, il, pos);
     }
@@ -21806,7 +21810,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                 DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
-    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_START);
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_Q_NORM_ROPE);
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", metal_graph_q(g), q_dim, il, pos);
     }

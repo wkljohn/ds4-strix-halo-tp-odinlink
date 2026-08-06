@@ -4,7 +4,7 @@ This fork adds production two-node tensor parallelism for AMD Strix Halo
 (`gfx1151`) over OdinLink Thunderbolt RDMA while retaining DS4's Metal, CUDA,
 generic verbs, and non-TP paths. The current validated configuration runs
 DeepSeek V4 Flash Q4_K at a median **138.78 prompt tokens/s**; the packed
-decode path reaches **12.93 generation tokens/s** on two Ryzen AI MAX+ 395
+decode path reaches **13.48 generation tokens/s** on two Ryzen AI MAX+ 395
 nodes.
 
 ```text
@@ -20,6 +20,7 @@ nodes.
 | Current fork, optimized OdinLink | 9,881 bytes | **138.78 t/s** | **+44.7%** | **11.23 t/s** | **+12.8%** |
 | + packed gfx1151 Q8 decode projection | 9,881-byte prefill / 1,000-token decode | **139.61 t/s** | no regression | **11.78 t/s** | **+5.7% paired** |
 | + packed Q8 decode expansion | 1,000-token decode | decode-only dispatch | — | **12.93 t/s** | **+8.4% paired** |
+| + packed Q8 Q-B projection | 1,000-token decode | decode-only dispatch | — | **13.48 t/s** | **+4.3% stability** |
 
 The historical row used a different prompt, so the raw +181.1% ratio is context
 rather than a controlled attribution. The optimized-OdinLink row is a
@@ -43,7 +44,10 @@ check confirms that the one-token-only dispatch does not regress prefill.
 The packed expansion used the same 1,000-token prompt for its 11.93 to 12.93
 t/s comparison. A separate 10,093-byte long-prompt check completed at 136.38
 t/s under accumulated page-warm pressure; it is a stability check on a
-different prompt, not a replacement for the published 138.78 median.
+different prompt, not a replacement for the published 138.78 median. The
+packed Q-B projection measured 12.72 to 13.34 t/s in its same-binary profiled
+control/candidate comparison and completed the unprofiled 1,000-token run at
+13.48 t/s. It is also one-token-only and cannot enter the prefill dispatch.
 
 ## Reproduce the Strix Halo setup
 
@@ -114,6 +118,7 @@ export DS4_TP_BIG_DIRECT=0
 export DS4_ROCM_DISABLE_Q4K_WMMA=1
 export DS4_ROCM_DISABLE_ATTN_OUT_LOW_PACK4=1
 export DS4_ROCM_DISABLE_ATTN_OUT_EXPAND_PACK4=1
+export DS4_ROCM_DISABLE_ATTN_Q_B_PACK4=1
 export ODL_VERBS_WC_STREAM_COPY=0
 ```
 

@@ -61,6 +61,27 @@ static int attention_output_expand_pack4_enabled(void) {
     return enabled && gfx1151;
 }
 
+static int attention_q_b_pack4_enabled(void) {
+    static int enabled = -1;
+    static int gfx1151;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_ROCM_ATTN_Q_B_PACK4");
+        const char *disable = getenv("DS4_ROCM_DISABLE_ATTN_Q_B_PACK4");
+        enabled = (value == NULL || strcmp(value, "0") != 0) &&
+                  !(disable != NULL && strcmp(disable, "1") == 0);
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+            gfx1151 = strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return enabled && gfx1151;
+}
+
 /* Diagnostic-only sweep for the decode compressor_proj kernel
  * (matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel), which measured as
  * the second-largest decode attention sub-stage (~131us). Pure launch-
@@ -391,6 +412,27 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
     if (n_tok == 1) {
+        /* DeepSeek V4 TP=2 decode Q-B projection: each rank owns 32 heads,
+         * hence 16,384 Q8 rows over the 1,024-wide LoRA activation.  Reuse
+         * the hardened four-block-per-wave kernel from the attention output
+         * expansion.  Keep this exact-shape and gfx1151-only so other Q8
+         * users and GPU generations retain their established dispatch. */
+        if (attention_q_b_pack4_enabled() &&
+            in_dim == 1024u && out_dim == 16384u && blocks == 32u) {
+            const unsigned threads = 1024u;
+            const unsigned rows_per_block = threads / 32u;
+            matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_kernel<<<
+                    (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+                    threads,
+                    (size_t)in_dim * sizeof(float)>>>(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    (const float *)x->ptr,
+                    (uint32_t)blocks,
+                    out_dim,
+                    blocks * 34u);
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 attention q_b pack4 launch");
+        }
         const bool extended_sharedx =
             in_dim > 8192u &&
             in_dim <= 16384u &&

@@ -42,7 +42,9 @@ default. It is a compute-only, exact-shape dispatch and does not inspect the
 RDMA provider, so system `libibverbs` and Mellanox paths are unaffected. Set
 `DS4_ROCM_DISABLE_ATTN_OUT_LOW_PACK4=1` on both ranks for its control arm. The
 matching packed expansion kernel has the same provider isolation and uses
-`DS4_ROCM_DISABLE_ATTN_OUT_EXPAND_PACK4=1` as its control.
+`DS4_ROCM_DISABLE_ATTN_OUT_EXPAND_PACK4=1` as its control. The packed Q-B
+decode kernel is likewise transport-neutral and uses
+`DS4_ROCM_DISABLE_ATTN_Q_B_PACK4=1`.
 
 Launch both model loads concurrently. The worker may begin connection retries
 before the coordinator listens; if it exhausts retries, relaunch only the
