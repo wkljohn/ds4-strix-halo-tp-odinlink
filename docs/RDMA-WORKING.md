@@ -63,7 +63,10 @@ claiming "RDMA makes prefill 3x worse" compared mismatched runs and was wrong.
 
 Start the worker first.
 
-**UPDATE (2026-08-05): do NOT set `DS4_CUDA_NO_Q8_F16_CACHE=1` anymore.**
+**UPDATE (2026-08-06): the Q8-to-F16 cache is now disabled by default.** It is
+available only with `DS4_ROCM_ENABLE_Q8_F16_CACHE=1`, which prints a warning
+because it consumes about 10 GiB per rank and can drive reported VRAM usage
+near 99%. Ordinary inference and tests must leave that switch unset.
 It was believed required because the cache takes ~9.9 GiB and the MoE arena
 OOMs without it - re-tested directly and this is no longer true (or never
 was, under today's code): the cache has its own graceful budget cap

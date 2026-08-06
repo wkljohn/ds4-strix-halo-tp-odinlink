@@ -1,5 +1,9 @@
 # First ds4 tensor-parallel run on ROCm — TP binds, blocked at session backend
 
+> Historical record: the Q8-to-F16 cache mentioned below is now disabled by
+> default and requires `DS4_ROCM_ENABLE_Q8_F16_CACHE=1`, which prints a memory
+> warning. See `Q8-F16-CACHE-POLICY.md` for the current policy.
+
 Date: 2026-08-03. Both nodes, DeepSeek-V4-Flash-Q4_K-0731 (164.6 GB GGUF),
 TCP transport (RDMA deliberately not yet enabled).
 

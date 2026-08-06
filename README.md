@@ -2,10 +2,10 @@
 
 This fork adds production two-node tensor parallelism for AMD Strix Halo
 (`gfx1151`) over OdinLink Thunderbolt RDMA while retaining DS4's Metal, CUDA,
-generic verbs, and non-TP paths. The current validated configuration runs
-DeepSeek V4 Flash Q4_K at a median **138.78 prompt tokens/s**; the packed
-decode path reaches **13.48 generation tokens/s** on two Ryzen AI MAX+ 395
-nodes.
+generic verbs, and non-TP paths. The low-memory default packed decode path
+reaches **13.79 generation tokens/s** on two Ryzen AI MAX+ 395 nodes. The
+published **138.78 prompt tokens/s** reference used the optional, memory-heavy
+Q8-to-F16 prefill cache described below; that cache is not enabled by default.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
@@ -30,11 +30,13 @@ complete gfx1151 Q4_K integer-WMMA MoE implementation for gate, up, and down
 projections, with capability checks, TP negotiation, DP4A fallback, and a kill
 switch; no external WMMA patch is required.
 
-The A/B used a 9,881-byte prompt, context 4,096, 30 deterministic generated
+The prefill A/B used a 9,881-byte prompt, context 4,096, 30 deterministic generated
 tokens, DS4 TP=2, and OdinLink provider commit `8a77ccb`. Four alternating
 runs produced byte-identical generated output. The provider optimization is
 explicit and does not enter the Mellanox path: without `DS4_TP_VERBS_LIB`, DS4
 loads system `libibverbs` directly and keeps the generic message policy.
+Those historical prefill runs enabled the Q8-to-F16 cache that was formerly
+automatic. Current default inference does not allocate it.
 
 The decode row is a separate direct kill-switch comparison: 11.15 t/s with
 the original low projection and 11.78 t/s with the packed kernel. The hardened
@@ -110,8 +112,9 @@ only the not-yet-production-safe attention row split, retains the useful FFN
 row split, uses registered-slab big gates, enables shape-checked gfx1151 Q4_K
 WMMA, enables a shape-checked packed Q8 attention-output projection for TP=2
 decode low and expansion stages, and enables provider WC streaming when
-`DS4_TP_VERBS_LIB` explicitly names OdinLink. Diagnostic kill switches remain
-available:
+`DS4_TP_VERBS_LIB` explicitly names OdinLink. The Q8-to-F16 weight cache is
+disabled by default because it consumed 9.85--9.91 GiB per rank and drove
+reported VRAM usage near 99%. Diagnostic kill switches remain available:
 
 ```sh
 export DS4_TP_BIG_DIRECT=0
@@ -121,6 +124,24 @@ export DS4_ROCM_DISABLE_ATTN_OUT_EXPAND_PACK4=1
 export DS4_ROCM_DISABLE_ATTN_Q_B_PACK4=1
 export ODL_VERBS_WC_STREAM_COPY=0
 ```
+
+The prefill cache is available only through this explicit switch. Enabling it
+prints a warning at startup. It is not part of the default inference or test
+configuration:
+
+```sh
+# Optional: measured +24.1% on one prefill workload, but costs about 10 GiB
+# per rank and may drive reported VRAM usage near 99%.
+export DS4_ROCM_ENABLE_Q8_F16_CACHE=1
+```
+
+In a matched 300-token check, disabling the cache changed decode only from
+13.80 to 13.79 t/s, while prefill changed from 115.56 to 87.67 t/s. Therefore
+the low-memory direct-Q8 path is the default; enable the cache only when its
+prefill gain is worth the explicitly acknowledged memory cost.
+The new default also completed a 10,093-byte long-prompt check at 101.32
+prefill t/s and 13.33 decode t/s (30 generated tokens); the longer 300-token
+default decode check above is the more reliable decode reference.
 
 Start both roles immediately so their independent model loads run in parallel;
 do not wait for the coordinator to finish loading or open port 5599 first:
@@ -137,9 +158,10 @@ do not wait for the coordinator to finish loading or open port 5599 first:
   --temp 0 --seed 42 -n 30 --prompt-file "$PROMPT"
 ```
 
-For a benchmark comparable to the recorded result, use a 9,881-byte prompt
-(`wc -c "$PROMPT"`), keep diagnostics disabled, and repeat an alternating
-off/on/on/off A/B. Because optimized OdinLink copying is the default, set
+For a default low-memory benchmark, use a 9,881-byte prompt (`wc -c
+"$PROMPT"`), leave `DS4_ROCM_ENABLE_Q8_F16_CACHE` unset, keep diagnostics
+disabled, and repeat an alternating off/on/on/off A/B. Because optimized
+OdinLink copying is the default, set
 `ODL_VERBS_WC_STREAM_COPY=0` in both off arms and leave it unset (or set it to
 `1`) in both on arms. Require:
 

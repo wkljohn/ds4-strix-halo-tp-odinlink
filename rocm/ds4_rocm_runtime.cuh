@@ -4969,11 +4969,33 @@ static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t r
     (void)cudaGetLastError();
 }
 
+static int cuda_q8_f16_cache_opted_in(void) {
+    static int enabled = -1;
+    if (enabled >= 0) return enabled;
+    const char *s = getenv("DS4_ROCM_ENABLE_Q8_F16_CACHE");
+    enabled = s && strcmp(s, "1") == 0;
+    if (enabled) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "WARNING: DS4_ROCM_ENABLE_Q8_F16_CACHE=1 enables an optional "
+                "Q8->F16 weight cache that may consume about 10 GiB per rank "
+                "and drive reported VRAM usage near 99%%\n");
+    } else if (s && s[0] != '\0') {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "ignoring DS4_ROCM_ENABLE_Q8_F16_CACHE=%s; only exact value 1 "
+                "enables the memory-heavy optional cache\n",
+                s);
+    }
+    return enabled;
+}
+
 static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
     if (g_q8_f16_disabled_for_multi_model) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
+    if (!cuda_q8_f16_cache_opted_in()) return 0;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||
         strstr(label, "attn_output_b") != NULL ||

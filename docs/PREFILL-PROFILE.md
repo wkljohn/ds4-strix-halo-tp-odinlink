@@ -1,5 +1,10 @@
 # Where prefill time actually goes (measured, not estimated)
 
+> Historical record: as of 2026-08-06 the Q8-to-F16 cache discussed below is
+> disabled by default. It is available only through the warning-bearing
+> `DS4_ROCM_ENABLE_Q8_F16_CACHE=1` opt-in; ordinary inference and tests leave
+> it unset. See `Q8-F16-CACHE-POLICY.md`.
+
 `DS4_ROCM_LAYER_STAGE_PROFILE=1` **on both ranks**, 3306-token prompt, TP=2 over
 RDMA, row split disabled.
 
