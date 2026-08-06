@@ -30,6 +30,12 @@ complete gfx1151 Q4_K integer-WMMA MoE implementation for gate, up, and down
 projections, with capability checks, TP negotiation, DP4A fallback, and a kill
 switch; no external WMMA patch is required.
 
+Q4_K remains packed four-bit model storage. On gfx1151 the kernel unpacks only
+the active tile into INT8 lanes and emits the native
+`v_wmma_i32_16x16x16_iu8` instruction, then applies the original Q4_K
+scale/minimum metadata. It does not maintain a persistent expanded INT8 or
+FP16 weight copy.
+
 The prefill A/B used a 9,881-byte prompt, context 4,096, 30 deterministic generated
 tokens, DS4 TP=2, and OdinLink provider commit `8a77ccb`. Four alternating
 runs produced byte-identical generated output. The provider optimization is
