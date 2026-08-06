@@ -26740,14 +26740,10 @@ static ds4_gpu_tensor *metal_graph_tensor_row_range_view(
 
 /* TP prefill threshold for row-splitting the replicated shared expert.
  * Routed experts remain ownership-split at every batch size. */
-/* DS4-TP-gfx1151 (patch 20): the ATTENTION row split needs
- * ds4_gpu_attention_prefill_raw_heads_range_tensor and
- * ..._static_mixed_heads_range_tensor, both unimplemented on ROCm, so it must be
- * disabled here. The FFN row split needs NO missing kernel - every ds4_gpu_* it
- * touches is implemented - and it row-splits the replicated shared expert.
- * They shared one threshold, so disabling attention silently disabled the FFN
- * split too and we were paying for the workaround twice. Give attention its own
- * knob; DS4_TP_PREFILL_SPLIT_MIN keeps its meaning for the FFN split. */
+/* Attention and FFN have separate row-split thresholds. The ROCm attention
+ * range kernels are implemented and hardware-correct, but their added TP
+ * exchange measured flat/slightly negative, so attention stays off by default.
+ * The FFN split remains useful and keeps its independent threshold below. */
 static uint32_t metal_graph_tp_prefill_split_min_attn(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -26757,13 +26753,9 @@ static uint32_t metal_graph_tp_prefill_split_min_attn(void) {
             cached = atoi(env);
         } else {
 #ifdef DS4_ROCM_BUILD
-            /* ds4_gpu_attention_prefill_raw_heads_range_tensor and
-             * ..._static_mixed_heads_range_tensor are unimplemented on ROCm
-             * (see comment above metal_graph_tp_prefill_split_min below) -
-             * the row-split path must stay off by default here, or every
-             * ordinary TP=2 ROCm prefill chunk >=32 tokens hits the
-             * ROCm-unavailable stub and fails. Explicit env override still
-             * works for anyone who has ported/tested the range kernels. */
+            /* Hardware A/B: replicated mean 99.25 t/s, forced split mean
+             * 98.75 t/s. Keep the correct range path available for experiments
+             * without paying its output exchange in normal TP=2 prefill. */
             cached = 1000000;
 #else
             cached = 32;

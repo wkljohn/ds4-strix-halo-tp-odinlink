@@ -240,6 +240,9 @@ next sections.
   setup, provider isolation, synchronization rules, and benchmark evidence.
 - [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md): safely merge canonical DS4
   updates while preserving and revalidating the fork's TP/ROCm acceleration.
+- [docs/ROCM-PREFILL-ATTENTION-REVIEW.md](docs/ROCM-PREFILL-ATTENTION-REVIEW.md):
+  current upstream kernel survey, cost bounds, and rejected gfx1151 attention
+  and FFN-wire prefill experiments.
 
 ## Model Weights
 
