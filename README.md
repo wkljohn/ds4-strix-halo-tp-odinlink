@@ -7,41 +7,23 @@ DeepSeek V4 Flash Q4_K at a median **138.78 prompt tokens/s** and **11.23
 generation tokens/s** on two Ryzen AI MAX+ 395 nodes.
 
 ```text
- Reference TP=2 topology (the node filesystems are independent)
-
- +-----------------------------------+       +-----------------------------------+
- | Node 1: coordinator / TP rank 0   |       | Node 2: worker / TP rank 1        |
- | Ryzen AI MAX+ 395, gfx1151        |       | Ryzen AI MAX+ 395, gfx1151        |
- | local ds4 + provider + GGUF copy  |       | local ds4 + provider + GGUF copy  |
- | owns 50% of routed experts        |       | owns 50% of routed experts        |
- | listens on 10.4.0.1:5599          |       | connects to 10.4.0.1:5599         |
- +-----------------+-----------------+       +-----------------+-----------------+
-                   |    OdinLink over Thunderbolt RDMA         |
-                   +<==========================================>+
-                    TP reductions: prefill bulk + decode gates
-
-       Start both roles together; each node loads its local files in parallel.
+ Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
+  Strix Halo #1       <== Thunderbolt RDMA ==>        Strix Halo #2
+    TP rank 0                                           TP rank 1
 ```
 
-| Two-node result | Baseline provider copy | Optimized OdinLink copy | Change |
-|---|---:|---:|---:|
-| Prefill | 95.89 t/s | **138.78 t/s** | **+44.7%** |
-| Decode | 9.96 t/s | **11.23 t/s** | **+12.8%** |
+| TP=2 generation | Workload | Prefill | Gain from prior | Decode | Gain from prior |
+|---|---:|---:|---:|---:|---:|
+| Pre-Q4_K-WMMA ROCm (`4b35010`) | 1,023 tokens | 34.11 t/s | — | — | — |
+| Current fork, provider-copy baseline | 9,881 bytes | 95.89 t/s | +181.1% (raw) | 9.96 t/s | — |
+| Current fork, optimized OdinLink | 9,881 bytes | **138.78 t/s** | **+44.7%** | **11.23 t/s** | **+12.8%** |
 
-For historical scale, the last archived pre-WMMA ROCm checkpoint measured
-**34.11 prefill t/s**:
-
-| Historical checkpoint | Prompt | Prefill | Evidence |
-|---|---:|---:|---|
-| TP=2 ROCm, before Q4_K WMMA | 1,023 tokens | 34.11 t/s | DS4 commit `4b35010` |
-| Current fork, optimized OdinLink | 9,881 bytes | **138.78 t/s median** | four-run alternating A/B |
-
-These rows use different prompts and are not a controlled percentage comparison;
-the older result documents the approximate pre-kernel starting point. This
-distribution includes the complete gfx1151 Q4_K integer-WMMA MoE implementation
-for gate, up, and down projections, its shape/capability checks, TP feature
-negotiation, DP4A fallback, and runtime kill switch. No external WMMA patch is
-required.
+The historical row used a different prompt, so the raw +181.1% ratio is context
+rather than a controlled attribution. The final row is a controlled four-run
+alternating A/B against the preceding row. This distribution includes the
+complete gfx1151 Q4_K integer-WMMA MoE implementation for gate, up, and down
+projections, with capability checks, TP negotiation, DP4A fallback, and a kill
+switch; no external WMMA patch is required.
 
 The A/B used a 9,881-byte prompt, context 4,096, 30 deterministic generated
 tokens, DS4 TP=2, and OdinLink provider commit `8a77ccb`. Four alternating
@@ -149,6 +131,24 @@ The optimized summaries must report `"enabled":true`, nonzero
 `stream_calls`, and no unexplained fallback traffic. See [ODINLINK.md](ODINLINK.md)
 for the complete validation record and provider-isolation details.
 
+## Following canonical DS4 updates
+
+This fork records canonical DS4 commit `54b36ed` as its merge base and includes
+a safe update helper. It fetches upstream into a review branch and stops before
+committing or pushing:
+
+```sh
+git switch main
+git pull --ff-only origin main
+./scripts/prepare-upstream-sync.sh
+```
+
+See [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md) for conflict policy,
+validation gates, and the procedure for installing the same reviewed commit on
+both independent node filesystems.
+
+---
+
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
@@ -238,6 +238,8 @@ next sections.
   continuation vectors used for regression checks.
 - [ODINLINK.md](ODINLINK.md): validated two-node Strix Halo tensor-parallel
   setup, provider isolation, synchronization rules, and benchmark evidence.
+- [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md): safely merge canonical DS4
+  updates while preserving and revalidating the fork's TP/ROCm acceleration.
 
 ## Model Weights
 
