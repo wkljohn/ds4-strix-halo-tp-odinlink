@@ -1941,3 +1941,64 @@ __global__ static void grouped_q8_0_a_preq_warp8_kernel(
     acc = warp_sum_f32(acc);
     if (lane == 0) low[tok * low_dim + row] = acc;
 }
+
+/* Reuse each Q8_0 weight block across a small prompt-token tile.  This keeps
+ * the existing Q8 activation format and native DP4A arithmetic, but avoids
+ * rereading the complete projection weights once per token. */
+template <uint32_t TOK_TILE>
+__global__ static void grouped_q8_0_a_preq_toktile_warp8_kernel(
+        float *low,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t rank,
+        uint32_t n_groups,
+        uint32_t n_tokens,
+        uint64_t blocks) {
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t tok0 = (uint32_t)blockIdx.y * TOK_TILE;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    if (row >= low_dim || tok0 >= n_tokens) return;
+
+    const uint64_t group = row / rank;
+    const unsigned char *wr = w + row * blocks * 34u;
+    float acc[TOK_TILE];
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] = 0.0f;
+
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        const unsigned char *blk = wr + b * 34u;
+        const float wd = __half2float(*(const __half *)blk);
+        const int8_t *wq = (const int8_t *)(blk + 2u);
+        int32_t packed_w[8];
+#pragma unroll
+        for (uint32_t i = 0; i < 8u; i++) {
+            packed_w[i] = load_i8x4_i32_unaligned(wq + i * 4u);
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < TOK_TILE; u++) {
+            const uint32_t tok = tok0 + u;
+            if (tok < n_tokens) {
+                const uint64_t xb = ((uint64_t)tok * n_groups + group) * blocks + b;
+                const int8_t *q = xq + xb * 32u;
+                int32_t dot = 0;
+#pragma unroll
+                for (uint32_t i = 0; i < 8u; i++) {
+                    dot = __dp4a(packed_w[i], load_i8x4_i32_aligned(q + i * 4u), dot);
+                }
+                acc[u] += wd * xscale[xb] * (float)dot;
+            }
+        }
+    }
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; u++) acc[u] = warp_sum_f32(acc[u]);
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t u = 0; u < TOK_TILE; u++) {
+            const uint32_t tok = tok0 + u;
+            if (tok < n_tokens) low[(uint64_t)tok * low_dim + row] = acc[u];
+        }
+    }
+}

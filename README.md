@@ -4,7 +4,7 @@ This fork adds production two-node tensor parallelism for AMD Strix Halo
 (`gfx1151`) over OdinLink Thunderbolt RDMA while retaining DS4's Metal, CUDA,
 generic verbs, and non-TP paths. The low-memory default packed decode path
 reaches **13.83 generation tokens/s** on two Ryzen AI MAX+ 395 nodes, while a
-10,093-byte long-prompt run measured **101.32 prompt tokens/s**. Both results
+10,093-byte long-prompt run measured **138.97 prompt tokens/s**. Both results
 use the default direct-Q8 path with the Q8-to-F16 cache disabled.
 
 ```text
@@ -13,16 +13,23 @@ use the default direct-Q8 path with the Q8-to-F16 cache disabled.
     TP rank 0                                           TP rank 1
 ```
 
-| TP=2 default, Q8-to-F16 cache disabled | Workload | Prefill | Decode |
-|---|---|---:|---:|
-| Long-prompt run | 10,093-byte prompt, 30 generated tokens | **101.32 t/s** | 13.33 t/s |
-| Decode run | 300 generated tokens | 86.89 t/s | **13.83 t/s** |
+| TP=2, Q8-to-F16 cache disabled | Workload | Prefill | Decode | Prefill change |
+|---|---|---:|---:|---:|
+| Previous direct-Q8 default | 10,093-byte prompt, 30 generated tokens | 101.32 t/s | 13.33 t/s | baseline |
+| Current token-tiled direct Q8 | same prompt and generation | **138.97 t/s** | 13.32 t/s | **+37.2%** |
+| Current decode reference | 300 generated tokens | 86.89 t/s | **13.83 t/s** | independent workload |
 
-The workloads differ, so the rows are independent reference points rather
-than an A/B comparison. This distribution includes the
+The first two rows are a matched historical comparison; the decode-reference
+row is an independent workload. This distribution includes the
 complete gfx1151 Q4_K integer-WMMA MoE implementation for gate, up, and down
 projections, with capability checks, TP negotiation, DP4A fallback, and a kill
 switch; no external WMMA patch is required.
+
+The default Q8 attention-output prefill path also retains compact Q8 weights
+and activations. It reuses each weight block across 16 prompt tokens and emits
+native `v_dot4_i32` instructions, eliminating the former per-token reread
+without creating an expanded weight copy. Set
+`DS4_ROCM_ATTN_OUT_Q8_A_PREQ_TOKTILE=0` only for a diagnostic rollback.
 
 Q4_K remains packed four-bit model storage. On gfx1151 the kernel unpacks only
 the active tile into INT8 lanes and emits the native
@@ -96,7 +103,8 @@ The optimized Strix Halo TP settings are defaults in this fork: ROCm disables
 only the not-yet-production-safe attention row split, retains the useful FFN
 row split, uses registered-slab big gates, enables shape-checked gfx1151 Q4_K
 WMMA, enables a shape-checked packed Q8 attention-output projection for TP=2
-decode low and expansion stages, and enables provider WC streaming when
+decode low and expansion stages, reuses compact Q8 attention-output weights
+across prompt-token tiles, and enables provider WC streaming when
 `DS4_TP_VERBS_LIB` explicitly names OdinLink. The Q8-to-F16 weight cache is
 disabled by default because it consumed 9.85--9.91 GiB per rank and drove
 reported VRAM usage near 99%. Diagnostic kill switches remain available:
@@ -107,6 +115,7 @@ export DS4_ROCM_DISABLE_Q4K_WMMA=1
 export DS4_ROCM_DISABLE_ATTN_OUT_LOW_PACK4=1
 export DS4_ROCM_DISABLE_ATTN_OUT_EXPAND_PACK4=1
 export DS4_ROCM_DISABLE_ATTN_Q_B_PACK4=1
+export DS4_ROCM_ATTN_OUT_Q8_A_PREQ_TOKTILE=0
 export ODL_VERBS_WC_STREAM_COPY=0
 ```
 
@@ -120,13 +129,14 @@ configuration:
 export DS4_ROCM_ENABLE_Q8_F16_CACHE=1
 ```
 
-In a matched 300-token check, disabling the cache changed decode only from
-13.80 to 13.79 t/s, while prefill changed from 115.56 to 87.67 t/s. Therefore
-the low-memory direct-Q8 path is the default; enable the cache only when its
-prefill gain is worth the explicitly acknowledged memory cost.
-The new default also completed a 10,093-byte long-prompt check at 101.32
-prefill t/s and 13.33 decode t/s (30 generated tokens); the longer 300-token
-default decode check above is the more reliable decode reference.
+In the earlier matched 300-token check, disabling the cache changed decode
+only from 13.80 to 13.79 t/s, while prefill changed from 115.56 to 87.67 t/s.
+The token-tiled compact-Q8 path removes that reason to enable the cache: a
+later 10,093-byte run reached 138.97 prefill t/s and 13.32 decode t/s with no
+persistent cache. The longer 300-token default decode check above remains the
+more reliable decode reference. See
+[docs/Q8-COMPACT-PREFILL.md](docs/Q8-COMPACT-PREFILL.md) for the dispatch,
+ISA, profiler, correctness, and alternative-kernel record.
 
 Start both roles immediately so their independent model loads run in parallel;
 do not wait for the coordinator to finish loading or open port 5599 first:

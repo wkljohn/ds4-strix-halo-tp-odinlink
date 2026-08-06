@@ -1334,17 +1334,33 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                 group_dim,
                                                 blocks_a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
-        dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
-        grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
-                                                          out_a,
-                                                          xq,
-                                                          xscale,
-                                                          group_dim,
-                                                          rank,
-                                                          n_groups,
-                                                          n_tokens,
-                                                          blocks_a,
-                                                          use_dp4a);
+        if (cuda_runtime_config()->attention_output_q8_a_preq_toktile &&
+            (group_dim & 31u) == 0u && n_tokens >= 8u) {
+            dim3 grid_a(((unsigned)low_dim + 7u) / 8u,
+                        ((unsigned)n_tokens + 15u) / 16u,
+                        1u);
+            grouped_q8_0_a_preq_toktile_warp8_kernel<16u><<<grid_a, 256>>>(
+                    (float *)low->ptr,
+                    out_a,
+                    xq,
+                    xscale,
+                    rank,
+                    n_groups,
+                    n_tokens,
+                    blocks_a);
+        } else {
+            dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
+            grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
+                                                              out_a,
+                                                              xq,
+                                                              xscale,
+                                                              group_dim,
+                                                              rank,
+                                                              n_groups,
+                                                              n_tokens,
+                                                              blocks_a,
+                                                              use_dp4a);
+        }
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
     }
 

@@ -4751,6 +4751,7 @@ struct ds4_rocm_runtime_config {
     int disable_splitk_attn_out_low;
     int disable_shared_gate_up_fused_w32;
     int attention_output_cublas_all;
+    int attention_output_q8_a_preq_toktile;
     int shared_down_cublas;
     int glm_grouped_value_project;
     int glm_grouped_qk_low;
@@ -4769,6 +4770,13 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
+        const char *attention_output_q8_a_preq_toktile_env =
+            getenv("DS4_ROCM_ATTN_OUT_Q8_A_PREQ_TOKTILE");
+        /* Token reuse is the validated low-memory prefill path.  Preserve an
+         * explicit =0 rollback for architecture and correctness bisects. */
+        g_rocm_cfg.attention_output_q8_a_preq_toktile =
+            attention_output_q8_a_preq_toktile_env == NULL ||
+            cuda_env_present(attention_output_q8_a_preq_toktile_env);
         g_rocm_cfg.shared_down_cublas = !g_quality_mode;
         const char *glm_grouped_value_project_env =
             getenv("DS4_ROCM_GLM_GROUPED_VALUE_PROJECT");
