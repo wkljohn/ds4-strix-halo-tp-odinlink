@@ -48,7 +48,7 @@ the actual file rather than reasoned about.
 ## Checkpoint evidence (read from the GGUF header, no VRAM)
 
 `scripts/gguf_tensor_types.py` on both local variants of
-Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF:
+DeepSeek V4 Flash Q4_K:
 
     Q4_K   variant: F32 492, F16 359, Q8_0 345, Q4_K  129, I32 3
     mxfp4  variant: F32 492, F16 359, Q8_0 345, MXFP4 129, I32 3

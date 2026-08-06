@@ -6,7 +6,7 @@ we actually run. Different quantisation, different byte counts, different
 conclusion. Recomputed directly from our own GGUF header below; the components
 sum exactly to the 153.32 GiB file total, so they are self-consistent.
 
-## Corrected numbers - Huihui-DeepSeek-V4-Flash-0731-abliterated Q4_K
+## Corrected numbers - DeepSeek V4 Flash Q4_K
 
 | component | total | streamed per token |
 |---|---|---|

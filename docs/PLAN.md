@@ -1,6 +1,6 @@
 # Plan: ds4 tensor parallelism on 2x AMD Strix Halo over OdinLink RDMA
 
-**Target:** `huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF` served
+**Target:** DeepSeek V4 Flash Q4_K served
 TP=2 across two gfx1151 nodes, DSpark speculative decoding on, RCCL-free
 point-to-point RDMA over Thunderbolt 5 (OdinLink).
 
@@ -199,10 +199,8 @@ Both fit two 96 GiB carves. Neither fits one.
 2. **wave32 correctness of the grouped attention kernel (B1).** Silent
    corruption that passes smoke tests. Mitigated by unit tests + answer-key/needle
    gates, all of which need no reference stack.
-3. **Abliterated-model drafter mismatch.** Prior finding in this lab: a
-   base-model MTP drafter did **not** transfer to an abliterated trunk. This
-   checkpoint is abliterated. DSpark acceptance must be *measured*; if it
-   collapses, TP still stands on its own.
+3. **Draft-model compatibility.** MTP acceptance must be measured against the
+   exact trunk checkpoint; TP remains useful if acceptance is too low.
 4. **ROCm one-GPU-per-process** (`ds4_rocm_compat.cu:21`). Not a problem — one
    GPU per node is exactly our topology.
 

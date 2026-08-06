@@ -1,0 +1,50 @@
+/* Shared graph code references CUDA-only fused and multi-device hooks even
+ * when ROCm validation guarantees that those paths cannot be selected.  Keep
+ * the unavailable surface in one place.  These C-linkage stubs intentionally
+ * accept any argument list because they never inspect their arguments. */
+
+#include <stdint.h>
+
+#include <stdio.h>
+/* DS4-TP-gfx1151 (diag): these stubs return 0 SILENTLY, which is
+ * indistinguishable from a genuine validation failure. Announce once per
+ * symbol so a decode failure names the missing entry point instead of
+ * requiring one-by-one instrumentation. */
+#define ROCM_UNAVAILABLE_INT(name) \
+    extern "C" int name(...) { \
+        static int warned = 0; \
+        if (!warned) { warned = 1; \
+            fprintf(stderr, "ds4: ROCm UNAVAILABLE STUB CALLED: " #name "\n"); } \
+        return 0; \
+    }
+
+ROCM_UNAVAILABLE_INT(ds4_gpu_add_xdev_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_attention_decode_rows_rope_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_attention_noncausal_raw_batch_heads_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_attention_output_low_q4_K_slice_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_attention_output_low_q8_rows_exact_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_attention_output_q4_K_batch_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_device_cache_support_tensors)
+ROCM_UNAVAILABLE_INT(ds4_gpu_device_cache_tensors)
+ROCM_UNAVAILABLE_INT(ds4_gpu_dspark_markov_argmax_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_indexer_top1_value_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_kv_fp8_store_raw_decode_rows_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor)
+/* DS4-TP-gfx1151 (patch 10): implemented in rocm/ds4_rocm_matmul.cuh */
+ROCM_UNAVAILABLE_INT(ds4_gpu_matmul_q8_0_top1_tensor)
+/* DS4-TP-gfx1151 (patch 14): implemented in rocm/ds4_rocm_matmul.cuh */
+ROCM_UNAVAILABLE_INT(ds4_gpu_moe_handoff_pack_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_register_model_map_no_copy)
+ROCM_UNAVAILABLE_INT(ds4_gpu_register_support_map)
+ROCM_UNAVAILABLE_INT(ds4_gpu_rope_tail_decode_rows_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_batch_owned_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_one_owned_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_owned_packed_combine_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_owned_slots_combine_rows_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_owned_slots_combine_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_shared_down_hc_expand_add_q8_0_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor)
+ROCM_UNAVAILABLE_INT(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor)
+
+extern "C" uint64_t ds4_gpu_tp_big_gate_kick(...) { return 0; }
+ROCM_UNAVAILABLE_INT(ds4_gpu_tp_big_gate_wait)

@@ -6,7 +6,7 @@
     ds4: prefill: 32.15 t/s, generation: 7.43 t/s
 
 Coherent English, correct answer, no stubs called, no Metal-only paths, no errors
-on either rank. DeepSeek-V4-Flash-0731-abliterated Q4_K (153 GiB) across two
+on either rank. DeepSeek V4 Flash Q4_K (153 GiB) across two
 Strix Halo gfx1151 nodes, 80.76 GiB resident per rank, TCP transport.
 
 The repetition after the answer is not a defect: this is a raw completion with no

@@ -186,10 +186,9 @@ already has a complete reference kernel with a CPU-verification mode
 (`ds4_cuda.cu:13500-13621`) - this is a bounded HIP port of existing logic,
 not new kernel research. Realistic expectation from this project's own
 llama.cpp precedent on the same checkpoint/hardware: **~11% uplift**
-(15 -> 16.6 t/s), not a multiplicative jump - and a base-model drafter is
-already documented as not transferring well to this abliterated trunk
-(`PLAN.md:202-205`), so acceptance rate must be measured before assuming
-any of that 11% carries over here. When this task starts, do it after
+(15 -> 16.6 t/s), not a multiplicative jump. Acceptance rate must be measured
+against the exact trunk before assuming any of that 11% carries over here.
+When this task starts, do it after
 Stage 0-1 above, since a faster greedy baseline makes any DSpark
 accept/reject economics easier to read.
 
