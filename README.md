@@ -3,9 +3,9 @@
 This fork adds production two-node tensor parallelism for AMD Strix Halo
 (`gfx1151`) over OdinLink Thunderbolt RDMA while retaining DS4's Metal, CUDA,
 generic verbs, and non-TP paths. The low-memory default packed decode path
-reaches **13.79 generation tokens/s** on two Ryzen AI MAX+ 395 nodes. The
-published **138.78 prompt tokens/s** reference used the optional, memory-heavy
-Q8-to-F16 prefill cache described below; that cache is not enabled by default.
+reaches **13.83 generation tokens/s** on two Ryzen AI MAX+ 395 nodes, while a
+10,093-byte long-prompt run measured **101.32 prompt tokens/s**. Both results
+use the default direct-Q8 path with the Q8-to-F16 cache disabled.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
@@ -13,19 +13,13 @@ Q8-to-F16 prefill cache described below; that cache is not enabled by default.
     TP rank 0                                           TP rank 1
 ```
 
-| TP=2 generation | Workload | Prefill | Gain from prior | Decode | Gain from prior |
-|---|---:|---:|---:|---:|---:|
-| Pre-Q4_K-WMMA ROCm (`4b35010`) | 1,023 tokens | 34.11 t/s | — | — | — |
-| Current fork, provider-copy baseline | 9,881 bytes | 95.89 t/s | +181.1% (raw) | 9.96 t/s | — |
-| Current fork, optimized OdinLink | 9,881 bytes | **138.78 t/s** | **+44.7%** | **11.23 t/s** | **+12.8%** |
-| + packed gfx1151 Q8 decode projection | 9,881-byte prefill / 1,000-token decode | **139.61 t/s** | no regression | **11.78 t/s** | **+5.7% paired** |
-| + packed Q8 decode expansion | 1,000-token decode | decode-only dispatch | — | **12.93 t/s** | **+8.4% paired** |
-| + packed Q8 Q-B projection | 1,000-token decode | decode-only dispatch | — | **13.48 t/s** | **+4.3% stability** |
+| TP=2 default, Q8-to-F16 cache disabled | Workload | Prefill | Decode |
+|---|---|---:|---:|
+| Long-prompt run | 10,093-byte prompt, 30 generated tokens | **101.32 t/s** | 13.33 t/s |
+| Decode run | 300 generated tokens | 86.89 t/s | **13.83 t/s** |
 
-The historical row used a different prompt, so the raw +181.1% ratio is context
-rather than a controlled attribution. The optimized-OdinLink row is a
-controlled four-run alternating A/B against the preceding row. This
-distribution includes the
+The workloads differ, so the rows are independent reference points rather
+than an A/B comparison. This distribution includes the
 complete gfx1151 Q4_K integer-WMMA MoE implementation for gate, up, and down
 projections, with capability checks, TP negotiation, DP4A fallback, and a kill
 switch; no external WMMA patch is required.
@@ -36,26 +30,11 @@ the active tile into INT8 lanes and emits the native
 scale/minimum metadata. It does not maintain a persistent expanded INT8 or
 FP16 weight copy.
 
-The prefill A/B used a 9,881-byte prompt, context 4,096, 30 deterministic generated
-tokens, DS4 TP=2, and OdinLink provider commit `8a77ccb`. Four alternating
-runs produced byte-identical generated output. The provider optimization is
-explicit and does not enter the Mellanox path: without `DS4_TP_VERBS_LIB`, DS4
-loads system `libibverbs` directly and keeps the generic message policy.
-Those historical prefill runs enabled the Q8-to-F16 cache that was formerly
-automatic. Current default inference does not allocate it.
-
-The decode row is a separate direct kill-switch comparison: 11.15 t/s with
-the original low projection and 11.78 t/s with the packed kernel. The hardened
-default completed a further 1,000-token stability run at 11.93 t/s, but that
-unpaired observation is not used for the percentage. Its long-prompt prefill
-check confirms that the one-token-only dispatch does not regress prefill.
-The packed expansion used the same 1,000-token prompt for its 11.93 to 12.93
-t/s comparison. A separate 10,093-byte long-prompt check completed at 136.38
-t/s under accumulated page-warm pressure; it is a stability check on a
-different prompt, not a replacement for the published 138.78 median. The
-packed Q-B projection measured 12.72 to 13.34 t/s in its same-binary profiled
-control/candidate comparison and completed the unprofiled 1,000-token run at
-13.48 t/s. It is also one-token-only and cannot enter the prefill dispatch.
+Both listed runs used context 4,096, deterministic generation, DS4 TP=2, and
+the optimized OdinLink provider. The provider optimization is explicit and
+does not enter the Mellanox path: without `DS4_TP_VERBS_LIB`, DS4 loads system
+`libibverbs` directly and keeps the generic message policy. Current default
+inference does not allocate the Q8-to-F16 cache.
 
 ## Reproduce the Strix Halo setup
 
