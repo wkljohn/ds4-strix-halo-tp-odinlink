@@ -14,48 +14,24 @@ reuse and a coalesced Q4_K MoE epilogue.
     TP rank 0                                           TP rank 1
 ```
 
-| Cache-free TP=2 generation | Workload | Prefill | Gain from previous generation |
-|---|---|---:|---:|
-| Before gfx1151 Q4_K WMMA | 1,023 prompt tokens | 34.11 t/s | baseline |
-| Previous direct-Q8 default | 10,093-byte prompt, 30 generated tokens | 101.32 t/s | different prompt; scale reference |
-| Compact-Q8 token reuse | same 10,093-byte prompt and generation | 138.97 t/s | +37.2% |
-| Current coalesced MoE epilogue | same prompt, 300-token validation | **167.73 t/s** | **+21.3% in matched 138.24 t/s rollback A/B** |
+| Cache-free TP=2 generation | Workload | Prefill | Decode | Prefill gain |
+|---|---|---:|---:|---:|
+| Before gfx1151 Q4_K WMMA | 1,023 prompt tokens | 34.11 t/s | — | baseline |
+| Previous direct-Q8 default | 10,093-byte prompt, 30 generated tokens | 101.32 t/s | 13.33 t/s | different-prompt scale reference |
+| Compact-Q8 token reuse | same prompt and generation | 138.97 t/s | 13.32 t/s | +37.2% |
+| **Current cache-free default** | same long prompt; 300-token decode validation | **167.73 t/s** | **13.83 t/s** | **+21.3% in matched rollback A/B** |
 
-The 34.11 t/s checkpoint predates Q4_K WMMA and uses a shorter prompt, so it is
-historical scale rather than a direct A/B. The current kernel was measured
-against its rollback using the same final binary; both 300-token outputs were
-byte-identical. Decode is deliberately excluded from this table: the new
-epilogue runs only when a batch has at least eight tokens, while the independent
-long-run decode reference remains **13.83 t/s**. This distribution includes the
-complete gfx1151 Q4_K integer-WMMA MoE implementation for gate, up, and down
-projections, with capability checks, TP negotiation, DP4A fallback, and a kill
-switch; no external WMMA patch is required.
+The current default requires no 10 GiB-per-node expanded-weight cache and adds
+no persistent memory over the compact model path. The prefill and decode
+figures use deterministic TP=2 runs; the longer decode reference was measured
+independently, and the matched 300-token default/rollback outputs were
+byte-identical.
 
-The default Q8 attention-output prefill path also retains compact Q8 weights
-and activations. It reuses each weight block across 16 prompt tokens and emits
-native `v_dot4_i32` instructions, eliminating the former per-token reread
-without creating an expanded weight copy. Set
-`DS4_ROCM_ATTN_OUT_Q8_A_PREQ_TOKTILE=0` only for a diagnostic rollback.
-
-The routed Q4_K gate/up epilogue assigns adjacent expert rows to adjacent GPU
-threads during prefill. This removed a serial, wave-strided memory walk and
-reduced that kernel from 3.779 s to 0.086 s in the 43-layer trace. It is gated
-out of decode, allocates no persistent memory, and can be rolled back with
-`DS4_ROCM_MOE_GATE_UP_EPILOGUE_COALESCED=0`. See
-[docs/MOE-EPILOGUE-PREFILL.md](docs/MOE-EPILOGUE-PREFILL.md) for the staged
-test and profiler evidence.
-
-Q4_K remains packed four-bit model storage. On gfx1151 the kernel unpacks only
-the active tile into INT8 lanes and emits the native
-`v_wmma_i32_16x16x16_iu8` instruction, then applies the original Q4_K
-scale/minimum metadata. It does not maintain a persistent expanded INT8 or
-FP16 weight copy.
-
-Both listed runs used context 4,096, deterministic generation, DS4 TP=2, and
-the optimized OdinLink provider. The provider optimization is explicit and
-does not enter the Mellanox path: without `DS4_TP_VERBS_LIB`, DS4 loads system
-`libibverbs` directly and keeps the generic message policy. Current default
-inference does not allocate the Q8-to-F16 cache.
+All Strix Halo acceleration is included in this fork—no external kernel patch
+is required. OdinLink-specific provider tuning is used only when its provider
+is selected; Mellanox and other standard verbs devices retain the generic
+transport path. Detailed kernel and validation reports are under
+[`docs/`](docs/).
 
 ## Reproduce the Strix Halo setup
 
