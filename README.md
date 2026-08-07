@@ -14,7 +14,7 @@ single-node modes.
 | Cache-free TP=2 generation | Workload | Prefill | Decode | Recorded change |
 |---|---|---:|---:|---:|
 | Original baseline | before gfx1151 acceleration | **34.11 t/s** | **9.96 t/s** | baseline |
-| **Current cache-free default** | same long prompt; 300-token decode validation | **167.73 t/s** | **13.83 t/s** | **+391.7% prefill / +38.9% decode vs original** |
+| **Current optimization** | same long prompt; 300-token decode validation | **167.73 t/s** | **13.83 t/s** | **+391.7% prefill / +38.9% decode vs original** |
 
 The current default requires no 10 GiB-per-node expanded-weight cache and adds
 no persistent memory over the compact model path. The prefill and decode
