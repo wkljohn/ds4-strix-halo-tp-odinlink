@@ -266,6 +266,61 @@ it needs candidate slack a chain drafter at α=0.955 does not have, and EcoSpec'
 DeepSeek result is only 1.15x on favourable hardware. **Skip trees and routing-biased
 drafting.**
 
+## 3.4 MEASURED: baseline and chain-cycles on the current build (2026-08-07)
+
+Both measured with `run-dspark-bench.sh`, three identical `/reset` repetitions in one
+loaded process, on the build with the DP4A launch reverted to 8 waves / 256 threads.
+Logs in `research-results/dspark-17tps-2026-08-07/`.
+
+| | baseline | chain-cycles |
+|---|---:|---:|
+| t/s (runs) | 15.01 / 15.04 / 15.18 | 14.65 / 14.32 / 14.50 |
+| **warm median** | **15.11** | **14.41** |
+| cycles (60 tokens) | 12 | 17 |
+| cycle time | 328 ms | **243 ms (-26%)** |
+| anchor | 70 ms | 25 ms |
+| propose | 26 ms | 26 ms |
+| verify | 232 ms | 190 ms |
+| tokens/cycle | 5.00 | **3.53** |
+| accept_rate | 85.71% | **72.00%** |
+| avg_accept | 4.00 | 3.18 |
+| `miss_first` | **0** | **3** |
+| accepted_len_hist | 1:2,3:1,4:2,5:7 | **0:3**,1:2,2:2,4:2,5:8 |
+
+**The DP4A revert is validated.** 15.11 warm median versus the handover's 14.88, and
+the spread collapses from the rejected 16-wave build's 11.86-15.03 to 0.17.
+
+**Three conclusions on chaining, all decisive:**
+
+1. **The old 6.56 t/s verdict was invalid**, as §3.1 predicted. Chaining measures 14.41
+   on the current build.
+2. **The restructure delivers its predicted time saving in full** — better, in fact.
+   Cycle time falls 328 -> 243 ms, beating both my byte-model estimate (259 ms) and
+   Fable's affine estimate (~260 ms). The anchor genuinely collapses, 70 -> 25 ms.
+3. **It is entirely cancelled by acceptance collapse, and Fable's hypothesis is
+   confirmed by the smoking gun**: `miss_first` goes 0 -> 3 and `accepted_len_hist`
+   gains a `0:3` bucket. The drafter's *first* token now disagrees with the target in
+   3 of 17 cycles (18%) when it previously never did. Per §3.1 this is drafter-seed
+   fidelity: the drafter consumes verifier-batch capture states while its statistics
+   were built against single-token-path captures.
+
+`metal_graph_dspark_capture_prepare_chain` (`ds4.c:26422`) is pure bookkeeping — it
+only adjusts counters and recomputes nothing, so the drafter consumes the verifier's
+captured hidden states directly. Note the deliberate off-by-one versus the non-chain
+sibling: the non-chain path sets `dspark_capture_batch_tokens = accepted_tokens + 1`
+(`ds4.c:26417`) while chain sets `= accepted_tokens` (`ds4.c:26436`), with both setting
+the same `checkpoint_len`. Whether that is the correct seed row is unverified and is a
+prime suspect alongside batch-kernel numerics.
+
+**This makes seed fidelity the single highest-value lever, ahead of the head split.**
+At the measured 243 ms/cycle:
+
+| tokens/cycle | t/s | note |
+|---:|---:|---|
+| 3.53 | 14.5 | today, chain mode |
+| **4.13** | **17.0** | **gate — needs ~60% of the lost acceptance back** |
+| 5.00 | 20.6 | full baseline acceptance restored |
+
 ## 4. The instrumentation gap
 
 `verify_layer` is 99.9% of `verify` with no internal breakdown, so §2.2's "102 ms of
@@ -295,7 +350,63 @@ verifier's router output would settle whether the 5-row union is 30 (independent
 closer to 18-20 (correlated routing), which decides whether cross-row expert dedup is
 worth anything.
 
-## 5. Ranked paths to >17 t/s
+## 5a. WHAT ACTUALLY HAPPENED — read this before §5
+
+§5 below was written BEFORE any of it was measured. **Most of it is now falsified.**
+Kept for the reasoning trail; the measured record is
+`research-results/dspark-17tps-2026-08-07/EXPERIMENT-LOG.md`.
+
+| §5 rank | lever | predicted | MEASURED | verdict |
+|---:|---|---:|---:|---|
+| 1 | TP attention head split | ~17.8 | **13.00** | falsified |
+| 2 | anchorless chaining | ~16.8 | **14.41** | falsified |
+| 1+2 | both | ~18.4 | **12.16** | falsified |
+| — | chain + preserve-cache | — | 12.91 | closed |
+| — | chain + two-context | — | 12.07 | closed |
+| — | **baseline (unbeaten)** | — | **15.11-15.15** | |
+
+**Two prediction errors worth recording:**
+
+1. **The head split's byte saving was overestimated ~4x.** I assumed all 5.49 GiB of
+   attention+indexer+compressor would halve. Only `attn_q_b` is splittable —
+   0.71 GiB/node, ~4.7%. Worse, the added per-layer big-gate exchange costs MORE than
+   that, so verify time rose. This rig's gate exchange is expensive enough that **any
+   lever paying an extra exchange must have its saving verified tensor-by-tensor
+   before implementation.**
+
+2. **The anchor forward is not wasted work here** — the deepest error, and it
+   invalidates §3.3's whole premise.
+
+   | | cost | tokens | ms/token |
+   |---|---:|---:|---:|
+   | anchor (1-row forward) | 70 ms | 1.00 guaranteed | **70** |
+   | verifier marginal drafts | 232 ms | 4.00 accepted | **58** |
+
+   Nearly equal. Removing the anchor cuts cycle time 26% but removes ~20% of the
+   tokens per cycle — they cancel before any acceptance penalty. The EAGLE-2/3,
+   Medusa, DeepSeek-MTP and vLLM-v1 argument that a standalone anchor pass is
+   structural waste assumes the anchor is pure overhead. On this rig the target
+   forward is bandwidth/compute-bound enough that a 1-row pass is nearly as
+   token-efficient as the verifier's marginal rows. **Transferring that assumption
+   without checking the local arithmetic cost four runs.**
+
+   Note the acceptance problem itself WAS solved: two-context recovered 67% of the gap
+   (72.00 -> 81.16%) and eliminated `miss_first` entirely. It still lost, because the
+   fix cost +25 ms/cycle. That is the cleanest possible demonstration that the branch
+   is structurally unprofitable, not merely buggy.
+
+**Also falsified — but conditionally:** §3.2's "width sweeps are dead" holds only at
+the measured p~=0.93 (top-k 4). At p~=0.97 the curve rises (w=6 -> 17.3, w=8 -> 17.7).
+Top-k and width are NOT independent, and width was swept at the wrong top-k. The
+drafter's own trained default is top-k **6**; every prior run used 4 (24 logs) or 2
+(1 log). Top-k 6 had never been tested.
+
+**Still true and untouched:** §2.2A, the expert-path efficiency collapse — 61% of
+roofline at 6 token/expert pairs vs **24% at 30**, ~102 ms/cycle. Every cheap knob
+into it is now closed (`SORTED_MIN_TOKENS=2` measured 5-11% worse pre-DP4A). It needs
+the §4 instrumentation, then a new small-batch Q4_K kernel.
+
+## 5. Ranked paths to >17 t/s (PRE-MEASUREMENT — see §5a)
 
 | # | path | est. cycle effect | est. t/s | risk | notes |
 |---:|---|---:|---:|---|---|
