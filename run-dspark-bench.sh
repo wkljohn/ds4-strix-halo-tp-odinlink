@@ -32,7 +32,15 @@ COMMON_ENV=(
   DS4_TP_EXPERT_SPLIT=118
   DS4_ROCM_TP_SKIP_UNOWNED=1
   DS4_DSPARK_SCHEDULER=0
-  DS4_DSPARK_SUPPORT_TOPK=4
+  # 6 is the support model's TRAINED default, not a tuned value. The handover's
+  # standard config specified 4, which silently overrode the drafter BELOW what it
+  # was trained for and cost ~10pp of acceptance. Measured 2026-08-07:
+  #   top-k 4 -> accept 85.71%, avg_accept 4.00, 12 cycles/60 tok, 15.11 t/s
+  #   top-k 6 -> accept 96.08%, avg_accept 4.455, 11 cycles/60 tok, 16.17 t/s
+  # Every run's own banner had been printing "trained/default top-k=6" the whole
+  # time. Only 4 (24 runs) and 2 (1 run) had ever been tested.
+  # metal_graph_dspark_support_topk() returns DS4_N_EXPERT_USED (=6) when unset.
+  DS4_DSPARK_SUPPORT_TOPK=6
   DS4_DSPARK_MAX_DRAFT_TOKENS=5
   DS4_DSPARK_STATS=1
   DS4_ROCM_Q8_SMALL_BATCH_TILE=1
