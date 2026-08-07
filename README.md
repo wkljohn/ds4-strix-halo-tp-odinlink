@@ -1,12 +1,9 @@
 # DS4 Strix Halo TP over OdinLink
 
-This fork adds production two-node tensor parallelism for AMD Strix Halo
-(`gfx1151`) over OdinLink Thunderbolt RDMA while retaining DS4's Metal, CUDA,
-generic verbs, and non-TP paths. The low-memory default packed decode path
-reaches **13.83 generation tokens/s** on two Ryzen AI MAX+ 395 nodes, while a
-10,093-byte long-prompt run measured **167.73 prompt tokens/s**. Both results
-use the cache-free defaults; the prefill result includes compact-Q8 token
-reuse and a coalesced Q4_K MoE epilogue.
+Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
+Thunderbolt RDMA. The cache-free defaults deliver **167.73 t/s prefill** and
+**13.83 t/s decode**, while preserving DS4's Metal, CUDA, generic verbs, and
+single-node modes.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
