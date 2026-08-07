@@ -18,9 +18,6 @@ reuse and a coalesced Q4_K MoE epilogue.
 |---|---|---:|---:|---:|
 | Before gfx1151 Q4_K WMMA | 1,023 prompt tokens | 34.11 t/s | — | baseline |
 | Original OdinLink baseline | two-node provider baseline | 95.89 t/s | **9.96 t/s** | pre-acceleration baseline |
-| Optimized OdinLink transfer | four-run alternating median | 138.78 t/s | 11.23 t/s | +44.7% prefill / +12.8% decode |
-| Previous direct-Q8 default | 10,093-byte prompt, 30 generated tokens | 101.32 t/s | 13.33 t/s | different-prompt scale reference |
-| Compact-Q8 token reuse | same prompt and generation | 138.97 t/s | 13.32 t/s | +37.2% |
 | **Current cache-free default** | same long prompt; 300-token decode validation | **167.73 t/s** | **13.83 t/s** | **+21.3% matched prefill / +38.9% decode vs original** |
 
 The current default requires no 10 GiB-per-node expanded-weight cache and adds
