@@ -350,6 +350,89 @@ __global__ static void matmul_f16_pair_five_row_kernel(
     }
 }
 
+/* DeepSeek V4 Flash HC control projection for the five-row DSpark verifier.
+ * The matrix is only 16384x24, so the generic skinny hipBLAS GEMM is dominated
+ * by setup and under-utilization.  One 256-thread block cooperates on each
+ * output row and reuses every F16 weight across all five activation rows.
+ * Twenty-four blocks provide substantially more parallelism than adapting the
+ * compressor kernel's eight-output-row block layout to this tiny output. */
+template <uint32_t TOKENS>
+__global__ static void matmul_f16_hc_five_row_kernel(
+        float *out,
+        const __half *w,
+        const __half *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (row >= out_dim) return;
+
+    float acc[TOKENS] = {0.0f};
+    const __half *wr = w + (uint64_t)row * in_dim;
+    for (uint32_t k = tid; k < in_dim; k += blockDim.x) {
+        const float fw = __half2float(wr[k]);
+#pragma unroll
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            acc[t] = fmaf(fw,
+                          __half2float(x[(uint64_t)t * in_dim + k]),
+                          acc[t]);
+        }
+    }
+
+    enum { WARPS = 8 };
+    __shared__ float partial[TOKENS][WARPS];
+#pragma unroll
+    for (uint32_t t = 0; t < TOKENS; t++) {
+        acc[t] = warp_sum_f32(acc[t]);
+        if (lane == 0u) partial[t][warp] = acc[t];
+    }
+    __syncthreads();
+
+    if (warp == 0u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            float v = lane < WARPS ? partial[t][lane] : 0.0f;
+            v = warp_sum_f32(v);
+            if (lane == 0u) {
+                out[(uint64_t)t * out_dim + row] = v;
+            }
+        }
+    }
+}
+
+/* Independent token/output reductions for the same HC shape.  This rereads
+ * each weight row for every token but exposes 120 blocks, avoids hipBLAS
+ * setup, and provides a second reduction order for numerical-path testing. */
+__global__ static void matmul_f16_hc_token_block_kernel(
+        float *out,
+        const __half *w,
+        const __half *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tok = blockIdx.y;
+    float sum = 0.0f;
+    const __half *wr = w + (uint64_t)row * in_dim;
+    const __half *xr = x + (uint64_t)tok * in_dim;
+    for (uint32_t k = threadIdx.x; k < in_dim; k += blockDim.x) {
+        sum = fmaf(__half2float(wr[k]), __half2float(xr[k]), sum);
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        out[(uint64_t)tok * out_dim + row] = partial[0];
+    }
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,

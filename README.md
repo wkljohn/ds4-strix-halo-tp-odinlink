@@ -386,6 +386,14 @@ free. Predictable continuations, especially code, tend to benefit most;
 low-yield prompts can be no faster or even slower. DSpark is therefore still
 experimental and explicitly opt-in.
 
+On the reference two-node Strix Halo/OdinLink setup, the current five-row
+DSpark path measured **20.31 generation tokens/s** as a controlled 60-token
+median at 96.08% acceptance. A 300-token, context-512 qualification measured
+**16.06 tokens/s** median versus 14.82 tokens/s with the newest HC projection
+disabled. Speculative throughput varies with acceptance and prompt trajectory,
+so these workloads are reported separately rather than blended into the
+non-DSpark table above. The kernel adds no persistent VRAM.
+
 The released DSpark checkpoint is packaged here as a separate support GGUF of
 about 5.6 GiB. It is not a standalone model. Download it once:
 

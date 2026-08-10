@@ -125,6 +125,45 @@ static int f16_pair_five_row_enabled(void) {
     return enabled && gfx1151;
 }
 
+static int f16_hc_five_row_enabled(void) {
+    static int enabled = -1;
+    static int gfx1151;
+    if (enabled < 0) {
+        const char *disable = getenv("DS4_ROCM_DISABLE_F16_HC_FIVE_ROW");
+        enabled = !(disable && strcmp(disable, "1") == 0);
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+            gfx1151 = strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return enabled && gfx1151;
+}
+
+static int f16_hc_five_row_mode(void) {
+    if (!f16_hc_five_row_enabled()) return 0;
+    static int mode = -1;
+    if (mode < 0) {
+        const char *value = getenv("DS4_ROCM_F16_HC_FIVE_ROW_MODE");
+        /* Independent token reductions were both slightly faster in the
+         * cold-weight oracle and materially more stable for DSpark acceptance
+         * than cross-token accumulation. Keep reuse as an experiment only. */
+        mode = 2;
+        if (value && strcmp(value, "reuse") == 0) {
+            mode = 1;
+        } else if (value && strcmp(value, "token") != 0) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "unsupported DS4_ROCM_F16_HC_FIVE_ROW_MODE=%s; using token\n",
+                    value);
+        }
+    }
+    return mode;
+}
+
 static void cuda_launch_q8_batch_sharedx(
         float *out,
         const unsigned char *w,
@@ -1007,6 +1046,29 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
     const int ordered_decode = n_tok == 1u;
+    const int hc5_shape = n_tok == 5u && in_dim == 16384u && out_dim == 24u;
+    const int hc5_mode = hc5_shape ? f16_hc_five_row_mode() : 0;
+    const int hc5_selected = hc5_mode != 0 &&
+        !g_quality_mode && !cuda_runtime_config()->graph_dump;
+    if (hc5_selected) {
+        const uint64_t xh_count = n_tok * in_dim;
+        __half *xh = (__half *)cuda_tmp_alloc(
+                xh_count * sizeof(__half), "f16 HC five-row activations");
+        if (!xh) return 0;
+        f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(
+                xh, (const float *)x->ptr, xh_count);
+        if (!cuda_ok(cudaGetLastError(), "f16 HC five-row conversion launch")) return 0;
+        if (hc5_mode == 2) {
+            matmul_f16_hc_token_block_kernel<<<dim3(24u, 5u), 256u>>>(
+                    (float *)out->ptr, w, xh,
+                    (uint32_t)in_dim, (uint32_t)out_dim);
+        } else {
+            matmul_f16_hc_five_row_kernel<5u><<<24u, 256u>>>(
+                    (float *)out->ptr, w, xh,
+                    (uint32_t)in_dim, (uint32_t)out_dim);
+        }
+        return cuda_ok(cudaGetLastError(), "f16 HC five-row launch");
+    }
     if (g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");

@@ -27405,6 +27405,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                     metal_graph_batch_cur_hc(g),
                                                     hc_dim,
                                                     n_tokens);
+    DS4_METAL_PROFILE_ATTN_STAGE("hc_project");
     if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
@@ -27450,11 +27451,11 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_N_HC_SINKHORN_ITER,
                                                             DS4_HC_EPS) != 0;
     }
+    DS4_METAL_PROFILE_ATTN_STAGE("hc_split_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_pre", metal_graph_batch_attn_cur(g),
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
-    DS4_METAL_PROFILE_ATTN_STAGE("hc_pre");
     if (ok && !fuse_hc_norm) {
         ok = ds4_gpu_rms_norm_weight_rows_tensor(metal_graph_batch_attn_norm(g),
                                                   metal_graph_batch_attn_cur(g),
@@ -29237,6 +29238,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                     metal_graph_batch_after_attn_hc(g),
                                                     hc_dim,
                                                     n_tokens);
+    DS4_METAL_PROFILE_FFN_STAGE("hc_project");
     if (metal_graph_use_reference_hc_decode()) {
         if (ok) ok = ds4_gpu_hc_split_sinkhorn_tensor(hc_split_view,
                                                         hc_mix_view,
@@ -29282,11 +29284,11 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                             DS4_N_HC_SINKHORN_ITER,
                                                             DS4_HC_EPS) != 0;
     }
+    DS4_METAL_PROFILE_FFN_STAGE("hc_split_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre", metal_graph_batch_ffn_cur(g),
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
-    DS4_METAL_PROFILE_FFN_STAGE("hc_pre");
     if (ok && !fuse_hc_norm) {
         ok = ds4_gpu_rms_norm_weight_rows_tensor(metal_graph_batch_ffn_norm(g),
                                                   metal_graph_batch_ffn_cur(g),
