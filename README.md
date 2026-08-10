@@ -14,13 +14,13 @@ available.
 
 | TP=2 configuration | Long-context workload | Prefill | Decode | Change from original |
 |---|---|---:|---:|---:|
-| Original Q4_K baseline | archived pre-gfx1151 long-prompt run | **34.11 t/s** | **9.96 t/s** | baseline |
-| **Current Q2_K** | fixed 2,048-token prefix + 300 generated tokens | **117.03 t/s** | **10.27 t/s** | **+243.1% / +3.1%** |
-| **Current Q4_K** | fixed 2,048-token prefix + 300 generated tokens | **169.65 t/s** | **9.92 t/s** | **+397.4% / -0.4%** |
-| **Current Q4_K + DSpark** | same fixed workload; 46/54 expert split | **170.71 t/s** | **14.24 t/s** | **+400.5% / +43.0%** |
+| Original Q4_K baseline | fixed 2,048-token prefix + 300 generated tokens | **30.38 t/s** | **7.58 t/s** | baseline |
+| **Current Q2_K** | same fixed workload | **117.03 t/s** | **10.27 t/s** | **+285.2% / +35.5%** |
+| **Current Q4_K** | same fixed workload | **169.65 t/s** | **9.92 t/s** | **+458.4% / +30.9%** |
+| **Current Q4_K + DSpark** | same fixed workload; 46/54 expert split | **170.71 t/s** | **14.24 t/s** | **+461.9% / +87.9%** |
 
-Current rows are three-run medians from `ds4-bench-tp`, with mandatory RDMA
-and zero provider fallback. DSpark accepted 51.43% of proposed long-context
+All rows are three-run medians from the same `ds4-bench-tp` workload over
+mandatory RDMA. DSpark accepted 51.43% of proposed long-context
 draft tokens in all three runs. Its benefit depends on prompt acceptance.
 
 Q2_K and Q4_K use the cache-free default. DSpark optionally keeps its Q8
