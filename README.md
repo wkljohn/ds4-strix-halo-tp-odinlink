@@ -1,9 +1,10 @@
 # DS4 Strix Halo TP over OdinLink
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
-Thunderbolt RDMA. The current optimization delivers **167.73 t/s prefill** and
-**13.83 t/s decode**, while preserving DS4's Metal, CUDA, generic verbs, and
-single-node modes.
+Thunderbolt RDMA. With Q4_K, the current optimization delivers **168.48 t/s
+prefill** and **13.83 t/s ordinary decode**. Opt-in DSpark speculative decoding
+reaches **20.31 t/s** on the controlled code workload. Metal, CUDA, generic
+verbs, and single-node modes remain available.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
@@ -11,16 +12,20 @@ single-node modes.
     TP rank 0                                           TP rank 1
 ```
 
-| Cache-free TP=2 generation | Workload | Prefill | Decode | Recorded change |
+| Cache-free Q4_K TP=2 | Workload | Prefill | Decode | Recorded change |
 |---|---|---:|---:|---:|
 | Original baseline | before gfx1151 acceleration | **34.11 t/s** | **9.96 t/s** | baseline |
-| **Current optimization** | same long prompt; 300-token decode validation | **167.73 t/s** | **13.83 t/s** | **+391.7% prefill / +38.9% decode vs original** |
+| **Current optimization, without DSpark** | 10,093-byte prefill; independent long decode validation | **168.48 t/s** | **13.83 t/s** | **+393.9% prefill / +38.9% decode** |
+| **Current optimization, with DSpark** | same Q4_K target; controlled 60-token code workload | **168.48 t/s*** | **20.31 t/s** | **+393.9% prefill / +103.9% decode** |
 
-The current default requires no 10 GiB-per-node expanded-weight cache and adds
-no persistent memory over the compact model path. The prefill and decode
-figures use deterministic TP=2 runs; the longer decode reference was measured
-independently, and the matched 300-token default/rollback outputs were
-byte-identical.
+\* DSpark accelerates decode, not prompt ingestion; its row repeats the same
+Q4_K target's long-prompt prefill result. The 20.31 t/s figure is a three-run
+median at 96.08% acceptance. A separate context-512, 300-token DSpark
+qualification measured **16.06 t/s** median, versus 14.82 t/s with the newest
+HC projection disabled. Speculative speed varies with prompt acceptance.
+
+The compact default requires no 10 GiB-per-node expanded-weight cache. The
+new DSpark verifier kernels also add no persistent VRAM.
 
 All Strix Halo acceleration is included in this fork—no external kernel patch
 is required. OdinLink-specific provider tuning is used only when its provider
