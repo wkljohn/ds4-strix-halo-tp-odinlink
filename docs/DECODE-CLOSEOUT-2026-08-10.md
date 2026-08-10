@@ -37,6 +37,16 @@ Q8_0 DP4A harness measured 2.04--3.88x kernel speedups with about 0.0037--0.0038
 NRMSE and no persistent allocation. End-to-end testing then proved a useful
 ordinary-decode gain.
 
+## Regression audit
+
+An exact-source comparison against the pre-DSpark checkpoint did not reproduce
+a code regression in ordinary decode. The apparent drop came from comparing
+the former 13+ t/s short/different-context observations with the fixed
+2,048+300 workload, whose pre-candidate Q4_K median was 9.92 t/s. The original
+historical `4b35010` code measured 7.58 t/s under that same fixed workload.
+Consequently all promotion decisions below use only like-for-like
+`ds4-bench-tp` runs; no interactive or short-generation number is substituted.
+
 ## Implemented mechanisms
 
 1. **Exact greedy top-2 TP exchange.** Rank 1 sends its best two `(id,value)`
