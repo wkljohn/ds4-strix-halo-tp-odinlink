@@ -51,6 +51,11 @@
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
+/* Both ranks load in parallel before opening the TP sockets.  A cold 160 GB
+ * GGUF can legitimately take longer than the runtime gate timeout on one
+ * node, while the already-loaded peer must remain resident and keep dialing.
+ * Keep peer discovery separate from failure detection in the live graph. */
+#define DS4_TP_DEFAULT_CONNECT_TIMEOUT_SEC 1800
 
 typedef struct {
     uint32_t magic;
@@ -444,6 +449,28 @@ static int tp_dial(const char *host, int port, double timeout_sec, char *err, si
                last_errno ? strerror(last_errno) : "unreachable");
     return -1;
 }
+
+static uint64_t tp_connect_timeout_sec(void) {
+    const char *s = getenv("DS4_TP_CONNECT_TIMEOUT_SEC");
+    if (!s || !s[0]) return DS4_TP_DEFAULT_CONNECT_TIMEOUT_SEC;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(s, &end, 10);
+    if (errno || !end || *end || value < 1 || value > 86400) {
+        fprintf(stderr,
+                "ds4-tp: ignoring invalid DS4_TP_CONNECT_TIMEOUT_SEC='%s' "
+                "(valid range 1..86400 seconds)\n",
+                s);
+        return DS4_TP_DEFAULT_CONNECT_TIMEOUT_SEC;
+    }
+    return (uint64_t)value;
+}
+
+#ifdef DS4_TP_TEST_HOOKS
+uint64_t ds4_tp_test_connect_timeout_sec(void) {
+    return tp_connect_timeout_sec();
+}
+#endif
 
 static int tp_send_frame(int fd, uint32_t type, const void *payload, uint32_t bytes) {
     ds4_tp_frame_header h = { DS4_TP_MAGIC, type, bytes };
@@ -1800,6 +1827,7 @@ int ds4_tp_create(
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
+    const uint64_t connect_timeout_sec = tp_connect_timeout_sec();
 
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
@@ -1820,7 +1848,7 @@ int ds4_tp_create(
         }
     } else {
         tp->control_fd = tp_dial(opt->leader_host, opt->leader_port,
-                                 (double)tp->timeout_sec, err, errlen);
+                                 (double)connect_timeout_sec, err, errlen);
         if (tp->control_fd < 0) goto fail;
     }
     tp_socket_tune(tp->control_fd);
@@ -1844,7 +1872,7 @@ int ds4_tp_create(
             }
         } else {
             tp->data_fd = tp_dial(opt->leader_host, opt->leader_port,
-                                  (double)tp->timeout_sec, err, errlen);
+                                  (double)connect_timeout_sec, err, errlen);
             if (tp->data_fd < 0) goto fail;
         }
         tp_socket_tune(tp->data_fd);
@@ -2602,7 +2630,6 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         malloc((size_t)vocab * sizeof(*logits)) : NULL;
     if (ds4_engine_tp_vocab_split(engine) && !logits) {
         ds4_log(stderr, DS4_LOG_ERROR, "tp worker: logits buffer allocation failed");
-        ds4_tp_free(tp);
         return 1;
     }
     ds4_log(stderr, DS4_LOG_OK, "tp worker ready for mirrored sessions");
@@ -2761,6 +2788,5 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     }
     free(sessions.v);
     free(logits);
-    ds4_tp_free(tp);
     return rc;
 }

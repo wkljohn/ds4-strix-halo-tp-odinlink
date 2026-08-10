@@ -8,6 +8,10 @@ TAG="${1:?usage: run-tp-ds4-bench.sh <tag> <model.gguf> [EXTRA_ENV=1 ...]}"
 MODEL="${2:?usage: run-tp-ds4-bench.sh <tag> <model.gguf> [EXTRA_ENV=1 ...]}"
 shift 2
 EXTRA_ENV=("$@")
+[[ $TAG =~ ^[A-Za-z0-9._-]+$ ]] || {
+  echo "error: tag may contain only letters, digits, '.', '_' and '-'" >&2
+  exit 2
+}
 
 REPO=/home/wkljohn/Desktop/cc/ds4-strix-halo-tp
 PEER_REPO=/home/wkljohn/Desktop/cc/ds4-strix-halo-tp
@@ -24,6 +28,7 @@ OUT="$REPO/research-results/quant-comparison-2026-08-10"
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
 SHOW_OUTPUT=${DS4_BENCH_SHOW_OUTPUT:-0}
 PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2 "$PEER_MGMT")
+PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2)
 
 [[ $FRONTIER =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid frontier" >&2; exit 2; }
 [[ $TOKENS =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid generated-token count" >&2; exit 2; }
@@ -51,7 +56,6 @@ COMMON_ENV=(
   DS4_TP_VERBS_LIB=/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs/libodl_tb5_verbs.so.0.1.0
   LD_LIBRARY_PATH=/home/wkljohn/Desktop/cc/OdinLink-Five/build/lib:/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs
   "${CURRENT_OPT_ENV[@]}"
-  "${EXTRA_ENV[@]}"
 )
 WORKER_ENV=("${COMMON_ENV[@]}")
 COORD_ENV=("${COMMON_ENV[@]}")
@@ -82,10 +86,36 @@ elif [[ $DSPARK != 0 ]]; then
   exit 2
 fi
 
+# Caller-supplied experiment switches intentionally come last so a bounded
+# diagnostic can override a benchmark default (for example draft width 1)
+# without editing the production configuration above.
+WORKER_ENV+=("${EXTRA_ENV[@]}")
+COORD_ENV+=("${EXTRA_ENV[@]}")
+
 COORD_LOG="$OUT/coordinator-$TAG.log"
 WORKER_LOG="$OUT/worker-$TAG.log"
 CSV="$OUT/$TAG.csv"
+WORKER_PIDFILE="$OUT/worker-$TAG.pid"
 mkdir -p "$OUT"
+
+sample_fingerprint() {
+  local path=$1 size half tail
+  size=$(stat -c %s "$path")
+  half=$(( size / 2 > 4194304 ? size / 2 - 4194304 : 0 ))
+  tail=$(( size > 8388608 ? size - 8388608 : 0 ))
+  {
+    printf '%s\n' "$size"
+    dd if="$path" iflag=skip_bytes,count_bytes skip=0 count=8388608 status=none
+    dd if="$path" iflag=skip_bytes,count_bytes skip="$half" count=8388608 status=none
+    dd if="$path" iflag=skip_bytes,count_bytes skip="$tail" count=8388608 status=none
+  } | sha256sum | awk '{print $1}'
+}
+
+remote_sample_fingerprint() {
+  local path=$1 quoted
+  printf -v quoted '%q' "$path"
+  "${PEER_SSH[@]}" "p=$quoted; s=\$(stat -c %s \"\$p\"); h=\$((s / 2 > 4194304 ? s / 2 - 4194304 : 0)); t=\$((s > 8388608 ? s - 8388608 : 0)); { printf '%s\\n' \"\$s\"; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=0 count=8388608 status=none; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=\"\$h\" count=8388608 status=none; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=\"\$t\" count=8388608 status=none; } | sha256sum | awk '{print \$1}'"
+}
 
 [[ -r $MODEL && -r $PROMPT_FILE ]] || { echo "error: missing local model or prompt" >&2; exit 1; }
 if [[ $DSPARK == 1 && ! -r $MTP ]]; then
@@ -103,25 +133,71 @@ if [[ $DSPARK == 1 ]]; then
   [[ $LOCAL_MTP_SIZE == "$PEER_MTP_SIZE" ]] || {
     echo "error: DSpark model sizes differ" >&2; exit 1;
   }
+  LOCAL_MTP_FINGERPRINT=$(sample_fingerprint "$MTP")
+  PEER_MTP_FINGERPRINT=$(remote_sample_fingerprint "$MTP")
+  [[ $LOCAL_MTP_FINGERPRINT == "$PEER_MTP_FINGERPRINT" ]] || {
+    echo "error: sampled DSpark model fingerprints differ" >&2; exit 1;
+  }
 fi
 LOCAL_MODEL_SIZE=$(stat -c %s "$MODEL")
 PEER_MODEL_SIZE=$("${PEER_SSH[@]}" "stat -c %s '$MODEL'")
 [[ $LOCAL_MODEL_SIZE == "$PEER_MODEL_SIZE" ]] || {
   echo "error: model sizes differ: local=$LOCAL_MODEL_SIZE peer=$PEER_MODEL_SIZE" >&2; exit 1;
 }
+LOCAL_MODEL_FINGERPRINT=$(sample_fingerprint "$MODEL")
+PEER_MODEL_FINGERPRINT=$(remote_sample_fingerprint "$MODEL")
+[[ $LOCAL_MODEL_FINGERPRINT == "$PEER_MODEL_FINGERPRINT" ]] || {
+  echo "error: sampled model fingerprints differ" >&2; exit 1;
+}
 LOCAL_DS4_HASH=$(sha256sum "$REPO/ds4" | awk '{print $1}')
 PEER_DS4_HASH=$("${PEER_SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}')
 [[ $LOCAL_DS4_HASH == "$PEER_DS4_HASH" ]] || {
   echo "error: worker binary hashes differ" >&2; exit 1;
 }
+LOCAL_BENCH_HASH=$(sha256sum "$REPO/ds4-bench-tp" | awk '{print $1}')
+
+if pgrep -af '[d]s4-bench-tp.*--role coordinator.*--tensor-parallel' >/dev/null; then
+  echo "error: a TP benchmark coordinator is already running; refusing to kill it" >&2
+  exit 1
+fi
+if "${PEER_SSH[@]}" "pgrep -af '[d]s4 .*--role worker.*--tensor-parallel'" >/dev/null; then
+  echo "error: a TP worker is already running on the peer; refusing to kill it" >&2
+  exit 1
+fi
+
+WORKER_STARTED=0
+worker_is_running() {
+  "${PEER_SSH[@]}" "test -r '$WORKER_PIDFILE' || exit 1; p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 1;; esac; test -r /proc/\$p/cmdline || exit 1; tr '\\0' ' ' < /proc/\$p/cmdline | grep -q -- './ds4 --role worker --tensor-parallel'"
+}
+
+wait_worker() {
+  local limit=${1:-180} i
+  for ((i = 0; i < limit; i++)); do
+    worker_is_running || return 0
+    sleep 1
+  done
+  return 1
+}
+
+terminate_owned_worker() {
+  (( WORKER_STARTED == 1 )) || return 0
+  worker_is_running || return 0
+  echo "warning: worker did not exit after coordinator disconnect; sending TERM to its verified PID" >&2
+  "${PEER_SSH[@]}" "p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 1;; esac; test -r /proc/\$p/cmdline || exit 0; tr '\\0' ' ' < /proc/\$p/cmdline | grep -q -- './ds4 --role worker --tensor-parallel' || exit 1; kill -TERM \"\$p\""
+  wait_worker 60 || {
+    echo "error: owned worker ignored TERM; leaving it intact to avoid unsafe GPU/RDMA teardown" >&2
+    return 1
+  }
+}
 
 cleanup() {
-  pkill -f '[d]s4-bench.*--role coordinator.*--tensor-parallel' 2>/dev/null || true
-  "${PEER_SSH[@]}" "pkill -f '[d]s4 --role worker --tensor-parallel'" 2>/dev/null || true
+  local rc=$?
+  if (( WORKER_STARTED == 1 )); then
+    wait_worker 180 || terminate_owned_worker || true
+  fi
+  return "$rc"
 }
 trap cleanup EXIT
-cleanup
-sleep 2
 "${PEER_SSH[@]}" "mkdir -p '$OUT'"
 
 echo "=== ds4-bench $TAG ==="
@@ -130,13 +206,21 @@ echo "workload: frontier=$FRONTIER generated_tokens=$TOKENS context=$CONTEXT pre
 if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
 if [[ $ROCPROF == 1 ]]; then echo "rocprof: kernel trace (diagnostic; timing is not benchmark evidence)"; fi
 echo "ds4_sha256: $LOCAL_DS4_HASH"
+echo "ds4_bench_tp_sha256: $LOCAL_BENCH_HASH"
+echo "model_sample_sha256: $LOCAL_MODEL_FINGERPRINT"
+if [[ $DSPARK == 1 ]]; then echo "mtp_sample_sha256: $LOCAL_MTP_FINGERPRINT resident_q8=1"; fi
 
-"${PEER_SSH[@]}" "cd '$PEER_REPO' && setsid -f env ${WORKER_ENV[*]} ./ds4 \
-  --role worker --tensor-parallel --coordinator '$COORDINATOR_ADDR' 9000 \
-  --transport rdma --rocm -m '$MODEL' -c '$CONTEXT' \
-  --prefill-chunk '$PREFILL_CHUNK' \
-  ${WORKER_ARGS[*]} \
-  > '$WORKER_LOG' 2>&1" &
+WORKER_CMD=(env "${WORKER_ENV[@]}" ./ds4
+  --role worker --tensor-parallel --coordinator "$COORDINATOR_ADDR" 9000
+  --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
+  --prefill-chunk "$PREFILL_CHUNK"
+  "${WORKER_ARGS[@]}")
+printf -v WORKER_CMD_Q '%q ' "${WORKER_CMD[@]}"
+printf -v PEER_REPO_Q '%q' "$PEER_REPO"
+printf -v WORKER_LOG_Q '%q' "$WORKER_LOG"
+printf -v WORKER_PIDFILE_Q '%q' "$WORKER_PIDFILE"
+"${PEER_SSH[@]}" "cd $PEER_REPO_Q || exit 1; nohup setsid $WORKER_CMD_Q > $WORKER_LOG_Q 2>&1 < /dev/null & p=\$!; echo \$p > $WORKER_PIDFILE_Q"
+WORKER_STARTED=1
 
 COORD_CMD=("$REPO/ds4-bench-tp")
 if [[ $ROCPROF == 1 ]]; then
@@ -159,13 +243,25 @@ env "${COORD_ENV[@]}" "${COORD_CMD[@]}" \
   "${COORD_ARGS[@]}" \
   > "$COORD_LOG" 2>&1
 
-cleanup
+wait_worker 180 || {
+  echo "error: worker did not exit gracefully after STOP" >&2
+  terminate_owned_worker || true
+  exit 1
+}
+WORKER_STARTED=0
 trap - EXIT
+"${PEER_SCP[@]}" "$PEER_MGMT:$WORKER_LOG" "$WORKER_LOG"
 grep -q 'worker connected, transport=rdma' "$COORD_LOG" || {
   echo "error: benchmark did not use RDMA; rejecting result" >&2; exit 1;
 }
 grep -q '"fallback_calls":0' "$COORD_LOG" || {
   echo "error: RDMA provider reported fallback traffic; rejecting result" >&2; exit 1;
+}
+grep -q 'leader connected, transport=rdma' "$WORKER_LOG" || {
+  echo "error: worker did not confirm RDMA; rejecting result" >&2; exit 1;
+}
+grep -q '"fallback_calls":0' "$WORKER_LOG" || {
+  echo "error: worker RDMA provider reported fallback traffic; rejecting result" >&2; exit 1;
 }
 cat "$CSV"
 echo RUN_DONE

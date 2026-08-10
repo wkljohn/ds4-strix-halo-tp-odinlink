@@ -218,7 +218,6 @@ int main(void) {
             ds4_tokens_free(&prompt[i]);
         }
         ds4_engine_close(engine);
-        ds4_tp_free(tp);
         fprintf(stderr,
                 "test_metal_session_batch DISCONNECT PASS invalidated=%d err=%s\n",
                 session_count, err[0] ? err : "unknown");
@@ -397,7 +396,6 @@ int main(void) {
     free(expected);
     if (tp) (void)ds4_tp_send_stop(tp);
     ds4_engine_close(engine);
-    ds4_tp_free(tp);
     fprintf(stderr,
             "test_metal_session_batch PASS sessions=%d steps=%d mixed_suffix=%d exact_logits=1\n",
             session_count, DECODE_STEPS, MIXED_SUFFIX_TOKENS);

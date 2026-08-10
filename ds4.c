@@ -57964,8 +57964,15 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && (defined(__APPLE__) || defined(DS4_ROCM_TP_READY))
-    if (e->tp.active) {
-        ds4_gpu_tp_shutdown();
+    if (e->tp.active || e->tp.ctx || e->tp.slab || e->tp.zero_vec ||
+        e->tp.out_views || e->tp.in_views || e->tp.batch_out_views ||
+        e->tp.batch_in_views) {
+        if (e->tp.active) ds4_gpu_tp_shutdown();
+        /* The TP context owns the verbs MR for slab. Deregister it while the
+         * allocation is still alive; freeing slab first can leave the OdinLink
+         * provider and kernel with an MR backed by released GPU memory. */
+        ds4_tp_free(e->tp.ctx);
+        e->tp.ctx = NULL;
         const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
         for (uint32_t i = 0; i < slots; i++) {
             if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);

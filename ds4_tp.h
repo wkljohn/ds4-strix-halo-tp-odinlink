@@ -177,6 +177,7 @@ int ds4_tp_test_select_transport(ds4_tp_transport requested,
 uint32_t ds4_tp_test_rdma_provider_decode_max_msg(const char *device_name);
 uint32_t ds4_tp_test_rdma_negotiate_decode_max_msg(uint32_t local,
                                                    uint32_t peer);
+uint64_t ds4_tp_test_connect_timeout_sec(void);
 #endif
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);

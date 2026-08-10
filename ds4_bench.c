@@ -71,6 +71,15 @@ static double bench_now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 }
 
+static uint64_t bench_token_hash_update(uint64_t hash, int token) {
+    const uint32_t value = (uint32_t)token;
+    for (unsigned int shift = 0; shift < 32; shift += 8) {
+        hash ^= (uint8_t)(value >> shift);
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 static uint64_t bench_snapshot_max_bytes(void) {
     const char *env = getenv("DS4_BENCH_SNAPSHOT_MAX_BYTES");
     if (!env || env[0] == '\0') return DS4_BENCH_DEFAULT_SNAPSHOT_MAX_BYTES;
@@ -710,7 +719,6 @@ int main(int argc, char **argv) {
         ds4_tokens_free(&prompt);
         if (tp_leader) ds4_tp_send_stop(tp_leader);
         ds4_engine_close(engine);
-        ds4_tp_free(tp_leader);
         return 1;
     }
 
@@ -720,7 +728,6 @@ int main(int argc, char **argv) {
         ds4_tokens_free(&prompt);
         if (tp_leader) ds4_tp_send_stop(tp_leader);
         ds4_engine_close(engine);
-        ds4_tp_free(tp_leader);
         return 1;
     }
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
@@ -730,7 +737,6 @@ int main(int argc, char **argv) {
         ds4_tokens_free(&prompt);
         if (tp_leader) ds4_tp_send_stop(tp_leader);
         ds4_engine_close(engine);
-        ds4_tp_free(tp_leader);
         return 1;
     }
     maybe_warn_distributed_step_shape(&cfg, session);
@@ -744,11 +750,12 @@ int main(int argc, char **argv) {
             ds4_tokens_free(&prompt);
             if (tp_leader) ds4_tp_send_stop(tp_leader);
             ds4_engine_close(engine);
-            ds4_tp_free(tp_leader);
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes,gen_cycles,gen_token_fnv64");
+    for (int i = 1; i <= 17; i++) fprintf(out, ",accept_len_%d", i);
+    fputc('\n', out);
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -816,6 +823,9 @@ int main(int argc, char **argv) {
         double gen_steady_sec = 0.0;
         int gen_done = 0;
         int gen_first_tokens = 0;
+        uint64_t gen_cycles = 0;
+        uint64_t gen_token_hash = UINT64_C(14695981039346656037);
+        uint64_t accept_len_hist[17] = {0};
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
@@ -857,6 +867,11 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
+            gen_cycles++;
+            if (accepted_n <= (int)(sizeof(accept_len_hist) /
+                                    sizeof(accept_len_hist[0]))) {
+                accept_len_hist[accepted_n - 1]++;
+            }
             const double token_t1 = bench_now_sec();
             if (gen_done == 0) {
                 gen_first_sec = token_t1 - token_t0;
@@ -865,6 +880,8 @@ int main(int argc, char **argv) {
                 gen_steady_sec += token_t1 - token_t0;
             }
             for (int j = 0; j < accepted_n && gen_done < cfg.gen_tokens; j++) {
+                gen_token_hash = bench_token_hash_update(gen_token_hash,
+                                                         accepted[j]);
                 if (gen_token_buf) gen_token_buf[gen_token_count++] = accepted[j];
                 gen_done++;
             }
@@ -906,7 +923,7 @@ int main(int argc, char **argv) {
         const int gen_steady_tokens =
             gen_done > gen_first_tokens ? gen_done - gen_first_tokens : 0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu,%llu,%016llx",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
@@ -915,7 +932,13 @@ int main(int argc, char **argv) {
                 gen_first_sec * 1000.0,
                 gen_steady_tokens,
                 gen_steady_sec > 0.0 ? (double)gen_steady_tokens / gen_steady_sec : 0.0,
-                (unsigned long long)(have_snapshot ? snap.len : 0));
+                (unsigned long long)(have_snapshot ? snap.len : 0),
+                (unsigned long long)gen_cycles,
+                (unsigned long long)gen_token_hash);
+        for (int i = 0; i < 17; i++) {
+            fprintf(out, ",%llu", (unsigned long long)accept_len_hist[i]);
+        }
+        fputc('\n', out);
         fflush(out);
 
         previous = frontier;
@@ -928,6 +951,5 @@ int main(int argc, char **argv) {
     ds4_tokens_free(&prompt);
     if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);
-    ds4_tp_free(tp_leader);
     return rc;
 }

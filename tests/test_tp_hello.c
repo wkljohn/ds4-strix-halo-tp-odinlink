@@ -1,6 +1,7 @@
 #include "ds4_tp.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int check(const char *name, uint32_t local, uint32_t peer, int want,
@@ -48,6 +49,27 @@ static int check_transport(const char *name,
     }
     if (!want_error && err[0] != '\0') {
         fprintf(stderr, "FAIL %s: unexpected error='%s'\n", name, err);
+        return 0;
+    }
+    fprintf(stderr, "PASS %s\n", name);
+    return 1;
+}
+
+static int check_connect_timeout(const char *name, const char *value,
+                                 uint64_t want) {
+    if (value) {
+        if (setenv("DS4_TP_CONNECT_TIMEOUT_SEC", value, 1) != 0) {
+            perror("setenv DS4_TP_CONNECT_TIMEOUT_SEC");
+            return 0;
+        }
+    } else if (unsetenv("DS4_TP_CONNECT_TIMEOUT_SEC") != 0) {
+        perror("unsetenv DS4_TP_CONNECT_TIMEOUT_SEC");
+        return 0;
+    }
+    const uint64_t got = ds4_tp_test_connect_timeout_sec();
+    if (got != want) {
+        fprintf(stderr, "FAIL %s: got=%llu want=%llu\n", name,
+                (unsigned long long)got, (unsigned long long)want);
         return 0;
     }
     fprintf(stderr, "PASS %s\n", name);
@@ -124,5 +146,11 @@ int main(void) {
     ok &= check_transport("explicit RDMA rejects missing peer device",
                           DS4_TP_TRANSPORT_RDMA, 1, 0, 0, 0,
                           "tp: --transport rdma but the peer side has no active device");
+    ok &= check_connect_timeout("connect timeout default", NULL, 1800u);
+    ok &= check_connect_timeout("connect timeout override", "2400", 2400u);
+    ok &= check_connect_timeout("connect timeout rejects zero", "0", 1800u);
+    ok &= check_connect_timeout("connect timeout rejects junk", "30s", 1800u);
+    ok &= check_connect_timeout("connect timeout maximum", "86400", 86400u);
+    unsetenv("DS4_TP_CONNECT_TIMEOUT_SEC");
     return ok ? 0 : 1;
 }

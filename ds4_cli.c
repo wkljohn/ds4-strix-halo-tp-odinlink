@@ -2208,7 +2208,6 @@ int main(int argc, char **argv) {
     }
     if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);
-    ds4_tp_free(tp_leader);
     ds4_dist_options_free(cfg.dist);
     free(cfg.prompt_owned);
     return rc;
