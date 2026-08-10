@@ -298,6 +298,58 @@ __global__ static void matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel(
     }
 }
 
+/* DSpark verifier microbatch: reuse each pair of compressor weights across
+ * all five rows.  hipBLAS handles these as two skinny GEMMs; on gfx1151 their
+ * launch/setup cost and poor N=5 utilization dominate.  The input is converted
+ * to F16 once by the caller so this follows the established hipBLAS path's
+ * activation precision while keeping each row's reduction independent. */
+template <uint32_t TOKENS>
+__global__ static void matmul_f16_pair_five_row_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const __half *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + (threadIdx.x >> 5u);
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim) return;
+
+    float acc0[TOKENS];
+    float acc1[TOKENS];
+#pragma unroll
+    for (uint32_t t = 0; t < TOKENS; t++) {
+        acc0[t] = 0.0f;
+        acc1[t] = 0.0f;
+    }
+    const __half *wr0 = w0 + (uint64_t)row * in_dim;
+    const __half *wr1 = w1 + (uint64_t)row * in_dim;
+    for (uint32_t k = lane; k < in_dim; k += 32u) {
+        const float fw0 = __half2float(wr0[k]);
+        const float fw1 = __half2float(wr1[k]);
+#pragma unroll
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            const float xv = __half2float(x[(uint64_t)t * in_dim + k]);
+            acc0[t] = fmaf(fw0, xv, acc0[t]);
+            acc1[t] = fmaf(fw1, xv, acc1[t]);
+        }
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < TOKENS; t++) {
+        acc0[t] = warp_sum_f32(acc0[t]);
+        acc1[t] = warp_sum_f32(acc1[t]);
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            out0[(uint64_t)t * out_dim + row] = acc0[t];
+            out1[(uint64_t)t * out_dim + row] = acc1[t];
+        }
+    }
+}
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,

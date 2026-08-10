@@ -27878,29 +27878,19 @@ static bool metal_graph_encode_layer_attention_batch(
             ok = false;
         }
         if (ok) {
-            ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
-                                             model->map,
-                                             model->size,
-                                             layer->attn_compressor_kv->abs_offset,
-                                             DS4_N_EMBD,
-                                             comp_width,
-                                             metal_graph_batch_attn_norm(g),
-                                             n_tokens) != 0;
+            ok = ds4_gpu_matmul_f16_pair_tensor(
+                    metal_graph_batch_comp_kv(g),
+                    metal_graph_batch_comp_sc(g),
+                    model->map,
+                    model->size,
+                    layer->attn_compressor_kv->abs_offset,
+                    layer->attn_compressor_gate->abs_offset,
+                    DS4_N_EMBD,
+                    comp_width,
+                    metal_graph_batch_attn_norm(g),
+                    n_tokens) != 0;
             if (!ok) {
-                fprintf(stderr, "ds4: gpu layer %u attention compressor KV projection failed\n", il);
-            }
-            if (ok) {
-                ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_sc(g),
-                                                model->map,
-                                                model->size,
-                                                layer->attn_compressor_gate->abs_offset,
-                                                DS4_N_EMBD,
-                                                comp_width,
-                                                metal_graph_batch_attn_norm(g),
-                                                n_tokens) != 0;
-                if (!ok) {
-                    fprintf(stderr, "ds4: gpu layer %u attention compressor score projection failed\n", il);
-                }
+                fprintf(stderr, "ds4: gpu layer %u paired attention compressor projection failed\n", il);
             }
         }
         if (ok) metal_graph_debug_dump_tensor("attn_comp_kv_raw",
@@ -28193,23 +28183,19 @@ static bool metal_graph_encode_layer_attention_batch(
                 ok = false;
             }
             if (ok) {
-                ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_kv(g),
-                                                 model->map,
-                                                 model->size,
-                                                 layer->indexer_compressor_kv->abs_offset,
-                                                 DS4_N_EMBD,
-                                                 index_width,
-                                                 metal_graph_batch_attn_norm(g),
-                                                 n_tokens) != 0;
-                if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_comp_sc(g),
-                                                         model->map,
-                                                         model->size,
-                                                         layer->indexer_compressor_gate->abs_offset,
-                                                         DS4_N_EMBD,
-                                                         index_width,
-                                                         metal_graph_batch_attn_norm(g),
-                                                         n_tokens) != 0;
+                ok = ds4_gpu_matmul_f16_pair_tensor(
+                        metal_graph_batch_comp_kv(g),
+                        metal_graph_batch_comp_sc(g),
+                        model->map,
+                        model->size,
+                        layer->indexer_compressor_kv->abs_offset,
+                        layer->indexer_compressor_gate->abs_offset,
+                        DS4_N_EMBD,
+                        index_width,
+                        metal_graph_batch_attn_norm(g),
+                        n_tokens) != 0;
             }
+            DS4_METAL_PROFILE_ATTN_STAGE("indexer_kv_gate_proj");
             if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
                                                   metal_graph_batch_comp_kv(g),
                                                   (uint64_t)index_width * n_tokens,
@@ -28227,6 +28213,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
                                                           metal_graph_batch_qr_norm(g),
                                                           n_tokens);
+            DS4_METAL_PROFILE_ATTN_STAGE("indexer_q_proj");
             if (ok) ok = ds4_gpu_rope_tail_tensor(metal_graph_batch_indexer_q(g),
                                                     n_tokens,
                                                     DS4_N_INDEXER_HEAD,
@@ -28244,6 +28231,7 @@ static bool metal_graph_encode_layer_attention_batch(
             if (ok) ok = ds4_gpu_dsv4_indexer_qat_tensor(metal_graph_batch_indexer_q(g),
                                                           n_tokens * DS4_N_INDEXER_HEAD,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
+            DS4_METAL_PROFILE_ATTN_STAGE("indexer_q_post");
             if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_indexer_weights(g),
                                                      model->map,
                                                      model->size,
@@ -28252,6 +28240,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      DS4_N_INDEXER_HEAD,
                                                      metal_graph_batch_attn_norm(g),
                                                      n_tokens) != 0;
+            DS4_METAL_PROFILE_ATTN_STAGE("indexer_weight_proj");
             if (zero_prefix) {
                 if (ok && n_comp > g->layer_comp_cap[il]) {
                     fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
@@ -28476,8 +28465,8 @@ static bool metal_graph_encode_layer_attention_batch(
                     }
                 }
             }
+            DS4_METAL_PROFILE_ATTN_STAGE("indexer_compressor");
         }
-        if (ratio == 4) DS4_METAL_PROFILE_ATTN_STAGE("indexer_setup");
 
         if (ok && !zero_prefix && n_tokens <= g->raw_cap) {
             const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, n_tokens);

@@ -106,6 +106,25 @@ static unsigned compressor_proj_rows_per_block(void) {
     return rows;
 }
 
+static int f16_pair_five_row_enabled(void) {
+    static int enabled = -1;
+    static int gfx1151;
+    if (enabled < 0) {
+        const char *disable = getenv("DS4_ROCM_DISABLE_F16_PAIR_FIVE_ROW");
+        enabled = !(disable && strcmp(disable, "1") == 0);
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+            gfx1151 = strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return enabled && gfx1151;
+}
+
 static void cuda_launch_q8_batch_sharedx(
         float *out,
         const unsigned char *w,
@@ -1094,6 +1113,41 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
         in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         return 0;
+    }
+    const int pair5_shape = n_tok == 5u && in_dim == 4096u &&
+        (out_dim == 256u || out_dim == 512u || out_dim == 1024u);
+    const int pair5_selected = pair5_shape && f16_pair_five_row_enabled() &&
+        !g_quality_mode && !cuda_runtime_config()->graph_dump;
+    if (pair5_selected) {
+        uint64_t weight_bytes = 0, x_bytes = 0, out_bytes = 0;
+        if (weight0_offset > model_size || weight1_offset > model_size ||
+            !cuda_u64_mul3_checked(out_dim, in_dim, sizeof(uint16_t), &weight_bytes) ||
+            !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+            !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+            weight_bytes > model_size - weight0_offset ||
+            weight_bytes > model_size - weight1_offset ||
+            x->bytes < x_bytes || out0->bytes < out_bytes || out1->bytes < out_bytes) {
+            return 0;
+        }
+        const __half *w0 = (const __half *)cuda_model_range_ptr(
+                model_map, weight0_offset, weight_bytes, "f16_pair5_0");
+        const __half *w1 = (const __half *)cuda_model_range_ptr(
+                model_map, weight1_offset, weight_bytes, "f16_pair5_1");
+        if (!w0 || !w1) return 0;
+        const uint64_t xh_count = n_tok * in_dim;
+        __half *xh = (__half *)cuda_tmp_alloc(
+                xh_count * sizeof(__half), "f16 pair five-row activations");
+        if (!xh) return 0;
+        f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(
+                xh, (const float *)x->ptr, xh_count);
+        if (!cuda_ok(cudaGetLastError(), "f16 pair five-row conversion launch")) return 0;
+        const uint32_t rows_per_block = 8u;
+        matmul_f16_pair_five_row_kernel<5u><<<
+                ((uint32_t)out_dim + rows_per_block - 1u) / rows_per_block,
+                rows_per_block * 32u>>>(
+                (float *)out0->ptr, (float *)out1->ptr, w0, w1, xh,
+                (uint32_t)in_dim, (uint32_t)out_dim);
+        return cuda_ok(cudaGetLastError(), "f16 pair five-row launch");
     }
     if (n_tok != 1) {
         return ds4_gpu_matmul_f16_tensor(out0, model_map, model_size, weight0_offset,
