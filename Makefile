@@ -10,7 +10,14 @@ SAMPLING_TEST := tests/test_sampling
 endif
 
 DEBUG_FLAGS ?= -g
+PROFILE ?= 0
+ifeq ($(PROFILE),1)
+DS4_PROFILE_CFLAGS := -DDS4_ENABLE_PROFILING=1
+else
+DS4_PROFILE_CFLAGS :=
+endif
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
+CFLAGS += $(DS4_PROFILE_CFLAGS)
 OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fobjc-arc
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
@@ -41,6 +48,7 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+ROCM_CFLAGS += $(DS4_PROFILE_CFLAGS)
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
@@ -117,6 +125,7 @@ help:
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make ds4-bench-tp        Build the fixed-frontier two-node TP benchmark"
 	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make rocm PROFILE=1      Build diagnostic profilers (disabled in production)"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
 	@echo "  make test                Build and run tests"
 	@echo "  make dspark-verify-depth Run DSpark speculative verification smoke if support GGUF is present"

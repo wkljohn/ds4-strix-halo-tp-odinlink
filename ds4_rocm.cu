@@ -116,6 +116,19 @@ typedef struct {
 
 #include "rocm/ds4_rocm_matmul.cuh"
 
+extern "C" void ds4_gpu_rocm_mark_speculative_decode(void) {
+    g_q8_decode_pair_dp4a_speculative = 1;
+    const char *pair = getenv("DS4_ROCM_Q8_DECODE_PAIR_DP4A");
+    const char *allow =
+        getenv("DS4_ROCM_Q8_DECODE_PAIR_DP4A_SPECULATIVE");
+    if (pair && pair[0] == '1' && pair[1] == '\0' &&
+        (!allow || allow[0] != '1' || allow[1] != '\0')) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "paired Q8 DP4A disabled for speculative target consistency; "
+                "ordinary decode remains accelerated\n");
+    }
+}
+
 #include "rocm/ds4_rocm_fp8_kv_launch.cuh"
 
 #include "rocm/ds4_rocm_compressor.cuh"
@@ -257,11 +270,15 @@ static ds4_tp_ffn_range_record *g_tp_ffn_range_device[2] = {};
 static ds4_tp_ffn_range_total g_tp_ffn_range_total[2] = {};
 
 static inline int ds4_tp_ffn_range_enabled(void) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_tp_ffn_range_profile < 0) {
         const char *s = getenv("DS4_TP_FFN_RANGE_PROFILE");
         g_tp_ffn_range_profile = s && strcmp(s, "1") == 0 ? 1 : 0;
     }
     return g_tp_ffn_range_profile;
+#else
+    return 0;
+#endif
 }
 
 __global__ static void ds4_tp_ffn_range_kernel(
@@ -435,8 +452,12 @@ static void ds4_tp_ffn_range_consume(int ch, uint64_t seq,
  * processed a gate. */
 static int g_tp_trace = -1;
 static inline int tp_trace(void) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_tp_trace < 0) g_tp_trace = getenv("DS4_TP_TRACE") ? 1 : 0;
     return g_tp_trace;
+#else
+    return 0;
+#endif
 }
 
 struct ds4_tp_interval_stat {
@@ -729,12 +750,16 @@ static void *ds4_tp_service_thread(void *arg) {
     (void)arg;
     uint64_t next[2] = { 1, 1 };
     uint32_t idle_streak = 0;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const char *profile_env = getenv("DS4_TP_SERVICE_INTERVAL_PROFILE");
     const char *verify_stage_env = getenv("DS4_DSPARK_VERIFY_STAGE_EVENTS");
     const int profile_enabled =
         (profile_env && strcmp(profile_env, "1") == 0) ||
         (verify_stage_env && verify_stage_env[0] &&
          strcmp(verify_stage_env, "0") != 0);
+#else
+    const int profile_enabled = 0;
+#endif
     const int ffn_range_enabled = ds4_tp_ffn_range_enabled() &&
                                   g_tp_ffn_range_host[0] &&
                                   g_tp_ffn_range_host[1];

@@ -38,5 +38,6 @@ __pycache__/
 *.pyc
 /misc/
 /research-results/
+/.rocprofv3/
 .*.swp
 .DS_Store

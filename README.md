@@ -2,9 +2,9 @@
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
 Thunderbolt RDMA. At 2,048 tokens of live context, optimized Q4_K reaches a
-**169.65 t/s** prefill median; opt-in DSpark raises long-context decode from
-**9.92 to 14.24 t/s**. Metal, CUDA, generic verbs, and single-node modes remain
-available.
+**166.56 t/s** prefill and **14.31 t/s** decode median; opt-in DSpark raises
+long-context decode to **14.92 t/s**. Metal, CUDA, generic verbs, and
+single-node modes remain available.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
@@ -15,13 +15,13 @@ available.
 | TP=2 configuration | Long-context workload | Prefill | Decode | Change from original |
 |---|---|---:|---:|---:|
 | Original Q4_K baseline | fixed 2,048-token prefix + 300 generated tokens | **30.38 t/s** | **7.58 t/s** | baseline |
-| **Current Q2_K** | same fixed workload | **117.03 t/s** | **10.27 t/s** | **+285.2% / +35.5%** |
-| **Current Q4_K** | same fixed workload | **169.65 t/s** | **9.92 t/s** | **+458.4% / +30.9%** |
-| **Current Q4_K + DSpark** | same fixed workload; 46/54 expert split | **170.71 t/s** | **14.24 t/s** | **+461.9% / +87.9%** |
+| **Current Q2_K** | same fixed workload | **118.24 t/s** | **13.25 t/s** | **+289.2% / +74.8%** |
+| **Current Q4_K** | same fixed workload | **166.56 t/s** | **14.31 t/s** | **+448.3% / +88.8%** |
+| **Current Q4_K + DSpark** | same fixed workload; 46/54 expert split | **166.92 t/s** | **14.92 t/s** | **+449.4% / +96.8%** |
 
 All rows are three-run medians from the same `ds4-bench-tp` workload over
-mandatory RDMA. DSpark accepted 51.43% of proposed long-context
-draft tokens in all three runs. Its benefit depends on prompt acceptance.
+mandatory RDMA. DSpark accepted 51.43% of proposed long-context draft tokens
+in all three current runs. Its benefit depends on prompt acceptance.
 
 Q2_K and Q4_K use the cache-free default. DSpark optionally keeps its Q8
 drafter on rank 0 and warns before reserving the additional 10.15 GiB.

@@ -46,6 +46,17 @@ enum {
      * over TCP before every layer.  Real verbs providers retain their normal
      * receive-before-send protocol; the transport checks the device name. */
     DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC = UINT32_C(1) << 2,
+    /* Exchange the exact vocab halves through the generic verbs bulk path.
+     * This preserves full logits for sampling/logprobs while keeping the
+     * per-token 256 KiB payload off the management/control socket. */
+    DS4_TP_FEATURE_RDMA_LOGITS = UINT32_C(1) << 3,
+    /* Rank 0 computes the exact full vocabulary head and rank 1 skips it.
+     * Useful when duplicating half a Q8 head is cheaper than transferring a
+     * full FP32 vocabulary half over the inter-node control/data path. */
+    DS4_TP_FEATURE_RANK0_FULL_LOGITS = UINT32_C(1) << 4,
+    /* Exact greedy mode: retain the row-sharded output head and exchange the
+     * worker's best two (id, value) pairs instead of its full FP32 half. */
+    DS4_TP_FEATURE_GREEDY_TOP2 = UINT32_C(1) << 5,
     /* Bits 8..15 carry the first expert owned by rank 1.  Including the
      * ownership boundary in the already exact-matched hello features makes
      * an asymmetric placement fail closed if the two independent nodes were
@@ -264,7 +275,13 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    DS4_TP_FRAME_LOGITS_TOP2 = 18,
 } ds4_tp_frame_type;
+
+typedef struct {
+    int32_t id[2];
+    float value[2];
+} ds4_tp_logits_top2;
 
 typedef struct {
     ds4_tp_frame_type type;
@@ -292,6 +309,10 @@ int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t
  * after every eval (and after a sync) on the control socket. */
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count);
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
+int ds4_tp_exchange_logits_halves(ds4_tp *tp, float *logits,
+                                  uint32_t half_count);
+int ds4_tp_send_logits_top2(ds4_tp *tp, const ds4_tp_logits_top2 *top2);
+int ds4_tp_recv_logits_top2(ds4_tp *tp, ds4_tp_logits_top2 *top2);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks

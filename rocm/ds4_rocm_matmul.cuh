@@ -231,6 +231,27 @@ static int q8_reuse_quant_enabled(void) {
     return enabled;
 }
 
+/* Speculative verification must agree numerically with the committed target
+ * path.  The one-token paired-DP4A projection is intentionally approximate;
+ * using it only for committed decode reduced measured DSpark acceptance from
+ * 51.43% to 29.83%.  The ROCm graph marks speculative processes before the
+ * first launch.  A research-only override keeps controlled A/B possible. */
+static int g_q8_decode_pair_dp4a_speculative = 0;
+
+static int q8_decode_pair_dp4a_enabled(void) {
+    if (g_q8_decode_pair_dp4a_speculative) {
+        const char *allow =
+            getenv("DS4_ROCM_Q8_DECODE_PAIR_DP4A_SPECULATIVE");
+        if (!allow || allow[0] != '1' || allow[1] != '\0') return 0;
+    }
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q8_DECODE_PAIR_DP4A");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
 static int q8_dp4a_shape_dispatch_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -896,6 +917,34 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     const char *w1 = cuda_model_range_ptr(model_map, weight1_offset, weight1_bytes, "q8_0_pair1");
     if (!w0 || !w1) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    if (n_tok == 1u && q8_decode_pair_dp4a_enabled() &&
+        (in_dim & 31u) == 0u) {
+        const uint64_t xq_bytes = blocks * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 decode pair shared prequant");
+        if (!tmp) return 0;
+        int8_t *xq = (int8_t *)tmp;
+        float *xscale = (float *)((char *)tmp + scale_offset);
+        quantize_q8_0_f32_kernel<<<dim3((uint32_t)blocks, 1u, 1u), 32>>>(
+            xq, xscale, (const float *)x->ptr, in_dim, blocks);
+        if (!cuda_ok(cudaGetLastError(),
+                     "q8_0 decode pair quantize launch")) return 0;
+        cuda_launch_q8_small_batch_dp4a(
+            (float *)out0->ptr,
+            reinterpret_cast<const unsigned char *>(w0),
+            xq, xscale, (uint32_t)blocks, (uint32_t)out0_dim,
+            1u, row_bytes);
+        if (!cuda_ok(cudaGetLastError(),
+                     "q8_0 decode pair first DP4A launch")) return 0;
+        cuda_launch_q8_small_batch_dp4a(
+            (float *)out1->ptr,
+            reinterpret_cast<const unsigned char *>(w1),
+            xq, xscale, (uint32_t)blocks, (uint32_t)out1_dim,
+            1u, row_bytes);
+        return cuda_ok(cudaGetLastError(),
+                       "q8_0 decode pair second DP4A launch");
+    }
     if (n_tok != 1) {
         const uint64_t xq_bytes = n_tok * blocks * 32u;
         const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;

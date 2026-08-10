@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <netdb.h>
 #include <stdarg.h>
 #include <sys/uio.h>
@@ -231,6 +232,7 @@ struct ds4_tp {
     uint64_t big_out_off;       /* direct=1 prefill big-gate local partial, opt-in */
     uint64_t big_in_off;        /* direct=1 prefill big-gate peer partial, opt-in */
     uint32_t big_capacity_rows; /* 0 unless DS4_TP_BIG_DIRECT=1 */
+    uint64_t logits_seq;
     uint64_t timeout_sec;
     atomic_bool failed;
 #ifdef DS4_TP_HAVE_VERBS
@@ -1170,6 +1172,7 @@ static void tp_rdma_gate_profile_print(void) {
 }
 
 static int tp_rdma_gate_profile_is_enabled(const ds4_tp *tp) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_tp_rdma_gate_profile_enabled < 0) {
         const char *s = getenv("DS4_TP_RDMA_GATE_PROFILE");
         g_tp_rdma_gate_profile_enabled =
@@ -1182,6 +1185,10 @@ static int tp_rdma_gate_profile_is_enabled(const ds4_tp *tp) {
         }
     }
     return g_tp_rdma_gate_profile_enabled;
+#else
+    (void)tp;
+    return 0;
+#endif
 }
 
 /* Arm the receive for gate seq: UC delivery order pairs the peer's seq'th
@@ -1231,12 +1238,14 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     const double profile_start = gate_profile ? tp_now_sec() : 0.0;
     /* DS4-TP-gfx1151 (patch 17): getenv is a linear scan of environ and this is
      * on the per-gate path. Cache it. */
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     static int gate_trace = -1;
     if (gate_trace < 0) gate_trace = getenv("DS4_TP_GATE_TRACE") ? 1 : 0;
     if (gate_trace) {
         fprintf(stderr, "ds4-tp: gate trace l=%u g=%u seq=%llu want_slot=%u\n",
                 layer, gate, (unsigned long long)seq, tp_gate_slot(tp, seq));
     }
+#endif
     if (slot != tp_gate_slot(tp, seq)) {
         fprintf(stderr, "ds4-tp: gate order broke: layer %u gate %u vs seq %llu\n",
                 layer, gate, (unsigned long long)seq);
@@ -1466,7 +1475,11 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     static uint64_t g_bg_empty_polls, g_bg_rounds;
     static uint64_t g_bg_gates;
     static int g_bg_trace = -1;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_bg_trace < 0) g_bg_trace = getenv("DS4_TP_BIGGATE_PROFILE") ? 1 : 0;
+#else
+    g_bg_trace = 0;
+#endif
     const double bg_t0 = g_bg_trace ? tp_now_sec() : 0.0;
     double bg_copy = 0.0;
 
@@ -2380,6 +2393,49 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
     return tp_read_full(tp->control_fd, half, bytes);
 }
 
+int ds4_tp_send_logits_top2(ds4_tp *tp, const ds4_tp_logits_top2 *top2) {
+    return tp && top2 &&
+           tp_send_frame(tp->control_fd, DS4_TP_FRAME_LOGITS_TOP2,
+                         top2, sizeof(*top2));
+}
+
+int ds4_tp_recv_logits_top2(ds4_tp *tp, ds4_tp_logits_top2 *top2) {
+    uint32_t type = 0, bytes = 0;
+    if (!tp || !top2 ||
+        !tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_LOGITS_TOP2 || bytes != sizeof(*top2)) {
+        fprintf(stderr, "ds4-tp: bad logits top2 frame (type %u bytes %u)\n",
+                type, bytes);
+        return 0;
+    }
+    return tp_read_full(tp->control_fd, top2, sizeof(*top2));
+}
+
+int ds4_tp_exchange_logits_halves(ds4_tp *tp, float *logits,
+                                  uint32_t half_count) {
+    if (!tp || !logits || half_count == 0u ||
+        (tp->runtime_features & DS4_TP_FEATURE_RDMA_LOGITS) == 0u) {
+        return 0;
+    }
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active) {
+        /* Each rank already owns one exact half in host memory after the GPU
+         * readback.  A symmetric bulk swap gives both ranks the full row and
+         * uses the registered verify staging region, so this adds no VRAM. */
+        float *local = logits + (uint64_t)tp->rank * half_count;
+        float *peer = logits + (uint64_t)(1 - tp->rank) * half_count;
+        return ds4_tp_big_gate_exchange(tp, UINT16_MAX - 1u,
+                                        ++tp->logits_seq,
+                                        local, peer,
+                                        (uint64_t)half_count * sizeof(float));
+    }
+#endif
+    if (tp->rank == 0) {
+        return ds4_tp_recv_logits_half(tp, logits + half_count, half_count);
+    }
+    return ds4_tp_send_logits_half(tp, logits + half_count, half_count);
+}
+
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n) {
     return tp_send_token_command(tp, DS4_TP_FRAME_VERIFY, session_id,
@@ -2489,10 +2545,28 @@ static void tp_worker_session_remove(ds4_tp_worker_sessions *sessions,
 
 static int tp_worker_send_logits(ds4_tp *tp, ds4_session *session,
                                  float *logits, int vocab) {
+    if ((ds4_tp_runtime_features(tp) &
+         DS4_TP_FEATURE_RANK0_FULL_LOGITS) != 0u) {
+        return 1;
+    }
     if (!logits || vocab <= 0 || (vocab & 1) != 0) return 0;
     const uint32_t vhalf = (uint32_t)vocab / 2u;
-    return ds4_session_copy_logits(session, logits, vocab) == vocab &&
-           ds4_tp_send_logits_half(tp, logits + vhalf, vhalf);
+    if (ds4_session_copy_logits(session, logits, vocab) != vocab) return 0;
+    if ((ds4_tp_runtime_features(tp) & DS4_TP_FEATURE_GREEDY_TOP2) != 0u) {
+        ds4_tp_logits_top2 top2 = {{-1, -1}, {-INFINITY, -INFINITY}};
+        for (uint32_t i = 0; i < vhalf; i++) {
+            const float value = logits[vhalf + i];
+            const int32_t id = (int32_t)(vhalf + i);
+            if (value > top2.value[0]) {
+                top2.id[1] = top2.id[0]; top2.value[1] = top2.value[0];
+                top2.id[0] = id; top2.value[0] = value;
+            } else if (value > top2.value[1]) {
+                top2.id[1] = id; top2.value[1] = value;
+            }
+        }
+        return ds4_tp_send_logits_top2(tp, &top2);
+    }
+    return ds4_tp_send_logits_half(tp, logits + vhalf, vhalf);
 }
 
 int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {

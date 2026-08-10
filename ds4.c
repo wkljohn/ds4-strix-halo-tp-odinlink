@@ -51,6 +51,20 @@
 #include "ds4_layer_pack.h"
 #include "ds4_gpu_mgpu.h"
 
+#if defined(DS4_ROCM_BUILD)
+extern void ds4_gpu_rocm_mark_speculative_decode(void);
+#endif
+
+/* Profiling and dump hooks are intentionally absent from production hot
+ * paths.  Build with PROFILE=1 to make diagnostic environment switches live. */
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+#define DS4_PROFILE_ENV(name) getenv(name)
+#define DS4_PROFILE_ENV_PRESENT(a, b) glm_graph_env_present((a), (b))
+#else
+#define DS4_PROFILE_ENV(name) NULL
+#define DS4_PROFILE_ENV_PRESENT(a, b) false
+#endif
+
 #define DS4_CUDA_TP_PEER_TMP_BYTES \
     ((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float) + 128u)
 
@@ -15358,6 +15372,7 @@ typedef struct {
     uint32_t tp_batch_rows;
     ds4_gpu_tensor *tp_zero;
     ds4_gpu_tensor *tp_logits_half;
+    bool tp_rank0_full_logits;
     /* direct=1 prefill big-gate views (opt-in, DS4_TP_BIG_DIRECT=1). Aliases
      * into the engine-owned TP slab, exactly like tp_out/tp_batch_out above,
      * sized to this graph's prefill_cap. NULL when the feature is off or
@@ -16991,6 +17006,9 @@ static bool metal_graph_alloc_raw_cap(
         bool                    cuda_tensor_parallel,
         const ds4_gpu_graph    *shared_prefill_workspace) {
     const int saved_dspark_exec_tier = g->dspark_exec_tier;
+#if defined(DS4_ROCM_BUILD)
+    if (enable_mtp) ds4_gpu_rocm_mark_speculative_decode();
+#endif
     memset(g, 0, sizeof(*g));
     g->dspark_exec_tier = saved_dspark_exec_tier;
     g->owns_prefill_workspace = shared_prefill_workspace == NULL;
@@ -17031,9 +17049,12 @@ static bool metal_graph_alloc_raw_cap(
         getenv("DS4_CUDA_NO_TP_ATTN_OUT_HC_FUSE") == NULL;
     g->shared_gate_up_swiglu_fuse =
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
-    g->decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
-    g->decode_index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
-    g->output_stage_profile = getenv("DS4_METAL_OUTPUT_STAGE_PROFILE") != NULL;
+    g->decode_stage_profile =
+        DS4_PROFILE_ENV("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
+    g->decode_index_stage_profile =
+        DS4_PROFILE_ENV("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
+    g->output_stage_profile =
+        DS4_PROFILE_ENV("DS4_METAL_OUTPUT_STAGE_PROFILE") != NULL;
     const bool enable_splitkv_spec = metal_graph_cuda_splitkv_spec_requested();
     const bool enable_splitkv_batch_verify =
         enable_splitkv_spec && metal_graph_cuda_splitkv_spec_batch_verify_requested();
@@ -24431,7 +24452,13 @@ static bool metal_graph_encode_output_head(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", metal_graph_output_norm(g), DS4_N_EMBD, DS4_N_LAYER, 0);
     }
-    if (ok && g->tp_world == 2 && g->tp_logits_half) {
+    if (ok && g->tp_world == 2 && g->tp_rank == 1 &&
+        g->tp_rank0_full_logits) {
+        /* Rank 0 owns the exact full output projection in this negotiated
+         * mode.  Rank 1 still completes the transformer graph in lockstep,
+         * but deliberately leaves its logits tensor untouched. */
+    } else if (ok && g->tp_world == 2 && g->tp_logits_half &&
+        !g->tp_rank0_full_logits) {
         /* Vocab-split: this rank computes its half of the head rows into
          * its logits view; the halves are bit-identical to the full head
          * (same kernel, same rows) and the worker ships its half to the
@@ -26632,7 +26659,7 @@ static bool metal_graph_encode_token_raw_swa(
     }
     /* Under the vocab split both ranks materialize their logits half. */
     if (g->tp_world == 2 && g->tp_rank == 1 &&
-        !g->tp_logits_half) need_logits = false;
+        (!g->tp_logits_half || g->tp_rank0_full_logits)) need_logits = false;
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
     metal_graph_dspark_capture_begin(g);
@@ -27058,6 +27085,7 @@ static bool metal_graph_stage_profile_enabled_for_layer(
         const char *flag_env_name,
         const char *layer_env_name,
         uint32_t    il) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     size_t flag_len = 0;
     const char *flag = metal_graph_env_trim(getenv(flag_env_name), &flag_len);
     if (!flag) return false;
@@ -27083,6 +27111,12 @@ static bool metal_graph_stage_profile_enabled_for_layer(
     }
 
     return metal_graph_profile_layer_value_match(layer_env, il);
+#else
+    (void)flag_env_name;
+    (void)layer_env_name;
+    (void)il;
+    return false;
+#endif
 }
 
 static bool metal_graph_layer_stage_profile_enabled(uint32_t il) {
@@ -29971,9 +30005,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         return false;
     }
 
-    const bool profile =
-        glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
-                              "DS4_METAL_GRAPH_TOKEN_PROFILE");
+    const bool profile = DS4_PROFILE_ENV_PRESENT(
+        "DS4_ROCM_GRAPH_TOKEN_PROFILE", "DS4_METAL_GRAPH_TOKEN_PROFILE");
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
     const uint32_t raw_row = pos % g->raw_cap;
@@ -30150,9 +30183,8 @@ static bool metal_graph_eval_token_raw_swa(
         return metal_graph_eval_token_raw_swa_streaming(g, model, weights, token, pos, logits);
     }
 
-    const bool profile =
-        glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
-                              "DS4_METAL_GRAPH_TOKEN_PROFILE");
+    const bool profile = DS4_PROFILE_ENV_PRESENT(
+        "DS4_ROCM_GRAPH_TOKEN_PROFILE", "DS4_METAL_GRAPH_TOKEN_PROFILE");
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
 
@@ -30162,7 +30194,8 @@ static bool metal_graph_eval_token_raw_swa(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
-    if (ok && logits && g->tp_world == 2 && g->tp_logits_half) {
+    if (ok && logits && g->tp_world == 2 && g->tp_logits_half &&
+        !g->tp_rank0_full_logits) {
         const uint64_t tp_vhalf = (uint64_t)DS4_N_VOCAB / 2u;
         const uint64_t off = (uint64_t)g->tp_rank * tp_vhalf * sizeof(float);
         ok = ds4_gpu_tensor_read(metal_graph_logits(g), off, logits + g->tp_rank * tp_vhalf,
@@ -30631,7 +30664,7 @@ static bool metal_graph_eval_token_raw_swa_top(
     if (top2) top2->fast_attention = fast_attention;
     const int old_fast_attention =
         ds4_gpu_set_decode_fast_attention(fast_attention ? 1 : 0);
-    const bool profile = getenv("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
+    const bool profile = DS4_PROFILE_ENV("DS4_METAL_GRAPH_TOKEN_PROFILE") != NULL;
     const double t0 = profile ? now_sec() : 0.0;
     const bool split_top1 =
         allow_split_top1 &&
@@ -31626,9 +31659,14 @@ static bool metal_graph_profile_layer_env_match(const char *env_name, uint32_t i
 }
 
 static bool metal_graph_dspark_stage_profile_enabled(uint32_t stage) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     return getenv("DS4_DSPARK_STAGE_PROFILE") != NULL &&
            metal_graph_profile_layer_env_match("DS4_DSPARK_STAGE_PROFILE_STAGE",
                                                stage);
+#else
+    (void)stage;
+    return false;
+#endif
 }
 
 static uint32_t metal_graph_dspark_support_topk(void) {
@@ -35049,8 +35087,12 @@ typedef struct ds4_verify_suffix_timing {
 } ds4_verify_suffix_timing;
 
 static bool metal_graph_dspark_verify_selected_profile_enabled(void) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     return getenv("DS4_DSPARK_VERIFY_SELECTED_PROFILE") != NULL &&
            getenv("DS4_DSPARK_DISABLE_VERIFY_SELECTED_PROFILE") == NULL;
+#else
+    return false;
+#endif
 }
 
 /* Layer-major speculative target verifier for tiny MTP suffixes.
@@ -48866,6 +48908,8 @@ struct ds4_session {
     token_vec checkpoint;
     token_vec greedy_splitkv_segment;
     float *logits;
+    ds4_tp_logits_top2 tp_peer_top2;
+    bool tp_peer_top2_valid;
     float *sample_probs;
     float *mtp_logits;
     int greedy_splitkv_anchor_len;
@@ -50510,12 +50554,30 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     const bool odinlink_batch_async_requested =
         odinlink_batch_async && odinlink_batch_async[0] &&
         strcmp(odinlink_batch_async, "0") != 0;
+    const char *rdma_logits = getenv("DS4_TP_RDMA_LOGITS");
+    const bool rdma_logits_requested =
+        rdma_logits && rdma_logits[0] && strcmp(rdma_logits, "0") != 0;
+    const char *rank0_full_logits = getenv("DS4_TP_RANK0_FULL_LOGITS");
+    const bool rank0_full_logits_requested =
+        rank0_full_logits && rank0_full_logits[0] &&
+        strcmp(rank0_full_logits, "0") != 0;
+    const char *greedy_top2 = getenv("DS4_TP_GREEDY_TOP2");
+    const bool greedy_top2_requested =
+        greedy_top2 && greedy_top2[0] && strcmp(greedy_top2, "0") != 0;
+    const bool greedy_top2_enabled = greedy_top2_requested && e &&
+        !e->mtp_ready &&
+        !(e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
     const uint32_t placement_features =
         ds4_tp_feature_expert_split(ds4_tp_expert_split_boundary()) |
         (batch_attn_head_split_requested ?
              DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT : 0u) |
         (odinlink_batch_async_requested ?
-             DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC : 0u);
+             DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC : 0u) |
+        (rdma_logits_requested && !greedy_top2_enabled ?
+             DS4_TP_FEATURE_RDMA_LOGITS : 0u) |
+        (rank0_full_logits_requested && !greedy_top2_enabled ?
+             DS4_TP_FEATURE_RANK0_FULL_LOGITS : 0u) |
+        (greedy_top2_enabled ? DS4_TP_FEATURE_GREEDY_TOP2 : 0u);
 #if !defined(DS4_ROCM_BUILD)
     (void)e;
     return placement_features;
@@ -57747,9 +57809,13 @@ static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint6
 static int ds4_engine_tp_batch_exchange(void *ud, uint32_t layer,
                                         uint32_t rows, uint64_t seq) {
     ds4_tp *tp = ud;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const char *profile_env = getenv("DS4_TP_BATCH_GATE_PROFILE");
     const bool profile = profile_env && profile_env[0] &&
                          strcmp(profile_env, "0") != 0;
+#else
+    const bool profile = false;
+#endif
     const double t0 = profile ? now_sec() : 0.0;
     const int ok = ds4_tp_batch_gate_exchange(tp, layer, rows, seq);
     if (profile) {
@@ -58272,6 +58338,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->graph.tp_batch_out = e->tp.batch_out_views;
         s->graph.tp_batch_in = e->tp.batch_in_views;
         s->graph.tp_zero = e->tp.zero_vec;
+        s->graph.tp_rank0_full_logits =
+            (ds4_tp_runtime_features(e->tp.ctx) &
+             DS4_TP_FEATURE_RANK0_FULL_LOGITS) != 0u;
         /* direct=1 prefill big-gate fix (opt-in, DS4_TP_BIG_DIRECT=1): alias
          * the prefill FFN all-reduce tensors into the registered TP slab, the
          * same way tp_out/tp_batch_out already alias into it above, so
@@ -59417,9 +59486,20 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         /* A successful worker sends its split logits even if the leader's
          * local prefill failed. Drain them to keep the control stream framed
          * before invalidating the mirrored session. */
-        if (worker_ok && s->engine->tp.vocab_split) {
+        if (worker_ok && s->engine->tp.vocab_split &&
+            (ds4_tp_runtime_features(s->engine->tp.ctx) &
+             DS4_TP_FEATURE_RANK0_FULL_LOGITS) == 0u) {
+            const bool top2 =
+                (ds4_tp_runtime_features(s->engine->tp.ctx) &
+                 DS4_TP_FEATURE_GREEDY_TOP2) != 0u;
             const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
-            if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
+            const bool received = top2 ?
+                ds4_tp_recv_logits_top2(s->engine->tp.ctx,
+                                        &s->tp_peer_top2) :
+                ds4_tp_recv_logits_half(s->engine->tp.ctx,
+                                        s->logits + vhalf, vhalf);
+            s->tp_peer_top2_valid = top2 && received;
+            if (!received) {
                 snprintf(err, errlen, "tp: worker sync logits half missing");
                 logits_ok = false;
             }
@@ -60323,15 +60403,16 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
-int ds4_session_argmax(ds4_session *s) {
-    return sample_argmax(s->logits, DS4_N_VOCAB);
-}
-
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
+    const bool tp_top2 = s->engine && s->engine->tp.active &&
+        s->engine->tp.rank == 0 && s->tp_peer_top2_valid &&
+        (ds4_tp_runtime_features(s->engine->tp.ctx) &
+         DS4_TP_FEATURE_GREEDY_TOP2) != 0u;
+    const uint32_t limit = tp_top2 ? DS4_N_VOCAB / 2u : DS4_N_VOCAB;
     int best = -1;
     float best_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+    for (uint32_t i = 0; i < limit; i++) {
         if ((int)i == excluded_id) continue;
         const float v = s->logits[i];
         if (best < 0 || v > best_logit) {
@@ -60339,7 +60420,23 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
             best_logit = v;
         }
     }
+    if (tp_top2) {
+        for (uint32_t i = 0; i < 2; i++) {
+            const int id = s->tp_peer_top2.id[i];
+            const float value = s->tp_peer_top2.value[i];
+            if (id < 0 || id == excluded_id) continue;
+            if (best < 0 || value > best_logit ||
+                (value == best_logit && id < best)) {
+                best = id;
+                best_logit = value;
+            }
+        }
+    }
     return best;
+}
+
+int ds4_session_argmax(ds4_session *s) {
+    return ds4_session_argmax_excluding(s, -1);
 }
 
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
@@ -61469,9 +61566,45 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     }
 #endif
     /* Vocab-split head: merge the halves after every eval (DS4 only). */
-    if (rc == 0 && s->engine && s->engine->tp.active && s->engine->tp.vocab_split) {
+    if (rc == 0 && s->engine && s->engine->tp.active &&
+        s->engine->tp.vocab_split &&
+        (ds4_tp_runtime_features(s->engine->tp.ctx) &
+         DS4_TP_FEATURE_RANK0_FULL_LOGITS) == 0u) {
         const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
-        if (s->engine->tp.rank == 0) {
+        if ((ds4_tp_runtime_features(s->engine->tp.ctx) &
+             DS4_TP_FEATURE_GREEDY_TOP2) != 0u) {
+            if (s->engine->tp.rank == 0) {
+                s->tp_peer_top2_valid =
+                    ds4_tp_recv_logits_top2(s->engine->tp.ctx,
+                                            &s->tp_peer_top2) != 0;
+                if (!s->tp_peer_top2_valid) {
+                    snprintf(err, errlen, "tp: worker greedy top2 missing");
+                    ds4_session_invalidate(s);
+                    return 1;
+                }
+            } else {
+                int id0 = -1, id1 = -1;
+                ds4_tp_logits_top2 top2 = {{-1, -1},
+                                           {DS4_NEG_INF, DS4_NEG_INF}};
+                logits_top2(s->logits + vhalf, vhalf,
+                            &id0, &top2.value[0],
+                            &id1, &top2.value[1]);
+                top2.id[0] = id0 + (int32_t)vhalf;
+                top2.id[1] = id1 + (int32_t)vhalf;
+                if (!ds4_tp_send_logits_top2(s->engine->tp.ctx, &top2)) {
+                    snprintf(err, errlen, "tp: worker greedy top2 send failed");
+                    return 1;
+                }
+            }
+        } else if ((ds4_tp_runtime_features(s->engine->tp.ctx) &
+             DS4_TP_FEATURE_RDMA_LOGITS) != 0u) {
+            if (!ds4_tp_exchange_logits_halves(s->engine->tp.ctx,
+                                               s->logits, vhalf)) {
+                snprintf(err, errlen, "tp: RDMA logits-half exchange failed");
+                if (s->engine->tp.rank == 0) ds4_session_invalidate(s);
+                return 1;
+            }
+        } else if (s->engine->tp.rank == 0) {
             if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
                 snprintf(err, errlen, "tp: worker logits half missing");
                 ds4_session_invalidate(s);
@@ -61869,18 +62002,33 @@ static bool ds4_sessions_tp_recv_logits(
     if (!e || !e->tp.active || e->tp.rank != 0 || !e->tp.vocab_split) {
         return true;
     }
+    if ((ds4_tp_runtime_features(e->tp.ctx) &
+         DS4_TP_FEATURE_RANK0_FULL_LOGITS) != 0u) {
+        return true;
+    }
+    const bool top2 = (ds4_tp_runtime_features(e->tp.ctx) &
+                       DS4_TP_FEATURE_GREEDY_TOP2) != 0u;
     const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
-    if (prefill &&
-        !ds4_tp_recv_logits_half(e->tp.ctx,
-                                 prefill->logits + vhalf, vhalf)) {
-        if (err && errlen) snprintf(err, errlen,
-                                    "tp: worker mixed-prefill logits missing");
-        return false;
+    if (prefill) {
+        const bool received = top2 ?
+            ds4_tp_recv_logits_top2(e->tp.ctx, &prefill->tp_peer_top2) :
+            ds4_tp_recv_logits_half(e->tp.ctx,
+                                    prefill->logits + vhalf, vhalf);
+        prefill->tp_peer_top2_valid = top2 && received;
+        if (!received) {
+            if (err && errlen) snprintf(err, errlen,
+                                        "tp: worker mixed-prefill logits missing");
+            return false;
+        }
     }
     for (int i = 0; i < count; i++) {
-        if (!ds4_tp_recv_logits_half(e->tp.ctx,
-                                     items[i].session->logits + vhalf,
-                                     vhalf)) {
+        ds4_session *session = items[i].session;
+        const bool received = top2 ?
+            ds4_tp_recv_logits_top2(e->tp.ctx, &session->tp_peer_top2) :
+            ds4_tp_recv_logits_half(e->tp.ctx,
+                                    session->logits + vhalf, vhalf);
+        session->tp_peer_top2_valid = top2 && received;
+        if (!received) {
             if (err && errlen) {
                 snprintf(err, errlen,
                          "tp: worker batch logits missing for item %d", i);
@@ -62905,7 +63053,9 @@ static int ds4_session_eval_dspark_speculative_argmax(
     }
     /* Vocab-split head: the last replay eval produced only our logits half;
      * merge the worker's before installing them as the session logits. */
-    if (replayed_drafts > 0 && tp_verify_sent && e->tp.vocab_split) {
+    if (replayed_drafts > 0 && tp_verify_sent && e->tp.vocab_split &&
+        (ds4_tp_runtime_features(e->tp.ctx) &
+         DS4_TP_FEATURE_RANK0_FULL_LOGITS) == 0u) {
         const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
         if (!ds4_tp_recv_logits_half(e->tp.ctx, row_logits + vhalf, vhalf)) {
             snprintf(err, errlen, "tp: replay logits half missing");
@@ -63225,7 +63375,9 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
     }
     if (replay_n > 0) {
         s->checkpoint_valid = true;
-        if (e->tp.vocab_split) {
+        if (e->tp.vocab_split &&
+            (ds4_tp_runtime_features(e->tp.ctx) &
+             DS4_TP_FEATURE_RANK0_FULL_LOGITS) == 0u) {
             const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
             if (!ds4_tp_send_logits_half(e->tp.ctx, logits + vhalf, vhalf)) {
                 free(scratch);

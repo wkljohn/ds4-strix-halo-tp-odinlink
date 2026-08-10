@@ -67,6 +67,15 @@ static uint32_t routed_moe_q4k_wmma_min_count(void) {
     return value;
 }
 
+static int routed_moe_q4k_decode_stage_xq_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_DECODE_STAGE_XQ");
+        enabled = env && env[0] && strcmp(env, "0") != 0;
+    }
+    return enabled;
+}
+
 static const ds4_q4k_wmma_dispatch_config *routed_moe_q4k_wmma_config(void) {
     static ds4_q4k_wmma_dispatch_config cfg = {-1, 0, 0};
     if (cfg.opt_in < 0) {
@@ -227,6 +236,7 @@ static void routed_moe_q4k_decode_event_print(void) {
 }
 
 static int routed_moe_q4k_decode_event_enabled(void) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_q4k_decode_event_enabled < 0) {
         const char *env = getenv("DS4_ROCM_Q4K_DECODE_EVENT_PROFILE");
         g_q4k_decode_event_enabled =
@@ -238,6 +248,9 @@ static int routed_moe_q4k_decode_event_enabled(void) {
         }
     }
     return g_q4k_decode_event_enabled;
+#else
+    return 0;
+#endif
 }
 
 static int routed_moe_q4k_decode_event_ensure_events(void) {
@@ -414,6 +427,7 @@ static void routed_moe_decode_profile_print(void) {
 }
 
 static int routed_moe_decode_profile_enabled(void) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_moe_decode_profile_enabled < 0) {
         const char *env = getenv("DS4_ROCM_MOE_DECODE_PROFILE");
         g_moe_decode_profile_enabled =
@@ -424,6 +438,9 @@ static int routed_moe_decode_profile_enabled(void) {
         }
     }
     return g_moe_decode_profile_enabled;
+#else
+    return 0;
+#endif
 }
 
 static int routed_moe_decode_profile_ensure_events(void) {
@@ -1881,6 +1898,24 @@ static int routed_moe_launch(
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (q4k_path) {
+                    if (routed_moe_q4k_decode_stage_xq_enabled()) {
+                    moe_gate_up_mid_decode_q4K_staged_xq_kernel<<<qgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_w,
+                        up_w,
+                        xq,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        clamp);
+                    } else {
                     moe_gate_up_mid_decode_q4K_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -1897,6 +1932,7 @@ static int routed_moe_launch(
                         n_expert,
                         write_gate_up,
                         clamp);
+                    }
                 } else if (use_decode_lut_gate) {
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,

@@ -2027,6 +2027,7 @@ static void cuda_stream_read_profile_print(void) {
 }
 
 static int cuda_stream_read_profile_enabled(void) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_stream_read_profile_enabled < 0) {
         const char *env = getenv("DS4_ROCM_STREAM_READ_PROFILE");
         g_stream_read_profile_enabled =
@@ -2038,6 +2039,9 @@ static int cuda_stream_read_profile_enabled(void) {
         }
     }
     return g_stream_read_profile_enabled;
+#else
+    return 0;
+#endif
 }
 
 static int cuda_stream_read_direct_disabled(void) {
@@ -6699,6 +6703,7 @@ static int ds4_rocm_decode_attn_event_ensure_events(void) {
 }
 
 extern "C" int ds4_gpu_decode_attn_event_profile_enabled(void) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_decode_attn_event_enabled < 0) {
         const char *env = getenv("DS4_ROCM_DECODE_ATTN_EVENT_PROFILE");
         g_decode_attn_event_enabled =
@@ -6709,6 +6714,9 @@ extern "C" int ds4_gpu_decode_attn_event_profile_enabled(void) {
         }
     }
     return g_decode_attn_event_enabled;
+#else
+    return 0;
+#endif
 }
 
 static int ds4_rocm_decode_attn_event_harvest(

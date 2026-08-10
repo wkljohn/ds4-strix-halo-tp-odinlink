@@ -21,23 +21,48 @@ PREFILL_CHUNK=${DS4_BENCH_PREFILL_CHUNK:-4096}
 DSPARK=${DS4_BENCH_DSPARK:-0}
 MTP=${DS4_BENCH_MTP:-/home/wkljohn/Desktop/cc/models/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf}
 OUT="$REPO/research-results/quant-comparison-2026-08-10"
+ROCPROF=${DS4_BENCH_ROCPROF:-0}
+SHOW_OUTPUT=${DS4_BENCH_SHOW_OUTPUT:-0}
 PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2 "$PEER_MGMT")
 
 [[ $FRONTIER =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid frontier" >&2; exit 2; }
 [[ $TOKENS =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid generated-token count" >&2; exit 2; }
 (( CONTEXT > FRONTIER + TOKENS )) || { echo "error: context must exceed frontier + tokens" >&2; exit 2; }
 
+CURRENT_OPT_ENV=(
+  DS4_TP_GREEDY_TOP2=1
+  DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
+)
+if [[ $DSPARK == 1 ]]; then
+  # Paired one-token DP4A changes the committed target trajectory unless the
+  # five-row verifier uses identical arithmetic. Keep the exact production
+  # DSpark path; the runtime independently enforces this safety invariant.
+  CURRENT_OPT_ENV+=(DS4_ROCM_Q8_DECODE_PAIR_DP4A=0)
+else
+  CURRENT_OPT_ENV+=(
+    DS4_ROCM_Q8_DECODE_PAIR_DP4A=1
+    DS4_ROCM_Q8_DP4A_SHAPE_DISPATCH=1
+  )
+fi
+
 COMMON_ENV=(
   DS4_ROCM_TP_SKIP_UNOWNED=1
   DS4_TP_ODINLINK_BATCH_ASYNC=1
   DS4_TP_VERBS_LIB=/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs/libodl_tb5_verbs.so.0.1.0
   LD_LIBRARY_PATH=/home/wkljohn/Desktop/cc/OdinLink-Five/build/lib:/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs
+  "${CURRENT_OPT_ENV[@]}"
   "${EXTRA_ENV[@]}"
 )
 WORKER_ENV=("${COMMON_ENV[@]}")
 COORD_ENV=("${COMMON_ENV[@]}")
 WORKER_ARGS=()
 COORD_ARGS=()
+if [[ $SHOW_OUTPUT == 1 ]]; then
+  COORD_ARGS+=(--show-output)
+elif [[ $SHOW_OUTPUT != 0 ]]; then
+  echo "error: DS4_BENCH_SHOW_OUTPUT must be 0 or 1" >&2
+  exit 2
+fi
 if [[ $DSPARK == 1 ]]; then
   DSPARK_ENV=(
     DS4_TP_EXPERT_SPLIT=118
@@ -51,7 +76,7 @@ if [[ $DSPARK == 1 ]]; then
   WORKER_ENV+=("${DSPARK_ENV[@]}")
   COORD_ENV+=("${DSPARK_ENV[@]}" DS4_DSPARK_RESIDENT_Q8=1)
   WORKER_ARGS=(--mtp "$MTP" --dspark)
-  COORD_ARGS=(--mtp "$MTP" --dspark)
+  COORD_ARGS+=(--mtp "$MTP" --dspark)
 elif [[ $DSPARK != 0 ]]; then
   echo "error: DS4_BENCH_DSPARK must be 0 or 1" >&2
   exit 2
@@ -103,6 +128,7 @@ echo "=== ds4-bench $TAG ==="
 echo "model: $MODEL"
 echo "workload: frontier=$FRONTIER generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK"
 if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
+if [[ $ROCPROF == 1 ]]; then echo "rocprof: kernel trace (diagnostic; timing is not benchmark evidence)"; fi
 echo "ds4_sha256: $LOCAL_DS4_HASH"
 
 "${PEER_SSH[@]}" "cd '$PEER_REPO' && setsid -f env ${WORKER_ENV[*]} ./ds4 \
@@ -112,7 +138,20 @@ echo "ds4_sha256: $LOCAL_DS4_HASH"
   ${WORKER_ARGS[*]} \
   > '$WORKER_LOG' 2>&1" &
 
-env "${COORD_ENV[@]}" "$REPO/ds4-bench-tp" \
+COORD_CMD=("$REPO/ds4-bench-tp")
+if [[ $ROCPROF == 1 ]]; then
+  ROCPROF_OUT="$OUT/rocprof-$TAG"
+  mkdir -p "$ROCPROF_OUT"
+  ROCPROF_PERIOD=${DS4_BENCH_ROCPROF_PERIOD:-70:30:1}
+  COORD_CMD=(rocprofv3 --kernel-trace --collection-period "$ROCPROF_PERIOD"
+             --stats --summary --summary-units usec
+             --output-directory "$ROCPROF_OUT" -- "$REPO/ds4-bench-tp")
+elif [[ $ROCPROF != 0 ]]; then
+  echo "error: DS4_BENCH_ROCPROF must be 0 or 1" >&2
+  exit 2
+fi
+
+env "${COORD_ENV[@]}" "${COORD_CMD[@]}" \
   --role coordinator --tensor-parallel --listen 0.0.0.0 9000 \
   --transport rdma --rocm -m "$MODEL" --prompt-file "$PROMPT_FILE" \
   --ctx-start "$FRONTIER" --ctx-max "$FRONTIER" --ctx-alloc "$CONTEXT" \
