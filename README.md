@@ -1,10 +1,10 @@
 # DS4 Strix Halo TP over OdinLink
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
-Thunderbolt RDMA. With Q4_K, the current optimization delivers **168.48 t/s
-prefill** and **13.83 t/s ordinary decode**. Opt-in DSpark speculative decoding
-reaches **20.31 t/s** on the controlled code workload. Metal, CUDA, generic
-verbs, and single-node modes remain available.
+Thunderbolt RDMA. At 2,048 tokens of live context, optimized Q4_K reaches a
+**169.65 t/s** prefill median; opt-in DSpark raises long-context decode from
+**9.92 to 14.24 t/s**. Metal, CUDA, generic verbs, and single-node modes remain
+available.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
@@ -12,20 +12,34 @@ verbs, and single-node modes remain available.
     TP rank 0                                           TP rank 1
 ```
 
-| Cache-free Q4_K TP=2 | Workload | Prefill | Decode | Recorded change |
+| TP=2 configuration | Long-context workload | Prefill | Decode | Change from original |
 |---|---|---:|---:|---:|
-| Original baseline | before gfx1151 acceleration | **34.11 t/s** | **9.96 t/s** | baseline |
-| **Current optimization, without DSpark** | 10,093-byte prefill; independent long decode validation | **168.48 t/s** | **13.83 t/s** | **+393.9% prefill / +38.9% decode** |
-| **Current optimization, with DSpark** | same Q4_K target; controlled 60-token code workload | **168.48 t/s*** | **20.31 t/s** | **+393.9% prefill / +103.9% decode** |
+| Original Q4_K baseline | archived pre-gfx1151 long-prompt run | **34.11 t/s** | **9.96 t/s** | baseline |
+| **Current Q2_K** | fixed 2,048-token prefix + 300 generated tokens | **117.03 t/s** | **10.27 t/s** | **+243.1% / +3.1%** |
+| **Current Q4_K** | fixed 2,048-token prefix + 300 generated tokens | **169.65 t/s** | **9.92 t/s** | **+397.4% / -0.4%** |
+| **Current Q4_K + DSpark** | same fixed workload; 46/54 expert split | **170.71 t/s** | **14.24 t/s** | **+400.5% / +43.0%** |
 
-\* DSpark accelerates decode, not prompt ingestion; its row repeats the same
-Q4_K target's long-prompt prefill result. The 20.31 t/s figure is a three-run
-median at 96.08% acceptance. A separate context-512, 300-token DSpark
-qualification measured **16.06 t/s** median, versus 14.82 t/s with the newest
-HC projection disabled. Speculative speed varies with prompt acceptance.
+Current rows are three-run medians from `ds4-bench-tp`, with mandatory RDMA
+and zero provider fallback. DSpark accepted 51.43% of proposed long-context
+draft tokens in all three runs. Its benefit depends on prompt acceptance.
 
-The compact default requires no 10 GiB-per-node expanded-weight cache. The
-new DSpark verifier kernels also add no persistent VRAM.
+Q2_K and Q4_K use the cache-free default. DSpark optionally keeps its Q8
+drafter on rank 0 and warns before reserving the additional 10.15 GiB.
+
+Reproduce one fixed long-context run after placing each model at the same
+absolute path on both nodes:
+
+```sh
+./run-tp-ds4-bench.sh q4-r1 /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
+./run-tp-ds4-bench.sh q2-r1 /absolute/path/DeepSeek-V4-Flash-Q2_K.gguf
+DS4_BENCH_DSPARK=1 DS4_BENCH_MTP=/absolute/path/dspark-Q8_0.gguf \
+  ./run-tp-ds4-bench.sh q4-dspark-r1 \
+  /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
+```
+
+Use three distinct tags per configuration and report the median. The launcher
+starts both independent filesystems in balance, requires RDMA, checks matching
+binary/model artifacts, and rejects provider fallback traffic.
 
 All Strix Halo acceleration is included in this fork—no external kernel patch
 is required. OdinLink-specific provider tuning is used only when its provider
@@ -381,8 +395,8 @@ select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 DSpark is an auxiliary draft model released by DeepSeek for DeepSeek V4 Flash.
 It reads hidden states from the main model and proposes up to five future
 tokens. DwarfStar checks those proposals with the main Flash model and commits
-only the accepted prefix. The main model remains authoritative; a rejected or
-low-confidence suffix falls back to ordinary target decoding.
+only the accepted prefix. The main model remains authoritative; a rejected
+suffix falls back to ordinary target decoding.
 
 The possible gain is faster generation: when several proposed tokens are
 accepted, one target verification pass advances the stream by several tokens.
@@ -392,15 +406,15 @@ low-yield prompts can be no faster or even slower. DSpark is therefore still
 experimental and explicitly opt-in.
 
 On the reference two-node Strix Halo/OdinLink setup, the current five-row
-DSpark path measured **20.31 generation tokens/s** as a controlled 60-token
-median at 96.08% acceptance. A 300-token, context-512 qualification measured
-**16.06 tokens/s** median versus 14.82 tokens/s with the newest HC projection
-disabled. Speculative throughput varies with acceptance and prompt trajectory,
-so these workloads are reported separately rather than blended into the
-non-DSpark table above. The kernel adds no persistent VRAM.
+DSpark path measured **14.24 generation tokens/s** at 2,048 tokens of live
+context, versus **9.92 tokens/s** without DSpark. Both are three-run medians
+over 300 generated tokens. This prompt accepted 51.43% of proposed draft
+tokens; other prompts can be faster or slower. The verifier kernel itself adds
+no persistent VRAM.
 
-The released DSpark checkpoint is packaged here as a separate support GGUF of
-about 5.6 GiB. It is not a standalone model. Download it once:
+The released DSpark checkpoint is packaged as a separate support GGUF. It is
+not a standalone model. The reference Q8_0 drafter occupies about 10.15 GiB
+when the optional resident mode is enabled on rank 0. Download it once:
 
 ```sh
 ./download_model.sh dspark-support

@@ -23,8 +23,8 @@ PEER_MGMT=${DS4_PEER_MGMT:-wkljohn@10.10.0.216}
 COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-10.10.0.181}
 PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2 "$PEER_MGMT")
 MODELS=/home/wkljohn/Desktop/cc/models/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF
-MODEL="$MODELS/DeepSeek-V4-Flash-Q4_K-0731.gguf"
-MTP="$MODELS/dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"
+MODEL=${DS4_BENCH_MODEL:-$MODELS/DeepSeek-V4-Flash-Q4_K-0731.gguf}
+MTP=${DS4_BENCH_MTP:-$MODELS/dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf}
 OUT="$REPO/research-results/dspark-17tps-2026-08-07"
 mkdir -p "$OUT"
 
@@ -62,6 +62,7 @@ COORD_ENV=("${COMMON_ENV[@]}" DS4_DSPARK_RESIDENT_Q8=1 "${EXTRA_ENV[@]}")
 
 echo "=== run $TAG ==="
 echo "env: ${EXTRA_ENV[*]:-<none>}"
+echo "model: $MODEL"
 echo "workload: context=$CONTEXT generated_tokens=$TOKENS repeats=$REPEATS"
 
 if [[ ! -r /dev/odl_tb5_0 ]]; then
