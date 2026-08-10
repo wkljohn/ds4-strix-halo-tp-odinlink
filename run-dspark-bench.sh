@@ -14,6 +14,8 @@ REPEATS=${DS4_BENCH_REPEATS:-3}
 [[ $REPEATS =~ ^[1-9][0-9]*$ ]] || { echo "error: DS4_BENCH_REPEATS must be positive" >&2; exit 2; }
 TOKENS=${DS4_BENCH_TOKENS:-60}
 [[ $TOKENS =~ ^[1-9][0-9]*$ ]] || { echo "error: DS4_BENCH_TOKENS must be positive" >&2; exit 2; }
+CONTEXT=${DS4_BENCH_CONTEXT:-128}
+[[ $CONTEXT =~ ^[1-9][0-9]*$ ]] || { echo "error: DS4_BENCH_CONTEXT must be positive" >&2; exit 2; }
 
 REPO=/home/wkljohn/Desktop/cc/ds4-strix-halo-tp
 PEER_REPO=/home/wkljohn/Desktop/cc/ds4-strix-halo-tp
@@ -60,6 +62,7 @@ COORD_ENV=("${COMMON_ENV[@]}" DS4_DSPARK_RESIDENT_Q8=1 "${EXTRA_ENV[@]}")
 
 echo "=== run $TAG ==="
 echo "env: ${EXTRA_ENV[*]:-<none>}"
+echo "workload: context=$CONTEXT generated_tokens=$TOKENS repeats=$REPEATS"
 
 if [[ ! -r /dev/odl_tb5_0 ]]; then
     echo "error: local OdinLink device /dev/odl_tb5_0 is unavailable" >&2
@@ -85,7 +88,7 @@ sleep 2
 
 # Worker and coordinator start concurrently; never wait for the coordinator port.
 "${PEER_SSH[@]}" "cd $PEER_REPO && setsid -f env ${WORKER_ENV[*]} ./ds4 --role worker --tensor-parallel \
-    --coordinator $COORDINATOR_ADDR 9000 --transport rdma --rocm -m '$MODEL' --mtp '$MTP' --dspark -c 128 \
+    --coordinator $COORDINATOR_ADDR 9000 --transport rdma --rocm -m '$MODEL' --mtp '$MTP' --dspark -c $CONTEXT \
     > $WORKER_LOG 2>&1" &
 
 # Three identical repetitions with /reset between them.
@@ -99,7 +102,7 @@ sleep 2
 
 env "${COORD_ENV[@]}" ./ds4 --role coordinator --tensor-parallel \
     --listen 0.0.0.0 9000 --transport rdma --rocm -m "$MODEL" --mtp "$MTP" --dspark \
-    -c 128 --temp 0 --seed 42 --nothink -n "$TOKENS" \
+    -c "$CONTEXT" --temp 0 --seed 42 --nothink -n "$TOKENS" \
     < "$OUT/driver-$TAG.txt" > "$COORD_LOG" 2>&1
 
 echo "=== run $TAG complete ==="
