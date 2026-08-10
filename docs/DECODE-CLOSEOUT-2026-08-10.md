@@ -89,6 +89,14 @@ Ordinary Q4_K decode runs were 13.12/14.49/14.31 t/s. Q2_K runs were
 14.92/15.05/14.78 t/s with identical 51.43% acceptance. Every accepted run
 used explicit RDMA and reported zero provider fallback calls.
 
+After the final profiling gate and documentation commits, the plain launcher
+command was rerun with synchronized binary SHA-256
+`f9b43ed5312552c1bcf647a7665a58e79dc3c1f3a148a503e03d8933a7ebb631`.
+It measured 167.67 prefill, 13.31 overall decode and 13.33 steady decode t/s
+with 300 generated tokens and zero provider fallback calls. This is a
+corroborating final-build run; the table retains the less selective three-run
+medians.
+
 ## DSpark incompatibility caught by A/B
 
 Applying paired one-token DP4A only to committed target decode changed its
