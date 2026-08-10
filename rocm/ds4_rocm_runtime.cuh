@@ -1,6 +1,20 @@
 static const void *g_model_host_base;
 static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
+static const void *g_support_host_base;
+static uint64_t g_support_host_size;
+static int g_support_fd = -1;
+static int g_support_direct_fd = -1;
+static uint64_t g_support_file_size;
+static uint64_t g_support_direct_align = 1;
+static uint64_t g_dspark_stage_offsets[3];
+static char *g_dspark_selected_gate;
+static char *g_dspark_selected_up;
+static char *g_dspark_selected_down;
+static uint64_t g_dspark_selected_gate_capacity;
+static uint64_t g_dspark_selected_down_capacity;
+static int32_t *g_dspark_selected_ids;
+static uint64_t g_dspark_selected_ids_capacity;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_fd = -1;
@@ -637,6 +651,101 @@ static void cuda_model_image_release_all(void) {
         if (img.device_ptr) (void)cudaFree(img.device_ptr);
     }
     g_model_images.clear();
+}
+
+static int cuda_env_enabled_exact(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+/* Optional DSpark-good placement: retain the compact Q8 support GGUF as one
+ * device image on the coordinator.  This is deliberately opt-in because the
+ * V4 Q8 drafter consumes about 10.15 GiB of persistent VRAM.  Keeping the
+ * original GGUF offsets lets every ordinary tensor lookup use the existing
+ * cuda_model_image_* helpers, while routed experts can be gathered D2D below.
+ *
+ * Do not silently fall back to NVMe streaming when the requested placement
+ * does not fit.  A dspark-good launch that accidentally streams is both much
+ * slower and very difficult for an operator to distinguish from a working
+ * resident run.
+ */
+static int cuda_dspark_make_support_resident(
+        const void *model_map, uint64_t model_size) {
+    if (!model_map || model_size == 0) return 0;
+    if (cuda_model_image_range_ptr(model_map, 0, model_size)) return 1;
+
+    uint64_t reserve_gib = 3;
+    const char *reserve_env = getenv("DS4_DSPARK_RESIDENT_RESERVE_GB");
+    if (reserve_env && reserve_env[0]) {
+        char *end = NULL;
+        unsigned long long parsed = strtoull(reserve_env, &end, 10);
+        if (end && *end == '\0' && parsed >= 1 && parsed <= 32) {
+            reserve_gib = (uint64_t)parsed;
+        }
+    }
+    const uint64_t reserve_bytes = reserve_gib << 30;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (!cuda_ok(cudaMemGetInfo(&free_bytes, &total_bytes),
+                 "DSpark resident VRAM query")) return 0;
+    if ((uint64_t)free_bytes < model_size ||
+        (uint64_t)free_bytes - model_size < reserve_bytes) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "DSpark resident Q8 refused: support=%.2f GiB free=%.2f GiB "
+                "required-reserve=%llu GiB. This mode is intentionally not "
+                "falling back to streamed weights.\n",
+                (double)model_size / 1073741824.0,
+                (double)free_bytes / 1073741824.0,
+                (unsigned long long)reserve_gib);
+        return 0;
+    }
+
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX
+            "WARNING: DS4_DSPARK_RESIDENT_Q8=1 retains %.2f GiB of Q8 "
+            "drafter weights in VRAM (opt-in; free before load %.2f/%.2f GiB, "
+            "reserve %llu GiB)\n",
+            (double)model_size / 1073741824.0,
+            (double)free_bytes / 1073741824.0,
+            (double)total_bytes / 1073741824.0,
+            (unsigned long long)reserve_gib);
+
+    char *device = NULL;
+    cudaError_t err = cudaMalloc((void **)&device, (size_t)model_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "DSpark resident Q8 allocation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const double t0 = cuda_wall_sec();
+    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    for (uint64_t copied = 0; copied < model_size; copied += chunk) {
+        const uint64_t bytes = model_size - copied < chunk
+            ? model_size - copied : chunk;
+        err = cudaMemcpy(device + copied,
+                         (const char *)model_map + copied,
+                         (size_t)bytes, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "DSpark resident Q8 copy failed at %.2f/%.2f GiB: %s\n",
+                    (double)copied / 1073741824.0,
+                    (double)model_size / 1073741824.0,
+                    cudaGetErrorString(err));
+            (void)cudaFree(device);
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    g_model_images.push_back({model_map, model_size, device, 0});
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+            "DSpark resident Q8 ready in %.3fs (%.2f GiB, compact GGUF "
+            "representation)\n",
+            cuda_wall_sec() - t0,
+            (double)model_size / 1073741824.0);
+    return 1;
 }
 
 static int cuda_stream_resident_reclaim_wait(const char *what) {
@@ -1747,6 +1856,11 @@ typedef struct cuda_stream_read_job {
     int uploaded;
     int errnum;
     int direct;
+    int use_own_fd;
+    int fd;
+    int direct_fd;
+    uint64_t file_size;
+    uint64_t direct_align;
 } cuda_stream_read_job;
 
 struct cuda_stream_batch_selected_pending {
@@ -1943,7 +2057,11 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
     job->uploaded = 0;
     job->errnum = 0;
     job->direct = 0;
-    if (!stage || job->bytes == 0 || g_model_fd < 0) {
+    const int read_fd = job->use_own_fd ? job->fd : g_model_fd;
+    const int direct_fd = job->use_own_fd ? job->direct_fd : g_model_direct_fd;
+    const uint64_t file_size = job->use_own_fd ? job->file_size : g_model_file_size;
+    const uint64_t direct_align = job->use_own_fd ? job->direct_align : g_model_direct_align;
+    if (!stage || job->bytes == 0 || read_fd < 0) {
         job->errnum = EINVAL;
         return;
     }
@@ -1958,18 +2076,18 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
      * alone so concurrent workers are unaffected.
      */
     if (!cuda_stream_read_direct_disabled() &&
-        g_model_direct_fd >= 0 &&
-        g_model_direct_align > 1 &&
-        g_model_file_size != 0) {
+        direct_fd >= 0 &&
+        direct_align > 1 &&
+        file_size != 0) {
         const uint64_t aligned_off =
-            cuda_round_down(job->offset, g_model_direct_align);
+            cuda_round_down(job->offset, direct_align);
         const uint64_t delta = job->offset - aligned_off;
         const uint64_t read_size =
-            cuda_round_up(delta + job->bytes, g_model_direct_align);
+            cuda_round_up(delta + job->bytes, direct_align);
         if (read_size <= stage_bytes &&
-            aligned_off <= g_model_file_size &&
-            read_size <= g_model_file_size - aligned_off &&
-            cuda_pread_full(g_model_direct_fd, stage, read_size, aligned_off)) {
+            aligned_off <= file_size &&
+            read_size <= file_size - aligned_off &&
+            cuda_pread_full(direct_fd, stage, read_size, aligned_off)) {
             job->host_buf = (char *)stage + delta;
             job->direct = 1;
             job->ok = 1;
@@ -1977,7 +2095,7 @@ static void cuda_stream_read_job_run(cuda_stream_read_job *job,
         }
     }
 #endif
-    if (cuda_pread_full(g_model_fd, job->host_buf, job->bytes, job->offset)) {
+    if (cuda_pread_full(read_fd, job->host_buf, job->bytes, job->offset)) {
         job->ok = 1;
     } else {
         job->errnum = errno ? errno : EIO;
@@ -2007,7 +2125,16 @@ static int cuda_stream_read_job_upload(
         return 0;
     }
     job->uploaded = 1;
-    if (!job->direct) cuda_model_drop_file_pages(job->offset, job->bytes);
+    if (!job->direct) {
+        if (job->use_own_fd) {
+#if defined(POSIX_FADV_DONTNEED)
+            (void)posix_fadvise(job->fd, (off_t)job->offset,
+                                (off_t)job->bytes, POSIX_FADV_DONTNEED);
+#endif
+        } else {
+            cuda_model_drop_file_pages(job->offset, job->bytes);
+        }
+    }
     return 1;
 }
 
@@ -2198,10 +2325,15 @@ static int cuda_stream_read_jobs_prepare(cuda_stream_read_job *jobs, uint32_t co
         jobs[i].host_buf = NULL;
         if (jobs[i].bytes > max_bytes) max_bytes = jobs[i].bytes;
     }
+    uint64_t max_align = g_model_direct_align;
+    for (uint32_t i = 0; i < count; i++) {
+        if (jobs[i].use_own_fd && jobs[i].direct_align > max_align) {
+            max_align = jobs[i].direct_align;
+        }
+    }
     /* Slack so direct reads can align their offset and length. */
-    if (g_model_direct_align > 1u &&
-        max_bytes <= UINT64_MAX - 2u * g_model_direct_align) {
-        max_bytes += 2u * g_model_direct_align;
+    if (max_align > 1u && max_bytes <= UINT64_MAX - 2u * max_align) {
+        max_bytes += 2u * max_align;
     }
 
     const uint32_t workers = g_stream_read_pool_started ?
@@ -4586,6 +4718,368 @@ static const char *cuda_model_range_copy_uncached(
     return (const char *)dev;
 }
 
+/* DSpark's three MXFP4 expert stages total about 9.56 GiB.  A TP rank has
+ * room for one stage, but not all three beside its 80.76 GiB base shard.
+ * Drop the previous stage's three independently allocated tables before
+ * resolving the next one; small dense support tensors remain cached. */
+static int cuda_dspark_select_expert_stage(
+        const void *model_map,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset) {
+    if (!model_map || model_map != g_support_host_base) return 1;
+    if (g_dspark_stage_offsets[0] == gate_offset &&
+        g_dspark_stage_offsets[1] == up_offset &&
+        g_dspark_stage_offsets[2] == down_offset) return 1;
+    if (g_dspark_stage_offsets[0] || g_dspark_stage_offsets[1] ||
+        g_dspark_stage_offsets[2]) {
+        if (!cuda_ok(cudaDeviceSynchronize(), "DSpark expert-stage switch")) {
+            return 0;
+        }
+        for (cuda_model_range &r : g_model_ranges) {
+            if (r.host_base != model_map || r.arena_allocated ||
+                !r.device_ptr) continue;
+            bool old_stage = false;
+            for (uint32_t i = 0; i < 3; i++) {
+                if (r.offset == g_dspark_stage_offsets[i]) old_stage = true;
+            }
+            if (!old_stage) continue;
+            (void)cudaFree(r.device_ptr);
+            if (g_model_range_bytes >= r.bytes) g_model_range_bytes -= r.bytes;
+            r.host_base = NULL;
+            r.offset = 0;
+            r.bytes = 0;
+            r.device_ptr = NULL;
+        }
+    }
+    g_dspark_stage_offsets[0] = gate_offset;
+    g_dspark_stage_offsets[1] = up_offset;
+    g_dspark_stage_offsets[2] = down_offset;
+    return 1;
+}
+
+static int cuda_dspark_prepare_selected_experts(
+        const void *model_map,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t n_total_expert,
+        const ds4_gpu_tensor *selected,
+        uint64_t pair_count,
+        ds4_gpu_tensor *selected_compact,
+        const char **gate_out,
+        const char **up_out,
+        const char **down_out) {
+    if (!model_map || model_map != g_support_host_base || !selected ||
+        !selected_compact || !gate_out || !up_out || !down_out ||
+        pair_count == 0 || pair_count > SIZE_MAX / sizeof(int32_t)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "DSpark selected expert staging rejected arguments: map=%p "
+                "support=%p selected=%p compact=%p pairs=%llu\n",
+                model_map, g_support_host_base, (const void *)selected,
+                (void *)selected_compact, (unsigned long long)pair_count);
+        return 0;
+    }
+    const char *profile_env = getenv("DS4_DSPARK_STAGE_PROFILE");
+    const bool profile = profile_env && profile_env[0] &&
+                         strcmp(profile_env, "0") != 0;
+    const double profile_t0 = profile ? cuda_wall_sec() : 0.0;
+    if (!cuda_ok(cudaDeviceSynchronize(), "DSpark selected expert staging")) return 0;
+    const double profile_t_sync = profile ? cuda_wall_sec() : 0.0;
+    std::vector<int32_t> ids((size_t)pair_count);
+    if (!cuda_ok(cudaMemcpy(ids.data(), selected->ptr,
+                            (size_t)pair_count * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost),
+                 "DSpark selected id readback")) return 0;
+    std::vector<int32_t> unique;
+    unique.reserve((size_t)pair_count);
+    for (uint64_t i = 0; i < pair_count; i++) {
+        int32_t id = ids[(size_t)i];
+        /* Router padding uses -1 with a zero weight. Preserve that sentinel:
+         * the MXFP4 kernels map it to compact slot zero for safe reads, while
+         * the zero pair weight makes its gate/up/mid/down contribution zero. */
+        if (id < 0) {
+            ids[(size_t)i] = -1;
+            continue;
+        }
+        if ((uint32_t)id >= n_total_expert) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "DSpark selected expert id %d at pair %llu is outside "
+                    "0..%u\n", id, (unsigned long long)i, n_total_expert);
+            return 0;
+        }
+        auto it = std::find(unique.begin(), unique.end(), id);
+        if (it == unique.end()) {
+            unique.push_back(id);
+            ids[(size_t)i] = (int32_t)unique.size() - 1;
+        } else {
+            ids[(size_t)i] = (int32_t)(it - unique.begin());
+        }
+    }
+    if (unique.empty()) {
+        /* All router slots are padding (-1, zero weight). The caller can
+         * materialize the mathematically correct zero routed contribution
+         * without staging or reading any expert weights. */
+        return 2;
+    }
+    const double profile_t_route = profile ? cuda_wall_sec() : 0.0;
+    uint64_t gate_need = 0, down_need = 0, ids_need = 0;
+    if (!cuda_u64_mul_checked(unique.size(), gate_expert_bytes, &gate_need) ||
+        !cuda_u64_mul_checked(unique.size(), down_expert_bytes, &down_need) ||
+        !cuda_u64_mul_checked(pair_count, sizeof(int32_t), &ids_need)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "DSpark selected expert staging size overflow: unique=%llu "
+                "pairs=%llu gate_eb=%llu down_eb=%llu\n",
+                (unsigned long long)unique.size(),
+                (unsigned long long)pair_count,
+                (unsigned long long)gate_expert_bytes,
+                (unsigned long long)down_expert_bytes);
+        return 0;
+    }
+    if (g_dspark_selected_gate_capacity < gate_need) {
+        if (g_dspark_selected_gate) (void)cudaFree(g_dspark_selected_gate);
+        if (g_dspark_selected_up) (void)cudaFree(g_dspark_selected_up);
+        g_dspark_selected_gate = NULL;
+        g_dspark_selected_up = NULL;
+        if (!cuda_ok(cudaMalloc((void **)&g_dspark_selected_gate, (size_t)gate_need),
+                     "DSpark selected gate alloc") ||
+            !cuda_ok(cudaMalloc((void **)&g_dspark_selected_up, (size_t)gate_need),
+                     "DSpark selected up alloc")) return 0;
+        g_dspark_selected_gate_capacity = gate_need;
+    }
+    if (g_dspark_selected_down_capacity < down_need) {
+        if (g_dspark_selected_down) (void)cudaFree(g_dspark_selected_down);
+        g_dspark_selected_down = NULL;
+        if (!cuda_ok(cudaMalloc((void **)&g_dspark_selected_down, (size_t)down_need),
+                     "DSpark selected down alloc")) return 0;
+        g_dspark_selected_down_capacity = down_need;
+    }
+    if (g_dspark_selected_ids_capacity < ids_need) {
+        if (g_dspark_selected_ids) (void)cudaFree(g_dspark_selected_ids);
+        g_dspark_selected_ids = NULL;
+        if (!cuda_ok(cudaMalloc((void **)&g_dspark_selected_ids, (size_t)ids_need),
+                     "DSpark selected ids alloc")) return 0;
+        g_dspark_selected_ids_capacity = ids_need;
+    }
+    const char *base = (const char *)model_map;
+    /* Upload the tiny compact routing map before scheduling asynchronous
+     * weight copies.  Keeping its source in this stack-owned vector avoids a
+     * pinned host allocation or a lifetime wait. */
+    if (!cuda_ok(cudaMemcpy(g_dspark_selected_ids, ids.data(), (size_t)ids_need,
+                            cudaMemcpyHostToDevice),
+                 "DSpark selected id upload")) return 0;
+    const double profile_t_setup = profile ? cuda_wall_sec() : 0.0;
+    bool transfer_done = false;
+    bool used_parallel_read = false;
+    bool used_resident_d2d = false;
+    const char *resident_base = cuda_model_image_range_ptr(
+            model_map, 0, g_support_host_size);
+    if (resident_base) {
+        for (size_t slot = 0; slot < unique.size(); slot++) {
+            const uint64_t expert = (uint64_t)(uint32_t)unique[slot];
+            if (!cuda_ok(cudaMemcpy(
+                             g_dspark_selected_gate + slot * gate_expert_bytes,
+                             resident_base + gate_offset +
+                                 expert * gate_expert_bytes,
+                             (size_t)gate_expert_bytes,
+                             cudaMemcpyDeviceToDevice),
+                         "DSpark resident selected gate gather") ||
+                !cuda_ok(cudaMemcpy(
+                             g_dspark_selected_up + slot * gate_expert_bytes,
+                             resident_base + up_offset +
+                                 expert * gate_expert_bytes,
+                             (size_t)gate_expert_bytes,
+                             cudaMemcpyDeviceToDevice),
+                         "DSpark resident selected up gather") ||
+                !cuda_ok(cudaMemcpy(
+                             g_dspark_selected_down + slot * down_expert_bytes,
+                             resident_base + down_offset +
+                                 expert * down_expert_bytes,
+                             (size_t)down_expert_bytes,
+                             cudaMemcpyDeviceToDevice),
+                         "DSpark resident selected down gather")) return 0;
+        }
+        transfer_done = true;
+        used_resident_d2d = true;
+    }
+#if defined(__HIP_PLATFORM_AMD__) && defined(HIP_VERSION_MAJOR) && HIP_VERSION_MAJOR >= 7
+    static int gfx1151 = -1;
+    if (gfx1151 < 0) {
+        cudaDeviceProp prop;
+        int device = 0;
+        gfx1151 = cudaGetDevice(&device) == cudaSuccess &&
+                  cudaGetDeviceProperties(&prop, device) == cudaSuccess &&
+                  strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+    }
+#else
+    const int gfx1151 = 0;
+#endif
+    const char *parallel_read_env = getenv("DS4_DSPARK_PARALLEL_READ");
+    const bool use_parallel_read = parallel_read_env
+            ? parallel_read_env[0] && strcmp(parallel_read_env, "0") != 0
+            : gfx1151 != 0;
+    if (!transfer_done && use_parallel_read && g_support_fd >= 0) {
+        const char *direct_read_env = getenv("DS4_DSPARK_DIRECT_READ");
+        const bool use_direct_read = direct_read_env &&
+                direct_read_env[0] && strcmp(direct_read_env, "0") != 0;
+        static int reader_notice = 0;
+        if (!reader_notice) {
+            const uint64_t max_expert_bytes =
+                gate_expert_bytes > down_expert_bytes ?
+                    gate_expert_bytes : down_expert_bytes;
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "DSpark parallel expert reader enabled "
+                    "(%s, bounded pinned staging <= %.2f MiB, "
+                    "no weight cache)\n",
+                    use_direct_read ? "direct-I/O override" : "buffered+evicted",
+                    (double)(max_expert_bytes *
+                             cuda_stream_read_worker_count()) / 1048576.0);
+            reader_notice = 1;
+        }
+        const size_t job_count = unique.size() * 3u;
+        std::vector<cuda_stream_read_job> jobs(job_count);
+        size_t job = 0;
+        for (size_t slot = 0; slot < unique.size(); slot++) {
+            const uint64_t expert = (uint64_t)(uint32_t)unique[slot];
+            cuda_stream_read_job *j = &jobs[job++];
+            j->dst = g_dspark_selected_gate + slot * gate_expert_bytes;
+            j->offset = gate_offset + expert * gate_expert_bytes;
+            j->bytes = gate_expert_bytes;
+            j = &jobs[job++];
+            j->dst = g_dspark_selected_up + slot * gate_expert_bytes;
+            j->offset = up_offset + expert * gate_expert_bytes;
+            j->bytes = gate_expert_bytes;
+            j = &jobs[job++];
+            j->dst = g_dspark_selected_down + slot * down_expert_bytes;
+            j->offset = down_offset + expert * down_expert_bytes;
+            j->bytes = down_expert_bytes;
+        }
+        for (size_t i = 0; i < job_count; i++) {
+            jobs[i].use_own_fd = 1;
+            jobs[i].fd = g_support_fd;
+            jobs[i].direct_fd = use_direct_read ? g_support_direct_fd : -1;
+            jobs[i].file_size = g_support_file_size;
+            jobs[i].direct_align = use_direct_read ? g_support_direct_align : 1;
+        }
+        /* The three expert tables are far apart in the GGUF.  Interleaving
+         * gate/up/down per expert turns a bounded read into repeated
+         * multi-gigabyte seeks.  Queue by file offset so the worker pool
+         * presents monotonic, locally adjacent requests to NVMe. */
+        std::sort(jobs.begin(), jobs.end(),
+                  [](const cuda_stream_read_job &a,
+                     const cuda_stream_read_job &b) {
+                      return a.offset < b.offset;
+                  });
+        if (cuda_stream_read_jobs_parallel(jobs.data(), (uint32_t)job_count) &&
+            cuda_stream_selected_upload_read_jobs(jobs.data(),
+                                                   (uint32_t)job_count)) {
+            transfer_done = true;
+            used_parallel_read = true;
+        }
+        cuda_stream_read_jobs_free(jobs.data(), (uint32_t)job_count);
+    }
+#if defined(__HIP_PLATFORM_AMD__) && defined(HIP_VERSION_MAJOR) && HIP_VERSION_MAJOR >= 7
+    const char *batch_copy_env = getenv("DS4_DSPARK_BATCH_COPY");
+    const bool use_batch_copy = batch_copy_env
+            ? atoi(batch_copy_env) != 0
+            : gfx1151 != 0;
+    if (!transfer_done && use_batch_copy) {
+        /* ROCm's batch API avoids serializing each mmap-backed gate/up/down
+         * range through its own synchronous pageable-memory copy.  It cut the
+         * measured DSpark support chain substantially on gfx1151 and adds no
+         * persistent weight storage.  The source map outlives the copies; the
+         * descriptor vectors are consumed by the submission call itself. */
+        if (!cuda_stream_selected_ensure_stream()) return 0;
+        const size_t copy_count = unique.size() * 3;
+        std::vector<void *> dsts(copy_count);
+        std::vector<void *> srcs(copy_count);
+        std::vector<size_t> sizes(copy_count);
+        size_t copy = 0;
+        for (size_t slot = 0; slot < unique.size(); slot++) {
+            const uint64_t expert = (uint64_t)(uint32_t)unique[slot];
+            dsts[copy] = g_dspark_selected_gate + slot * gate_expert_bytes;
+            srcs[copy] = (void *)(base + gate_offset + expert * gate_expert_bytes);
+            sizes[copy++] = (size_t)gate_expert_bytes;
+            dsts[copy] = g_dspark_selected_up + slot * gate_expert_bytes;
+            srcs[copy] = (void *)(base + up_offset + expert * gate_expert_bytes);
+            sizes[copy++] = (size_t)gate_expert_bytes;
+            dsts[copy] = g_dspark_selected_down + slot * down_expert_bytes;
+            srcs[copy] = (void *)(base + down_offset + expert * down_expert_bytes);
+            sizes[copy++] = (size_t)down_expert_bytes;
+        }
+        size_t fail_index = SIZE_MAX;
+        hipError_t batch_err = hipMemcpyBatchAsync(
+                dsts.data(), srcs.data(), sizes.data(), copy_count,
+                NULL, NULL, 0, &fail_index, g_stream_selected_upload_stream);
+        if (batch_err != hipSuccess) {
+            static int warned = 0;
+            if (!warned) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "DSpark selected expert batch copy unavailable at %llu: "
+                        "%s; using synchronous copies\n",
+                        (unsigned long long)fail_index,
+                        hipGetErrorString(batch_err));
+                warned = 1;
+            }
+            (void)hipGetLastError();
+        } else {
+            if (!cuda_stream_selected_upload_record_ready()) return 0;
+            if (profile) {
+                if (!cuda_stream_selected_upload_wait_host(
+                            "DSpark selected expert profiled batch copy")) return 0;
+            } else if (!cuda_stream_selected_wait_upload_ready()) {
+                return 0;
+            }
+            transfer_done = true;
+        }
+    }
+#endif
+    if (!transfer_done) {
+        for (size_t slot = 0; slot < unique.size(); slot++) {
+            const uint64_t expert = (uint64_t)(uint32_t)unique[slot];
+            if (!cuda_ok(cudaMemcpy(g_dspark_selected_gate + slot * gate_expert_bytes,
+                                    base + gate_offset + expert * gate_expert_bytes,
+                                    (size_t)gate_expert_bytes, cudaMemcpyHostToDevice),
+                         "DSpark selected gate copy") ||
+                !cuda_ok(cudaMemcpy(g_dspark_selected_up + slot * gate_expert_bytes,
+                                    base + up_offset + expert * gate_expert_bytes,
+                                    (size_t)gate_expert_bytes, cudaMemcpyHostToDevice),
+                         "DSpark selected up copy") ||
+                !cuda_ok(cudaMemcpy(g_dspark_selected_down + slot * down_expert_bytes,
+                                    base + down_offset + expert * down_expert_bytes,
+                                    (size_t)down_expert_bytes, cudaMemcpyHostToDevice),
+                         "DSpark selected down copy")) return 0;
+        }
+    }
+    if (profile) {
+        const double profile_done = cuda_wall_sec();
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "DSpark expert stage profile unique=%llu pairs=%llu bytes=%.2f MiB "
+                "mode=%s sync=%.3f ms route=%.3f ms setup=%.3f ms copy=%.3f ms "
+                "total=%.3f ms\n",
+                (unsigned long long)unique.size(),
+                (unsigned long long)pair_count,
+                (double)(gate_need * 2u + down_need) / 1048576.0,
+                used_resident_d2d ? "resident-d2d" :
+                    (used_parallel_read ? "parallel-read" :
+                     (transfer_done ? "batch" : "sync")),
+                (profile_t_sync - profile_t0) * 1000.0,
+                (profile_t_route - profile_t_sync) * 1000.0,
+                (profile_t_setup - profile_t_route) * 1000.0,
+                (profile_done - profile_t_setup) * 1000.0,
+                (profile_done - profile_t0) * 1000.0);
+    }
+    selected_compact->ptr = g_dspark_selected_ids;
+    selected_compact->bytes = ids_need;
+    selected_compact->owner = 0;
+    *gate_out = g_dspark_selected_gate;
+    *up_out = g_dspark_selected_up;
+    *down_out = g_dspark_selected_down;
+    return 1;
+}
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
     const char *image_ptr =
@@ -5913,6 +6407,29 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_host_base = NULL;
     g_model_device_base = NULL;
     g_model_registered_size = 0;
+    g_support_host_base = NULL;
+    g_support_host_size = 0;
+    g_support_fd = -1;
+    if (g_support_direct_fd >= 0) {
+        (void)close(g_support_direct_fd);
+        g_support_direct_fd = -1;
+    }
+    g_support_file_size = 0;
+    g_support_direct_align = 1;
+    g_dspark_stage_offsets[0] = 0;
+    g_dspark_stage_offsets[1] = 0;
+    g_dspark_stage_offsets[2] = 0;
+    if (g_dspark_selected_gate) (void)cudaFree(g_dspark_selected_gate);
+    if (g_dspark_selected_up) (void)cudaFree(g_dspark_selected_up);
+    if (g_dspark_selected_down) (void)cudaFree(g_dspark_selected_down);
+    if (g_dspark_selected_ids) (void)cudaFree(g_dspark_selected_ids);
+    g_dspark_selected_gate = NULL;
+    g_dspark_selected_up = NULL;
+    g_dspark_selected_down = NULL;
+    g_dspark_selected_ids = NULL;
+    g_dspark_selected_gate_capacity = 0;
+    g_dspark_selected_down_capacity = 0;
+    g_dspark_selected_ids_capacity = 0;
     g_model_device_owned = 0;
     g_model_range_mapping_supported = 1;
     g_model_fd = -1;
@@ -6298,6 +6815,232 @@ extern "C" void ds4_gpu_decode_attn_event_profile_record(
     }
 }
 
+/* Verifier stage timing deliberately uses enough slots for one complete
+ * DS4-Flash verifier graph.  The graph queues every layer before its normal
+ * completion/readback, so a 16-slot pool would drop most of a 43-layer
+ * sample even when the GPU is behaving normally.  Reuse is still guarded by
+ * hipEventQuery and drops rather than waits. */
+enum { DS4_ROCM_VERIFY_STAGE_EVENT_POOL_SIZE = 64 };
+
+typedef struct {
+    hipEvent_t events[DS4_GPU_VERIFY_STAGE_EVENT_COUNT];
+    uint32_t valid_mask;
+    int complete;
+} ds4_rocm_verify_stage_event_slot;
+
+typedef struct {
+    uint64_t count;
+    double sum_ms;
+    float min_ms;
+    float max_ms;
+} ds4_rocm_verify_stage_event_stat;
+
+enum {
+    DS4_ROCM_VERIFY_STAT_LAYER = 0,
+    DS4_ROCM_VERIFY_STAT_ATTN,
+    DS4_ROCM_VERIFY_STAT_DENSE_Q8,
+    DS4_ROCM_VERIFY_STAT_ROUTED_MOE,
+    DS4_ROCM_VERIFY_STAT_RESIDUAL,
+    DS4_ROCM_VERIFY_STAT_COUNT
+};
+
+static ds4_rocm_verify_stage_event_slot
+    g_verify_stage_event_slots[DS4_ROCM_VERIFY_STAGE_EVENT_POOL_SIZE];
+static ds4_rocm_verify_stage_event_stat
+    g_verify_stage_event_stats[DS4_ROCM_VERIFY_STAT_COUNT];
+static int g_verify_stage_events_enabled = -1;
+static int g_verify_stage_events_ready;
+static int g_verify_stage_events_atexit_registered;
+static int g_verify_stage_events_active_slot = -1;
+static uint32_t g_verify_stage_events_next_slot;
+static uint32_t g_verify_stage_events_rank;
+static uint64_t g_verify_stage_events_samples;
+static uint64_t g_verify_stage_events_dropped;
+
+static void ds4_rocm_verify_stage_stat_add(uint32_t stat_index, float ms) {
+    ds4_rocm_verify_stage_event_stat *s = &g_verify_stage_event_stats[stat_index];
+    if (s->count == 0u || ms < s->min_ms) s->min_ms = ms;
+    if (s->count == 0u || ms > s->max_ms) s->max_ms = ms;
+    s->count++;
+    s->sum_ms += ms;
+}
+
+extern "C" void ds4_gpu_verify_stage_events_print(void) {
+    if (!g_verify_stage_events_enabled || g_verify_stage_events_samples == 0u) return;
+    static const char *const names[DS4_ROCM_VERIFY_STAT_COUNT] = {
+        "layer", "attention", "dense_q8", "routed_moe", "residual"
+    };
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+            "DSpark verify stage events rank=%u layers=%llu dropped=%llu",
+            g_verify_stage_events_rank,
+            (unsigned long long)g_verify_stage_events_samples,
+            (unsigned long long)g_verify_stage_events_dropped);
+    for (uint32_t i = 0; i < DS4_ROCM_VERIFY_STAT_COUNT; i++) {
+        const ds4_rocm_verify_stage_event_stat *s = &g_verify_stage_event_stats[i];
+        if (!s->count) continue;
+        fprintf(stderr, " %s[n=%llu mean=%.3f min=%.3f max=%.3f]",
+                names[i], (unsigned long long)s->count,
+                s->sum_ms / (double)s->count,
+                (double)s->min_ms, (double)s->max_ms);
+    }
+    fputc('\n', stderr);
+}
+
+extern "C" int ds4_gpu_verify_stage_events_enabled(void) {
+    if (g_verify_stage_events_enabled < 0) {
+        const char *env = getenv("DS4_DSPARK_VERIFY_STAGE_EVENTS");
+        g_verify_stage_events_enabled =
+            env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+        if (g_verify_stage_events_enabled &&
+            !g_verify_stage_events_atexit_registered) {
+            atexit(ds4_gpu_verify_stage_events_print);
+            g_verify_stage_events_atexit_registered = 1;
+        }
+    }
+    return g_verify_stage_events_enabled;
+}
+
+extern "C" int ds4_gpu_verify_stage_events_prepare(void) {
+    if (!ds4_gpu_verify_stage_events_enabled()) return 0;
+    if (g_verify_stage_events_ready) return 1;
+    for (uint32_t slot = 0; slot < DS4_ROCM_VERIFY_STAGE_EVENT_POOL_SIZE; slot++) {
+        for (uint32_t stage = 0; stage < DS4_GPU_VERIFY_STAGE_EVENT_COUNT; stage++) {
+            hipError_t err = hipEventCreate(&g_verify_stage_event_slots[slot].events[stage]);
+            if (err != hipSuccess) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "verify stage event creation failed: %s\n",
+                        hipGetErrorString(err));
+                g_verify_stage_events_enabled = 0;
+                return 0;
+            }
+        }
+    }
+    g_verify_stage_events_ready = 1;
+    return 1;
+}
+
+static int ds4_rocm_verify_stage_elapsed(
+        ds4_rocm_verify_stage_event_slot *slot,
+        ds4_gpu_verify_stage_event_stage start,
+        ds4_gpu_verify_stage_event_stage end,
+        float *ms) {
+    const uint32_t bits = (1u << start) | (1u << end);
+    if ((slot->valid_mask & bits) != bits) return 0;
+    hipError_t err = hipEventElapsedTime(ms, slot->events[start], slot->events[end]);
+    if (err != hipSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "verify stage event elapsed failed: %s\n",
+                hipGetErrorString(err));
+        g_verify_stage_events_enabled = 0;
+        return -1;
+    }
+    return 1;
+}
+
+static int ds4_rocm_verify_stage_harvest_slot(
+        ds4_rocm_verify_stage_event_slot *slot) {
+    if (!slot->complete) return 1;
+    hipError_t query = hipEventQuery(slot->events[DS4_GPU_VERIFY_STAGE_EVENT_LAYER_END]);
+    if (query == hipErrorNotReady) {
+        /* hipEventQuery is the only readiness test.  Clear NotReady from the
+         * per-thread last-error slot so a later launch check cannot consume it. */
+        (void)hipGetLastError();
+        return 0;
+    }
+    if (query != hipSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "verify stage event query failed: %s\n", hipGetErrorString(query));
+        g_verify_stage_events_enabled = 0;
+        return 0;
+    }
+
+    float layer_ms = 0.0f, attn_ms = 0.0f, gate_up_ms = 0.0f;
+    float down_ms = 0.0f, routed_ms = 0.0f;
+    const int have_layer = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_LAYER_START,
+        DS4_GPU_VERIFY_STAGE_EVENT_LAYER_END, &layer_ms);
+    const int have_attn = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_LAYER_START,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_END, &attn_ms);
+    const int have_gate_up = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_DENSE_GATE_UP_START,
+        DS4_GPU_VERIFY_STAGE_EVENT_DENSE_GATE_UP_END, &gate_up_ms);
+    const int have_down = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_DENSE_DOWN_START,
+        DS4_GPU_VERIFY_STAGE_EVENT_DENSE_DOWN_END, &down_ms);
+    const int have_routed = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ROUTED_MOE_START,
+        DS4_GPU_VERIFY_STAGE_EVENT_ROUTED_MOE_END, &routed_ms);
+    if (!g_verify_stage_events_enabled) return 0;
+    if (have_layer > 0) ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_LAYER, layer_ms);
+    if (have_attn > 0) ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN, attn_ms);
+    if (have_gate_up > 0 || have_down > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_DENSE_Q8,
+                                      gate_up_ms + down_ms);
+    }
+    if (have_routed > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ROUTED_MOE, routed_ms);
+    }
+    if (have_layer > 0 && have_attn > 0 && have_routed > 0) {
+        float residual = layer_ms - attn_ms - routed_ms - gate_up_ms - down_ms;
+        if (residual < 0.0f) residual = 0.0f;
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_RESIDUAL, residual);
+    }
+    slot->complete = 0;
+    slot->valid_mask = 0u;
+    g_verify_stage_events_samples++;
+    return 1;
+}
+
+extern "C" void ds4_gpu_verify_stage_events_harvest(void) {
+    if (!g_verify_stage_events_enabled || !g_verify_stage_events_ready) return;
+    for (uint32_t i = 0; i < DS4_ROCM_VERIFY_STAGE_EVENT_POOL_SIZE; i++) {
+        if (g_verify_stage_event_slots[i].complete) {
+            (void)ds4_rocm_verify_stage_harvest_slot(&g_verify_stage_event_slots[i]);
+        }
+    }
+}
+
+extern "C" void ds4_gpu_verify_stage_events_record(
+        ds4_gpu_verify_stage_event_stage stage, uint32_t rank) {
+    if (!g_verify_stage_events_enabled || !g_verify_stage_events_ready ||
+        stage < DS4_GPU_VERIFY_STAGE_EVENT_LAYER_START ||
+        stage >= DS4_GPU_VERIFY_STAGE_EVENT_COUNT) return;
+    if (stage == DS4_GPU_VERIFY_STAGE_EVENT_LAYER_START) {
+        ds4_rocm_verify_stage_event_slot *slot =
+            &g_verify_stage_event_slots[g_verify_stage_events_next_slot];
+        if (slot->complete && !ds4_rocm_verify_stage_harvest_slot(slot)) {
+            g_verify_stage_events_dropped++;
+            g_verify_stage_events_active_slot = -1;
+            return;
+        }
+        if (!g_verify_stage_events_enabled) return;
+        slot->valid_mask = 0u;
+        slot->complete = 0;
+        g_verify_stage_events_active_slot = (int)g_verify_stage_events_next_slot;
+        g_verify_stage_events_next_slot =
+            (g_verify_stage_events_next_slot + 1u) %
+            DS4_ROCM_VERIFY_STAGE_EVENT_POOL_SIZE;
+        g_verify_stage_events_rank = rank;
+    }
+    if (g_verify_stage_events_active_slot < 0) return;
+    ds4_rocm_verify_stage_event_slot *slot =
+        &g_verify_stage_event_slots[g_verify_stage_events_active_slot];
+    hipError_t err = hipEventRecord(slot->events[stage], 0);
+    if (err != hipSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "verify stage event record failed: %s\n", hipGetErrorString(err));
+        g_verify_stage_events_enabled = 0;
+        g_verify_stage_events_active_slot = -1;
+        return;
+    }
+    slot->valid_mask |= 1u << stage;
+    if (stage == DS4_GPU_VERIFY_STAGE_EVENT_LAYER_END) {
+        slot->complete = 1;
+        g_verify_stage_events_active_slot = -1;
+    }
+}
+
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
@@ -6338,6 +7081,52 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     /* Strix Halo uses the staged full-copy path in ds4_gpu_set_model_map_range().
      * Avoid host-registering the mmap here: that would make the staged copier
      * believe the model is already device-resident. */
+    return 1;
+}
+
+extern "C" int ds4_gpu_register_support_map(
+        const void *map, uint64_t size, uint64_t bias, int fd) {
+    (void)bias;
+    if (!map || size == 0) return 0;
+    g_support_host_base = map;
+    g_support_host_size = size;
+    g_support_fd = fd;
+    if (g_support_direct_fd >= 0) {
+        (void)close(g_support_direct_fd);
+        g_support_direct_fd = -1;
+    }
+    g_support_file_size = 0;
+    g_support_direct_align = 1;
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size > 0) {
+            g_support_file_size = (uint64_t)st.st_size;
+            if (st.st_blksize > 1) {
+                g_support_direct_align = (uint64_t)st.st_blksize;
+            }
+        }
+#if defined(__linux__) && defined(O_DIRECT)
+        char proc_path[64];
+        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
+        g_support_direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
+        if (g_support_direct_fd >= 0 && g_support_direct_align < 512) {
+            g_support_direct_align = 512;
+        }
+#endif
+    }
+    g_dspark_stage_offsets[0] = 0;
+    g_dspark_stage_offsets[1] = 0;
+    g_dspark_stage_offsets[2] = 0;
+    if (cuda_env_enabled_exact("DS4_DSPARK_RESIDENT_Q8") &&
+        !cuda_dspark_make_support_resident(map, size)) {
+        return 0;
+    }
+    fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "registered %.2f GiB compact DSpark support "
+            "(%s)\n",
+            (double)size / 1073741824.0,
+            cuda_model_image_range_ptr(map, 0, size)
+                ? "resident Q8 device image" : "bounded per-stage loading");
     return 1;
 }
 

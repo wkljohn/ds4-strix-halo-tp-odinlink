@@ -1,6 +1,8 @@
 #!/bin/bash
-# One DSpark TP=2 benchmark run: launch peer worker + local coordinator together,
-# drive three identical /reset repetitions, capture logs, then tear down.
+# One long-prompt DSpark TP=2 benchmark run: launch peer worker + local
+# coordinator together, drive identical /reset repetitions, capture logs, then
+# tear down. The interactive CLI treats every input line as a new request, so
+# flatten the prose fixture to one line before feeding it.
 #
 # Usage: ./run-dspark-bench.sh <tag> [extra env assignments...]
 #   e.g. ./run-dspark-bench.sh baseline
@@ -12,8 +14,6 @@ shift
 EXTRA_ENV=("$@")
 REPEATS=${DS4_BENCH_REPEATS:-3}
 [[ $REPEATS =~ ^[1-9][0-9]*$ ]] || { echo "error: DS4_BENCH_REPEATS must be positive" >&2; exit 2; }
-TOKENS=${DS4_BENCH_TOKENS:-60}
-[[ $TOKENS =~ ^[1-9][0-9]*$ ]] || { echo "error: DS4_BENCH_TOKENS must be positive" >&2; exit 2; }
 
 REPO=/home/wkljohn/Desktop/cc/ds4-strix-halo-tp
 PEER_REPO=/home/wkljohn/Desktop/cc/ds4-strix-halo-tp
@@ -26,8 +26,8 @@ MTP="$MODELS/dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"
 OUT="$REPO/research-results/dspark-17tps-2026-08-07"
 mkdir -p "$OUT"
 
-COORD_LOG="$OUT/coordinator-$TAG.log"
-WORKER_LOG="$OUT/worker-$TAG.log"
+COORD_LOG="$OUT/coordinator-long-$TAG.log"
+WORKER_LOG="$OUT/worker-long-$TAG.log"
 
 # Standard DSpark test configuration from the handover note.
 # NOTE: DS4_DSPARK_RESIDENT_Q8=1 is COORDINATOR-ONLY. Only rank 0 runs the
@@ -85,21 +85,22 @@ sleep 2
 
 # Worker and coordinator start concurrently; never wait for the coordinator port.
 "${PEER_SSH[@]}" "cd $PEER_REPO && setsid -f env ${WORKER_ENV[*]} ./ds4 --role worker --tensor-parallel \
-    --coordinator $COORDINATOR_ADDR 9000 --transport rdma --rocm -m '$MODEL' --mtp '$MTP' --dspark -c 128 \
+    --coordinator $COORDINATOR_ADDR 9000 --transport rdma --rocm -m '$MODEL' --mtp '$MTP' --dspark -c 4096 \
     > $WORKER_LOG 2>&1" &
 
 # Three identical repetitions with /reset between them.
 {
   for ((i = 1; i <= REPEATS; i++)); do
     echo "/reset"
-    echo "Write a Python function that returns the factorial of a non-negative integer."
+    tr '\n' ' ' < "$REPO/bench-prompt-long.txt"
+    echo
   done
   echo "/quit"
 } > "$OUT/driver-$TAG.txt"
 
 env "${COORD_ENV[@]}" ./ds4 --role coordinator --tensor-parallel \
     --listen 0.0.0.0 9000 --transport rdma --rocm -m "$MODEL" --mtp "$MTP" --dspark \
-    -c 128 --temp 0 --seed 42 --nothink -n "$TOKENS" \
+    -c 4096 --temp 0 --seed 42 --nothink -n 256 \
     < "$OUT/driver-$TAG.txt" > "$COORD_LOG" 2>&1
 
 echo "=== run $TAG complete ==="

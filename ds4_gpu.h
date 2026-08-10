@@ -115,6 +115,28 @@ int ds4_gpu_decode_attn_event_profile_enabled(void);
 void ds4_gpu_decode_attn_event_profile_record(ds4_gpu_decode_attn_event_stage stage,
                                               uint32_t rank);
 
+/* Default-off, ROCm verifier-only stage events.  Markers are recorded on the
+ * existing compute stream; harvesting is explicitly non-blocking. */
+typedef enum {
+    DS4_GPU_VERIFY_STAGE_EVENT_LAYER_START = 0,
+    DS4_GPU_VERIFY_STAGE_EVENT_ATTN_END,
+    DS4_GPU_VERIFY_STAGE_EVENT_DENSE_GATE_UP_START,
+    DS4_GPU_VERIFY_STAGE_EVENT_DENSE_GATE_UP_END,
+    DS4_GPU_VERIFY_STAGE_EVENT_DENSE_DOWN_START,
+    DS4_GPU_VERIFY_STAGE_EVENT_DENSE_DOWN_END,
+    DS4_GPU_VERIFY_STAGE_EVENT_ROUTED_MOE_START,
+    DS4_GPU_VERIFY_STAGE_EVENT_ROUTED_MOE_END,
+    DS4_GPU_VERIFY_STAGE_EVENT_LAYER_END,
+    DS4_GPU_VERIFY_STAGE_EVENT_COUNT
+} ds4_gpu_verify_stage_event_stage;
+
+int ds4_gpu_verify_stage_events_enabled(void);
+int ds4_gpu_verify_stage_events_prepare(void);
+void ds4_gpu_verify_stage_events_record(ds4_gpu_verify_stage_event_stage stage,
+                                        uint32_t rank);
+void ds4_gpu_verify_stage_events_harvest(void);
+void ds4_gpu_verify_stage_events_print(void);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
@@ -142,7 +164,8 @@ typedef struct {
 int ds4_gpu_device_cache_tensors(int device_id,
                                  const ds4_tensor_range *ranges,
                                  int n_ranges);
-int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias);
+int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias,
+                                 int fd);
 int ds4_gpu_device_cache_support_tensors(int device_id,
                                          int entry_device_id,
                                          const ds4_tensor_range *ranges,
@@ -267,6 +290,10 @@ void ds4_gpu_tp_shutdown(void);
  * Shared-event arrival is required in that mode to make each partial vector
  * CPU-visible before the transport thread reads it. */
 void ds4_gpu_tp_set_session_batch_mode(int enabled);
+/* Set the first routed-expert id owned by rank 1.  The default is half the
+ * model experts; DSpark may give rank 1 a larger target shard to make room
+ * for a coordinator-local drafter.  Call before TP bind. */
+void ds4_gpu_tp_set_expert_split(uint32_t first_rank1);
 /* The coordinator-only DSpark support model does not participate in TP.
  * Suspend ownership only while encoding it; base-model verification remains
  * split across both ranks. */
@@ -754,6 +781,16 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         float                   clamp);
 
 int ds4_gpu_matmul_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+int ds4_gpu_matmul_bf16_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,

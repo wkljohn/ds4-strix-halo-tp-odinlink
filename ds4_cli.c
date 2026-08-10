@@ -1274,6 +1274,7 @@ static void print_repl_help(void) {
     puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
+    puts("  /reset         Start a fresh chat without reloading the model.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
     puts("  /read FILE     Read a prompt from FILE and run it.");
     puts("  /quit, /exit   Leave the prompt.");
@@ -1652,6 +1653,14 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                     printf("Power: %d%%.\n", power);
                 }
             }
+        } else if (!strcmp(cmd, "/reset")) {
+            repl_chat_free(&chat);
+            rc = repl_chat_init(engine, &chat, cfg);
+            if (rc != 0) {
+                linenoiseFree(line);
+                break;
+            }
+            puts("Chat reset.");
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {
             char *arg = trim_inplace(cmd + 4);
             if (!arg[0]) {

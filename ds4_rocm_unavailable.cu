@@ -20,7 +20,6 @@
 
 ROCM_UNAVAILABLE_INT(ds4_gpu_add_xdev_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_attention_decode_rows_rope_tensor)
-ROCM_UNAVAILABLE_INT(ds4_gpu_attention_noncausal_raw_batch_heads_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_attention_output_low_q4_K_slice_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_attention_output_low_q8_rows_exact_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_attention_output_q4_K_batch_tensor)
@@ -35,7 +34,6 @@ ROCM_UNAVAILABLE_INT(ds4_gpu_matmul_q8_0_top1_tensor)
 /* DS4-TP-gfx1151 (patch 14): implemented in rocm/ds4_rocm_matmul.cuh */
 ROCM_UNAVAILABLE_INT(ds4_gpu_moe_handoff_pack_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_register_model_map_no_copy)
-ROCM_UNAVAILABLE_INT(ds4_gpu_register_support_map)
 ROCM_UNAVAILABLE_INT(ds4_gpu_rope_tail_decode_rows_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_batch_owned_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_one_owned_tensor)

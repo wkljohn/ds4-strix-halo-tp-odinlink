@@ -23,6 +23,50 @@ typedef struct {
     int gfx1151;
 } ds4_q4k_wmma_dispatch_config;
 
+/* Keep the production crossover unchanged while allowing the tiny 2..5-row
+ * DSpark verifier to exercise the already validated sorted Q4_K kernels.  The
+ * experiment is deliberately two-dimensional: sorting and the WMMA bucket
+ * crossover can be varied independently, so a result cannot accidentally be
+ * attributed to a bundle of changes. */
+static uint32_t routed_moe_q4k_env_u32(
+        const char *name,
+        uint32_t default_value,
+        uint32_t min_value,
+        uint32_t max_value) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return default_value;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || errno != 0 ||
+        value < min_value || value > max_value) {
+        return default_value;
+    }
+    return (uint32_t)value;
+}
+
+static uint32_t routed_moe_q4k_sorted_min_tokens(void) {
+    static uint32_t value;
+    static int initialized;
+    if (!initialized) {
+        value = routed_moe_q4k_env_u32(
+                "DS4_ROCM_Q4K_SORTED_MIN_TOKENS", 32u, 2u, 32u);
+        initialized = 1;
+    }
+    return value;
+}
+
+static uint32_t routed_moe_q4k_wmma_min_count(void) {
+    static uint32_t value;
+    static int initialized;
+    if (!initialized) {
+        value = routed_moe_q4k_env_u32(
+                "DS4_ROCM_Q4K_WMMA_MIN_COUNT", 6u, 1u, 16u);
+        initialized = 1;
+    }
+    return value;
+}
+
 static const ds4_q4k_wmma_dispatch_config *routed_moe_q4k_wmma_config(void) {
     static ds4_q4k_wmma_dispatch_config cfg = {-1, 0, 0};
     if (cfg.opt_in < 0) {
@@ -87,9 +131,13 @@ extern "C" void ds4_gpu_set_tp_runtime_features(uint32_t rank,
     const int q4k = (features & DS4_TP_FEATURE_Q4K_WMMA) != 0;
     fprintf(stderr, DS4_GPU_LOG_PREFIX
             "Q4_K WMMA startup rank=%u negotiated=0x%08x gate=%d up=%d "
-            "down=%d gate_up_threshold=6 down_threshold=1 quality=%d "
+            "down=%d sorted_min_tokens=%u gate_up_threshold=%u "
+            "down_threshold=1 quality=%d "
             "kill_switch=%d\n",
-            rank, features, q4k, q4k, q4k, g_quality_mode, cfg->disabled);
+            rank, features, q4k, q4k, q4k,
+            routed_moe_q4k_sorted_min_tokens(),
+            routed_moe_q4k_wmma_min_count(),
+            g_quality_mode, cfg->disabled);
 }
 
 static int routed_moe_q4k_wmma_enabled(
@@ -805,6 +853,154 @@ static int routed_moe_full_table_is_cached(
            cuda_model_range_is_cached(model_map, down_offset, down_bytes);
 }
 
+static int routed_moe_mxfp4_launch(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens) {
+    if (!out || !gate || !up || !mid || !model_map || !selected || !weights || !x ||
+        expert_in_dim == 0 || expert_mid_dim == 0 || out_dim == 0 ||
+        n_total_expert == 0 || n_expert == 0 || n_tokens == 0 ||
+        (expert_in_dim & 31u) != 0 || (expert_mid_dim & 31u) != 0) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "MXFP4 routed MoE rejected basic arguments: out=%p gate=%p up=%p "
+                "mid=%p map=%p selected=%p weights=%p x=%p in=%u mid_dim=%u "
+                "out_dim=%u total=%u used=%u tokens=%u\n",
+                (void *)out, (void *)gate, (void *)up, (void *)mid, model_map,
+                (const void *)selected, (const void *)weights, (const void *)x,
+                expert_in_dim, expert_mid_dim, out_dim, n_total_expert,
+                n_expert, n_tokens);
+        return 0;
+    }
+    uint64_t pair_count = 0, mid_elems = 0, out_elems = 0;
+    uint64_t gate_bytes = 0, down_bytes = 0;
+    if (!cuda_u64_mul_checked(n_tokens, n_expert, &pair_count) ||
+        !cuda_u64_mul_checked(pair_count, expert_mid_dim, &mid_elems) ||
+        !cuda_u64_mul_checked(n_tokens, out_dim, &out_elems) ||
+        !cuda_u64_mul_checked(n_total_expert, gate_expert_bytes, &gate_bytes) ||
+        !cuda_u64_mul_checked(n_total_expert, down_expert_bytes, &down_bytes) ||
+        pair_count > UINT32_MAX ||
+        mid_elems > UINT64_MAX / sizeof(float) ||
+        out_elems > UINT64_MAX / sizeof(float) ||
+        selected->bytes < pair_count * sizeof(int32_t) ||
+        weights->bytes < pair_count * sizeof(float) ||
+        x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
+        gate->bytes < mid_elems * sizeof(float) ||
+        up->bytes < mid_elems * sizeof(float) ||
+        mid->bytes < mid_elems * sizeof(float) ||
+        out->bytes < out_elems * sizeof(float) ||
+        gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+        up_offset > model_size || gate_bytes > model_size - up_offset ||
+        down_offset > model_size || down_bytes > model_size - down_offset) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "MXFP4 routed MoE rejected sizes: pairs=%llu mid_elems=%llu "
+                "out_elems=%llu sel=%llu/%llu weights=%llu/%llu x=%llu/%llu "
+                "gate=%llu/%llu up=%llu/%llu mid=%llu/%llu out=%llu/%llu "
+                "model=%llu gate_off=%llu gate_span=%llu up_off=%llu "
+                "down_off=%llu down_span=%llu\n",
+                (unsigned long long)pair_count,
+                (unsigned long long)mid_elems,
+                (unsigned long long)out_elems,
+                (unsigned long long)selected->bytes,
+                (unsigned long long)(pair_count * sizeof(int32_t)),
+                (unsigned long long)weights->bytes,
+                (unsigned long long)(pair_count * sizeof(float)),
+                (unsigned long long)x->bytes,
+                (unsigned long long)((uint64_t)n_tokens * expert_in_dim * sizeof(float)),
+                (unsigned long long)gate->bytes,
+                (unsigned long long)(mid_elems * sizeof(float)),
+                (unsigned long long)up->bytes,
+                (unsigned long long)(mid_elems * sizeof(float)),
+                (unsigned long long)mid->bytes,
+                (unsigned long long)(mid_elems * sizeof(float)),
+                (unsigned long long)out->bytes,
+                (unsigned long long)(out_elems * sizeof(float)),
+                (unsigned long long)model_size,
+                (unsigned long long)gate_offset,
+                (unsigned long long)gate_bytes,
+                (unsigned long long)up_offset,
+                (unsigned long long)down_offset,
+                (unsigned long long)down_bytes);
+        return 0;
+    }
+
+    const char *gate_w = NULL, *up_w = NULL, *down_w = NULL;
+    const ds4_gpu_tensor *selected_exec = selected;
+    ds4_gpu_tensor selected_compact = {0};
+    if (model_map == g_support_host_base) {
+        const char *disable_direct =
+            getenv("DS4_DSPARK_DISABLE_RESIDENT_DIRECT_EXPERTS");
+        const bool direct_resident =
+            !(disable_direct && strcmp(disable_direct, "1") == 0);
+        const char *resident_base = direct_resident ?
+            cuda_model_image_range_ptr(model_map, 0, g_support_host_size) : NULL;
+        if (resident_base) {
+            /* The full compact support GGUF is already device-resident. The
+             * MXFP4 kernels index expert tables with selected[pair], so they
+             * can consume the original router IDs directly. Avoid the old
+             * synchronize -> D2H route scan -> per-expert D2D gather that
+             * copied weights out of the same resident image every stage. */
+            gate_w = resident_base + gate_offset;
+            up_w = resident_base + up_offset;
+            down_w = resident_base + down_offset;
+        } else {
+            const int staged = cuda_dspark_prepare_selected_experts(
+                    model_map, gate_offset, up_offset, down_offset,
+                    gate_expert_bytes, down_expert_bytes, n_total_expert,
+                    selected, pair_count, &selected_compact,
+                    &gate_w, &up_w, &down_w);
+            if (staged == 2) {
+                return cuda_ok(cudaMemsetAsync(out->ptr, 0,
+                                               (size_t)(out_elems * sizeof(float))),
+                               "DSpark inactive routed output clear");
+            }
+            if (!staged) return 0;
+            selected_exec = &selected_compact;
+        }
+    } else {
+        if (!cuda_dspark_select_expert_stage(
+                model_map, gate_offset, up_offset, down_offset)) return 0;
+        gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "mxfp4_gate");
+        up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "mxfp4_up");
+        down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "mxfp4_down");
+        if (!gate_w || !up_w || !down_w) return 0;
+    }
+
+    const dim3 gate_grid(expert_mid_dim, (unsigned)pair_count, 1);
+    moe_gate_up_mid_mxfp4_f32_kernel<<<gate_grid, 256>>>(
+        (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+        gate_w, up_w, (const float *)x->ptr,
+        (const int32_t *)selected_exec->ptr, (const float *)weights->ptr,
+        gate_expert_bytes, gate_row_bytes, expert_in_dim / 32u,
+        expert_in_dim, expert_mid_dim, n_expert, clamp);
+    if (!cuda_ok(cudaGetLastError(), "routed_moe MXFP4 gate/up launch")) return 0;
+    const dim3 down_grid(out_dim, n_tokens, 1);
+    moe_down_sum_mxfp4_f32_kernel<<<down_grid, 256>>>(
+        (float *)out->ptr, down_w, (const float *)mid->ptr,
+        (const int32_t *)selected_exec->ptr, down_expert_bytes, down_row_bytes,
+        expert_mid_dim / 32u, expert_mid_dim, out_dim, n_expert);
+    return cuda_ok(cudaGetLastError(), "routed_moe MXFP4 down launch");
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -834,6 +1030,21 @@ static int routed_moe_launch(
         uint32_t layer_index,
         uint32_t n_tokens,
         bool force_resident) {
+    if (gate_type == 39u || down_type == 39u) {
+        if (gate_type != 39u || down_type != 39u) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "mixed MXFP4 routed expert types are not supported\n");
+            return 0;
+        }
+        return routed_moe_mxfp4_launch(
+            out, gate, up, mid, model_map, model_size,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_expert,
+            clamp, x, n_tokens);
+    }
     routed_moe_launch_plan plan;
     if (!routed_moe_build_plan(out, gate, up, mid, down, model_map, model_size,
                                gate_offset, up_offset, down_offset, gate_type, down_type,
@@ -1035,8 +1246,12 @@ static int routed_moe_launch(
             iq2_gate_path && getenv("DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED") != NULL;
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
-            (!q4k_path || n_tokens >= 32u) &&
+            (!q4k_path ||
+             n_tokens >= routed_moe_q4k_sorted_min_tokens()) &&
             !disable_resident_iq2_sorted;
+        const char *tp_skip_env = getenv("DS4_ROCM_TP_SKIP_UNOWNED");
+        const uint32_t tp_skip_unowned =
+            tp_skip_env && tp_skip_env[0] == '1' && tp_skip_env[1] == '\0';
         const uint32_t use_expert_tiles = use_sorted_pairs;
         /* DS4-TP-gfx1151 (patch 22): expert tile width, env-selectable for A/B.
          *
@@ -1097,6 +1312,21 @@ static int routed_moe_launch(
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+        /* A negative TP sentinel removes unowned pairs from sorted buckets.
+         * Clear their pair slots before valid pairs overwrite their own rows,
+         * preserving exact zero contribution on the general prefill path. */
+        if (ok && tp_skip_unowned && use_sorted_pairs) {
+            const uint64_t mid_zero_bytes =
+                pair_count64 * (uint64_t)expert_mid_dim * sizeof(float);
+            const uint64_t down_zero_bytes =
+                pair_count64 * (uint64_t)out_dim * sizeof(float);
+            ok = cuda_ok(cudaMemset(mid->ptr, 0, (size_t)mid_zero_bytes),
+                         "routed_moe TP skipped mid clear");
+            if (ok) {
+                ok = cuda_ok(cudaMemset(down->ptr, 0, (size_t)down_zero_bytes),
+                             "routed_moe TP skipped down clear");
+            }
+        }
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
             if (batch_stream_split_selected) {
@@ -1472,7 +1702,8 @@ static int routed_moe_launch(
             if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
                 if (q4k_path) {
                     if (use_q4k_wmma) {
-                        const uint32_t wmma_min_count = 6u;
+                        const uint32_t wmma_min_count =
+                            routed_moe_q4k_wmma_min_count();
                         const size_t wmma_smem =
                             (16u * 36u + 64u * 76u) * sizeof(int32_t);
                         dim3 wgrid((expert_mid_dim + 63u) / 64u,
@@ -2986,10 +3217,18 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
     const ds4_gpu_tensor *use_weights = weights;
     uint64_t pairs64 = 0;
     if (!cuda_u64_mul_checked(n_tokens, n_expert, &pairs64) || pairs64 > UINT32_MAX) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "routed_moe_BATCH pair count rejected: tokens=%u used=%u\n",
+                n_tokens, n_expert);
         return 0;
     }
     if (!ds4_tp_shard_prepare(selected, weights, (uint32_t)pairs64, n_total_expert,
                               gate_expert_bytes, down_expert_bytes, &v)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "routed_moe_BATCH TP shard preparation failed: layer=%u "
+                "pairs=%llu total=%u used=%u gate_type=%u down_type=%u\n",
+                layer_index, (unsigned long long)pairs64, n_total_expert,
+                n_expert, gate_type, down_type);
         return 0;
     }
     if (v.active) {
@@ -3000,12 +3239,25 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
         down_offset += v.down_off_delta;
         n_total_expert = v.n_total_expert;
     }
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             use_selected, use_weights, n_total_expert, n_expert, clamp, x, layer_index, n_tokens,
-                             force_resident);
+    const int rc = routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+                                    gate_offset, up_offset, down_offset,
+                                    gate_type, down_type,
+                                    gate_expert_bytes, gate_row_bytes,
+                                    down_expert_bytes, down_row_bytes,
+                                    expert_in_dim, expert_mid_dim, out_dim,
+                                    use_selected, use_weights, n_total_expert,
+                                    n_expert, clamp, x, layer_index, n_tokens,
+                                    force_resident);
+    if (!rc) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "routed_moe_BATCH failed: layer=%u shard=%d pairs=%llu total=%u "
+                "used=%u gate_type=%u down_type=%u in=%u mid=%u out=%u "
+                "gate_off=%llu gate_eb=%llu\n",
+                layer_index, v.active, (unsigned long long)pairs64,
+                n_total_expert, n_expert, gate_type, down_type,
+                expert_in_dim, expert_mid_dim, out_dim,
+                (unsigned long long)gate_offset,
+                (unsigned long long)gate_expert_bytes);
+    }
+    return rc;
 }

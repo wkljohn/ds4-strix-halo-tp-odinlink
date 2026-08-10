@@ -112,6 +112,33 @@ __global__ static void matmul_f16_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+__global__ static void matmul_bf16_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    float sum = 0.0f;
+    const uint16_t *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        sum += __uint_as_float((uint32_t)wr[i] << 16) * xr[i];
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
 __global__ static void matmul_f16_ordered_chunks_kernel(
         float *out,
         const __half *w,
@@ -175,6 +202,35 @@ __global__ static void matmul_f16_f32_sharedx_warp_rows_w32_kernel(
     }
     for (; i < in_dim; i += 32u) {
         acc += __half2float(wr[i]) * shx[i];
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
+/* Decode-sized BF16 projection: one wave32 per output row, with the input
+ * vector shared by all waves in the block.  The generic BF16 kernel launches
+ * one 256-thread block per row; for DSpark's 256 -> vocab Markov head that is
+ * 129,280 tiny blocks and is dominated by scheduling overhead. */
+__global__ static void matmul_bf16_f32_sharedx_warp_rows_w32_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t in_dim,
+        uint64_t out_dim) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const uint16_t *wr = w + row * (uint64_t)in_dim;
+    float acc = 0.0f;
+    for (uint32_t i = lane; i < in_dim; i += 32u) {
+        acc += __uint_as_float((uint32_t)wr[i] << 16) * shx[i];
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;

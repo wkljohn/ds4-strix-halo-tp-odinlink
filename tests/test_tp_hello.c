@@ -23,6 +23,37 @@ static int check(const char *name, uint32_t local, uint32_t peer, int want,
     return 1;
 }
 
+static int check_transport(const char *name,
+                           ds4_tp_transport requested,
+                           int local_rdma_ok,
+                           int peer_rdma_ok,
+                           int want_ok,
+                           int want_active,
+                           const char *want_error) {
+    char err[160] = "";
+    int active = -1;
+    const int got = ds4_tp_test_select_transport(
+            requested, local_rdma_ok, peer_rdma_ok, &active,
+            err, sizeof(err));
+    if (got != want_ok || active != want_active) {
+        fprintf(stderr,
+                "FAIL %s: got ok=%d active=%d want ok=%d active=%d\n",
+                name, got, active, want_ok, want_active);
+        return 0;
+    }
+    if (want_error && strcmp(err, want_error) != 0) {
+        fprintf(stderr, "FAIL %s: error='%s' want='%s'\n",
+                name, err, want_error);
+        return 0;
+    }
+    if (!want_error && err[0] != '\0') {
+        fprintf(stderr, "FAIL %s: unexpected error='%s'\n", name, err);
+        return 0;
+    }
+    fprintf(stderr, "PASS %s\n", name);
+    return 1;
+}
+
 int main(void) {
     int ok = 1;
     ok &= check("hello equal-enabled",
@@ -31,6 +62,33 @@ int main(void) {
     ok &= check("hello mismatched-feature-masks",
                 DS4_TP_FEATURE_Q4K_WMMA, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00000001 peer=0x00000000)");
+    ok &= check("hello equal-batch-attn-head-split",
+                DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
+                DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);
+    ok &= check("hello mismatched-batch-attn-head-split",
+                DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00000002 peer=0x00000000)");
+    ok &= check("hello equal-odinlink-batch-async",
+                DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC,
+                DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC, 1, NULL);
+    ok &= check("hello mismatched-odinlink-batch-async",
+                DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00000004 peer=0x00000000)");
+    const uint32_t split_118 = ds4_tp_feature_expert_split(118u);
+    const uint32_t split_128 = ds4_tp_feature_expert_split(128u);
+    ok &= check("hello equal-asymmetric-expert-split",
+                split_118 | DS4_TP_FEATURE_Q4K_WMMA,
+                split_118 | DS4_TP_FEATURE_Q4K_WMMA, 1, NULL);
+    ok &= check("hello mismatched-expert-split",
+                split_118 | DS4_TP_FEATURE_Q4K_WMMA,
+                split_128 | DS4_TP_FEATURE_Q4K_WMMA, 0,
+                "tp hello: runtime feature mismatch (local=0x00007601 peer=0x00008001)");
+    if (ds4_tp_feature_expert_split_value(split_118) != 118u) {
+        fprintf(stderr, "FAIL expert split feature round trip\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS expert split feature round trip\n");
+    }
     if (ds4_tp_test_rdma_provider_decode_max_msg("odl_tb5_0") != 131072) {
         fprintf(stderr, "FAIL OdinLink decode message policy\n");
         ok = 0;
@@ -52,5 +110,19 @@ int main(void) {
     } else {
         fprintf(stderr, "PASS decode message negotiation\n");
     }
+    ok &= check_transport("transport auto falls back without RDMA",
+                          DS4_TP_TRANSPORT_AUTO, 0, 0, 1, 0, NULL);
+    ok &= check_transport("transport auto uses mutual RDMA",
+                          DS4_TP_TRANSPORT_AUTO, 1, 1, 1, 1, NULL);
+    ok &= check_transport("transport tcp stays TCP",
+                          DS4_TP_TRANSPORT_TCP, 1, 1, 1, 0, NULL);
+    ok &= check_transport("explicit RDMA succeeds mutually",
+                          DS4_TP_TRANSPORT_RDMA, 1, 1, 1, 1, NULL);
+    ok &= check_transport("explicit RDMA rejects missing local device",
+                          DS4_TP_TRANSPORT_RDMA, 0, 1, 0, 0,
+                          "tp: --transport rdma but this side has no active device");
+    ok &= check_transport("explicit RDMA rejects missing peer device",
+                          DS4_TP_TRANSPORT_RDMA, 1, 0, 0, 0,
+                          "tp: --transport rdma but the peer side has no active device");
     return ok ? 0 : 1;
 }

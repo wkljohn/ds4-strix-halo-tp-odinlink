@@ -1,7 +1,7 @@
 # DS4 Strix Halo TP over OdinLink
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
-Thunderbolt RDMA. The cache-free defaults deliver **167.73 t/s prefill** and
+Thunderbolt RDMA. The current optimization delivers **167.73 t/s prefill** and
 **13.83 t/s decode**, while preserving DS4's Metal, CUDA, generic verbs, and
 single-node modes.
 
@@ -409,10 +409,9 @@ Run it with greedy decoding:
 ```
 
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
-The default confidence threshold is `0.9`; it prunes suffixes that are unlikely
-to repay their verification cost. `--dspark-confidence 0` forces fixed
-five-token blocks and is intended for diagnostics. Sampled decoding does not
-use DSpark proposals. `--quality` and `--dspark-strict` also keep target-only
+DSpark proposes the support model's fixed five-token block and commits only the
+prefix accepted by exact target verification. Sampled decoding does not use
+DSpark proposals. `--quality` and `--dspark-strict` also keep target-only
 decoding, which is useful for comparisons and correctness checks.
 
 ## Speed

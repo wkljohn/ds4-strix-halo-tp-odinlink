@@ -103,11 +103,73 @@ __global__ static void quantize_q8_0_f32_kernel(
     if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
     int8_t *dst = xq + (tok * blocks + b) * 32;
     if (threadIdx.x < bn) {
-        int v = (int)lrintf(xr[threadIdx.x] * id);
+        int v;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        v = __float2int_rn(xr[threadIdx.x] * id);
+#else
+        v = (int)lrintf(xr[threadIdx.x] * id);
+#endif
         v = v > 127 ? 127 : (v < -128 ? -128 : v);
         dst[threadIdx.x] = (int8_t)v;
     } else {
         dst[threadIdx.x] = 0;
+    }
+}
+
+/* Small-row Q8_0 GEMM for gfx1151.  Activations are dynamically quantized by
+ * quantize_q8_0_f32_kernel above; one wave owns an output row and reuses each
+ * packed weight word across the whole token tile. */
+template <uint32_t TOK_TILE>
+__global__ static void matmul_q8_0_preq_toktile_dp4a_kernel(
+        float *out,
+        const unsigned char *w,
+        const int8_t *xq,
+        const float *xscale,
+        uint32_t n_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + (uint64_t)row * row_bytes;
+    float acc[TOK_TILE];
+#pragma unroll
+    for (uint32_t t = 0; t < TOK_TILE; ++t) acc[t] = 0.0f;
+    for (uint32_t b = lane; b < n_blocks; b += 32u) {
+        const unsigned char *bp = wr + (uint64_t)b * 34u;
+        const float ws = __half2float(*reinterpret_cast<const __half *>(bp));
+        int32_t qw[8];
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; ++j) {
+            const uint8_t *p = bp + 2u + 4u * j;
+            qw[j] = (int32_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                              ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+        }
+#pragma unroll
+        for (uint32_t t = 0; t < TOK_TILE; ++t) {
+            if (t >= n_tok) continue;
+            const uint64_t xb = (uint64_t)t * n_blocks + b;
+            const int8_t *q = xq + xb * 32u;
+            int32_t dot = 0;
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; ++j) {
+                int32_t xw;
+                __builtin_memcpy(&xw, q + 4u * j, sizeof(xw));
+                dot = __dp4a(qw[j], xw, dot);
+            }
+            acc[t] += ws * xscale[xb] * (float)dot;
+        }
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < TOK_TILE; ++t) acc[t] = warp_sum_f32(acc[t]);
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOK_TILE; ++t) {
+            if (t < n_tok) out[(uint64_t)t * out_dim + row] = acc[t];
+        }
     }
 }
 

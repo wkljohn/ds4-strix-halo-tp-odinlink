@@ -717,11 +717,40 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     return out;
 }
 
-extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size, uint64_t bias) {
+extern "C" int ds4_gpu_register_support_map(const void *map, uint64_t size,
+                                              uint64_t bias, int fd) {
+    (void)fd;
     if (!map || size == 0 || bias == 0) return 0;
     g_support_host_base = map;
     g_support_host_size = size;
     g_support_offset_bias = bias;
+
+#ifdef DS4_ROCM_BUILD
+    /* A network TP rank has one local GPU (g_n_gpus == 1).  Keep the
+     * compact support GGUF in ROCm's HMM address space instead of copying
+     * another ~10 GiB into its already-full device arena.  Every ordinary
+     * weight resolver scans g_model_ranges by host_base, so this alias covers
+     * BF16/Q8 and routed-expert tensors without replacing the base mapping.
+     *
+     * Multi-tier engines install support tensors in their explicit
+     * per-device cache below and must not also pin this whole mapping. */
+    if (g_n_gpus <= 1) {
+        for (const cuda_model_range &r : g_model_ranges) {
+            if (r.host_base == map && r.offset == 0 && r.bytes >= size) {
+                return 1;
+            }
+        }
+        /* gfx1151 is an APU with coherent HMM access to the mmap address.
+         * arena_allocated=1 tells range cleanup that this is a non-owning
+         * alias, not a cudaMalloc allocation. */
+        g_model_ranges.push_back({map, 0, size, (char *)map,
+                                  NULL, NULL, 0, 0, 1});
+        fprintf(stderr,
+                "ds4: ROCm mapped %.2f GiB compact DSpark support weights "
+                "without a persistent device copy\n",
+                (double)size / 1073741824.0);
+    }
+#endif
     return 1;
 }
 
@@ -3886,6 +3915,33 @@ __global__ static void matmul_f16_kernel(
         sum += __half2float(wr[i]) * xr[i];
     }
 
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
+__global__ static void matmul_bf16_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint64_t tok = (uint64_t)blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    float sum = 0.0f;
+    const uint16_t *wr = w + row * in_dim;
+    const float *xr = x + tok * in_dim;
+    for (uint64_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        sum += __uint_as_float((uint32_t)wr[i] << 16) * xr[i];
+    }
     __shared__ float partial[256];
     partial[threadIdx.x] = sum;
     __syncthreads();
@@ -13157,6 +13213,30 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_elems = out_dim * in_dim;
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset ||
+        n_tok > UINT64_MAX / in_dim ||
+        n_tok * in_dim > UINT64_MAX / sizeof(float) ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        n_tok > UINT64_MAX / out_dim ||
+        n_tok * out_dim > UINT64_MAX / sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out);
+    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset, weight_bytes, logical_tier, "bf16");
+    if (!wptr) return 0;
+    const dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
+    matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr,
+                                      (const uint16_t *)wptr,
+                                      (const float *)x->ptr,
+                                      in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
 }
 
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
@@ -27637,6 +27717,10 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
 
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     (void)suspend;
+}
+
+extern "C" void ds4_gpu_tp_set_expert_split(uint32_t first_rank1) {
+    (void)first_rank1;
 }
 
 extern "C" void ds4_gpu_tp_keepalive_pause(int paused) {

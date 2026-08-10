@@ -459,6 +459,74 @@ static void test_metal_f16_prefill_matmul(void) {
     free(weights_raw);
 }
 
+static uint16_t test_float_to_bf16(float x) {
+    uint32_t bits = 0;
+    memcpy(&bits, &x, sizeof(bits));
+    return (uint16_t)(bits >> 16);
+}
+
+static float test_bf16_to_float(uint16_t x) {
+    uint32_t bits = (uint32_t)x << 16;
+    float out = 0.0f;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static void test_rocm_bf16_decode_sharedx_matmul(void) {
+    const uint32_t in_dim = 256;
+    const uint32_t out_dim = 257;
+    const uint64_t weight_bytes =
+        (uint64_t)in_dim * out_dim * sizeof(uint16_t);
+    const uint64_t weight_alloc =
+        test_round_up_u64(weight_bytes, (uint64_t)getpagesize());
+    void *weights_raw = NULL;
+    TEST_ASSERT(posix_memalign(&weights_raw, (size_t)getpagesize(),
+                              (size_t)weight_alloc) == 0);
+    if (!weights_raw) return;
+    memset(weights_raw, 0, (size_t)weight_alloc);
+    uint16_t *weights = weights_raw;
+    float x_host[in_dim];
+    float out_host[out_dim];
+    for (uint32_t i = 0; i < in_dim; i++) {
+        x_host[i] = (float)((int)(i % 29u) - 14) / 32.0f;
+    }
+    for (uint32_t o = 0; o < out_dim; o++) {
+        for (uint32_t i = 0; i < in_dim; i++) {
+            const float w =
+                (float)((int)((o * 7u + i * 11u) % 41u) - 20) / 64.0f;
+            weights[(uint64_t)o * in_dim + i] = test_float_to_bf16(w);
+        }
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(sizeof(x_host));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(sizeof(out_host));
+    TEST_ASSERT(x != NULL && out != NULL);
+    if (x && out) {
+        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, x_host, sizeof(x_host)) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(weights_raw, weight_alloc) != 0);
+        TEST_ASSERT(ds4_gpu_matmul_bf16_tensor(out, weights_raw,
+                                               weight_alloc, 0,
+                                               in_dim, out_dim, x, 1) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host,
+                                       sizeof(out_host)) != 0);
+        float max_abs = 0.0f;
+        for (uint32_t o = 0; o < out_dim; o++) {
+            float ref = 0.0f;
+            for (uint32_t i = 0; i < in_dim; i++) {
+                ref += test_bf16_to_float(
+                           weights[(uint64_t)o * in_dim + i]) * x_host[i];
+            }
+            TEST_ASSERT(isfinite(out_host[o]));
+            const float err = fabsf(out_host[o] - ref);
+            if (err > max_abs) max_abs = err;
+        }
+        TEST_ASSERT(max_abs < 0.0002f);
+    }
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(x);
+    free(weights_raw);
+}
+
 static void test_metal_q8_0_prefill_matmul(void) {
     const uint32_t in_dim = 128;
     const uint32_t out_dim = 64;
@@ -4871,6 +4939,9 @@ static void test_metal_router_weights_batch_exact(void) {
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
+#if defined(DS4_ROCM_TP_READY)
+    test_rocm_bf16_decode_sharedx_matmul();
+#endif
     test_metal_q8_0_prefill_matmul();
     test_metal_pack_slot_rows_f32();
     test_metal_store_raw_kv_batch_wrap();
@@ -6580,8 +6651,6 @@ static ds4_engine *test_open_dspark_engine(const char *support_path) {
         .mtp_path = support_path,
         .mtp_draft_tokens = 0,
         .dspark = true,
-        .dspark_confidence_threshold = 0.9f,
-        .dspark_confidence_threshold_set = true,
     };
     const int rc = ds4_engine_open(&engine, &opt);
     TEST_ASSERT(rc == 0);
@@ -6714,6 +6783,9 @@ static const ds4_test_entry test_entries[] = {
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
+#if defined(DS4_ROCM_TP_READY)
+    {"--rocm-bf16-sharedx", "rocm-bf16-sharedx", "gfx1151 BF16 decode shared-input matmul exactness", test_rocm_bf16_decode_sharedx_matmul},
+#endif
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},

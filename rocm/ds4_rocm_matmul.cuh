@@ -129,6 +129,107 @@ static void cuda_launch_q8_batch_sharedx(
     }
 }
 
+/* The token-tiled Q8 batch kernel has compiled shapes for 2/4/8/16/32 rows.
+ * Normal prefill benefits from tile 32, but a DSpark verifier has only 2--5
+ * rows: reserving and filling a 32-row LDS tile wastes most of the 64 KiB and
+ * suppresses occupancy. Keep the established dispatch as the default while
+ * the exact small-row shapes are measured independently. */
+static uint32_t q8_batch_token_tile(uint64_t n_tok) {
+    const char *env = getenv("DS4_ROCM_Q8_SMALL_BATCH_TILE");
+    const bool enabled = env && env[0] == '1' && env[1] == '\0';
+    if (!enabled || n_tok > 8u) return 32u;
+    if (n_tok <= 2u) return 2u;
+    if (n_tok <= 4u) return 4u;
+    return 8u;
+}
+
+static uint32_t q8_small_batch_block_tile(uint64_t n_tok) {
+    if (n_tok > 8u) return 16u;
+    const char *env = getenv("DS4_ROCM_Q8_SMALL_BATCH_BLOCK_TILE");
+    if (!env || !env[0] || strcmp(env, "16") == 0) return 16u;
+    if (strcmp(env, "8") == 0) return 8u;
+    if (strcmp(env, "32") == 0) return 32u;
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "unsupported DS4_ROCM_Q8_SMALL_BATCH_BLOCK_TILE=%s; using 16\n",
+                env);
+        warned = 1;
+    }
+    return 16u;
+}
+
+static int q8_small_batch_dp4a_enabled(void) {
+    const char *env = getenv("DS4_ROCM_Q8_SMALL_BATCH_DP4A");
+    return env && env[0] == '1' && env[1] == '\0';
+}
+
+static int q8_reuse_quant_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q8_REUSE_QUANT");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
+static int q8_dp4a_shape_dispatch_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q8_DP4A_SHAPE_DISPATCH");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
+static uint32_t q8_small_batch_dp4a_rows_per_block(
+        uint32_t n_blocks, uint32_t out_dim) {
+    if (!q8_dp4a_shape_dispatch_enabled()) return 8u;
+
+    const uint32_t in_dim = n_blocks * 32u;
+    /* Standalone gfx1151 sweeps selected 16 waves for these exact DFlash
+     * projection shapes.  Q-B (1024 -> 32768, or 16384 after TP slicing)
+     * was flat/slightly better at the established 8-wave launch, as were
+     * shapes not covered by the sweep. */
+    if ((in_dim == 4096u && out_dim == 8192u) ||
+        (in_dim == 8192u && out_dim == 4096u) ||
+        (in_dim == 12288u && out_dim == 4096u)) {
+        return 16u;
+    }
+    return 8u;
+}
+
+static void cuda_launch_q8_small_batch_dp4a(
+        float *out, const unsigned char *w, const int8_t *xq,
+        const float *xscale, uint32_t n_blocks, uint32_t out_dim,
+        uint32_t n_tok, uint64_t row_bytes) {
+    /* 8 waves / 256 threads is the proven default.  A global 16-wave launch
+     * was unstable end-to-end (11.86-15.03 t/s), so the opt-in dispatcher
+     * limits 16 waves to shapes where the standalone sweep selected it.  The
+     * kernel derives rows_per_block from blockDim, so grid and threads change
+     * together. */
+    const uint32_t rows_per_block =
+        q8_small_batch_dp4a_rows_per_block(n_blocks, out_dim);
+    const uint32_t threads = rows_per_block * 32u;
+    const dim3 grid((out_dim + rows_per_block - 1u) / rows_per_block);
+    if (n_tok <= 2u) {
+        matmul_q8_0_preq_toktile_dp4a_kernel<2u><<<grid, threads>>>(
+                out, w, xq, xscale, n_blocks, out_dim, n_tok, row_bytes);
+    } else if (n_tok == 3u) {
+        matmul_q8_0_preq_toktile_dp4a_kernel<3u><<<grid, threads>>>(
+                out, w, xq, xscale, n_blocks, out_dim, n_tok, row_bytes);
+    } else if (n_tok <= 4u) {
+        matmul_q8_0_preq_toktile_dp4a_kernel<4u><<<grid, threads>>>(
+                out, w, xq, xscale, n_blocks, out_dim, n_tok, row_bytes);
+    } else if (n_tok == 5u) {
+        matmul_q8_0_preq_toktile_dp4a_kernel<5u><<<grid, threads>>>(
+                out, w, xq, xscale, n_blocks, out_dim, n_tok, row_bytes);
+    } else {
+        matmul_q8_0_preq_toktile_dp4a_kernel<8u><<<grid, threads>>>(
+                out, w, xq, xscale, n_blocks, out_dim, n_tok, row_bytes);
+    }
+}
+
 template <uint32_t BT>
 static void cuda_launch_grouped_q8_a_sharedx_bt(
         float *low,
@@ -491,6 +592,31 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (n_tok > 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        if (q8_small_batch_dp4a_enabled() && n_tok <= 8u &&
+            (in_dim & 31u) == 0u) {
+            const uint64_t xq_bytes = n_tok * blocks * 32u;
+            const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+            const uint64_t tmp_bytes =
+                scale_offset + n_tok * blocks * sizeof(float);
+            void *tmp = cuda_tmp_alloc(tmp_bytes, "q8 small-batch dp4a");
+            if (!tmp) return 0;
+            int8_t *xq = (int8_t *)tmp;
+            float *xscale = (float *)((char *)tmp + scale_offset);
+            const dim3 qgrid((uint32_t)blocks, (uint32_t)n_tok, 1u);
+            quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                    xq, xscale, (const float *)x->ptr, in_dim, blocks);
+            if (!cuda_ok(cudaGetLastError(),
+                         "q8 small-batch dp4a quantize launch")) return 0;
+            cuda_launch_q8_small_batch_dp4a(
+                    (float *)out->ptr,
+                    reinterpret_cast<const unsigned char *>(wptr),
+                    xq, xscale, (uint32_t)blocks, (uint32_t)out_dim,
+                    (uint32_t)n_tok, blocks * 34u);
+            return cuda_ok(cudaGetLastError(),
+                           "q8 small-batch dp4a matmul launch");
+        }
+#endif
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (!g_quality_mode && (in_dim % 32u) == 0u &&
             out_dim >= 1024u &&
             n_tok >= 256u &&
@@ -511,8 +637,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
-            const uint32_t tile = 32u;
-            const uint32_t block_tile = 16u;
+            const uint32_t tile = q8_batch_token_tile(n_tok);
+            const uint32_t block_tile = q8_small_batch_block_tile(n_tok);
             cuda_launch_q8_batch_sharedx((float *)out->ptr,
                                          reinterpret_cast<const unsigned char *>(wptr),
                                          (const float *)x->ptr,
@@ -685,7 +811,9 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         in_dim > UINT32_MAX || out0_dim > UINT32_MAX || out1_dim > UINT32_MAX || n_tok > UINT32_MAX) {
         return 0;
     }
-    if (n_tok != 1) {
+    if (n_tok != 1 &&
+        !(q8_reuse_quant_enabled() && q8_small_batch_dp4a_enabled() &&
+          n_tok <= 8u && (in_dim & 31u) == 0u)) {
         return cuda_matmul_q8_0_tensor_labeled(out0, model_map, model_size, weight0_offset,
                                                in_dim, out0_dim, x, n_tok, "q8_0_pair0") &&
                cuda_matmul_q8_0_tensor_labeled(out1, model_map, model_size, weight1_offset,
@@ -701,15 +829,44 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     }
     if (weight0_bytes > model_size - weight0_offset ||
         weight1_bytes > model_size - weight1_offset ||
-        x->bytes < in_dim * sizeof(float) ||
-        out0->bytes < out0_dim * sizeof(float) ||
-        out1->bytes < out1_dim * sizeof(float)) {
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        out0->bytes < n_tok * out0_dim * sizeof(float) ||
+        out1->bytes < n_tok * out1_dim * sizeof(float)) {
         return 0;
     }
     const char *w0 = cuda_model_range_ptr(model_map, weight0_offset, weight0_bytes, "q8_0_pair0");
     const char *w1 = cuda_model_range_ptr(model_map, weight1_offset, weight1_bytes, "q8_0_pair1");
     if (!w0 || !w1) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    if (n_tok != 1) {
+        const uint64_t xq_bytes = n_tok * blocks * 32u;
+        const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+        const uint64_t tmp_bytes =
+            scale_offset + n_tok * blocks * sizeof(float);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair shared prequant");
+        if (!tmp) return 0;
+        int8_t *xq = (int8_t *)tmp;
+        float *xscale = (float *)((char *)tmp + scale_offset);
+        const dim3 qgrid((uint32_t)blocks, (uint32_t)n_tok, 1u);
+        quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                xq, xscale, (const float *)x->ptr, in_dim, blocks);
+        if (!cuda_ok(cudaGetLastError(),
+                     "q8_0 pair shared quantize launch")) return 0;
+        cuda_launch_q8_small_batch_dp4a(
+                (float *)out0->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                xq, xscale, (uint32_t)blocks, (uint32_t)out0_dim,
+                (uint32_t)n_tok, row_bytes);
+        if (!cuda_ok(cudaGetLastError(),
+                     "q8_0 pair shared first matmul launch")) return 0;
+        cuda_launch_q8_small_batch_dp4a(
+                (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w1),
+                xq, xscale, (uint32_t)blocks, (uint32_t)out1_dim,
+                (uint32_t)n_tok, row_bytes);
+        return cuda_ok(cudaGetLastError(),
+                       "q8_0 pair shared second matmul launch");
+    }
     if ((in_dim & 31u) == 0u && in_dim <= 8192u) {
         const unsigned rows_per_block = 32u;
         const unsigned threads = rows_per_block * 32u;
@@ -883,6 +1040,44 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     }
     matmul_f16_kernel<<<grid, 256>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_elems = out_dim * in_dim;
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset ||
+        n_tok > UINT64_MAX / in_dim ||
+        n_tok * in_dim > UINT64_MAX / sizeof(float) ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        n_tok > UINT64_MAX / out_dim ||
+        n_tok * out_dim > UINT64_MAX / sizeof(float) ||
+        out->bytes < n_tok * out_dim * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "bf16");
+    if (!wptr) return 0;
+    if (n_tok == 1u && in_dim <= 8192u &&
+        in_dim * sizeof(float) <= 65536u &&
+        getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") == NULL) {
+        const uint32_t rows_per_block = 32u;
+        matmul_bf16_f32_sharedx_warp_rows_w32_kernel<<<
+                ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                rows_per_block * 32u,
+                (size_t)in_dim * sizeof(float)>>>(
+                (float *)out->ptr,
+                (const uint16_t *)wptr,
+                (const float *)x->ptr,
+                (uint32_t)in_dim,
+                out_dim);
+        return cuda_ok(cudaGetLastError(), "matmul_bf16 sharedx launch");
+    }
+    const dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
+    matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr,
+                                      (const uint16_t *)wptr,
+                                      (const float *)x->ptr,
+                                      in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
 }
 
 extern "C" int ds4_gpu_matmul_f16_pair_tensor(

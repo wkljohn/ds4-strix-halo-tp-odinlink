@@ -151,6 +151,7 @@ typedef struct {
     int gid_index;
     uint32_t max_inline;
     uint32_t decode_max_msg;
+    bool is_odinlink;
     ds4_tp_rdma_info peer;
     uint32_t send_outstanding;  /* signaled sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
@@ -274,10 +275,45 @@ static int tp_hello_validate_runtime_features(uint32_t local, uint32_t peer,
     return 0;
 }
 
+/* Resolve the negotiated data transport in one fail-closed place.  AUTO may
+ * deliberately fall back to TCP; an explicit RDMA request never may.  Keep
+ * this separate from device probing and the hello socket so the policy has a
+ * small deterministic regression test. */
+static int tp_select_transport(ds4_tp_transport requested,
+                               int local_rdma_ok,
+                               int peer_rdma_ok,
+                               bool *rdma_active,
+                               char *err,
+                               size_t errlen) {
+    const bool active = requested != DS4_TP_TRANSPORT_TCP &&
+                        local_rdma_ok != 0 && peer_rdma_ok != 0;
+    if (rdma_active) *rdma_active = active;
+    if (requested == DS4_TP_TRANSPORT_RDMA && !active) {
+        tp_set_err(err, errlen,
+                   "tp: --transport rdma but %s side has no active device",
+                   local_rdma_ok ? "the peer" : "this");
+        return 0;
+    }
+    return 1;
+}
+
 #ifdef DS4_TP_TEST_HOOKS
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
                                                 char *err, size_t errlen) {
     return tp_hello_validate_runtime_features(local, peer, err, errlen);
+}
+
+int ds4_tp_test_select_transport(ds4_tp_transport requested,
+                                 int local_rdma_ok,
+                                 int peer_rdma_ok,
+                                 int *rdma_active,
+                                 char *err,
+                                 size_t errlen) {
+    bool active = false;
+    const int ok = tp_select_transport(requested, local_rdma_ok, peer_rdma_ok,
+                                       &active, err, errlen);
+    if (rdma_active) *rdma_active = active ? 1 : 0;
+    return ok;
 }
 #endif
 
@@ -823,13 +859,14 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
             (pa.state == IBV_PORT_ACTIVE || want_name)) {
             r->ctx = ctx;
             r->port = pa;
+            r->is_odinlink = strncmp(name, "odl_tb5_", 8) == 0;
             r->decode_max_msg = tp_rdma_decode_max_msg_override(
                     tp_rdma_provider_decode_max_msg(name));
             fprintf(stderr, "ds4-tp: rdma device %s (port state %d)\n", name, (int)pa.state);
             fprintf(stderr,
                     "ds4-tp: rdma decode message policy %u bytes%s\n",
                     r->decode_max_msg,
-                    strncmp(name, "odl_tb5_", 8) == 0 ? " (OdinLink)" : " (generic provider)");
+                    r->is_odinlink ? " (OdinLink)" : " (generic provider)");
             break;
         }
         size_t off = strlen(states);
@@ -1726,15 +1763,8 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     tp->gate_slot_step = id->gate_slot_step;
     tp->gates_per_token = id->gates_per_token;
     tp_slab_layout(tp);
-    /* Transport decision: RDMA only when both sides can. */
-    int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
-    tp->rdma_active = want_rdma && rdma_ok && theirs.rdma_ok;
-    if (tp->opt.transport == DS4_TP_TRANSPORT_RDMA && !tp->rdma_active) {
-        tp_set_err(err, errlen, "tp: --transport rdma but %s side has no active device",
-                   rdma_ok ? "the peer" : "this");
-        return 0;
-    }
-    return 1;
+    return tp_select_transport(tp->opt.transport, rdma_ok, theirs.rdma_ok,
+                               &tp->rdma_active, err, errlen);
 }
 
 int ds4_tp_create(
@@ -1910,17 +1940,26 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                              (uint16_t)rows, seq };
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
-        ds4_tp_gate_header ph;
-        if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
-        if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
-            ph.gate != rows || ph.seq != seq) {
-            fprintf(stderr,
-                    "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
-                    "want l=%u rows=%u seq=%llu\n",
-                    ph.layer, ph.gate, (unsigned long long)ph.seq,
-                    layer, rows, (unsigned long long)seq);
-            return 0;
+        const bool odinlink_async = tp->rdma.is_odinlink &&
+            (tp->runtime_features & DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC) != 0;
+        /* A normal decode receive window must still be drained behind the TCP
+         * barrier before the QP changes message shape.  Once in batch mode,
+         * OdinLink retains early stream messages, so repeated barriers merely
+         * serialize the ranks and add a scheduler-sensitive TCP round trip.
+         * Generic verbs providers always keep the conservative barrier. */
+        if (!odinlink_async || tp->rdma.recv_window_active) {
+            if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+            ds4_tp_gate_header ph;
+            if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+            if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+                ph.gate != rows || ph.seq != seq) {
+                fprintf(stderr,
+                        "ds4-tp: batch gate desync: got l=%u rows=%u seq=%llu, "
+                        "want l=%u rows=%u seq=%llu\n",
+                        ph.layer, ph.gate, (unsigned long long)ph.seq,
+                        layer, rows, (unsigned long long)seq);
+                return 0;
+            }
         }
         if (!tp_rdma_drain_decode_window(tp)) return 0;
         return tp_rdma_big_gate_exchange(

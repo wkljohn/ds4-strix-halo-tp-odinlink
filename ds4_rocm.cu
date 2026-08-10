@@ -224,6 +224,7 @@ static volatile int             g_tp_run         = 0;
 static int                      g_tp_failed      = 0;   /* atomics only */
 static int                      g_tp_session_batch = 0;
 static int                      g_tp_expert_shard_suspended = 0;
+static uint32_t                 g_tp_expert_split = 0;
 static int                      g_tp_keepalive_paused = 0;
 static int                      g_tp_attn_head_split = 0;
 static uint32_t                 g_tp_split_rank = 0;
@@ -455,10 +456,17 @@ struct ds4_tp_interval_stat {
  * model always uses exactly 2, but a future model's row-gate count per
  * layer must not index out of bounds. */
 #define DS4_TP_GATE_BUCKETS 4
+#define DS4_TP_KIND_BUCKETS 3
 
 struct ds4_tp_interval_profile {
     struct ds4_tp_interval_stat detect[2];
+    struct ds4_tp_interval_stat detect_by_kind[DS4_TP_KIND_BUCKETS];
     struct ds4_tp_interval_stat callback[2];
+    struct ds4_tp_interval_stat callback_by_kind[DS4_TP_KIND_BUCKETS];
+    /* Host-side upper bound from noticing an arrival through publishing its
+     * release.  Unlike a compute-stream event, this cannot absorb unrelated
+     * default-stream work. */
+    struct ds4_tp_interval_stat detect_to_release_by_kind[DS4_TP_KIND_BUCKETS];
     /* callback_by_gate[ch][gate] is the DIRECT, trustworthy measurement of a
      * gate's real cross-rank exchange cost - measured purely via
      * clock_gettime() on the service thread around the g_tp_fn() call, with
@@ -472,6 +480,7 @@ struct ds4_tp_interval_profile {
      * DECODE-ACCELERATION-PLAN.md's "Stage 0d" correction. */
     struct ds4_tp_interval_stat callback_by_gate[2][DS4_TP_GATE_BUCKETS];
     struct ds4_tp_interval_stat release_to_arrival[2];
+    struct ds4_tp_interval_stat release_to_arrival_by_kind[DS4_TP_KIND_BUCKETS];
     struct ds4_tp_interval_stat release_to_arrival_by_gate[2][DS4_TP_GATE_BUCKETS];
     uint64_t last_miss_ns[2];
     uint64_t last_release_ns[2];
@@ -512,6 +521,9 @@ static void ds4_tp_interval_print(const struct ds4_tp_interval_profile *p) {
         "callback_gate=0_attn", "callback_gate=1_ffn",
         "callback_gate=2", "callback_gate=3+"
     };
+    static const char *kind_names[DS4_TP_KIND_BUCKETS] = {
+        "row", "batch", "big"
+    };
     for (int ch = 0; ch < 2; ch++) {
         ds4_tp_interval_print_one(ch, "detect_upper_bound", &p->detect[ch]);
         ds4_tp_interval_print_one(ch, "callback", &p->callback[ch]);
@@ -525,6 +537,21 @@ static void ds4_tp_interval_print(const struct ds4_tp_interval_profile *p) {
             ds4_tp_interval_print_one(ch, gate_names[g],
                                       &p->release_to_arrival_by_gate[ch][g]);
         }
+    }
+    for (int kind = 0; kind < DS4_TP_KIND_BUCKETS; kind++) {
+        char name[64];
+        snprintf(name, sizeof(name), "detect_upper_bound_kind=%s", kind_names[kind]);
+        ds4_tp_interval_print_one(kind == DS4_TP_ROW ? 0 : 1, name,
+                                  &p->detect_by_kind[kind]);
+        snprintf(name, sizeof(name), "callback_kind=%s", kind_names[kind]);
+        ds4_tp_interval_print_one(kind == DS4_TP_ROW ? 0 : 1, name,
+                                  &p->callback_by_kind[kind]);
+        snprintf(name, sizeof(name), "detect_to_release_kind=%s", kind_names[kind]);
+        ds4_tp_interval_print_one(kind == DS4_TP_ROW ? 0 : 1, name,
+                                  &p->detect_to_release_by_kind[kind]);
+        snprintf(name, sizeof(name), "release_to_arrival_kind=%s", kind_names[kind]);
+        ds4_tp_interval_print_one(kind == DS4_TP_ROW ? 0 : 1, name,
+                                  &p->release_to_arrival_by_kind[kind]);
     }
 }
 
@@ -621,19 +648,26 @@ static int ds4_tp_pump_profile(int ch, uint64_t *next,
         p->last_miss_ns[ch] = noticed_ns;
         return 0;
     }
+    const struct ds4_tp_req *r = &c->ring[*next % DS4_TP_RING];
     if (p->last_miss_ns[ch]) {
         /* Consume it: back-to-back hits with no intervening miss (a burst of
          * already-arrived gates) must not keep reusing this stale timestamp,
          * which would otherwise record a growing, meaningless interval for
          * every hit in the burst instead of just the first. */
-        ds4_tp_interval_add(&p->detect[ch], noticed_ns - p->last_miss_ns[ch]);
+        const uint64_t detect_ns = noticed_ns - p->last_miss_ns[ch];
+        ds4_tp_interval_add(&p->detect[ch], detect_ns);
+        if (r->kind < DS4_TP_KIND_BUCKETS) {
+            ds4_tp_interval_add(&p->detect_by_kind[r->kind], detect_ns);
+        }
         p->last_miss_ns[ch] = 0;
     }
-    const struct ds4_tp_req *r = &c->ring[*next % DS4_TP_RING];
     ds4_tp_ffn_range_consume(ch, *next, r);
     if (p->last_release_ns[ch]) {
         uint64_t dt = noticed_ns - p->last_release_ns[ch];
         ds4_tp_interval_add(&p->release_to_arrival[ch], dt);
+        if (r->kind < DS4_TP_KIND_BUCKETS) {
+            ds4_tp_interval_add(&p->release_to_arrival_by_kind[r->kind], dt);
+        }
         if (r->kind == DS4_TP_ROW) {
             uint32_t gb = r->gate < DS4_TP_GATE_BUCKETS ?
                           r->gate : DS4_TP_GATE_BUCKETS - 1;
@@ -665,6 +699,9 @@ static int ds4_tp_pump_profile(int ch, uint64_t *next,
     uint64_t callback_end_ns = ds4_tp_monotonic_ns();
     uint64_t callback_ns = callback_end_ns - callback_start_ns;
     ds4_tp_interval_add(&p->callback[ch], callback_ns);
+    if (r->kind < DS4_TP_KIND_BUCKETS) {
+        ds4_tp_interval_add(&p->callback_by_kind[r->kind], callback_ns);
+    }
     if (r->kind == DS4_TP_ROW) {
         uint32_t cb_gb = r->gate < DS4_TP_GATE_BUCKETS ?
                          r->gate : DS4_TP_GATE_BUCKETS - 1;
@@ -678,7 +715,12 @@ static int ds4_tp_pump_profile(int ch, uint64_t *next,
                 r->kind, r->layer, (unsigned long long)*next);
     }
     __atomic_store_n(c->cpu_flag, *next, __ATOMIC_RELEASE);
-    p->last_release_ns[ch] = ds4_tp_monotonic_ns();
+    const uint64_t released_ns = ds4_tp_monotonic_ns();
+    if (r->kind < DS4_TP_KIND_BUCKETS) {
+        ds4_tp_interval_add(&p->detect_to_release_by_kind[r->kind],
+                            released_ns - noticed_ns);
+    }
+    p->last_release_ns[ch] = released_ns;
     (*next)++;
     return 1;
 }
@@ -688,7 +730,11 @@ static void *ds4_tp_service_thread(void *arg) {
     uint64_t next[2] = { 1, 1 };
     uint32_t idle_streak = 0;
     const char *profile_env = getenv("DS4_TP_SERVICE_INTERVAL_PROFILE");
-    const int profile_enabled = profile_env && strcmp(profile_env, "1") == 0;
+    const char *verify_stage_env = getenv("DS4_DSPARK_VERIFY_STAGE_EVENTS");
+    const int profile_enabled =
+        (profile_env && strcmp(profile_env, "1") == 0) ||
+        (verify_stage_env && verify_stage_env[0] &&
+         strcmp(verify_stage_env, "0") != 0);
     const int ffn_range_enabled = ds4_tp_ffn_range_enabled() &&
                                   g_tp_ffn_range_host[0] &&
                                   g_tp_ffn_range_host[1];
@@ -1054,6 +1100,7 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) { g_tp_batch_fn = fn; }
 extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn)     { g_tp_big_fn = fn; }
 extern "C" void ds4_gpu_tp_set_session_batch_mode(int enabled)                 { g_tp_session_batch = enabled; }
+extern "C" void ds4_gpu_tp_set_expert_split(uint32_t first_rank1)              { g_tp_expert_split = first_rank1; }
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend)                { g_tp_expert_shard_suspended = suspend; }
 extern "C" void ds4_gpu_tp_keepalive_pause(int paused)                         { g_tp_keepalive_paused = paused; }
 extern "C" void ds4_gpu_tp_set_attn_head_split(int enabled)                    { g_tp_attn_head_split = enabled; }
@@ -1098,26 +1145,29 @@ extern "C" int ds4_gpu_tp_failed(void) { return ds4_tp_fail_get(); }
  * ------------------------------------------------------------------------ */
 __global__ void ds4_tp_shard_remap_kernel(int32_t *sel_dst, float *w_dst,
                                           const int32_t *sel_src, const float *w_src,
-                                          uint32_t n, int32_t lo, int32_t hi) {
+                                          uint32_t n, int32_t lo, int32_t hi,
+                                          int32_t unowned_sentinel) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int32_t e = sel_src[i];
     const bool own = (e >= lo && e < hi);
     /* Rebase onto the shard: the launcher is handed gate/up/down offsets that
      * already start at expert `lo`, so an owned expert must be addressed as
-     * e-lo. Unowned pairs get index 0 (in range, so no OOB read) and weight 0,
-     * so they contribute nothing and the two ranks' partial sums still
-     * recombine to exactly the unsharded result. */
-    sel_dst[i] = own ? (e - lo) : 0;
+     * e-lo. Normally unowned pairs get index 0 and weight 0. The experimental
+     * skip path uses -1 instead, allowing Q4_K kernels to avoid the known-zero
+     * dot products while preserving the same zero contribution. */
+    sel_dst[i] = own ? (e - lo) : unowned_sentinel;
     w_dst[i]   = own ? w_src[i] : 0.0f;
 }
 
-/* Owned half of the expert range. Mirrors ds4_metal.m:8327-8342, including
- * rank 1 taking the odd remainder. */
+/* Owned contiguous expert range.  A zero/out-of-range boundary retains the
+ * historical half split; DSpark's standard two-node mode sets 118/138. */
 static void ds4_tp_expert_range(uint32_t n_total, int32_t *lo, int32_t *hi) {
     *lo = 0; *hi = (int32_t)n_total;
     if (g_tp_split_world != 2 || g_tp_expert_shard_suspended) return;
-    const uint32_t low = n_total / 2u;
+    const uint32_t low = g_tp_expert_split > 0u &&
+                         g_tp_expert_split < n_total ?
+                         g_tp_expert_split : n_total / 2u;
     if (g_tp_split_rank == 1) { *lo = (int32_t)low; }
     else                      { *hi = (int32_t)low; }
 }
@@ -1155,8 +1205,17 @@ extern "C" int ds4_gpu_tp_expert_shard_remap(
     float   *w_dst   = (float *)(sel_dst + n_pairs);
     const uint32_t threads = 256u;
     const uint32_t blocks = (n_pairs + threads - 1u) / threads;
+    const char *skip_env = getenv("DS4_ROCM_TP_SKIP_UNOWNED");
+    const bool skip_unowned = skip_env && skip_env[0] == '1' && skip_env[1] == '\0';
+    static bool logged_skip_unowned = false;
+    if (skip_unowned && !logged_skip_unowned) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "experimental TP unowned Q4_K expert skipping enabled\n");
+        logged_skip_unowned = true;
+    }
     hipLaunchKernelGGL(ds4_tp_shard_remap_kernel, dim3(blocks), dim3(threads), 0, 0,
-                       sel_dst, w_dst, selected, weights, n_pairs, lo, hi);
+                       sel_dst, w_dst, selected, weights, n_pairs, lo, hi,
+                       skip_unowned ? -1 : 0);
     if (out_selected) *out_selected = sel_dst;
     if (out_weights)  *out_weights  = w_dst;
     if (out_base)     *out_base     = (uint32_t)lo;

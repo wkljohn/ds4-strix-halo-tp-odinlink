@@ -8317,6 +8317,7 @@ static uint64_t g_tp_batch_seq;
  * not bound; world 2 assigns each rank one contiguous expert range. */
 static int32_t g_tp_split_rank;
 static int32_t g_tp_split_world = 1;
+static uint32_t g_tp_expert_split;
 static int32_t g_tp_session_batch_mode;
 
 static int ds4_gpu_tp_world_is_two(void) {
@@ -8332,7 +8333,9 @@ static void ds4_gpu_tp_expert_range(uint32_t n_total_expert,
     *n_expert = n_total_expert;
     if (g_tp_split_world != 2) return;
 
-    const uint32_t low_experts = n_total_expert / 2u;
+    const uint32_t low_experts =
+        g_tp_expert_split > 0u && g_tp_expert_split < n_total_expert ?
+        g_tp_expert_split : n_total_expert / 2u;
     if (g_tp_split_rank == 1) {
         *first_expert = low_experts;
         *n_expert = n_total_expert - low_experts;
@@ -8647,6 +8650,10 @@ void ds4_gpu_tp_shutdown(void) {
 void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     if (!g_tp_thread_running) return;
     g_tp_split_world = suspend ? 1 : 2;
+}
+
+void ds4_gpu_tp_set_expert_split(uint32_t first_rank1) {
+    g_tp_expert_split = first_rank1;
 }
 
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {

@@ -36,7 +36,34 @@ enum {
 
 enum {
     DS4_TP_FEATURE_Q4K_WMMA = UINT32_C(1) << 0,
+    /* The verifier attention head split changes the per-layer big-gate
+     * schedule.  Put it in the exact-matched hello word so independently
+     * launched ranks cannot enter different schedules and deadlock. */
+    DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT = UINT32_C(1) << 1,
+    /* OdinLink's stream-backed provider retains an arrived message until a
+     * posted receive consumes it.  This permits the batch verifier to stay on
+     * its RDMA channel after the transition barrier instead of rendezvousing
+     * over TCP before every layer.  Real verbs providers retain their normal
+     * receive-before-send protocol; the transport checks the device name. */
+    DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC = UINT32_C(1) << 2,
+    /* Bits 8..15 carry the first expert owned by rank 1.  Including the
+     * ownership boundary in the already exact-matched hello features makes
+     * an asymmetric placement fail closed if the two independent nodes were
+     * launched with different settings. */
+    DS4_TP_FEATURE_EXPERT_SPLIT_SHIFT = 8,
+    DS4_TP_FEATURE_EXPERT_SPLIT_MASK = UINT32_C(0xff) <<
+                                           DS4_TP_FEATURE_EXPERT_SPLIT_SHIFT,
 };
+
+static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {
+    return (first_rank1 & UINT32_C(0xff)) <<
+           DS4_TP_FEATURE_EXPERT_SPLIT_SHIFT;
+}
+
+static inline uint32_t ds4_tp_feature_expert_split_value(uint32_t features) {
+    return (features & DS4_TP_FEATURE_EXPERT_SPLIT_MASK) >>
+           DS4_TP_FEATURE_EXPERT_SPLIT_SHIFT;
+}
 
 static inline bool ds4_tp_runtime_features_equal(uint32_t local,
                                                   uint32_t peer) {
@@ -130,6 +157,12 @@ uint32_t ds4_tp_runtime_features(const ds4_tp *tp);
 #ifdef DS4_TP_TEST_HOOKS
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
                                                 char *err, size_t errlen);
+int ds4_tp_test_select_transport(ds4_tp_transport requested,
+                                 int local_rdma_ok,
+                                 int peer_rdma_ok,
+                                 int *rdma_active,
+                                 char *err,
+                                 size_t errlen);
 uint32_t ds4_tp_test_rdma_provider_decode_max_msg(const char *device_name);
 uint32_t ds4_tp_test_rdma_negotiate_decode_max_msg(uint32_t local,
                                                    uint32_t peer);

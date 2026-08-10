@@ -1970,7 +1970,19 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) {
+        for (uint32_t rr = 0; rr < 4u; rr++) {
+            const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+            if (row >= expert_mid_dim || lane != 0u) continue;
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = 0.0f;
+                up_out[off] = 0.0f;
+            }
+            mid_out[off] = 0.0f;
+        }
+        return;
+    }
     uint32_t expert = (uint32_t)expert_i;
     const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
     for (uint32_t rr = 0; rr < 4u; rr++) {
@@ -2246,7 +2258,7 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
         if (slot >= n_expert) continue;
         int32_t expert_i = selected[slot];
-        if (expert_i < 0) expert_i = 0;
+        if (expert_i < 0) continue;
         const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
         const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
         float acc = 0.0f;
@@ -2274,7 +2286,10 @@ __global__ static void moe_down_q4K_qwarp32_kernel(
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) {
+        if (lane == 0u) down_out[(uint64_t)pair * out_dim + row] = 0.0f;
+        return;
+    }
     const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;
@@ -5217,4 +5232,130 @@ __global__ static void moe_down_f32_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
+}
+/* Native GGUF MXFP4 routed experts used by DeepSeek-V4 DSpark.  Keep this
+ * correctness-first path self-contained: weights remain in their 17-byte
+ * blocks and activations stay F32, so it adds no persistent expansion cache. */
+typedef struct {
+    uint8_t e;
+    uint8_t qs[16];
+} ds4_block_mxfp4;
+static_assert(sizeof(ds4_block_mxfp4) == 17, "MXFP4 block layout mismatch");
+
+__device__ __forceinline__ static float ds4_mxfp4_e8m0_half(uint8_t e) {
+    const uint32_t bits = e < 2u ? (0x00200000u << e)
+                                 : ((uint32_t)(e - 1u) << 23);
+    return __uint_as_float(bits);
+}
+
+__device__ __forceinline__ static float ds4_mxfp4_value(uint8_t q) {
+    constexpr int8_t values[16] = {
+        0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    return (float)values[q & 15u];
+}
+
+__device__ __forceinline__ static float ds4_mxfp4_dot_f32(
+        const ds4_block_mxfp4 *w,
+        const float *x,
+        uint32_t n_blocks) {
+    float sum = 0.0f;
+    for (uint32_t b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+        const ds4_block_mxfp4 block = w[b];
+        const float d = ds4_mxfp4_e8m0_half(block.e);
+        float block_sum = 0.0f;
+        #pragma unroll
+        for (uint32_t j = 0; j < 16u; j++) {
+            const uint8_t q = block.qs[j];
+            block_sum += ds4_mxfp4_value(q) * x[b * 32u + j];
+            block_sum += ds4_mxfp4_value(q >> 4) * x[b * 32u + j + 16u];
+        }
+        sum += d * block_sum;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    return partial[0];
+}
+
+__global__ static void moe_gate_up_mid_mxfp4_f32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const float *x,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t in_blocks,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        float clamp) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t pair = blockIdx.y;
+    if (row >= expert_mid_dim) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[pair];
+    if (expert_i < 0) expert_i = 0;
+    const uint32_t expert = (uint32_t)expert_i;
+    const ds4_block_mxfp4 *gate_row = (const ds4_block_mxfp4 *)(
+        gate_base + (uint64_t)expert * gate_expert_bytes +
+        (uint64_t)row * gate_row_bytes);
+    const ds4_block_mxfp4 *up_row = (const ds4_block_mxfp4 *)(
+        up_base + (uint64_t)expert * gate_expert_bytes +
+        (uint64_t)row * gate_row_bytes);
+    const float *xrow = x + (uint64_t)tok * expert_in_dim;
+    const float gate_sum = ds4_mxfp4_dot_f32(gate_row, xrow, in_blocks);
+    __syncthreads();
+    const float up_sum = ds4_mxfp4_dot_f32(up_row, xrow, in_blocks);
+    if (threadIdx.x == 0) {
+        float gate = gate_sum;
+        float up = up_sum;
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        gate_out[off] = gate;
+        up_out[off] = up;
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[pair];
+    }
+}
+
+__global__ static void moe_down_sum_mxfp4_f32_kernel(
+        float *out,
+        const char *down_base,
+        const float *mid,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t mid_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint32_t pair = tok * n_expert + slot;
+        int32_t expert_i = selected[pair];
+        if (expert_i < 0) expert_i = 0;
+        const ds4_block_mxfp4 *down_row = (const ds4_block_mxfp4 *)(
+            down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+            (uint64_t)row * down_row_bytes);
+        const float *mid_row = mid + (uint64_t)pair * expert_mid_dim;
+        total += ds4_mxfp4_dot_f32(down_row, mid_row, mid_blocks);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[(uint64_t)tok * out_dim + row] = total;
 }
