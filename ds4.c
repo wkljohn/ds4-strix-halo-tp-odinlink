@@ -16124,7 +16124,7 @@ static bool metal_graph_configure_dspark_capture(
         g->dspark_validate_decode_layers =
             ds4_gpu_tensor_alloc(layer_hc_bytes);
         const uint64_t stage_hc_bytes =
-            5u * (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+            7u * (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
         g->dspark_validate_batch_stages =
             ds4_gpu_tensor_alloc(stage_hc_bytes);
         g->dspark_validate_decode_stages =
@@ -23109,6 +23109,17 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                    model->map, model->size,
                                                                    layer->ffn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    if (ok && il == 0) {
+        const uint64_t hc_elems = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+        ok = metal_graph_dspark_validate_copy_values(
+                g->dspark_validate_decode_stages,
+                5u * hc_elems,
+                metal_graph_ffn_cur(g), 0, DS4_N_EMBD) &&
+             metal_graph_dspark_validate_copy_values(
+                g->dspark_validate_decode_stages,
+                6u * hc_elems,
+                metal_graph_ffn_norm(g), 0, DS4_N_EMBD);
+    }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", metal_graph_ffn_norm(g), DS4_N_EMBD, il, pos);
@@ -27357,6 +27368,20 @@ static bool metal_graph_encode_layer_attention_batch(
         g->tp_batch_rows == n_tokens &&
         (DS4_N_HEAD & 1u) == 0u &&
         metal_graph_tp_env_flag("DS4_TP_BATCH_ATTN_HEAD_SPLIT", false);
+    /* Fidelity experiment for anchorless DSpark chaining.  Current one-token
+     * ROCm TP decode contributes the first half of the grouped attention
+     * output and a zero second-rank partial.  Reproduce that exact distributed
+     * reduction tree in the batch verifier before attempting to consume its
+     * captured hidden state.  This is deliberately opt-in until the full
+     * batch-vs-decode validator is exact enough to preserve routing. */
+    const bool tp_batch_attn_legacy_decode =
+        g->tp_world == 2 &&
+        g->tp_batch_rows == n_tokens &&
+        !tp_batch_attn_head_split &&
+        (n_groups & 1u) == 0u &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        metal_graph_tp_env_flag("DS4_TP_BATCH_ATTN_LEGACY_DECODE", false);
     const uint32_t tp_batch_heads = tp_batch_attn_head_split ?
         (uint32_t)DS4_N_HEAD / 2u : (uint32_t)DS4_N_HEAD;
     const uint32_t tp_batch_head0 = tp_batch_attn_head_split ?
@@ -28985,6 +29010,7 @@ static bool metal_graph_encode_layer_attention_batch(
         !attn_out_debug &&
         !tp_row_split_attn &&
         !tp_batch_attn_head_split &&
+        !tp_batch_attn_legacy_decode &&
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
         layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
         !metal_graph_directional_steering_attn_enabled(g)) {
@@ -29070,6 +29096,27 @@ static bool metal_graph_encode_layer_attention_batch(
                     ds4_gpu_tensor_free(send_sub);
                 }
             }
+        } else if (ok && tp_batch_attn_legacy_decode) {
+#ifdef DS4_ROCM_BUILD
+            const uint32_t owned_groups = n_groups / 2u;
+            if (g->tp_rank != 0) {
+                ok = ds4_gpu_tensor_fill_f32(
+                        metal_graph_batch_attn_out(g), 0.0f,
+                        (uint64_t)n_tokens * DS4_N_EMBD) != 0;
+            } else {
+                ok = ds4_gpu_attention_output_q8_tp_batch_tensor(
+                        metal_graph_batch_attn_out(g),
+                        metal_graph_batch_attn_low(g),
+                        model->map, model->size,
+                        layer->attn_output_a->abs_offset,
+                        layer->attn_output_b->abs_offset,
+                        group_dim, rank, n_groups,
+                        0u, owned_groups, DS4_N_EMBD,
+                        metal_graph_batch_heads(g), n_tokens) != 0;
+            }
+#else
+            ok = false;
+#endif
         } else if (ok) {
             ok = metal_graph_attention_output_dense_quant_batch(tp_attn_out ? tp_attn_out : metal_graph_batch_attn_out(g),
                                                                 metal_graph_batch_attn_low(g),
@@ -29096,7 +29143,7 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
-    if (ok && tp_batch_attn_head_split) {
+    if (ok && (tp_batch_attn_head_split || tp_batch_attn_legacy_decode)) {
         /* batch_attn_out is this rank's partial because every unowned head
          * column was zero during the full-width projection.  Exchange those
          * partials through the existing big gate and add rank 0 then rank 1
@@ -29337,14 +29384,42 @@ static bool metal_graph_encode_layer_ffn_batch(
         metal_graph_debug_dump_tensor("ffn_norm", metal_graph_batch_ffn_norm(g),
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
+    if (ok && il == 0) {
+        const uint64_t hc_elems = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+        ok = metal_graph_dspark_validate_copy_values(
+                g->dspark_validate_batch_stages,
+                5u * hc_elems,
+                metal_graph_batch_ffn_cur(g),
+                (uint64_t)(n_tokens - 1u) * DS4_N_EMBD,
+                DS4_N_EMBD) &&
+             metal_graph_dspark_validate_copy_values(
+                g->dspark_validate_batch_stages,
+                6u * hc_elems,
+                metal_graph_batch_ffn_norm(g),
+                (uint64_t)(n_tokens - 1u) * DS4_N_EMBD,
+                DS4_N_EMBD);
+    }
     DS4_METAL_PROFILE_FFN_STAGE("norm");
-    if (ok) ok = metal_graph_matmul_plain_tensor(metal_graph_batch_router_logits(g),
-                                                 model,
-                                                 layer->ffn_gate_inp,
-                                                 DS4_N_EMBD,
-                                                 DS4_N_EXPERT,
-                                                 metal_graph_batch_ffn_norm(g),
-                                                 n_tokens);
+    const bool exact_verify_router =
+        g->tp_batch_rows == n_tokens &&
+        layer->ffn_gate_inp->type == DS4_TENSOR_F16 &&
+        DS4_N_EMBD == 4096u && DS4_N_EXPERT == 256u &&
+        metal_graph_tp_env_flag("DS4_DSPARK_VERIFY_EXACT_ROUTER", false);
+    if (ok && exact_verify_router) {
+        ok = ds4_gpu_matmul_f16_router_rows_exact_tensor(
+                metal_graph_batch_router_logits(g),
+                model->map, model->size,
+                layer->ffn_gate_inp->abs_offset,
+                metal_graph_batch_ffn_norm(g), n_tokens) != 0;
+    } else if (ok) {
+        ok = metal_graph_matmul_plain_tensor(metal_graph_batch_router_logits(g),
+                                             model,
+                                             layer->ffn_gate_inp,
+                                             DS4_N_EMBD,
+                                             DS4_N_EXPERT,
+                                             metal_graph_batch_ffn_norm(g),
+                                             n_tokens);
+    }
 
     ds4_gpu_tensor *router_tokens = NULL;
     if (ok) {
@@ -63170,30 +63245,32 @@ static int ds4_session_eval_dspark_speculative_argmax(
             const uint64_t hc_elems =
                 (uint64_t)DS4_N_HC * DS4_N_EMBD;
             float *batch_stages = malloc(
-                    (size_t)(5u * hc_elems) * sizeof(float));
+                    (size_t)(7u * hc_elems) * sizeof(float));
             float *decode_stages = malloc(
-                    (size_t)(5u * hc_elems) * sizeof(float));
+                    (size_t)(7u * hc_elems) * sizeof(float));
             const bool stages_read_ok = batch_stages && decode_stages &&
                 ds4_gpu_tensor_read(s->graph.dspark_validate_batch_stages,
                                     0, batch_stages,
-                                    5u * hc_elems * sizeof(float)) != 0 &&
+                                    7u * hc_elems * sizeof(float)) != 0 &&
                 ds4_gpu_tensor_read(s->graph.dspark_validate_decode_stages,
                                     0, decode_stages,
-                                    5u * hc_elems * sizeof(float)) != 0;
+                                    7u * hc_elems * sizeof(float)) != 0;
             if (stages_read_ok) {
-                static const char *const stage_names[5] = {
+                static const char *const stage_names[7] = {
                     "input_hc", "attention_pre", "attention_norm",
-                    "attention_out", "attention_hc"
+                    "attention_out", "attention_hc", "ffn_pre", "ffn_norm"
                 };
-                static const uint32_t stage_slots[5] = {0, 1, 2, 3, 4};
-                const uint64_t stage_elems[5] = {
+                static const uint32_t stage_slots[7] = {0, 1, 2, 3, 4, 5, 6};
+                const uint64_t stage_elems[7] = {
                     DS4_N_HC * DS4_N_EMBD,
                     DS4_N_EMBD,
                     DS4_N_EMBD,
                     DS4_N_EMBD,
-                    DS4_N_HC * DS4_N_EMBD
+                    DS4_N_HC * DS4_N_EMBD,
+                    DS4_N_EMBD,
+                    DS4_N_EMBD
                 };
-                for (uint32_t stage = 0; stage < 5u; stage++) {
+                for (uint32_t stage = 0; stage < 7u; stage++) {
                     if (stage == 3u) continue;
                     const uint64_t off =
                         (uint64_t)stage_slots[stage] * hc_elems;

@@ -1497,6 +1497,61 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                            n_tokens,
                                            "attn_output_b");
 }
+
+/* Batched equivalent of the current TP decode output decomposition.  This is
+ * diagnostic infrastructure for verifier/decode fidelity: the caller owns a
+ * contiguous range of output groups, then combines rank partials in canonical
+ * order.  Keeping the API group-sliced also makes the legacy rank-0-only
+ * trajectory reproducible while that decode behavior remains unchanged. */
+extern "C" int ds4_gpu_attention_output_q8_tp_batch_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *low, const void *model_map,
+        uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
+        uint64_t group_dim, uint64_t rank, uint32_t n_groups_total,
+        uint32_t group0, uint32_t group_cnt, uint64_t out_dim,
+        const ds4_gpu_tensor *heads, uint32_t n_tokens) {
+    if (!out || !low || !heads || !model_map || n_tokens == 0u ||
+        group_dim == 0u || rank == 0u || n_groups_total == 0u ||
+        group_cnt == 0u || group0 > n_groups_total ||
+        group_cnt > n_groups_total - group0 || out_dim == 0u ||
+        group_dim > UINT32_MAX || rank > UINT32_MAX) {
+        return 0;
+    }
+    const uint64_t low_dim_owned = (uint64_t)group_cnt * rank;
+    if (heads->bytes < (uint64_t)n_tokens * n_groups_total * group_dim * sizeof(float) ||
+        low->bytes < (uint64_t)n_tokens * low_dim_owned * sizeof(float) ||
+        out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        return 0;
+    }
+    /* Fidelity path for anchorless DSpark chaining.  Reuse the production
+     * one-token TP projection for every verifier row so its split-K tree and
+     * Q8 accumulation order are identical to ordinary decode.  Once the
+     * validator is exact, these launches can be fused without changing that
+     * arithmetic tree. */
+    for (uint32_t row = 0; row < n_tokens; row++) {
+        ds4_gpu_tensor heads_row = *heads;
+        ds4_gpu_tensor low_row = *low;
+        ds4_gpu_tensor out_row = *out;
+        heads_row.ptr = (char *)heads->ptr +
+            (uint64_t)row * n_groups_total * group_dim * sizeof(float);
+        heads_row.bytes = (uint64_t)n_groups_total * group_dim * sizeof(float);
+        heads_row.owner = 0;
+        low_row.ptr = (char *)low->ptr +
+            (uint64_t)row * low_dim_owned * sizeof(float);
+        low_row.bytes = low_dim_owned * sizeof(float);
+        low_row.owner = 0;
+        out_row.ptr = (char *)out->ptr +
+            (uint64_t)row * out_dim * sizeof(float);
+        out_row.bytes = out_dim * sizeof(float);
+        out_row.owner = 0;
+        if (!ds4_gpu_attention_output_q8_tp_tensor(
+                    &out_row, &low_row, model_map, model_size,
+                    out_a_offset, out_b_offset, group_dim, rank,
+                    n_groups_total, group0, group_cnt, out_dim, &heads_row)) {
+            return 0;
+        }
+    }
+    return 1;
+}
 extern "C" int ds4_gpu_attention_output_low_q8_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,

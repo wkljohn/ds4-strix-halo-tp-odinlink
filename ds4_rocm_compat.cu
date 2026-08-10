@@ -229,8 +229,29 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
 extern "C" int ds4_gpu_matmul_f16_router_rows_exact_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, const ds4_gpu_tensor *x, uint32_t n_rows) {
-    return ds4_gpu_matmul_f16_tensor(out, model_map, model_size, weight_offset,
-                                     4096u, 256u, x, n_rows);
+    if (!out || !x || n_rows == 0u ||
+        x->bytes < (uint64_t)n_rows * 4096u * sizeof(float) ||
+        out->bytes < (uint64_t)n_rows * 256u * sizeof(float)) {
+        return 0;
+    }
+    for (uint32_t row = 0; row < n_rows; row++) {
+        ds4_gpu_tensor in_row = *x;
+        ds4_gpu_tensor out_row = *out;
+        in_row.ptr = (char *)x->ptr +
+            (uint64_t)row * 4096u * sizeof(float);
+        in_row.bytes = 4096u * sizeof(float);
+        in_row.owner = 0;
+        out_row.ptr = (char *)out->ptr +
+            (uint64_t)row * 256u * sizeof(float);
+        out_row.bytes = 256u * sizeof(float);
+        out_row.owner = 0;
+        if (!ds4_gpu_matmul_f16_tensor(
+                    &out_row, model_map, model_size, weight_offset,
+                    4096u, 256u, &in_row, 1u)) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
