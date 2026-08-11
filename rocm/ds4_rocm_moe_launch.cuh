@@ -76,6 +76,15 @@ static int routed_moe_q4k_decode_stage_xq_enabled(void) {
     return enabled;
 }
 
+static int routed_moe_q4k_l2_pair_order_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_L2_PAIR_ORDER");
+        enabled = env && strcmp(env, "1") == 0;
+    }
+    return enabled;
+}
+
 static const ds4_q4k_wmma_dispatch_config *routed_moe_q4k_wmma_config(void) {
     static ds4_q4k_wmma_dispatch_config cfg = {-1, 0, 0};
     if (cfg.opt_in < 0) {
@@ -1282,6 +1291,10 @@ static int routed_moe_launch(
             (!q4k_path ||
              n_tokens >= routed_moe_q4k_sorted_min_tokens()) &&
             !disable_resident_iq2_sorted;
+        const uint32_t use_q4k_l2_pair_order =
+            q4k_path && n_tokens == 5u && !use_sorted_pairs &&
+            routed_moe_q4k_decode_stage_xq_enabled() &&
+            routed_moe_q4k_l2_pair_order_enabled();
         const char *tp_skip_env = getenv("DS4_ROCM_TP_SKIP_UNOWNED");
         const uint32_t tp_skip_unowned =
             tp_skip_env && tp_skip_env[0] == '1' && tp_skip_env[1] == '\0';
@@ -1348,6 +1361,21 @@ static int routed_moe_launch(
         if (ok && q4k_decode_event_profile) {
             routed_moe_q4k_decode_event_record(
                     DS4_ROCM_Q4K_DECODE_EVENT_X_QUANT, n_tokens);
+        }
+        if (ok && use_q4k_l2_pair_order) {
+            sorted_pairs = (uint32_t *)cuda_tmp_alloc(
+                    (uint64_t)pair_count * sizeof(uint32_t),
+                    "routed_moe Q4_K L2 pair order");
+            if (!sorted_pairs) {
+                ok = 0;
+            } else {
+                moe_build_l2_pair_order_kernel<<<1u, 32u>>>(
+                        sorted_pairs,
+                        (const int32_t *)selected_exec->ptr,
+                        pair_count);
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe Q4_K L2 pair order launch");
+            }
         }
         /* A negative TP sentinel removes unowned pairs from sorted buckets.
          * Clear their pair slots before valid pairs overwrite their own rows,
@@ -1740,7 +1768,26 @@ static int routed_moe_launch(
         }
         if (ok && !split_gateup_done) {
             dim3 mgrid((expert_mid_dim + 31u) / 32u, pair_count, 1);
-            if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
+            if (ok && use_q4k_l2_pair_order && sorted_pairs) {
+                dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1u);
+                moe_gate_up_mid_decode_q4K_staged_xq_kernel<true><<<qgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        gate_w,
+                        up_w,
+                        xq,
+                        sorted_pairs,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        clamp);
+            } else if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
                 if (q4k_path) {
                     if (use_q4k_wmma) {
                         const uint32_t wmma_min_count =
@@ -1938,13 +1985,14 @@ static int routed_moe_launch(
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (q4k_path) {
                     if (routed_moe_q4k_decode_stage_xq_enabled()) {
-                    moe_gate_up_mid_decode_q4K_staged_xq_kernel<<<qgrid, 256>>>(
+                    moe_gate_up_mid_decode_q4K_staged_xq_kernel<false><<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
                         gate_w,
                         up_w,
                         xq,
+                        NULL,
                         (const int32_t *)selected_exec->ptr,
                         (const float *)weights->ptr,
                         gate_expert_bytes,

@@ -19,6 +19,31 @@ static constexpr uint32_t kBlocks = 16;
 static constexpr uint32_t kMid = 2048;
 static constexpr uint32_t kMaxPerExpert = 5;
 
+__global__ static void build_l2_pair_order(
+        uint32_t *pair_order,
+        const int32_t *selected,
+        uint32_t pair_count) {
+    if (blockIdx.x != 0u || threadIdx.x >= 32u) return;
+    const uint32_t lane = threadIdx.x;
+    uint32_t key = UINT32_MAX;
+    if (lane < pair_count) {
+        const int32_t expert = selected[lane];
+        const uint32_t expert_key = expert < 0 ? 0xffffu : (uint32_t)expert;
+        key = (expert_key << 8u) | lane;
+    }
+    for (uint32_t span = 2u; span <= 32u; span <<= 1u) {
+        for (uint32_t stride = span >> 1u; stride != 0u; stride >>= 1u) {
+            const uint32_t other = __shfl_xor(key, stride, 32);
+            const uint32_t lo = key < other ? key : other;
+            const uint32_t hi = key < other ? other : key;
+            const bool ascending = (lane & span) == 0u;
+            const bool low_lane = (lane & stride) == 0u;
+            key = ascending == low_lane ? lo : hi;
+        }
+    }
+    if (lane < pair_count) pair_order[lane] = key & 0xffu;
+}
+
 __device__ static float q4k_dot_one(
         const cuda_block_q4_K *w,
         const cuda_block_q8_K *x) {
@@ -27,6 +52,7 @@ __device__ static float q4k_dot_one(
     return acc[0];
 }
 
+template <bool ORDERED>
 __global__ static void q4k_pair_major_reference(
         float *mid_out,
         const char *gate_base,
@@ -34,11 +60,12 @@ __global__ static void q4k_pair_major_reference(
         const cuda_block_q8_K *xq,
         const int32_t *selected,
         const float *weights,
+        const uint32_t *pair_order,
         uint64_t expert_bytes,
         uint64_t row_bytes) {
     const uint32_t lane = threadIdx.x & 7u;
     const uint32_t row_lane = threadIdx.x >> 3u;
-    const uint32_t pair = blockIdx.y;
+    const uint32_t pair = ORDERED ? pair_order[blockIdx.y] : blockIdx.y;
     const uint32_t tok = pair / kUsed;
     const int32_t expert_i = selected[pair];
     if (expert_i < 0) return;
@@ -175,6 +202,12 @@ int main(int argc, char **argv) {
         remapped[pair] = (int32_t)slot;
         pairs[slot * kMaxPerExpert + counts[slot]++] = pair;
     }
+    std::vector<uint32_t> pair_order(kPairs);
+    for (uint32_t pair = 0; pair < kPairs; pair++) pair_order[pair] = pair;
+    std::stable_sort(pair_order.begin(), pair_order.end(),
+                     [&](uint32_t a, uint32_t b) {
+                         return remapped[a] < remapped[b];
+                     });
     const uint32_t unique = (uint32_t)original.size();
     std::vector<uint32_t> slot_experts(kPairs, 0u);
     for (uint32_t i = 0; i < unique; i++) slot_experts[i] = i;
@@ -209,9 +242,11 @@ int main(int argc, char **argv) {
     cuda_block_q8_K *d_xq = NULL;
     int32_t *d_selected = NULL, *d_singletons = NULL;
     uint32_t *d_slot_experts = NULL, *d_counts = NULL, *d_pairs = NULL;
+    uint32_t *d_pair_order = NULL;
     uint32_t *d_duplicate_experts = NULL, *d_duplicate_counts = NULL;
     uint32_t *d_duplicate_pairs = NULL;
-    float *d_weights = NULL, *d_ref = NULL, *d_grouped = NULL, *d_hybrid = NULL;
+    float *d_weights = NULL, *d_ref = NULL, *d_ordered = NULL;
+    float *d_grouped = NULL, *d_hybrid = NULL;
     const size_t weight_bytes = blocks_per_matrix * sizeof(cuda_block_q4_K);
     const size_t out_bytes = (size_t)kPairs * kMid * sizeof(float);
     hip_check(hipMalloc(&d_gate, weight_bytes), "malloc gate");
@@ -222,11 +257,14 @@ int main(int argc, char **argv) {
     hip_check(hipMalloc(&d_slot_experts, slot_experts.size() * sizeof(uint32_t)), "malloc slots");
     hip_check(hipMalloc(&d_counts, counts.size() * sizeof(uint32_t)), "malloc counts");
     hip_check(hipMalloc(&d_pairs, pairs.size() * sizeof(uint32_t)), "malloc pairs");
+    hip_check(hipMalloc(&d_pair_order, pair_order.size() * sizeof(uint32_t)),
+              "malloc pair order");
     hip_check(hipMalloc(&d_duplicate_experts, duplicate_experts.size() * sizeof(uint32_t)), "malloc duplicate experts");
     hip_check(hipMalloc(&d_duplicate_counts, duplicate_counts.size() * sizeof(uint32_t)), "malloc duplicate counts");
     hip_check(hipMalloc(&d_duplicate_pairs, duplicate_pairs.size() * sizeof(uint32_t)), "malloc duplicate pairs");
     hip_check(hipMalloc(&d_weights, weights.size() * sizeof(float)), "malloc weights");
     hip_check(hipMalloc(&d_ref, out_bytes), "malloc ref");
+    hip_check(hipMalloc(&d_ordered, out_bytes), "malloc ordered");
     hip_check(hipMalloc(&d_grouped, out_bytes), "malloc grouped");
     hip_check(hipMalloc(&d_hybrid, out_bytes), "malloc hybrid");
     hip_check(hipMemcpy(d_gate, gate.data(), weight_bytes, hipMemcpyHostToDevice), "copy gate");
@@ -237,6 +275,9 @@ int main(int argc, char **argv) {
     hip_check(hipMemcpy(d_slot_experts, slot_experts.data(), slot_experts.size() * sizeof(uint32_t), hipMemcpyHostToDevice), "copy slots");
     hip_check(hipMemcpy(d_counts, counts.data(), counts.size() * sizeof(uint32_t), hipMemcpyHostToDevice), "copy counts");
     hip_check(hipMemcpy(d_pairs, pairs.data(), pairs.size() * sizeof(uint32_t), hipMemcpyHostToDevice), "copy pairs");
+    hip_check(hipMemcpy(d_pair_order, pair_order.data(),
+                        pair_order.size() * sizeof(uint32_t),
+                        hipMemcpyHostToDevice), "copy pair order");
     hip_check(hipMemcpy(d_duplicate_experts, duplicate_experts.data(), duplicate_experts.size() * sizeof(uint32_t), hipMemcpyHostToDevice), "copy duplicate experts");
     hip_check(hipMemcpy(d_duplicate_counts, duplicate_counts.data(), duplicate_counts.size() * sizeof(uint32_t), hipMemcpyHostToDevice), "copy duplicate counts");
     hip_check(hipMemcpy(d_duplicate_pairs, duplicate_pairs.data(), duplicate_pairs.size() * sizeof(uint32_t), hipMemcpyHostToDevice), "copy duplicate pairs");
@@ -247,9 +288,15 @@ int main(int argc, char **argv) {
     const dim3 direct_grid((kMid + 127u) / 128u, kPairs, 1u);
     const dim3 grouped_grid((kMid + 127u) / 128u, kPairs, 1u);
     auto direct = [&]() {
-        q4k_pair_major_reference<<<direct_grid, 256>>>(
+        q4k_pair_major_reference<false><<<direct_grid, 256>>>(
                 d_ref, (const char *)d_gate, (const char *)d_up, d_xq,
-                d_selected, d_weights, expert_bytes, row_bytes);
+                d_selected, d_weights, nullptr, expert_bytes, row_bytes);
+    };
+    auto ordered = [&]() {
+        build_l2_pair_order<<<1u, 32u>>>(d_pair_order, d_selected, kPairs);
+        q4k_pair_major_reference<true><<<direct_grid, 256>>>(
+                d_ordered, (const char *)d_gate, (const char *)d_up, d_xq,
+                d_selected, d_weights, d_pair_order, expert_bytes, row_bytes);
     };
     auto grouped = [&]() {
         q4k_expert_major_grouped5<<<grouped_grid, 256>>>(
@@ -260,22 +307,29 @@ int main(int argc, char **argv) {
     const dim3 duplicate_grid((kMid + 127u) / 128u,
                               (uint32_t)duplicate_experts.size(), 1u);
     auto hybrid = [&]() {
-        q4k_pair_major_reference<<<direct_grid, 256>>>(
+        q4k_pair_major_reference<false><<<direct_grid, 256>>>(
                 d_hybrid, (const char *)d_gate, (const char *)d_up, d_xq,
-                d_singletons, d_weights, expert_bytes, row_bytes);
+                d_singletons, d_weights, nullptr, expert_bytes, row_bytes);
         q4k_expert_major_grouped5<<<duplicate_grid, 256>>>(
                 d_hybrid, (const char *)d_gate, (const char *)d_up, d_xq,
                 d_duplicate_experts, d_duplicate_counts, d_duplicate_pairs,
                 d_weights, expert_bytes, row_bytes);
     };
-    direct(); grouped(); hybrid();
+    direct(); ordered(); grouped(); hybrid();
     hip_check(hipDeviceSynchronize(), "correctness synchronize");
-    std::vector<float> ref((size_t)kPairs * kMid), got(ref.size()), hybrid_got(ref.size());
+    std::vector<float> ref((size_t)kPairs * kMid), ordered_got(ref.size());
+    std::vector<float> got(ref.size()), hybrid_got(ref.size());
     hip_check(hipMemcpy(ref.data(), d_ref, out_bytes, hipMemcpyDeviceToHost), "read ref");
     hip_check(hipMemcpy(got.data(), d_grouped, out_bytes, hipMemcpyDeviceToHost), "read grouped");
+    hip_check(hipMemcpy(ordered_got.data(), d_ordered, out_bytes,
+                        hipMemcpyDeviceToHost), "read ordered");
     hip_check(hipMemcpy(hybrid_got.data(), d_hybrid, out_bytes, hipMemcpyDeviceToHost), "read hybrid");
+    double ordered_max_abs = 0.0, ordered_rms = 0.0;
     double max_abs = 0.0, rms = 0.0, hybrid_max_abs = 0.0, hybrid_rms = 0.0;
     for (size_t i = 0; i < ref.size(); i++) {
+        const double od = fabs((double)ref[i] - ordered_got[i]);
+        ordered_max_abs = std::max(ordered_max_abs, od);
+        ordered_rms += od * od;
         const double d = fabs((double)ref[i] - got[i]);
         max_abs = std::max(max_abs, d);
         rms += d * d;
@@ -283,15 +337,20 @@ int main(int argc, char **argv) {
         hybrid_max_abs = std::max(hybrid_max_abs, hd);
         hybrid_rms += hd * hd;
     }
+    ordered_rms = sqrt(ordered_rms / ref.size());
     rms = sqrt(rms / ref.size());
     hybrid_rms = sqrt(hybrid_rms / ref.size());
     const BenchResult base = time_launch(direct);
+    const BenchResult ordered_time = time_launch(ordered);
     const BenchResult cand = time_launch(grouped);
     const BenchResult hybrid_time = time_launch(hybrid);
     printf("device=%s arch=%s tokens=%u pairs=%u unique=%u duplicate_reuse=%.1f%%\n",
            prop.name, prop.gcnArchName, kTokens, kPairs, unique,
            100.0 * (double)(kPairs - unique) / kPairs);
     printf("correctness max_abs=%.9g rms=%.9g\n", max_abs, rms);
+    printf("l2_ordered max_abs=%.9g rms=%.9g us=%.2f change=%+.1f%%\n",
+           ordered_max_abs, ordered_rms, ordered_time.median_us,
+           100.0 * (ordered_time.median_us / base.median_us - 1.0));
     printf("pair_major_us=%.2f grouped_us=%.2f change=%+.1f%%\n",
            base.median_us, cand.median_us,
            100.0 * (cand.median_us / base.median_us - 1.0));
@@ -302,9 +361,11 @@ int main(int argc, char **argv) {
 
     (void)hipFree(d_gate); (void)hipFree(d_up); (void)hipFree(d_xq);
     (void)hipFree(d_selected); (void)hipFree(d_singletons); (void)hipFree(d_slot_experts);
-    (void)hipFree(d_counts); (void)hipFree(d_pairs); (void)hipFree(d_weights);
+    (void)hipFree(d_counts); (void)hipFree(d_pairs); (void)hipFree(d_pair_order);
+    (void)hipFree(d_weights);
     (void)hipFree(d_duplicate_experts); (void)hipFree(d_duplicate_counts);
     (void)hipFree(d_duplicate_pairs);
-    (void)hipFree(d_ref); (void)hipFree(d_grouped); (void)hipFree(d_hybrid);
-    return hybrid_max_abs > 1.0e-3 ? 3 : 0;
+    (void)hipFree(d_ref); (void)hipFree(d_ordered);
+    (void)hipFree(d_grouped); (void)hipFree(d_hybrid);
+    return ordered_max_abs != 0.0 || hybrid_max_abs > 1.0e-3 ? 3 : 0;
 }

@@ -2,8 +2,8 @@
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
 Thunderbolt RDMA. At 2,048 tokens of live context, optimized Q4_K reaches a
-**166.56 t/s** prefill and **14.31 t/s** decode median; opt-in DSpark raises
-long-context decode to **14.92 t/s**. Metal, CUDA, generic verbs, and
+**166.56 t/s** prefill and **14.31 t/s** decode median; opt-in DSpark reaches
+**169.37 t/s** prefill and **16.22 t/s** decode. Metal, CUDA, generic verbs, and
 single-node modes remain available.
 
 ```text
@@ -17,10 +17,10 @@ single-node modes remain available.
 | Original Q4_K baseline | fixed 2,048-token prefix + 300 generated tokens | **30.38 t/s** | **7.58 t/s** | baseline |
 | **Current Q2_K** | same fixed workload | **118.24 t/s** | **13.25 t/s** | **+289.2% / +74.8%** |
 | **Current Q4_K** | same fixed workload | **166.56 t/s** | **14.31 t/s** | **+448.3% / +88.8%** |
-| **Current Q4_K + DSpark** | same fixed workload; 46/54 expert split | **166.92 t/s** | **14.92 t/s** | **+449.4% / +96.8%** |
+| **Current Q4_K + DSpark** | same fixed workload; 46/54 expert split | **169.37 t/s** | **16.22 t/s** | **+457.5% / +114.0%** |
 
 All rows are three-run medians from the same `ds4-bench-tp` workload over
-mandatory RDMA. DSpark accepted 51.43% of proposed long-context draft tokens
+mandatory RDMA. DSpark accepted 66.34% of proposed long-context draft tokens
 in all three current runs. Its benefit depends on prompt acceptance.
 
 Q2_K and Q4_K use the cache-free default. DSpark optionally keeps its Q8
@@ -406,9 +406,9 @@ low-yield prompts can be no faster or even slower. DSpark is therefore still
 experimental and explicitly opt-in.
 
 On the reference two-node Strix Halo/OdinLink setup, the current five-row
-DSpark path measured **14.24 generation tokens/s** at 2,048 tokens of live
-context, versus **9.92 tokens/s** without DSpark. Both are three-run medians
-over 300 generated tokens. This prompt accepted 51.43% of proposed draft
+DSpark path measured **16.22 generation tokens/s** at 2,048 tokens of live
+context, versus **14.31 tokens/s** without DSpark. Both are three-run medians
+over 300 generated tokens. This prompt accepted 66.34% of proposed draft
 tokens; other prompts can be faster or slower. The verifier kernel itself adds
 no persistent VRAM.
 

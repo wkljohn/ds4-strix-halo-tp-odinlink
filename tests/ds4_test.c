@@ -6783,6 +6783,8 @@ static const ds4_test_entry test_entries[] = {
     {"--local-golden-vectors", "local-golden-vectors", "local top-k/logit drift regression for long Metal prefill", test_local_golden_vectors},
     {"--metal-short-prefill", "metal-short-prefill", "Metal ratio-4 short prefill regression", test_metal_short_prefill_ratio4},
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
+    {"--slot-row-pack", "slot-row-pack", "slot-row range packing exactness", test_metal_pack_slot_rows_f32},
+    {"--dspark-cache-window", "dspark-cache-window", "DSpark logical rolling-window metadata", test_dspark_cache_window_crop},
 #if defined(DS4_ROCM_TP_READY)
     {"--rocm-bf16-sharedx", "rocm-bf16-sharedx", "gfx1151 BF16 decode shared-input matmul exactness", test_rocm_bf16_decode_sharedx_matmul},
 #endif

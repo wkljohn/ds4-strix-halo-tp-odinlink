@@ -433,7 +433,8 @@ __global__ static void matmul_f16_hc_token_block_kernel(
     }
 }
 
-/* Up-to-five-row speculative indexer Q projection (K=1536, M=8192 on V4 Flash).
+/* Up-to-five-row speculative indexer Q projection (K=1024, M=8192 on the
+ * tested V4 Flash GGUF; K=1536 is retained for compatible variants).
  * One persistent block per gfx1151 CU streams output rows while all 16 waves
  * reuse up to five F16 activation rows from LDS.  Every token keeps its own
  * wave reduction; the only numerical change versus hipBLAS is the dot-product

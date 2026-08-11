@@ -615,6 +615,33 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         head_dim == 512 &&
         top_k <= DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        static int dspark_hpg8 = -1;
+        if (dspark_hpg8 < 0) {
+            const char *env = getenv("DS4_ROCM_DSPARK_BATCH_ATTN_HPG8");
+            dspark_hpg8 = env && env[0] && strcmp(env, "0") != 0;
+        }
+        if (!g_quality_mode && n_head <= 64u && dspark_hpg8) {
+            dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+            attention_indexed_mixed_heads8_online_kernel<8, 8><<<grid, 256>>>(
+                    (float *)heads->ptr,
+                    sinks,
+                    (const float *)q->ptr,
+                    (const float *)raw_kv->ptr,
+                    (const float *)comp_kv->ptr,
+                    topk_ptr,
+                    n_tokens,
+                    pos0,
+                    n_raw,
+                    raw_cap,
+                    raw_start,
+                    n_comp,
+                    top_k,
+                    window,
+                    ratio,
+                    n_head,
+                    head_dim);
+            return cuda_ok(cudaGetLastError(), "attention indexed online heads8 launch");
+        }
         if (!g_quality_mode && n_head <= 64u) {
             dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 32><<<grid, 1024>>>((float *)heads->ptr,

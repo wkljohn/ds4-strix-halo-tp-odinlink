@@ -38,6 +38,8 @@ __pycache__/
 *.pyc
 /misc/
 /research-results/
+/deploy/config.env.local
+/deploy/runtime/
 /.rocprofv3/
 .*.swp
 .DS_Store

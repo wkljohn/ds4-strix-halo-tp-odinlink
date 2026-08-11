@@ -169,6 +169,9 @@ static int f16_indexer_q_wvsplit_cus(void) {
     static int cus = -1;
     if (cus < 0) {
         cus = 0;
+        const char *enable =
+            getenv("DS4_ROCM_ENABLE_F16_INDEXER_Q_WVSPLIT");
+        if (!enable || strcmp(enable, "1") != 0) return cus;
         const char *disable =
             getenv("DS4_ROCM_DISABLE_F16_INDEXER_Q_WVSPLIT");
         if (disable && strcmp(disable, "1") == 0) return cus;
@@ -1144,7 +1147,8 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         return cuda_ok(cudaGetLastError(), "f16 HC five-row launch");
     }
     const int indexer_q_cus =
-        in_dim == 1536u && out_dim == 8192u && n_tok <= 5u &&
+        (in_dim == 1024u || in_dim == 1536u) &&
+        out_dim == 8192u && n_tok <= 5u &&
         !g_quality_mode && !cuda_runtime_config()->graph_dump
             ? f16_indexer_q_wvsplit_cus() : 0;
     if (indexer_q_cus > 0) {
@@ -1160,15 +1164,15 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         const dim3 block(32u, 16u);
         switch (n_tok) {
             case 1u: matmul_f16_indexer_q_wvsplit_kernel<1u><<<indexer_q_cus, block>>>(
-                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+                         (float *)out->ptr, w, xh, (uint32_t)in_dim, 8192u); break;
             case 2u: matmul_f16_indexer_q_wvsplit_kernel<2u><<<indexer_q_cus, block>>>(
-                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+                         (float *)out->ptr, w, xh, (uint32_t)in_dim, 8192u); break;
             case 3u: matmul_f16_indexer_q_wvsplit_kernel<3u><<<indexer_q_cus, block>>>(
-                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+                         (float *)out->ptr, w, xh, (uint32_t)in_dim, 8192u); break;
             case 4u: matmul_f16_indexer_q_wvsplit_kernel<4u><<<indexer_q_cus, block>>>(
-                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+                         (float *)out->ptr, w, xh, (uint32_t)in_dim, 8192u); break;
             case 5u: matmul_f16_indexer_q_wvsplit_kernel<5u><<<indexer_q_cus, block>>>(
-                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+                         (float *)out->ptr, w, xh, (uint32_t)in_dim, 8192u); break;
             default: return 0;
         }
         return cuda_ok(cudaGetLastError(), "f16 indexer Q wvSplitK launch");

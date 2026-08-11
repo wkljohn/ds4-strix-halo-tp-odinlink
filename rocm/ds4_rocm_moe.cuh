@@ -1047,6 +1047,36 @@ __global__ static void moe_scatter_sorted_pairs_deterministic_kernel(
     }
 }
 
+/* Stable expert-adjacent order for tiny speculative batches. One wave sorts
+ * the at-most-30 (expert,pair) keys in registers, avoiding the general
+ * count/prefix/scatter launch sequence. The pair index is the low key byte,
+ * making equal-expert order deterministic. Negative TP sentinels sort last
+ * and are still handled by the arithmetic kernels' exact zero path. */
+__global__ static void moe_build_l2_pair_order_kernel(
+        uint32_t *pair_order,
+        const int32_t *selected,
+        uint32_t pair_count) {
+    if (blockIdx.x != 0u || threadIdx.x >= 32u) return;
+    const uint32_t lane = threadIdx.x;
+    uint32_t key = UINT32_MAX;
+    if (lane < pair_count) {
+        const int32_t expert = selected[lane];
+        const uint32_t expert_key = expert < 0 ? 0xffffu : (uint32_t)expert;
+        key = (expert_key << 8u) | lane;
+    }
+    for (uint32_t span = 2u; span <= 32u; span <<= 1u) {
+        for (uint32_t stride = span >> 1u; stride != 0u; stride >>= 1u) {
+            const uint32_t other = __shfl_xor(key, stride, 32);
+            const uint32_t lo = key < other ? key : other;
+            const uint32_t hi = key < other ? other : key;
+            const bool ascending = (lane & span) == 0u;
+            const bool low_lane = (lane & stride) == 0u;
+            key = ascending == low_lane ? lo : hi;
+        }
+    }
+    if (lane < pair_count) pair_order[lane] = key & 0xffu;
+}
+
 __global__ static void moe_build_expert_tile_offsets_kernel(
         uint32_t *tile_offsets,
         uint32_t *tile_total,
@@ -2019,6 +2049,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
  * gfx1151 those loads usually hit cache, but they still consume vector-load
  * instructions and cache ports.  This variant copies the 4.6 KiB activation
  * row once per 128-row workgroup and preserves the same dot/reduction order. */
+template <bool ORDERED>
 __global__ static void moe_gate_up_mid_decode_q4K_staged_xq_kernel(
         float *gate_out,
         float *up_out,
@@ -2026,6 +2057,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_staged_xq_kernel(
         const char *gate_base,
         const char *up_base,
         const cuda_block_q8_K *xq,
+        const uint32_t *pair_order,
         const int32_t *selected,
         const float *weights,
         uint64_t gate_expert_bytes,
@@ -2037,7 +2069,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_staged_xq_kernel(
         float clamp) {
     const uint32_t lane = threadIdx.x & 7u;
     const uint32_t row_lane = threadIdx.x >> 3u;
-    const uint32_t pair = blockIdx.y;
+    const uint32_t pair = ORDERED ? pair_order[blockIdx.y] : blockIdx.y;
     const uint32_t tok = pair / n_expert;
     const uint32_t slot = pair - tok * n_expert;
     const int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
@@ -2400,7 +2432,10 @@ __global__ static void moe_down_q4K_sorted_qwarp32_kernel(
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) {
+        if (lane == 0u) down_out[(uint64_t)pair * out_dim + row] = 0.0f;
+        return;
+    }
     const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
     const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
     float acc = 0.0f;

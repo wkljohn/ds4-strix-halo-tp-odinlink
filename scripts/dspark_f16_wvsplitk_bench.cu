@@ -146,25 +146,27 @@ static float elapsed(hipEvent_t a, hipEvent_t b) {
 }
 
 template <uint32_t TOKENS>
-static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
+static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations,
+                      uint32_t weight_sets) {
     const uint64_t w_count = (uint64_t)kdim * mdim;
+    const uint64_t w_total = w_count * weight_sets;
     const uint64_t x_count = (uint64_t)TOKENS * kdim;
     const uint64_t o_count = (uint64_t)TOKENS * mdim;
     std::mt19937 rng(12345u + kdim + mdim);
     std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
-    std::vector<_Float16> hw(w_count);
+    std::vector<_Float16> hw(w_total);
     std::vector<float> hx(x_count);
     for (auto &v : hw) v = (_Float16)dist(rng);
     for (auto &v : hx) v = dist(rng);
 
     _Float16 *dw = nullptr, *dxh = nullptr;
     float *dxf = nullptr, *dref = nullptr, *dcand = nullptr;
-    check(hipMalloc(&dw, w_count * sizeof(*dw)), "hipMalloc weights");
+    check(hipMalloc(&dw, w_total * sizeof(*dw)), "hipMalloc weights");
     check(hipMalloc(&dxh, x_count * sizeof(*dxh)), "hipMalloc xh");
     check(hipMalloc(&dxf, x_count * sizeof(*dxf)), "hipMalloc xf");
     check(hipMalloc(&dref, o_count * sizeof(*dref)), "hipMalloc ref");
     check(hipMalloc(&dcand, o_count * sizeof(*dcand)), "hipMalloc cand");
-    check(hipMemcpy(dw, hw.data(), w_count * sizeof(*dw), hipMemcpyHostToDevice),
+    check(hipMemcpy(dw, hw.data(), w_total * sizeof(*dw), hipMemcpyHostToDevice),
           "copy weights");
     check(hipMemcpy(dxf, hx.data(), x_count * sizeof(*dxf), hipMemcpyHostToDevice),
           "copy x");
@@ -174,10 +176,11 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
     hipblasHandle_t blas;
     check_blas(hipblasCreate(&blas), "hipblasCreate");
     const float alpha = 1.0f, beta = 0.0f;
-    auto launch_ref = [&]() {
+    auto launch_ref = [&](uint32_t set) {
+        const _Float16 *wset = dw + (uint64_t)(set % weight_sets) * w_count;
         check_blas(hipblasGemmEx(blas, HIPBLAS_OP_T, HIPBLAS_OP_N,
                                  (int)mdim, (int)TOKENS, (int)kdim,
-                                 &alpha, dw, HIP_R_16F, (int)kdim,
+                                 &alpha, wset, HIP_R_16F, (int)kdim,
                                  dxh, HIP_R_16F, (int)kdim,
                                  &beta, dref, HIP_R_32F, (int)mdim,
                                  HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
@@ -187,20 +190,21 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
     check(hipGetDevice(&device), "hipGetDevice");
     check(hipDeviceGetAttribute(&cu_count, hipDeviceAttributeMultiprocessorCount,
                                 device), "CU count");
-    auto launch_cand = [&]() {
+    auto launch_cand = [&](uint32_t set) {
+        const _Float16 *wset = dw + (uint64_t)(set % weight_sets) * w_count;
         const dim3 block(32u, 16u);
         if (mdim >= 512u) {
             f16_wvsplitk_n5<TOKENS, 4u, 2u><<<cu_count, block>>>(
-                dcand, dw, dxh, kdim, mdim);
+                dcand, wset, dxh, kdim, mdim);
         } else {
             f16_wvsplitk_n5<TOKENS, 1u, 4u><<<cu_count, block>>>(
-                dcand, dw, dxh, kdim, mdim);
+                dcand, wset, dxh, kdim, mdim);
         }
         check(hipGetLastError(), "wvSplitK launch");
     };
 
-    launch_ref();
-    launch_cand();
+    launch_ref(0u);
+    launch_cand(0u);
     check(hipDeviceSynchronize(), "warmup synchronize");
     std::vector<float> href(o_count), hcand(o_count);
     check(hipMemcpy(href.data(), dref, o_count * sizeof(float), hipMemcpyDeviceToHost),
@@ -220,19 +224,20 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
     check(hipEventCreate(&a), "event a");
     check(hipEventCreate(&b), "event b");
     check(hipEventRecord(a), "record ref a");
-    for (uint32_t i = 0; i < iterations; ++i) launch_ref();
+    for (uint32_t i = 0; i < iterations; ++i) launch_ref(i);
     check(hipEventRecord(b), "record ref b");
     check(hipEventSynchronize(b), "sync ref");
     const float ref_ms = elapsed(a, b) / iterations;
     check(hipEventRecord(a), "record candidate a");
-    for (uint32_t i = 0; i < iterations; ++i) launch_cand();
+    for (uint32_t i = 0; i < iterations; ++i) launch_cand(i);
     check(hipEventRecord(b), "record candidate b");
     check(hipEventSynchronize(b), "sync candidate");
     const float cand_ms = elapsed(a, b) / iterations;
 
-    std::printf("shape N=%u K=%u M=%u hipblas_ms=%.6f wvsplitk_ms=%.6f "
+    std::printf("shape N=%u K=%u M=%u sets=%u hipblas_ms=%.6f wvsplitk_ms=%.6f "
                 "speedup=%.3fx max_abs=%.9g rel_rms=%.9g\n",
-                TOKENS, kdim, mdim, ref_ms, cand_ms, ref_ms / cand_ms, max_abs,
+                TOKENS, kdim, mdim, weight_sets, ref_ms, cand_ms,
+                ref_ms / cand_ms, max_abs,
                 std::sqrt(sq / std::max(ref_sq, 1e-30)));
 
     hipEventDestroy(b);
@@ -246,11 +251,14 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
 }
 
 int main() {
-    run_shape<1u>(1536u, 8192u, 100u);
-    run_shape<2u>(1536u, 8192u, 100u);
-    run_shape<3u>(1536u, 8192u, 100u);
-    run_shape<4u>(1536u, 8192u, 100u);
-    run_shape<5u>(1536u, 8192u, 100u); // indexer Q projection
-    run_shape<5u>(4096u, 64u, 500u);   // indexer per-head weight projection
+    // V4 Flash Q4_K stores 21 alternating-layer F16 indexer-Q matrices at
+    // K=1024, M=8192. Rotate a 256 MiB working set so the oracle does not
+    // mistake a repeatedly cache-hot single matrix for production behavior.
+    run_shape<1u>(1024u, 8192u, 128u, 16u);
+    run_shape<2u>(1024u, 8192u, 128u, 16u);
+    run_shape<3u>(1024u, 8192u, 128u, 16u);
+    run_shape<4u>(1024u, 8192u, 128u, 16u);
+    run_shape<5u>(1024u, 8192u, 128u, 16u);
+    run_shape<5u>(4096u, 64u, 500u, 1u); // per-head weight projection
     return 0;
 }

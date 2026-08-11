@@ -26159,12 +26159,25 @@ static void metal_graph_dspark_cache_reset(ds4_gpu_graph *g) {
     g->dspark_cache_len = 0;
 }
 
+/* dspark_cache_cap is a physical allocation sized for prefill batching.  It is
+ * deliberately larger than the model's attention window on long-context
+ * sessions (4096 versus 128 for the reference V4 model).  The DSpark drafter,
+ * however, was trained with the model sliding window and must never see the
+ * extra physical rows as logical history. */
+static uint32_t metal_graph_dspark_cache_logical_cap(
+        const ds4_gpu_graph *g) {
+    if (!g) return 0;
+    uint32_t cap = DS4_N_SWA;
+    if (cap == 0 || cap > g->dspark_cache_cap) cap = g->dspark_cache_cap;
+    return cap;
+}
+
 static bool metal_graph_dspark_cache_window_valid(
         const ds4_gpu_graph *g,
         uint32_t             token_start,
         uint32_t             raw_start,
         uint32_t             len) {
-    if (!g || len > g->dspark_cache_cap) return false;
+    if (!g || len > metal_graph_dspark_cache_logical_cap(g)) return false;
     if (len == 0) return true;
     if (g->dspark_cache_cap == 0 ||
         raw_start >= g->dspark_cache_cap ||
@@ -26187,7 +26200,7 @@ static bool metal_graph_dspark_cache_current_window_valid(
 static bool metal_graph_dspark_cache_set_window(ds4_gpu_graph *g,
                                                 uint32_t       token_start,
                                                 uint32_t       len) {
-    if (!g || len > g->dspark_cache_cap) return false;
+    if (!g || len > metal_graph_dspark_cache_logical_cap(g)) return false;
     const uint32_t raw_start =
         len && g->dspark_cache_cap ? token_start % g->dspark_cache_cap : 0;
     if (!metal_graph_dspark_cache_window_valid(g,
@@ -26231,10 +26244,11 @@ static bool metal_graph_dspark_cache_claim_appended_row(ds4_gpu_graph *g,
     if (!g || g->dspark_cache_len == 0 ||
         !metal_graph_dspark_cache_ends_at(g, pos)) return false;
     g->dspark_cache_len += 1u;
-    if (g->dspark_cache_len > g->dspark_cache_cap) {
-        const uint32_t excess = g->dspark_cache_len - g->dspark_cache_cap;
+    const uint32_t logical_cap = metal_graph_dspark_cache_logical_cap(g);
+    if (g->dspark_cache_len > logical_cap) {
+        const uint32_t excess = g->dspark_cache_len - logical_cap;
         g->dspark_cache_token_start += excess;
-        g->dspark_cache_len = g->dspark_cache_cap;
+        g->dspark_cache_len = logical_cap;
         g->dspark_cache_start =
             g->dspark_cache_token_start % g->dspark_cache_cap;
     }
@@ -26273,6 +26287,27 @@ bool ds4_test_dspark_cache_window_crop(void) {
     if (!metal_graph_dspark_cache_ends_at(&g, 20)) return false;
 
     if (metal_graph_dspark_cache_set_window(&g, UINT32_MAX - 1u, 2)) {
+        return false;
+    }
+
+    /* A large physical prefill ring must still roll at the trained 128-row
+     * logical window.  This is the canonical TP session shape. */
+    memset(&g, 0, sizeof(g));
+    g.dspark_cache_cap = 4096;
+    if (!metal_graph_dspark_cache_set_window(&g, 1000, DS4_N_SWA)) {
+        return false;
+    }
+    if (!metal_graph_dspark_cache_claim_appended_row(&g,
+                                                     1000 + DS4_N_SWA)) {
+        return false;
+    }
+    if (g.dspark_cache_token_start != 1001 ||
+        g.dspark_cache_start != 1001u % 4096u ||
+        g.dspark_cache_len != DS4_N_SWA ||
+        !metal_graph_dspark_cache_ends_at(&g, 1001 + DS4_N_SWA)) {
+        return false;
+    }
+    if (metal_graph_dspark_cache_set_window(&g, 1000, DS4_N_SWA + 1u)) {
         return false;
     }
     return true;
@@ -31838,6 +31873,14 @@ static bool metal_graph_seed_dspark_initial_cache_from_prefill(
         return false;
     }
 
+    const uint32_t logical_cap = metal_graph_dspark_cache_logical_cap(g);
+    if (logical_cap == 0) return false;
+    const uint32_t source_row =
+        n_tokens > logical_cap ? n_tokens - logical_cap : 0u;
+    const uint32_t seed_rows = n_tokens - source_row;
+    if (batch_start > UINT32_MAX - source_row) return false;
+    const uint32_t seed_pos = batch_start + source_row;
+
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = metal_graph_eval_dspark_stage0_batch(g,
@@ -31851,9 +31894,9 @@ static bool metal_graph_seed_dspark_initial_cache_from_prefill(
                                                         dspark_model,
                                                         dw,
                                                         stage,
-                                                        0,
-                                                        batch_start,
-                                                        n_tokens,
+                                                        source_row,
+                                                        seed_pos,
+                                                        seed_rows,
                                                         true);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -31861,10 +31904,10 @@ static bool metal_graph_seed_dspark_initial_cache_from_prefill(
         (void)ds4_gpu_synchronize();
         return false;
     }
-    if (!metal_graph_dspark_cache_set_window(g, batch_start, n_tokens)) {
+    if (!metal_graph_dspark_cache_set_window(g, seed_pos, seed_rows)) {
         return false;
     }
-    if (seeded_rows) *seeded_rows = n_tokens;
+    if (seeded_rows) *seeded_rows = seed_rows;
     return true;
 }
 
@@ -58326,6 +58369,36 @@ static bool ds4_dspark_stats_enabled(void) {
     return env && env[0] && strcmp(env, "0") != 0;
 }
 
+static bool ds4_dspark_env_flag(const char *name, bool fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    return env[0] == '1' && env[1] == '\0';
+}
+
+/* The position-addressed rolling support cache is validated for the ROCm
+ * TP=2 DSpark path.  Keep other backends and single-node execution on their
+ * established proposal schedule; explicit environment flags remain available
+ * for diagnostics and as a production kill switch. */
+static bool ds4_dspark_tp_rolling_default(const ds4_session *s) {
+#if defined(DS4_ROCM_BUILD)
+    return s && s->engine && s->engine->tp.active;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
+static bool ds4_dspark_chain_cycles_enabled(const ds4_session *s) {
+    return ds4_dspark_env_flag("DS4_DSPARK_CHAIN_CYCLES",
+                               ds4_dspark_tp_rolling_default(s));
+}
+
+static bool ds4_dspark_chain_preserve_enabled(const ds4_session *s) {
+    return ds4_dspark_chain_cycles_enabled(s) &&
+           ds4_dspark_env_flag("DS4_DSPARK_CHAIN_PRESERVE_CACHE",
+                               ds4_dspark_tp_rolling_default(s));
+}
+
 static void ds4_format_len_hist(
         char           *buf,
         size_t          buflen,
@@ -61040,20 +61113,12 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             draft_cache_ready &&
             captured_batch_end_ok &&
             (uint32_t)captured_batch_end == pos;
-        const char *preserve_chain_cache_env =
-            getenv("DS4_DSPARK_CHAIN_PRESERVE_CACHE");
         const char *two_context_env =
             getenv("DS4_DSPARK_CHAIN_TWO_CONTEXT");
-        const char *chain_cycles_env = getenv("DS4_DSPARK_CHAIN_CYCLES");
         const bool chain_cycles_enabled =
-            chain_cycles_env &&
-            chain_cycles_env[0] == '1' &&
-            chain_cycles_env[1] == '\0';
+            ds4_dspark_chain_cycles_enabled(s);
         const bool preserve_chain_cache =
-            chain_cycles_enabled &&
-            preserve_chain_cache_env &&
-            preserve_chain_cache_env[0] == '1' &&
-            preserve_chain_cache_env[1] == '\0';
+            ds4_dspark_chain_preserve_enabled(s);
         const bool two_context_requested =
             chain_cycles_enabled &&
             two_context_env &&
@@ -62874,21 +62939,14 @@ static int ds4_session_eval_dspark_speculative_argmax(
     const bool spec_log = getenv("DS4_DSPARK_SPEC_LOG") != NULL;
     const bool stats_enabled = s && ds4_dspark_stats_enabled();
     const bool scheduler_enabled = s && ds4_dspark_scheduler_enabled();
-    const char *chain_env = getenv("DS4_DSPARK_CHAIN_CYCLES");
-    const bool chain_cycles =
-        chain_env && chain_env[0] == '1' && chain_env[1] == '\0';
+    const bool chain_cycles = ds4_dspark_chain_cycles_enabled(s);
     const char *validate_capture_env =
         getenv("DS4_DSPARK_VALIDATE_VERIFIER_CAPTURE");
     const bool validate_verifier_capture =
         validate_capture_env && validate_capture_env[0] == '1' &&
         validate_capture_env[1] == '\0';
-    const char *chain_preserve_env =
-        getenv("DS4_DSPARK_CHAIN_PRESERVE_CACHE");
     const bool chain_preserve_cache =
-        chain_cycles &&
-        chain_preserve_env &&
-        chain_preserve_env[0] == '1' &&
-        chain_preserve_env[1] == '\0';
+        ds4_dspark_chain_preserve_enabled(s);
     const char *chain_two_context_env =
         getenv("DS4_DSPARK_CHAIN_TWO_CONTEXT");
     const bool chain_two_context =
@@ -66643,9 +66701,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                                 accepted_cap,
                                                                 err,
                                                                 errlen);
-        const char *chain_env = getenv("DS4_DSPARK_CHAIN_CYCLES");
-        const bool chain_cycles =
-            chain_env && chain_env[0] == '1' && chain_env[1] == '\0';
+        const bool chain_cycles = ds4_dspark_chain_cycles_enabled(s);
         while (chain_cycles && result > 0 && result < max_tokens &&
                result < accepted_cap && s->dspark_draft_valid &&
                accepted[result - 1] != eos_token) {
