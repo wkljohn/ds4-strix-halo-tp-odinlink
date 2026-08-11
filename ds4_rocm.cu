@@ -371,6 +371,30 @@ static int                      g_tp_sig_is_host = 0;
 static int ds4_tp_fail_get(void) { return __atomic_load_n(&g_tp_failed, __ATOMIC_ACQUIRE); }
 static void ds4_tp_fail_set(void) { __atomic_store_n(&g_tp_failed, 1, __ATOMIC_RELEASE); }
 
+/* A transport callback failure is terminal for the lockstep TP session.  The
+ * encoder can have many wait-value packets queued behind the failed gate; if
+ * only that one sequence is released, the service thread enters the next
+ * transport callback and can wait another full RDMA timeout for every queued
+ * gate.  Release both channels past all possible queued sequence numbers and
+ * stop the service loop immediately.  UINT64_MAX is a terminal sentinel only:
+ * the latched failure prevents any later gate from being submitted. */
+static void ds4_tp_fail_release_gpu_waits(void) {
+    ds4_tp_fail_set();
+    for (int ch = 0; ch < 2; ch++) {
+        if (g_tp_chan[ch].cpu_flag) {
+            __atomic_store_n(g_tp_chan[ch].cpu_flag, UINT64_MAX,
+                             __ATOMIC_RELEASE);
+        }
+    }
+    /* The bitwise pump expression may still inspect the other channel once
+     * before its loop condition observes g_tp_run=0.  Null callbacks make
+     * that inspection fail locally instead of starting another network wait. */
+    g_tp_fn = NULL;
+    g_tp_batch_fn = NULL;
+    g_tp_big_fn = NULL;
+    g_tp_run = 0;
+}
+
 static void ds4_tp_ffn_range_print(const char *gate_type, int layer,
                                    const ds4_tp_ffn_range_total *t) {
     const uint64_t finite = t->elements - t->nan_count -
@@ -610,13 +634,15 @@ static int ds4_tp_pump(int ch, uint64_t *next) {
     default: ok = 0; break;
     }
     if (!ok) {
-        ds4_tp_fail_set();
+        ds4_tp_fail_release_gpu_waits();
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "TP exchange failed (kind %u layer %u seq %llu); releasing "
                 "anyway so the GPU does not hang\n",
                 r->kind, r->layer, (unsigned long long)*next);
     }
-    __atomic_store_n(c->cpu_flag, *next, __ATOMIC_RELEASE);
+    /* Failure already published the terminal UINT64_MAX release.  Do not
+     * overwrite it with this request's smaller sequence number. */
+    if (ok) __atomic_store_n(c->cpu_flag, *next, __ATOMIC_RELEASE);
     (*next)++;
     return 1;
 }
@@ -646,13 +672,13 @@ static int ds4_tp_pump_ffn_range(int ch, uint64_t *next) {
     default: ok = 0; break;
     }
     if (!ok) {
-        ds4_tp_fail_set();
+        ds4_tp_fail_release_gpu_waits();
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "TP exchange failed (kind %u layer %u seq %llu); releasing "
                 "anyway so the GPU does not hang\n",
                 r->kind, r->layer, (unsigned long long)*next);
     }
-    __atomic_store_n(c->cpu_flag, *next, __ATOMIC_RELEASE);
+    if (ok) __atomic_store_n(c->cpu_flag, *next, __ATOMIC_RELEASE);
     (*next)++;
     return 1;
 }
@@ -729,13 +755,13 @@ static int ds4_tp_pump_profile(int ch, uint64_t *next,
         ds4_tp_interval_add(&p->callback_by_gate[ch][cb_gb], callback_ns);
     }
     if (!ok) {
-        ds4_tp_fail_set();
+        ds4_tp_fail_release_gpu_waits();
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "TP exchange failed (kind %u layer %u seq %llu); releasing "
                 "anyway so the GPU does not hang\n",
                 r->kind, r->layer, (unsigned long long)*next);
     }
-    __atomic_store_n(c->cpu_flag, *next, __ATOMIC_RELEASE);
+    if (ok) __atomic_store_n(c->cpu_flag, *next, __ATOMIC_RELEASE);
     const uint64_t released_ns = ds4_tp_monotonic_ns();
     if (r->kind < DS4_TP_KIND_BUCKETS) {
         ds4_tp_interval_add(&p->detect_to_release_by_kind[r->kind],
@@ -1036,7 +1062,7 @@ static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "TP gate queue overflow on channel %d (seq %llu)\n",
                 ch, (unsigned long long)seq);
-        ds4_tp_fail_set();
+        ds4_tp_fail_release_gpu_waits();
         return 0;
     }
     c->ring[seq % DS4_TP_RING] = *req;
@@ -1046,7 +1072,7 @@ static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
                             ch, (unsigned long long)seq, (int)req->kind, req->layer);
     if (hipStreamWriteValue64(g_tp_stream, (void *)c->gpu_flag, (int64_t)seq, 0) != hipSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "TP gate: stream write failed\n");
-        ds4_tp_fail_set();
+        ds4_tp_fail_release_gpu_waits();
         return 0;
     }
     if (ds4_tp_gate_kick_enabled()) {
@@ -1056,14 +1082,14 @@ static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "TP gate: kick kernel launch failed: %s\n",
                     hipGetErrorString(kick_err));
-            ds4_tp_fail_set();
+            ds4_tp_fail_release_gpu_waits();
             return 0;
         }
     }
     if (hipStreamWaitValue64(g_tp_stream, (void *)c->cpu_flag, (int64_t)seq,
                              hipStreamWaitValueGte, ~0ULL) != hipSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "TP gate: stream wait failed\n");
-        ds4_tp_fail_set();
+        ds4_tp_fail_release_gpu_waits();
         return 0;
     }
     return 1;

@@ -89,3 +89,21 @@ fallback traffic. Always compare greedy output bytes as well as throughput.
 The provider retains one reusable bounce allocation per send-queue slot. Its
 memory high-water mark therefore depends on queue depth and the largest send
 that occupies each slot; monitor RSS for substantially larger workloads.
+
+## Terminal callback failure
+
+An RDMA callback failure is terminal for a lockstep TP session. The GPU may
+already have many wait-value gates queued when a callback times out; releasing
+only the failed sequence lets the service thread enter another network wait
+while both GPUs remain parked.
+
+DS4 now handles this in the transport-neutral ROCm gate runtime: it latches the
+failure, publishes a terminal release value to both gate channels, prevents a
+smaller per-request release from overwriting it, disables further callbacks,
+and stops the service loop. This changes no successful gate or provider path,
+so OdinLink and generic/Mellanox verbs retain identical normal behavior. No
+OdinLink provider or kernel-module change is required for this failure mode.
+
+Do not abruptly kill either rank while its GPU is waiting at a TP gate. Allow
+the terminal drain to return both processes; verify zero GPU activity and VRAM
+before changing modules, devices, or providers.
