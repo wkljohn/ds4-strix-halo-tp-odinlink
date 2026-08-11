@@ -200,6 +200,30 @@ cleanup() {
 trap cleanup EXIT
 "${PEER_SSH[@]}" "mkdir -p '$OUT'"
 
+# The two TP nodes do not share a filesystem. Diagnostic graph-dump prefixes
+# are passed to both ranks, so create their parent directory on both machines
+# before either process starts. Keep automatic creation inside the durable
+# research tree; reject a surprising path instead of mutating an arbitrary
+# peer directory.
+for env_kv in "${EXTRA_ENV[@]}"; do
+  case $env_kv in
+    DS4_ROCM_GRAPH_DUMP_PREFIX=*|DS4_METAL_GRAPH_DUMP_PREFIX=*)
+      dump_prefix=${env_kv#*=}
+      dump_dir=$(dirname -- "$dump_prefix")
+      case $dump_dir/ in
+        "$REPO/research-results/"*) ;;
+        *)
+          echo "error: graph dump directory must be under $REPO/research-results: $dump_dir" >&2
+          exit 2
+          ;;
+      esac
+      mkdir -p "$dump_dir"
+      printf -v dump_dir_q '%q' "$dump_dir"
+      "${PEER_SSH[@]}" "mkdir -p $dump_dir_q"
+      ;;
+  esac
+done
+
 echo "=== ds4-bench $TAG ==="
 echo "model: $MODEL"
 echo "workload: frontier=$FRONTIER generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK"
