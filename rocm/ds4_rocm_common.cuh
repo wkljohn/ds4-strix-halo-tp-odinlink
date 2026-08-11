@@ -433,6 +433,114 @@ __global__ static void matmul_f16_hc_token_block_kernel(
     }
 }
 
+/* Up-to-five-row speculative indexer Q projection (K=1536, M=8192 on V4 Flash).
+ * One persistent block per gfx1151 CU streams output rows while all 16 waves
+ * reuse up to five F16 activation rows from LDS.  Every token keeps its own
+ * wave reduction; the only numerical change versus hipBLAS is the dot-product
+ * reduction order.  The caller restricts this research kernel to gfx1151 and
+ * N=1..5. */
+#if defined(__HIP_PLATFORM_AMD__)
+union alignas(16) ds4_f16_pack8h {
+    __half h[8];
+    float4 raw;
+    float packed2[4];
+};
+
+static __device__ __forceinline__ void ds4_f16_dot2_acc(
+        float &acc, float a, float b) {
+    asm("v_dot2_f32_f16 %0, %1, %2, %0"
+        : "+v"(acc) : "v"(a), "v"(b));
+}
+
+template <uint32_t TOKENS, uint32_t YTILE = 4u, uint32_t UNROLL = 2u>
+__launch_bounds__(512, 1)
+__global__ static void matmul_f16_indexer_q_wvsplit_kernel(
+        float *out,
+        const __half *weights,
+        const __half *x,
+        uint32_t kdim,
+        uint32_t mdim) {
+    __shared__ __align__(16) __half sx[5u * 1536u];
+    const uint32_t lane = threadIdx.x;
+    const uint32_t wave = threadIdx.y;
+    const uint32_t linear = wave * 32u + lane;
+
+    const uint32_t x_elems = TOKENS * kdim;
+    for (uint32_t i = linear * 8u; i < x_elems; i += 512u * 8u) {
+        reinterpret_cast<float4 *>(sx)[i / 8u] =
+            reinterpret_cast<const float4 *>(x)[i / 8u];
+    }
+    __syncthreads();
+
+    uint32_t m0 = (blockIdx.x * 16u + wave) * YTILE;
+    const uint32_t m_stride = gridDim.x * 16u * YTILE;
+    while (m0 < mdim) {
+        float sum[TOKENS][YTILE] = {};
+        for (uint32_t k0 = 0; k0 < kdim; k0 += 32u * 8u * UNROLL) {
+            ds4_f16_pack8h av[TOKENS][UNROLL];
+            ds4_f16_pack8h wv[YTILE][UNROLL];
+#pragma unroll
+            for (uint32_t u = 0; u < UNROLL; ++u) {
+                const uint32_t k = k0 + u * 32u * 8u + lane * 8u;
+                if (k < kdim) {
+#pragma unroll
+                    for (uint32_t t = 0; t < TOKENS; ++t) {
+                        av[t][u].raw = reinterpret_cast<const float4 *>(
+                            sx + (uint64_t)t * kdim + k)[0];
+                    }
+#pragma unroll
+                    for (uint32_t y = 0; y < YTILE; ++y) {
+                        const uint32_t m = min(m0 + y, mdim - 1u);
+                        wv[y][u].raw = reinterpret_cast<const float4 *>(
+                            weights + (uint64_t)m * kdim + k)[0];
+                    }
+                } else {
+#pragma unroll
+                    for (uint32_t t = 0; t < TOKENS; ++t) av[t][u].raw = {};
+#pragma unroll
+                    for (uint32_t y = 0; y < YTILE; ++y) wv[y][u].raw = {};
+                }
+            }
+#pragma unroll
+            for (uint32_t u = 0; u < UNROLL; ++u) {
+#pragma unroll
+                for (uint32_t t = 0; t < TOKENS; ++t) {
+#pragma unroll
+                    for (uint32_t y = 0; y < YTILE; ++y) {
+#pragma unroll
+                        for (uint32_t p = 0; p < 4u; ++p) {
+                            ds4_f16_dot2_acc(sum[t][y], av[t][u].packed2[p],
+                                             wv[y][u].packed2[p]);
+                        }
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (uint32_t mask = 16u; mask != 0u; mask >>= 1u) {
+#pragma unroll
+            for (uint32_t t = 0; t < TOKENS; ++t) {
+#pragma unroll
+                for (uint32_t y = 0; y < YTILE; ++y) {
+                    sum[t][y] += __shfl_xor(sum[t][y], mask, 32);
+                }
+            }
+        }
+        if (lane == 0u) {
+#pragma unroll
+            for (uint32_t t = 0; t < TOKENS; ++t) {
+#pragma unroll
+                for (uint32_t y = 0; y < YTILE; ++y) {
+                    const uint32_t m = m0 + y;
+                    if (m < mdim) out[(uint64_t)t * mdim + m] = sum[t][y];
+                }
+            }
+        }
+        m0 += m_stride;
+    }
+}
+#endif
+
 __global__ static void matmul_f16_pair_ordered_chunks_kernel(
         float *out0,
         float *out1,

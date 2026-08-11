@@ -28287,6 +28287,8 @@ static bool metal_graph_encode_layer_attention_batch(
             n_comp = g->layer_n_comp[il];
         }
         DS4_METAL_PROFILE_ATTN_STAGE("compressor");
+        DS4_VERIFY_ATTN_EVENT(
+            DS4_GPU_VERIFY_STAGE_EVENT_ATTN_COMPRESSOR_END);
 
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
@@ -28310,6 +28312,8 @@ static bool metal_graph_encode_layer_attention_batch(
                         n_tokens) != 0;
             }
             DS4_METAL_PROFILE_ATTN_STAGE("indexer_kv_gate_proj");
+            DS4_VERIFY_ATTN_EVENT(
+                DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_KV_GATE_END);
             if (ok) metal_graph_debug_dump_tensor("indexer_comp_kv_raw",
                                                   metal_graph_batch_comp_kv(g),
                                                   (uint64_t)index_width * n_tokens,
@@ -28328,6 +28332,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           metal_graph_batch_qr_norm(g),
                                                           n_tokens);
             DS4_METAL_PROFILE_ATTN_STAGE("indexer_q_proj");
+            DS4_VERIFY_ATTN_EVENT(
+                DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_Q_END);
             if (ok) ok = ds4_gpu_rope_tail_tensor(metal_graph_batch_indexer_q(g),
                                                     n_tokens,
                                                     DS4_N_INDEXER_HEAD,
@@ -28346,6 +28352,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           n_tokens * DS4_N_INDEXER_HEAD,
                                                           DS4_N_INDEXER_HEAD_DIM) != 0;
             DS4_METAL_PROFILE_ATTN_STAGE("indexer_q_post");
+            DS4_VERIFY_ATTN_EVENT(
+                DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_Q_POST_END);
             if (ok) ok = ds4_gpu_matmul_f16_tensor(metal_graph_batch_indexer_weights(g),
                                                      model->map,
                                                      model->size,
@@ -28355,6 +28363,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      metal_graph_batch_attn_norm(g),
                                                      n_tokens) != 0;
             DS4_METAL_PROFILE_ATTN_STAGE("indexer_weight_proj");
+            DS4_VERIFY_ATTN_EVENT(
+                DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_PROJ_END);
             if (zero_prefix) {
                 if (ok && n_comp > g->layer_comp_cap[il]) {
                     fprintf(stderr, "ds4: Metal layer-major indexer cache capacity exceeded at layer %u\n", il);
@@ -28580,6 +28590,8 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
             }
             DS4_METAL_PROFILE_ATTN_STAGE("indexer_compressor");
+            DS4_VERIFY_ATTN_EVENT(
+                DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_COMPRESSOR_END);
         }
 
         if (ok && !zero_prefix && n_tokens <= g->raw_cap) {
@@ -28599,6 +28611,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                      pos0,
                                                      n_tokens,
                                                      DS4_N_HEAD_DIM) != 0;
+            DS4_VERIFY_ATTN_EVENT(
+                DS4_GPU_VERIFY_STAGE_EVENT_ATTN_CACHE_STORE_END);
             if (ok && ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K) {
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (index_stage_profile) {

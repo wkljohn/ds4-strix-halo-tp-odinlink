@@ -26,6 +26,7 @@ DSPARK=${DS4_BENCH_DSPARK:-0}
 MTP=${DS4_BENCH_MTP:-/home/wkljohn/Desktop/cc/models/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf}
 OUT="$REPO/research-results/quant-comparison-2026-08-10"
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
+ROCPROF_RUNTIME=${DS4_BENCH_ROCPROF_RUNTIME:-1}
 SHOW_OUTPUT=${DS4_BENCH_SHOW_OUTPUT:-0}
 PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2 "$PEER_MGMT")
 PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2)
@@ -251,7 +252,21 @@ if [[ $ROCPROF == 1 ]]; then
   ROCPROF_OUT="$OUT/rocprof-$TAG"
   mkdir -p "$ROCPROF_OUT"
   ROCPROF_PERIOD=${DS4_BENCH_ROCPROF_PERIOD:-70:30:1}
-  COORD_CMD=(rocprofv3 --kernel-trace --collection-period "$ROCPROF_PERIOD"
+  ROCPROF_TRACE=(--runtime-trace)
+  if [[ $ROCPROF_RUNTIME == 1 ]]; then
+    # Gate-A diagnostics need both GPU dispatch intervals and the host HIP API
+    # calls which submitted them. Runtime tracing is heavy and its timing is
+    # never accepted as benchmark evidence, but unlike one-sided kernel-only
+    # tracing it has completed safely with the asymmetric TP launch protocol.
+    :
+  elif [[ $ROCPROF_RUNTIME == 0 ]]; then
+    echo "error: kernel-only rocprof is unsafe for asymmetric TP; use DS4_BENCH_ROCPROF_RUNTIME=1" >&2
+    exit 2
+  else
+    echo "error: DS4_BENCH_ROCPROF_RUNTIME must be 1" >&2
+    exit 2
+  fi
+  COORD_CMD=(rocprofv3 "${ROCPROF_TRACE[@]}" --collection-period "$ROCPROF_PERIOD"
              --stats --summary --summary-units usec
              --output-directory "$ROCPROF_OUT" -- "$REPO/ds4-bench-tp")
 elif [[ $ROCPROF != 0 ]]; then

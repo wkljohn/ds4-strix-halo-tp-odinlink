@@ -164,6 +164,31 @@ static int f16_hc_five_row_mode(void) {
     return mode;
 }
 
+static int f16_indexer_q_wvsplit_cus(void) {
+#if defined(__HIP_PLATFORM_AMD__)
+    static int cus = -1;
+    if (cus < 0) {
+        cus = 0;
+        const char *disable =
+            getenv("DS4_ROCM_DISABLE_F16_INDEXER_Q_WVSPLIT");
+        if (disable && strcmp(disable, "1") == 0) return cus;
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess &&
+            strncmp(prop.gcnArchName, "gfx1151", 7) == 0) {
+            cus = prop.multiProcessorCount;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return cus;
+#else
+    return 0;
+#endif
+}
+
 static void cuda_launch_q8_batch_sharedx(
         float *out,
         const unsigned char *w,
@@ -1117,6 +1142,37 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                     (uint32_t)in_dim, (uint32_t)out_dim);
         }
         return cuda_ok(cudaGetLastError(), "f16 HC five-row launch");
+    }
+    const int indexer_q_cus =
+        in_dim == 1536u && out_dim == 8192u && n_tok <= 5u &&
+        !g_quality_mode && !cuda_runtime_config()->graph_dump
+            ? f16_indexer_q_wvsplit_cus() : 0;
+    if (indexer_q_cus > 0) {
+#if defined(__HIP_PLATFORM_AMD__)
+        const uint64_t xh_count = n_tok * in_dim;
+        __half *xh = (__half *)cuda_tmp_alloc(
+                xh_count * sizeof(__half), "f16 indexer Q activations");
+        if (!xh) return 0;
+        f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256u>>>(
+                xh, (const float *)x->ptr, xh_count);
+        if (!cuda_ok(cudaGetLastError(),
+                     "f16 indexer Q activation conversion launch")) return 0;
+        const dim3 block(32u, 16u);
+        switch (n_tok) {
+            case 1u: matmul_f16_indexer_q_wvsplit_kernel<1u><<<indexer_q_cus, block>>>(
+                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+            case 2u: matmul_f16_indexer_q_wvsplit_kernel<2u><<<indexer_q_cus, block>>>(
+                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+            case 3u: matmul_f16_indexer_q_wvsplit_kernel<3u><<<indexer_q_cus, block>>>(
+                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+            case 4u: matmul_f16_indexer_q_wvsplit_kernel<4u><<<indexer_q_cus, block>>>(
+                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+            case 5u: matmul_f16_indexer_q_wvsplit_kernel<5u><<<indexer_q_cus, block>>>(
+                         (float *)out->ptr, w, xh, 1536u, 8192u); break;
+            default: return 0;
+        }
+        return cuda_ok(cudaGetLastError(), "f16 indexer Q wvSplitK launch");
+#endif
     }
     if (g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;

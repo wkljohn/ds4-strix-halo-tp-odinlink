@@ -6850,6 +6850,14 @@ enum {
     DS4_ROCM_VERIFY_STAT_ATTN_FRONT,
     DS4_ROCM_VERIFY_STAT_ATTN_QKV_TO_CORE,
     DS4_ROCM_VERIFY_STAT_ATTN_PRE_INDEXER,
+    DS4_ROCM_VERIFY_STAT_ATTN_COMPRESSOR,
+    DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_PROJ,
+    DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_KV_GATE,
+    DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_Q,
+    DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_Q_POST,
+    DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_WEIGHT,
+    DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_COMPRESSOR,
+    DS4_ROCM_VERIFY_STAT_ATTN_CACHE_STORE,
     DS4_ROCM_VERIFY_STAT_ATTN_INDEXER,
     DS4_ROCM_VERIFY_STAT_ATTN_INDEXED_CORE,
     DS4_ROCM_VERIFY_STAT_ATTN_OUTPUT,
@@ -6885,7 +6893,11 @@ extern "C" void ds4_gpu_verify_stage_events_print(void) {
     if (!g_verify_stage_events_enabled || g_verify_stage_events_samples == 0u) return;
     static const char *const names[DS4_ROCM_VERIFY_STAT_COUNT] = {
         "layer", "attention", "attn_front", "attn_qkv_to_core",
-        "attn_pre_indexer", "attn_indexer", "attn_indexed_core",
+        "attn_pre_indexer", "attn_compressor", "attn_indexer_proj",
+        "attn_indexer_kv_gate", "attn_indexer_q",
+        "attn_indexer_q_post", "attn_indexer_weight",
+        "attn_indexer_compressor", "attn_cache_store",
+        "attn_indexer", "attn_indexed_core",
         "attn_output", "attn_post", "dense_q8", "routed_moe", "residual"
     };
     fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -6976,6 +6988,10 @@ static int ds4_rocm_verify_stage_harvest_slot(
     float down_ms = 0.0f, routed_ms = 0.0f;
     float attn_front_ms = 0.0f, attn_qkv_to_core_ms = 0.0f;
     float attn_pre_indexer_ms = 0.0f, attn_indexer_ms = 0.0f;
+    float attn_compressor_ms = 0.0f, attn_indexer_proj_ms = 0.0f;
+    float attn_indexer_kv_gate_ms = 0.0f, attn_indexer_q_ms = 0.0f;
+    float attn_indexer_q_post_ms = 0.0f, attn_indexer_weight_ms = 0.0f;
+    float attn_indexer_compressor_ms = 0.0f, attn_cache_store_ms = 0.0f;
     float attn_indexed_core_ms = 0.0f, attn_output_ms = 0.0f;
     float attn_post_ms = 0.0f;
     const int have_layer = ds4_rocm_verify_stage_elapsed(
@@ -6993,6 +7009,38 @@ static int ds4_rocm_verify_stage_harvest_slot(
     const int have_attn_pre_indexer = ds4_rocm_verify_stage_elapsed(
         slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_QKV_END,
         DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_START, &attn_pre_indexer_ms);
+    const int have_attn_compressor = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_QKV_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_COMPRESSOR_END,
+        &attn_compressor_ms);
+    const int have_attn_indexer_proj = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_COMPRESSOR_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_PROJ_END,
+        &attn_indexer_proj_ms);
+    const int have_attn_indexer_kv_gate = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_COMPRESSOR_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_KV_GATE_END,
+        &attn_indexer_kv_gate_ms);
+    const int have_attn_indexer_q = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_KV_GATE_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_Q_END,
+        &attn_indexer_q_ms);
+    const int have_attn_indexer_q_post = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_Q_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_Q_POST_END,
+        &attn_indexer_q_post_ms);
+    const int have_attn_indexer_weight = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_Q_POST_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_PROJ_END,
+        &attn_indexer_weight_ms);
+    const int have_attn_indexer_compressor = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_PROJ_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_COMPRESSOR_END,
+        &attn_indexer_compressor_ms);
+    const int have_attn_cache_store = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_COMPRESSOR_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_CACHE_STORE_END,
+        &attn_cache_store_ms);
     const int have_attn_indexer = ds4_rocm_verify_stage_elapsed(
         slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_START,
         DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_END, &attn_indexer_ms);
@@ -7028,6 +7076,42 @@ static int ds4_rocm_verify_stage_harvest_slot(
     if (have_attn_pre_indexer > 0) {
         ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_PRE_INDEXER,
                                       attn_pre_indexer_ms);
+    }
+    if (have_attn_compressor > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_COMPRESSOR,
+                                      attn_compressor_ms);
+    }
+    if (have_attn_indexer_proj > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_PROJ,
+                                      attn_indexer_proj_ms);
+    }
+    if (have_attn_indexer_kv_gate > 0) {
+        ds4_rocm_verify_stage_stat_add(
+            DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_KV_GATE,
+            attn_indexer_kv_gate_ms);
+    }
+    if (have_attn_indexer_q > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_Q,
+                                      attn_indexer_q_ms);
+    }
+    if (have_attn_indexer_q_post > 0) {
+        ds4_rocm_verify_stage_stat_add(
+            DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_Q_POST,
+            attn_indexer_q_post_ms);
+    }
+    if (have_attn_indexer_weight > 0) {
+        ds4_rocm_verify_stage_stat_add(
+            DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_WEIGHT,
+            attn_indexer_weight_ms);
+    }
+    if (have_attn_indexer_compressor > 0) {
+        ds4_rocm_verify_stage_stat_add(
+            DS4_ROCM_VERIFY_STAT_ATTN_INDEXER_COMPRESSOR,
+            attn_indexer_compressor_ms);
+    }
+    if (have_attn_cache_store > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_CACHE_STORE,
+                                      attn_cache_store_ms);
     }
     if (have_attn_indexer > 0) {
         ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_INDEXER,

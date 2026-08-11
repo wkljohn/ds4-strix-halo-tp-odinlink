@@ -20,8 +20,6 @@
 #include <random>
 #include <vector>
 
-static constexpr uint32_t kTokens = 5;
-
 static void check(hipError_t rc, const char *where) {
     if (rc != hipSuccess) {
         std::fprintf(stderr, "%s: %s\n", where, hipGetErrorString(rc));
@@ -56,7 +54,7 @@ static __device__ __forceinline__ void dot2_acc(float &acc, float a, float b) {
 // One persistent workgroup per CU. Each wave streams one or more weight rows,
 // while all waves reuse the five activation rows staged in LDS. The five rows
 // remain independent accumulators; only weight and activation loads are shared.
-template <uint32_t YTILE, uint32_t UNROLL>
+template <uint32_t TOKENS, uint32_t YTILE, uint32_t UNROLL>
 __launch_bounds__(512, 1)
 __global__ static void f16_wvsplitk_n5(
         float *out, const _Float16 *weights, const _Float16 *x,
@@ -66,7 +64,7 @@ __global__ static void f16_wvsplitk_n5(
     const uint32_t wave = threadIdx.y;
     const uint32_t linear = wave * 32u + lane;
 
-    const uint32_t x_elems = kTokens * kdim;
+    const uint32_t x_elems = TOKENS * kdim;
     for (uint32_t i = linear * 8u; i < x_elems; i += 512u * 8u) {
         reinterpret_cast<float4 *>(sx)[i / 8u] =
             reinterpret_cast<const float4 *>(x)[i / 8u];
@@ -76,16 +74,16 @@ __global__ static void f16_wvsplitk_n5(
     uint32_t m0 = (blockIdx.x * 16u + wave) * YTILE;
     const uint32_t m_stride = gridDim.x * 16u * YTILE;
     while (m0 < mdim) {
-        float sum[kTokens][YTILE] = {};
+        float sum[TOKENS][YTILE] = {};
         for (uint32_t k0 = 0; k0 < kdim; k0 += 32u * 8u * UNROLL) {
-            pack8h av[kTokens][UNROLL];
+            pack8h av[TOKENS][UNROLL];
             pack8h wv[YTILE][UNROLL];
 #pragma unroll
             for (uint32_t u = 0; u < UNROLL; ++u) {
                 const uint32_t k = k0 + u * 32u * 8u + lane * 8u;
                 if (k < kdim) {
 #pragma unroll
-                    for (uint32_t t = 0; t < kTokens; ++t) {
+                    for (uint32_t t = 0; t < TOKENS; ++t) {
                         av[t][u].raw = reinterpret_cast<const float4 *>(
                             sx + (uint64_t)t * kdim + k)[0];
                     }
@@ -97,7 +95,7 @@ __global__ static void f16_wvsplitk_n5(
                     }
                 } else {
 #pragma unroll
-                    for (uint32_t t = 0; t < kTokens; ++t) av[t][u].raw = {};
+                    for (uint32_t t = 0; t < TOKENS; ++t) av[t][u].raw = {};
 #pragma unroll
                     for (uint32_t y = 0; y < YTILE; ++y) wv[y][u].raw = {};
                 }
@@ -105,7 +103,7 @@ __global__ static void f16_wvsplitk_n5(
 #pragma unroll
             for (uint32_t u = 0; u < UNROLL; ++u) {
 #pragma unroll
-                for (uint32_t t = 0; t < kTokens; ++t) {
+                for (uint32_t t = 0; t < TOKENS; ++t) {
 #pragma unroll
                     for (uint32_t y = 0; y < YTILE; ++y) {
 #pragma unroll
@@ -120,7 +118,7 @@ __global__ static void f16_wvsplitk_n5(
 #pragma unroll
         for (uint32_t mask = 16u; mask != 0u; mask >>= 1u) {
 #pragma unroll
-            for (uint32_t t = 0; t < kTokens; ++t) {
+            for (uint32_t t = 0; t < TOKENS; ++t) {
 #pragma unroll
                 for (uint32_t y = 0; y < YTILE; ++y) {
                     sum[t][y] += __shfl_xor(sum[t][y], mask, 32);
@@ -129,7 +127,7 @@ __global__ static void f16_wvsplitk_n5(
         }
         if (lane == 0u) {
 #pragma unroll
-            for (uint32_t t = 0; t < kTokens; ++t) {
+            for (uint32_t t = 0; t < TOKENS; ++t) {
 #pragma unroll
                 for (uint32_t y = 0; y < YTILE; ++y) {
                     const uint32_t m = m0 + y;
@@ -147,10 +145,11 @@ static float elapsed(hipEvent_t a, hipEvent_t b) {
     return ms;
 }
 
+template <uint32_t TOKENS>
 static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
     const uint64_t w_count = (uint64_t)kdim * mdim;
-    const uint64_t x_count = (uint64_t)kTokens * kdim;
-    const uint64_t o_count = (uint64_t)kTokens * mdim;
+    const uint64_t x_count = (uint64_t)TOKENS * kdim;
+    const uint64_t o_count = (uint64_t)TOKENS * mdim;
     std::mt19937 rng(12345u + kdim + mdim);
     std::uniform_real_distribution<float> dist(-0.25f, 0.25f);
     std::vector<_Float16> hw(w_count);
@@ -177,7 +176,7 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
     const float alpha = 1.0f, beta = 0.0f;
     auto launch_ref = [&]() {
         check_blas(hipblasGemmEx(blas, HIPBLAS_OP_T, HIPBLAS_OP_N,
-                                 (int)mdim, (int)kTokens, (int)kdim,
+                                 (int)mdim, (int)TOKENS, (int)kdim,
                                  &alpha, dw, HIP_R_16F, (int)kdim,
                                  dxh, HIP_R_16F, (int)kdim,
                                  &beta, dref, HIP_R_32F, (int)mdim,
@@ -191,10 +190,10 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
     auto launch_cand = [&]() {
         const dim3 block(32u, 16u);
         if (mdim >= 512u) {
-            f16_wvsplitk_n5<4u, 2u><<<cu_count, block>>>(
+            f16_wvsplitk_n5<TOKENS, 4u, 2u><<<cu_count, block>>>(
                 dcand, dw, dxh, kdim, mdim);
         } else {
-            f16_wvsplitk_n5<1u, 4u><<<cu_count, block>>>(
+            f16_wvsplitk_n5<TOKENS, 1u, 4u><<<cu_count, block>>>(
                 dcand, dw, dxh, kdim, mdim);
         }
         check(hipGetLastError(), "wvSplitK launch");
@@ -231,9 +230,9 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
     check(hipEventSynchronize(b), "sync candidate");
     const float cand_ms = elapsed(a, b) / iterations;
 
-    std::printf("shape N=5 K=%u M=%u hipblas_ms=%.6f wvsplitk_ms=%.6f "
+    std::printf("shape N=%u K=%u M=%u hipblas_ms=%.6f wvsplitk_ms=%.6f "
                 "speedup=%.3fx max_abs=%.9g rel_rms=%.9g\n",
-                kdim, mdim, ref_ms, cand_ms, ref_ms / cand_ms, max_abs,
+                TOKENS, kdim, mdim, ref_ms, cand_ms, ref_ms / cand_ms, max_abs,
                 std::sqrt(sq / std::max(ref_sq, 1e-30)));
 
     hipEventDestroy(b);
@@ -247,7 +246,11 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations) {
 }
 
 int main() {
-    run_shape(1536u, 8192u, 100u); // indexer Q projection
-    run_shape(4096u, 64u, 500u);   // indexer per-head weight projection
+    run_shape<1u>(1536u, 8192u, 100u);
+    run_shape<2u>(1536u, 8192u, 100u);
+    run_shape<3u>(1536u, 8192u, 100u);
+    run_shape<4u>(1536u, 8192u, 100u);
+    run_shape<5u>(1536u, 8192u, 100u); // indexer Q projection
+    run_shape<5u>(4096u, 64u, 500u);   // indexer per-head weight projection
     return 0;
 }
