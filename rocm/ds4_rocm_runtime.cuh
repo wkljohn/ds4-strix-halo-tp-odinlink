@@ -6828,6 +6828,7 @@ extern "C" void ds4_gpu_decode_attn_event_profile_record(
  * completion/readback, so a 16-slot pool would drop most of a 43-layer
  * sample even when the GPU is behaving normally.  Reuse is still guarded by
  * hipEventQuery and drops rather than waits. */
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
 enum { DS4_ROCM_VERIFY_STAGE_EVENT_POOL_SIZE = 64 };
 
 typedef struct {
@@ -6846,6 +6847,13 @@ typedef struct {
 enum {
     DS4_ROCM_VERIFY_STAT_LAYER = 0,
     DS4_ROCM_VERIFY_STAT_ATTN,
+    DS4_ROCM_VERIFY_STAT_ATTN_FRONT,
+    DS4_ROCM_VERIFY_STAT_ATTN_QKV_TO_CORE,
+    DS4_ROCM_VERIFY_STAT_ATTN_PRE_INDEXER,
+    DS4_ROCM_VERIFY_STAT_ATTN_INDEXER,
+    DS4_ROCM_VERIFY_STAT_ATTN_INDEXED_CORE,
+    DS4_ROCM_VERIFY_STAT_ATTN_OUTPUT,
+    DS4_ROCM_VERIFY_STAT_ATTN_POST,
     DS4_ROCM_VERIFY_STAT_DENSE_Q8,
     DS4_ROCM_VERIFY_STAT_ROUTED_MOE,
     DS4_ROCM_VERIFY_STAT_RESIDUAL,
@@ -6876,7 +6884,9 @@ static void ds4_rocm_verify_stage_stat_add(uint32_t stat_index, float ms) {
 extern "C" void ds4_gpu_verify_stage_events_print(void) {
     if (!g_verify_stage_events_enabled || g_verify_stage_events_samples == 0u) return;
     static const char *const names[DS4_ROCM_VERIFY_STAT_COUNT] = {
-        "layer", "attention", "dense_q8", "routed_moe", "residual"
+        "layer", "attention", "attn_front", "attn_qkv_to_core",
+        "attn_pre_indexer", "attn_indexer", "attn_indexed_core",
+        "attn_output", "attn_post", "dense_q8", "routed_moe", "residual"
     };
     fprintf(stderr, DS4_GPU_LOG_PREFIX
             "DSpark verify stage events rank=%u layers=%llu dropped=%llu",
@@ -6964,12 +6974,37 @@ static int ds4_rocm_verify_stage_harvest_slot(
 
     float layer_ms = 0.0f, attn_ms = 0.0f, gate_up_ms = 0.0f;
     float down_ms = 0.0f, routed_ms = 0.0f;
+    float attn_front_ms = 0.0f, attn_qkv_to_core_ms = 0.0f;
+    float attn_pre_indexer_ms = 0.0f, attn_indexer_ms = 0.0f;
+    float attn_indexed_core_ms = 0.0f, attn_output_ms = 0.0f;
+    float attn_post_ms = 0.0f;
     const int have_layer = ds4_rocm_verify_stage_elapsed(
         slot, DS4_GPU_VERIFY_STAGE_EVENT_LAYER_START,
         DS4_GPU_VERIFY_STAGE_EVENT_LAYER_END, &layer_ms);
     const int have_attn = ds4_rocm_verify_stage_elapsed(
         slot, DS4_GPU_VERIFY_STAGE_EVENT_LAYER_START,
         DS4_GPU_VERIFY_STAGE_EVENT_ATTN_END, &attn_ms);
+    const int have_attn_front = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_LAYER_START,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_QKV_END, &attn_front_ms);
+    const int have_attn_qkv_to_core = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_QKV_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_CORE_END, &attn_qkv_to_core_ms);
+    const int have_attn_pre_indexer = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_QKV_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_START, &attn_pre_indexer_ms);
+    const int have_attn_indexer = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_START,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_END, &attn_indexer_ms);
+    const int have_attn_indexed_core = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_CORE_END, &attn_indexed_core_ms);
+    const int have_attn_output = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_CORE_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_OUTPUT_END, &attn_output_ms);
+    const int have_attn_post = ds4_rocm_verify_stage_elapsed(
+        slot, DS4_GPU_VERIFY_STAGE_EVENT_ATTN_OUTPUT_END,
+        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_END, &attn_post_ms);
     const int have_gate_up = ds4_rocm_verify_stage_elapsed(
         slot, DS4_GPU_VERIFY_STAGE_EVENT_DENSE_GATE_UP_START,
         DS4_GPU_VERIFY_STAGE_EVENT_DENSE_GATE_UP_END, &gate_up_ms);
@@ -6982,6 +7017,34 @@ static int ds4_rocm_verify_stage_harvest_slot(
     if (!g_verify_stage_events_enabled) return 0;
     if (have_layer > 0) ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_LAYER, layer_ms);
     if (have_attn > 0) ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN, attn_ms);
+    if (have_attn_front > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_FRONT,
+                                      attn_front_ms);
+    }
+    if (have_attn_qkv_to_core > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_QKV_TO_CORE,
+                                      attn_qkv_to_core_ms);
+    }
+    if (have_attn_pre_indexer > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_PRE_INDEXER,
+                                      attn_pre_indexer_ms);
+    }
+    if (have_attn_indexer > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_INDEXER,
+                                      attn_indexer_ms);
+    }
+    if (have_attn_indexed_core > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_INDEXED_CORE,
+                                      attn_indexed_core_ms);
+    }
+    if (have_attn_output > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_OUTPUT,
+                                      attn_output_ms);
+    }
+    if (have_attn_post > 0) {
+        ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_ATTN_POST,
+                                      attn_post_ms);
+    }
     if (have_gate_up > 0 || have_down > 0) {
         ds4_rocm_verify_stage_stat_add(DS4_ROCM_VERIFY_STAT_DENSE_Q8,
                                       gate_up_ms + down_ms);
@@ -7048,6 +7111,17 @@ extern "C" void ds4_gpu_verify_stage_events_record(
         g_verify_stage_events_active_slot = -1;
     }
 }
+#else
+extern "C" int ds4_gpu_verify_stage_events_enabled(void) { return 0; }
+extern "C" int ds4_gpu_verify_stage_events_prepare(void) { return 0; }
+extern "C" void ds4_gpu_verify_stage_events_harvest(void) {}
+extern "C" void ds4_gpu_verify_stage_events_record(
+        ds4_gpu_verify_stage_event_stage stage, uint32_t rank) {
+    (void)stage;
+    (void)rank;
+}
+extern "C" void ds4_gpu_verify_stage_events_print(void) {}
+#endif
 
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");

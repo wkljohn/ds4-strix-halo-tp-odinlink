@@ -27491,6 +27491,18 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
             metal_graph_batch_after_attn_hc(g), 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const bool verify_attn_events =
+        g->tp_batch_rows == n_tokens &&
+        ds4_gpu_verify_stage_events_enabled() != 0;
+#define DS4_VERIFY_ATTN_EVENT(stage) do { \
+        if (ok && verify_attn_events) { \
+            ds4_gpu_verify_stage_events_record((stage), g->tp_rank); \
+        } \
+    } while (0)
+#else
+#define DS4_VERIFY_ATTN_EVENT(stage) do { (void)sizeof(stage); } while (0)
+#endif
     const bool fuse_hc_norm = n_tokens > 1 &&
                               DS4_N_HC == 4 &&
                               !metal_graph_use_reference_hc_decode() &&
@@ -27874,6 +27886,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("kv_path");
+    DS4_VERIFY_ATTN_EVENT(DS4_GPU_VERIFY_STAGE_EVENT_ATTN_QKV_END);
     /*
      * Static graph order is q, kv, cpy_k(raw SWA), then attention. For a
      * zero-prefix batch it is safe to store the whole batch at once: attention
@@ -28596,6 +28609,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
+                DS4_VERIFY_ATTN_EVENT(DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_START);
                 ok = ds4_gpu_indexer_scores_decode_batch_tensor(metal_graph_indexer_scores(g),
                                                                   metal_graph_batch_indexer_q(g),
                                                                   metal_graph_batch_indexer_weights(g),
@@ -28644,6 +28658,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           pos0);
                     }
                 }
+                DS4_VERIFY_ATTN_EVENT(DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_END);
                 if (ok) {
                     use_indexed_comp = true;
                 }
@@ -28717,6 +28732,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 n_comp,
                                                                 &index_stage_t0);
             }
+            DS4_VERIFY_ATTN_EVENT(DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_START);
             ok = ds4_gpu_indexer_scores_prefill_tensor(metal_graph_indexer_scores(g),
                                                          metal_graph_batch_indexer_q(g),
                                                          metal_graph_batch_indexer_weights(g),
@@ -28764,6 +28780,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                       pos0);
                 }
             }
+            DS4_VERIFY_ATTN_EVENT(DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_END);
             if (ok && tp_row_split_attn) {
                 /* Score/top-k selection above ran replicated over all rows;
                  * only the attention consumption splits.  Passing the row
@@ -29011,6 +29028,7 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("attention");
+    DS4_VERIFY_ATTN_EVENT(DS4_GPU_VERIFY_STAGE_EVENT_ATTN_CORE_END);
 
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", metal_graph_batch_heads(g),
@@ -29200,6 +29218,7 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
+    DS4_VERIFY_ATTN_EVENT(DS4_GPU_VERIFY_STAGE_EVENT_ATTN_OUTPUT_END);
     ds4_gpu_tensor *tp_batch_attn_a = NULL;
     ds4_gpu_tensor *tp_batch_attn_b = NULL;
     if (ok && (tp_batch_attn_head_split || tp_batch_attn_legacy_decode)) {
@@ -29341,6 +29360,7 @@ static bool metal_graph_encode_layer_attention_batch(
     if (comp_counts != comp_counts_stack) free(comp_counts);
 #undef DS4_METAL_PROFILE_ATTN_STAGE
 #undef DS4_METAL_PROFILE_Q_STAGE
+#undef DS4_VERIFY_ATTN_EVENT
     return ok;
 }
 
@@ -29459,7 +29479,7 @@ static bool metal_graph_encode_layer_ffn_batch(
         g->tp_world == 2u && g->tp_batch_rows == n_tokens &&
         metal_graph_tp_env_flag("DS4_DSPARK_VERIFY_TP_SHARED_SPLIT", false);
     const bool layer_stage_profile = metal_graph_layer_stage_profile_enabled(il);
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const bool verify_stage_events =
         g->tp_batch_rows == n_tokens &&
         ds4_gpu_verify_stage_events_enabled() != 0;
@@ -29893,7 +29913,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                 tp_verify_batch_moe_default);
     const bool cuda_tp_owned_batch_moe =
         g->cuda_tp_ep && g->cuda_tp_prefill_ffn;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     bool verify_routed_end_recorded = false;
     if (ok && verify_stage_events) {
         ds4_gpu_verify_stage_events_record(
@@ -30006,7 +30026,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                 ds4_gpu_tensor_free(out_row);
             }
         }
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
         if (ok && verify_stage_events) {
             ds4_gpu_verify_stage_events_record(
                 DS4_GPU_VERIFY_STAGE_EVENT_ROUTED_MOE_END, g->tp_rank);
@@ -30051,7 +30071,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                &g->batch_routed_mid_is_f16,
                                                false) != 0;
     }
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (ok && verify_stage_events && !verify_routed_end_recorded) {
         ds4_gpu_verify_stage_events_record(
             DS4_GPU_VERIFY_STAGE_EVENT_ROUTED_MOE_END, g->tp_rank);
@@ -30208,7 +30228,7 @@ static bool metal_graph_encode_layer_batch(
         uint32_t                il,
         uint32_t                pos0,
         uint32_t                n_tokens) {
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const bool verify_stage_events =
         g->tp_batch_rows == n_tokens &&
         ds4_gpu_verify_stage_events_enabled() != 0;
@@ -30219,7 +30239,7 @@ static bool metal_graph_encode_layer_batch(
             return false;
         }
     }
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (verify_stage_events) {
         ds4_gpu_verify_stage_events_record(
             DS4_GPU_VERIFY_STAGE_EVENT_LAYER_START, g->tp_rank);
@@ -30234,7 +30254,7 @@ static bool metal_graph_encode_layer_batch(
     if (ok) {
         ok = metal_graph_encode_layer_attention_batch(g, model, layer, il, pos0, n_tokens);
     }
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (ok && verify_stage_events) {
         ds4_gpu_verify_stage_events_record(
             DS4_GPU_VERIFY_STAGE_EVENT_ATTN_END, g->tp_rank);
@@ -30259,7 +30279,7 @@ static bool metal_graph_encode_layer_batch(
                 g->dspark_validate_batch_layers,
                 metal_graph_batch_cur_hc(g), il, n_tokens - 1u);
     }
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (verify_stage_events) {
         ds4_gpu_verify_stage_events_record(
             DS4_GPU_VERIFY_STAGE_EVENT_LAYER_END, g->tp_rank);
@@ -35433,7 +35453,7 @@ static bool metal_graph_verify_suffix_tops_impl(
                         g->tp_batch_out != NULL && g->tp_batch_in != NULL &&
                         n_tokens <= (uint32_t)DS4_TP_BATCH_MAX_ROWS)
                        ? n_tokens : 0;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     /* Allocate the event ring before the measured command stream begins.
      * Both ranks take this path from the same opt-in environment setting. */
     const bool verify_stage_events =
@@ -35591,7 +35611,7 @@ static bool metal_graph_verify_suffix_tops_impl(
                                    row_logits,
                                    (uint64_t)n_tokens * DS4_N_VOCAB * sizeof(row_logits[0])) != 0;
     }
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     /* The existing verifier completion/readback above is the synchronization
      * point.  Harvest only now, and only with hipEventQuery. */
     if (verify_stage_events) ds4_gpu_verify_stage_events_harvest();
@@ -58390,7 +58410,7 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             net_saved_ms,
             draft_hist,
             accept_hist);
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     /* Keep the cumulative event breakdown adjacent to the cumulative DSpark
      * stats line.  This function never waits for an event. */
     ds4_gpu_verify_stage_events_print();
