@@ -593,6 +593,12 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
             token = ds4_session_sample(session, cfg->gen.temperature, 0,
                                        cfg->gen.top_p, cfg->gen.min_p, &rng);
         }
+        if (token < 0) {
+            fprintf(stderr,
+                    "ds4: sampling policy is unavailable for the active TP logits mode\n");
+            ds4_session_free(session);
+            return 1;
+        }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 
         int toks[17];
@@ -1501,6 +1507,11 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
+        }
+        if (token < 0) {
+            fprintf(stderr,
+                    "ds4: sampling policy is unavailable for the active TP logits mode\n");
+            return 1;
         }
         if (ds4_token_is_stop_for_think_mode(engine, token, think_mode)) break;
 

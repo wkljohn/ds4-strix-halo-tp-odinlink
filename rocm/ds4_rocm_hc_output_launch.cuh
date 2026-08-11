@@ -484,7 +484,10 @@ extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
                 (unsigned long long)k_off,(unsigned long long)k_cnt);
         return 0;
     }
-    if (heads->bytes < (uint64_t)(group0 + group_cnt) * group_dim * sizeof(float) ||
+    /* Contract shared with Metal: heads contains only the owned groups,
+     * compact at its base. group0 selects the corresponding weight groups;
+     * it is not also an offset into this rank-local activation buffer. */
+    if (heads->bytes < (uint64_t)group_cnt * group_dim * sizeof(float) ||
         low->bytes < k_cnt * sizeof(float) ||
         out->bytes < out_dim * sizeof(float)) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attn_out_q8_tp: tensor too small "
@@ -497,7 +500,6 @@ extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
     }
 
     ds4_gpu_tensor heads_slice = *heads;
-    heads_slice.ptr = (char *)heads->ptr + (uint64_t)group0 * group_dim * sizeof(float);
     heads_slice.bytes = (uint64_t)group_cnt * group_dim * sizeof(float);
     heads_slice.owner = 0;
 

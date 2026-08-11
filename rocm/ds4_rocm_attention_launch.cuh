@@ -275,6 +275,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  0, 0, n_head, head_dim);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
+
 static int attention_prefill_raw_range_launch(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t q_row0, uint32_t n_q, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
     if (!heads || !q || !raw_kv || !model_map || sinks_offset > model_size ||
         n_q == 0 || q_row0 > n_tokens || n_q > n_tokens - q_row0 ||
@@ -1559,8 +1560,9 @@ extern "C" int ds4_gpu_attention_output_q8_tp_batch_tensor(
         ds4_gpu_tensor low_row = *low;
         ds4_gpu_tensor out_row = *out;
         heads_row.ptr = (char *)heads->ptr +
-            (uint64_t)row * n_groups_total * group_dim * sizeof(float);
-        heads_row.bytes = (uint64_t)n_groups_total * group_dim * sizeof(float);
+            ((uint64_t)row * n_groups_total + group0) *
+                group_dim * sizeof(float);
+        heads_row.bytes = (uint64_t)group_cnt * group_dim * sizeof(float);
         heads_row.owner = 0;
         low_row.ptr = (char *)low->ptr +
             (uint64_t)row * low_dim_owned * sizeof(float);

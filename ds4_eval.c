@@ -3873,6 +3873,22 @@ static eval_run_result run_one_case(ds4_engine *engine, ds4_session *session,
         if (token < 0)
             token = ds4_session_sample(session, cfg->temperature, 0,
                                        cfg->top_p, cfg->min_p, rng);
+        if (token < 0) {
+            static const char unavailable[] =
+                "sampling policy is unavailable for the active TP logits mode";
+            plain_reset_color(use_plain_color);
+            ui->generated_tokens[idx] = ui->generated;
+            tui_run_clock_stop(ui);
+            fprintf(stderr, "ds4-eval: %s for %s\n", unavailable, tc->id);
+            trace_write_case(trace, cfg, tc, idx, ui->ncases, "ERROR",
+                             unavailable, system, question,
+                             raw.v ? raw.v : "", think_mode, prompt_tokens,
+                             ui->generated, now_sec() - t0, "?", &think_close);
+            free(question);
+            ds4_tokens_free(&think_close_tokens);
+            buf_free(&raw);
+            return EVAL_RUN_ERROR;
+        }
         if (ds4_token_is_stop(engine, token)) break;
         if (close_kind != EVAL_THINK_CLOSE_NONE &&
             think_close.kind == EVAL_THINK_CLOSE_NONE) {

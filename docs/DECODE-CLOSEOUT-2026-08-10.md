@@ -47,12 +47,24 @@ historical `4b35010` code measured 7.58 t/s under that same fixed workload.
 Consequently all promotion decisions below use only like-for-like
 `ds4-bench-tp` runs; no interactive or short-generation number is substituted.
 
+> **2026-08-11 validation update:** the 14.31 t/s ordinary and 14.92 t/s
+> DSpark rows below were produced by configurations that no longer pass the
+> repaired token-fingerprint gate. They are retained as historical research,
+> not production claims. The valid ordinary full-head baseline is 165.16 t/s
+> prefill and 12.40 t/s decode; the repaired exact greedy-only top-2 candidate
+> measured 154.40/12.54 t/s and fingerprint `752795b2398ef49c`. Its paired
+> final full-head control measured 154.88/12.32 t/s, showing no meaningful
+> prefill change and a 1.79% decode gain in the current system state.
+
 ## Implemented mechanisms
 
 1. **Exact greedy top-2 TP exchange.** Rank 1 sends its best two `(id,value)`
    pairs instead of a 256 KiB FP32 vocabulary half. Two candidates are enough
    to preserve both ordinary argmax and argmax excluding one token. The
    feature is negotiated and automatically disabled for speculative sessions.
+   Greedy sampling uses the TP-aware candidate merge; temperature sampling and
+   full-logit/logprob consumers fail closed because the complete logits row is
+   intentionally not materialized.
 2. **Staged Q4_K activation.** The one-token gate/up workgroup stages sixteen
    Q8_K activation blocks once in about 4.6 KiB LDS and reuses them across its
    output rows. Dot and reduction order remain unchanged.
@@ -64,15 +76,13 @@ Consequently all promotion decisions below use only like-for-like
    per-layer, event and graph-token profiling branches out. Diagnostic builds
    use `make rocm PROFILE=1`. Correctness checks and error reporting remain.
 
-The benchmark launcher enables these ordinary greedy candidates. They remain
-explicit inference switches because paired DP4A is approximate and top-2 is a
-greedy-only protocol:
+These remain explicit inference switches. Current candidate validation keeps
+paired DP4A disabled because it changed trajectories; top-2 is greedy-only:
 
 ```sh
 export DS4_TP_GREEDY_TOP2=1
 export DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
-export DS4_ROCM_Q8_DECODE_PAIR_DP4A=1
-export DS4_ROCM_Q8_DP4A_SHAPE_DISPATCH=1
+export DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
 ```
 
 ## Fixed-workload results

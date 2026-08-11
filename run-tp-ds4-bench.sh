@@ -31,6 +31,14 @@ SHOW_OUTPUT=${DS4_BENCH_SHOW_OUTPUT:-0}
 CANDIDATE=${DS4_BENCH_CANDIDATE:-0}
 EXPECTED_FNV64=${DS4_BENCH_EXPECT_FNV64:-}
 TP_TIMEOUT_SEC=${DS4_BENCH_TP_TIMEOUT_SEC:-60}
+TP_TIMEOUT_EXPLICIT=${DS4_BENCH_TP_TIMEOUT_SEC+x}
+DECODE_SELF_CHECK=${DS4_BENCH_DECODE_SELF_CHECK:-0}
+TEACHER_FORCE_CONTROL=${DS4_BENCH_TEACHER_FORCE_CONTROL:-0}
+QUALITY=${DS4_BENCH_QUALITY:-0}
+ALLOW_NONSTANDARD_SPLIT=${DS4_BENCH_ALLOW_NONSTANDARD_SPLIT:-0}
+EXPECT_GREEDY_TOP2=0
+CANDIDATE_ARGS=()
+CLEAN_ENV=(env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8)
 PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2 "$PEER_MGMT")
 PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2)
 
@@ -38,13 +46,69 @@ PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4
 [[ $TOKENS =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid generated-token count" >&2; exit 2; }
 (( CONTEXT > FRONTIER + TOKENS )) || { echo "error: context must exceed frontier + tokens" >&2; exit 2; }
 [[ $TP_TIMEOUT_SEC =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid TP timeout" >&2; exit 2; }
+if [[ $ROCPROF == 1 && -z $TP_TIMEOUT_EXPLICIT ]]; then
+  # Coordinator-only tracing can delay one rank substantially. This affects
+  # diagnostics only; production retains the 60-second fail-closed timeout.
+  TP_TIMEOUT_SEC=300
+fi
+if [[ -n ${DS4_TP_EXPERT_SPLIT+x} ]]; then
+  echo "error: ambient DS4_TP_EXPERT_SPLIT is not accepted; pass inference settings as trailing NAME=VALUE arguments" >&2
+  exit 2
+fi
 if [[ $CANDIDATE == 1 ]]; then
   [[ $EXPECTED_FNV64 =~ ^[0-9a-fA-F]{16}$ ]] || {
     echo "error: candidate runs require DS4_BENCH_EXPECT_FNV64" >&2; exit 2;
   }
   SHOW_OUTPUT=1
+  CANDIDATE_ARGS=(--semantic-smoke)
+  if [[ $ROCPROF != 0 ]]; then
+    echo "error: candidate timing cannot run under rocprof" >&2
+    exit 2
+  fi
 elif [[ $CANDIDATE != 0 ]]; then
   echo "error: DS4_BENCH_CANDIDATE must be 0 or 1" >&2
+  exit 2
+fi
+for env_kv in "${EXTRA_ENV[@]}"; do
+  [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
+    echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
+    exit 2
+  }
+  if [[ $env_kv == DS4_TP_EXPERT_SPLIT=* && $DSPARK == 0 ]]; then
+    if [[ $CANDIDATE == 1 || $ALLOW_NONSTANDARD_SPLIT != 1 ]]; then
+      echo "error: non-DSpark production/candidate runs require the balanced 128/128 expert split" >&2
+      echo "error: reserve DS4_TP_EXPERT_SPLIT=118 (46/54) for DSpark; set DS4_BENCH_ALLOW_NONSTANDARD_SPLIT=1 only for diagnostics" >&2
+      exit 2
+    fi
+    echo "warning: running a nonstandard non-DSpark expert split; result is diagnostic only" >&2
+  fi
+  case $env_kv in
+    DS4_TP_GREEDY_TOP2=|DS4_TP_GREEDY_TOP2=0) ;;
+    DS4_TP_GREEDY_TOP2=*) EXPECT_GREEDY_TOP2=1 ;;
+  esac
+  if [[ $CANDIDATE == 1 ]]; then
+    case $env_kv in
+      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*)
+        echo "error: candidate timing cannot enable graph dumps, profilers, or reference oracles: ${env_kv%%=*}" >&2
+        exit 2
+        ;;
+    esac
+  fi
+done
+if [[ $DECODE_SELF_CHECK == 1 ]]; then
+  CANDIDATE_ARGS+=(--decode-self-check)
+elif [[ $DECODE_SELF_CHECK != 0 ]]; then
+  echo "error: DS4_BENCH_DECODE_SELF_CHECK must be 0 or 1" >&2
+  exit 2
+fi
+if [[ $TEACHER_FORCE_CONTROL == 1 ]]; then
+  CANDIDATE_ARGS+=(--teacher-force-control)
+elif [[ $TEACHER_FORCE_CONTROL != 0 ]]; then
+  echo "error: DS4_BENCH_TEACHER_FORCE_CONTROL must be 0 or 1" >&2
+  exit 2
+fi
+if [[ $DECODE_SELF_CHECK == 1 && $TEACHER_FORCE_CONTROL == 1 ]]; then
+  echo "error: choose only one TP decode diagnostic per run" >&2
   exit 2
 fi
 
@@ -72,8 +136,18 @@ COMMON_ENV=(
 )
 WORKER_ENV=("${COMMON_ENV[@]}")
 COORD_ENV=("${COMMON_ENV[@]}")
+if [[ $CANDIDATE == 1 && $EXPECT_GREEDY_TOP2 == 1 ]]; then
+  COORD_ENV+=(DS4_BENCH_EXPECT_GREEDY_TOP2=1)
+fi
 WORKER_ARGS=()
 COORD_ARGS=()
+if [[ $QUALITY == 1 ]]; then
+  WORKER_ARGS+=(--quality)
+  COORD_ARGS+=(--quality)
+elif [[ $QUALITY != 0 ]]; then
+  echo "error: DS4_BENCH_QUALITY must be 0 or 1" >&2
+  exit 2
+fi
 if [[ $SHOW_OUTPUT == 1 ]]; then
   COORD_ARGS+=(--show-output)
 elif [[ $SHOW_OUTPUT != 0 ]]; then
@@ -247,7 +321,7 @@ echo "ds4_bench_tp_sha256: $LOCAL_BENCH_HASH"
 echo "model_sample_sha256: $LOCAL_MODEL_FINGERPRINT"
 if [[ $DSPARK == 1 ]]; then echo "mtp_sample_sha256: $LOCAL_MTP_FINGERPRINT resident_q8=1"; fi
 
-WORKER_CMD=(env "${WORKER_ENV[@]}" ./ds4
+WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}" ./ds4
   --role worker --tensor-parallel --coordinator "$COORDINATOR_ADDR" 9000
   --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
   --prefill-chunk "$PREFILL_CHUNK"
@@ -263,8 +337,8 @@ COORD_CMD=("$REPO/ds4-bench-tp")
 if [[ $ROCPROF == 1 ]]; then
   ROCPROF_OUT="$OUT/rocprof-$TAG"
   mkdir -p "$ROCPROF_OUT"
-  ROCPROF_PERIOD=${DS4_BENCH_ROCPROF_PERIOD:-70:30:1}
-  ROCPROF_TRACE=(--runtime-trace)
+  ROCPROF_TRACE=(--runtime-trace --selected-regions)
+  COORD_ENV+=(DS4_BENCH_ROCPROF_SELECTED_REGIONS=1)
   if [[ $ROCPROF_RUNTIME == 1 ]]; then
     # Gate-A diagnostics need both GPU dispatch intervals and the host HIP API
     # calls which submitted them. Runtime tracing is heavy and its timing is
@@ -278,7 +352,7 @@ if [[ $ROCPROF == 1 ]]; then
     echo "error: DS4_BENCH_ROCPROF_RUNTIME must be 1" >&2
     exit 2
   fi
-  COORD_CMD=(rocprofv3 "${ROCPROF_TRACE[@]}" --collection-period "$ROCPROF_PERIOD"
+  COORD_CMD=(rocprofv3 "${ROCPROF_TRACE[@]}"
              --stats --summary --summary-units usec
              --output-directory "$ROCPROF_OUT" -- "$REPO/ds4-bench-tp")
 elif [[ $ROCPROF != 0 ]]; then
@@ -286,11 +360,12 @@ elif [[ $ROCPROF != 0 ]]; then
   exit 2
 fi
 
-env "${COORD_ENV[@]}" "${COORD_CMD[@]}" \
+"${CLEAN_ENV[@]}" "${COORD_ENV[@]}" "${COORD_CMD[@]}" \
   --role coordinator --tensor-parallel --listen 0.0.0.0 9000 \
   --transport rdma --rocm -m "$MODEL" --prompt-file "$PROMPT_FILE" \
   --ctx-start "$FRONTIER" --ctx-max "$FRONTIER" --ctx-alloc "$CONTEXT" \
   --prefill-chunk "$PREFILL_CHUNK" --gen-tokens "$TOKENS" --csv "$CSV" \
+  "${CANDIDATE_ARGS[@]}" \
   "${COORD_ARGS[@]}" \
   > "$COORD_LOG" 2>&1
 
@@ -302,7 +377,11 @@ wait_worker 180 || {
 WORKER_STARTED=0
 trap - EXIT
 "${PEER_SCP[@]}" "$PEER_MGMT:$WORKER_LOG" "$WORKER_LOG"
+if [[ $DECODE_SELF_CHECK == 1 || $TEACHER_FORCE_CONTROL == 1 ]]; then
+  echo "TP_DECODE_DIAGNOSTIC_DONE"
+  exit 0
+fi
 "$REPO/scripts/check-ds4-bench-result.sh" \
-  "$CSV" "$COORD_LOG" "$WORKER_LOG" "$EXPECTED_FNV64" "$TOKENS"
+  "$CSV" "$COORD_LOG" "$WORKER_LOG" "$EXPECTED_FNV64" "$TOKENS" "$CANDIDATE"
 cat "$CSV"
 echo RUN_DONE

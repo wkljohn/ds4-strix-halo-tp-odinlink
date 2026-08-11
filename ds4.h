@@ -366,6 +366,9 @@ int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
+/* Returns a token id, or -1 when the active compact-logits mode cannot satisfy
+ * the requested sampling policy (for example temperature sampling under TP
+ * greedy-top2). */
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,

@@ -16312,15 +16312,45 @@ static ds4_gpu_tensor *metal_graph_alloc_kv_cache_tensor(bool managed, uint64_t 
  * isolated here.
  */
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+
 typedef struct {
     int init;
     const char *prefix;
     const char *name;
     int layer_set;
     uint32_t layer;
+    int layer2_set;
+    uint32_t layer2;
     int pos_set;
     uint32_t pos;
+    int pos2_set;
+    uint32_t pos2;
 } metal_graph_debug_config;
+
+static void metal_graph_debug_parse_pair(
+        const char *value,
+        int *first_set,
+        uint32_t *first,
+        int *second_set,
+        uint32_t *second) {
+    if (!value || !value[0]) return;
+    char *end = NULL;
+    const unsigned long a = strtoul(value, &end, 10);
+    if (end == value || a > UINT32_MAX) return;
+    *first_set = 1;
+    *first = (uint32_t)a;
+    while (*end && isspace((unsigned char)*end)) end++;
+    if (*end != ',') return;
+    const char *next = end + 1;
+    while (*next && isspace((unsigned char)*next)) next++;
+    const unsigned long b = strtoul(next, &end, 10);
+    if (end == next || b > UINT32_MAX) return;
+    while (*end && isspace((unsigned char)*end)) end++;
+    if (*end != '\0') return;
+    *second_set = 1;
+    *second = (uint32_t)b;
+}
 
 static const metal_graph_debug_config *metal_graph_debug_get_config(void) {
     static metal_graph_debug_config cfg;
@@ -16336,15 +16366,17 @@ static const metal_graph_debug_config *metal_graph_debug_get_config(void) {
         const char *layer_env = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_LAYER",
                                                     "DS4_METAL_GRAPH_DUMP_LAYER");
         if (layer_env && layer_env[0] && strcmp(layer_env, "all") != 0) {
-            cfg.layer_set = 1;
-            cfg.layer = (uint32_t)strtoul(layer_env, NULL, 10);
+            metal_graph_debug_parse_pair(layer_env,
+                                         &cfg.layer_set, &cfg.layer,
+                                         &cfg.layer2_set, &cfg.layer2);
         }
 
         const char *pos_env = glm_graph_env_value("DS4_ROCM_GRAPH_DUMP_POS",
                                                   "DS4_METAL_GRAPH_DUMP_POS");
         if (pos_env && pos_env[0]) {
-            cfg.pos_set = 1;
-            cfg.pos = (uint32_t)strtoul(pos_env, NULL, 10);
+            metal_graph_debug_parse_pair(pos_env,
+                                         &cfg.pos_set, &cfg.pos,
+                                         &cfg.pos2_set, &cfg.pos2);
         }
     }
     return &cfg;
@@ -16354,8 +16386,10 @@ static const char *metal_graph_debug_prefix_for(const char *name, uint32_t il, u
     const metal_graph_debug_config *cfg = metal_graph_debug_get_config();
     if (!cfg->prefix) return NULL;
     if (cfg->name && strstr(cfg->name, name) == NULL) return NULL;
-    if (cfg->layer_set && cfg->layer != il) return NULL;
-    if (cfg->pos_set && cfg->pos != pos) return NULL;
+    if (cfg->layer_set && cfg->layer != il &&
+        (!cfg->layer2_set || cfg->layer2 != il)) return NULL;
+    if (cfg->pos_set && cfg->pos != pos &&
+        (!cfg->pos2_set || cfg->pos2 != pos)) return NULL;
     return cfg->prefix;
 }
 
@@ -16487,6 +16521,243 @@ static void metal_graph_debug_dump_i32_tensor(
         fprintf(stderr, "ds4: failed to resume Metal command batch after dumping %s layer %u pos %u\n", name, il, pos);
     }
 }
+
+/* Diagnostic-only TP oracle for the FFN half of one decode layer.  It starts
+ * from the actual post-attention HC state, recomputes the complete (unsharded)
+ * FFN with the CPU reference, and compares that with the sum of the existing
+ * local and peer TP partials.  Reading the partials directly is important: it
+ * leaves the production fused two-partial HC expansion in place, so the probe
+ * can distinguish bad FFN partials from a bad fused HC expansion without
+ * perturbing the path being diagnosed.  The two selectors are required so an
+ * accidental environment leak cannot add readbacks or CPU work to production
+ * inference. */
+static bool metal_graph_debug_compare_tp_ffn_reference(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        int                     token) {
+#ifdef DS4_ROCM_BUILD
+    static int initialized;
+    static long selected_layer = -1;
+    static long selected_pos[2] = {-1, -1};
+    static uint32_t n_selected_pos;
+    static bool reported[DS4_MAX_LAYER][2];
+    if (!initialized) {
+        initialized = 1;
+        const char *layer_env = getenv("DS4_ROCM_TP_REFERENCE_FFN_LAYER");
+        const char *pos_env = getenv("DS4_ROCM_TP_REFERENCE_FFN_POS");
+        if (layer_env && layer_env[0] && pos_env && pos_env[0]) {
+            char *layer_end = NULL;
+            char *pos_end = NULL;
+            const bool all_layers = strcmp(layer_env, "all") == 0;
+            const long parsed_layer =
+                all_layers ? -2 : strtol(layer_env, &layer_end, 10);
+            selected_pos[0] = strtol(pos_env, &pos_end, 10);
+            bool pos_valid = pos_end != pos_env;
+            n_selected_pos = 1;
+            if (pos_end && *pos_end == ',') {
+                const char *second = pos_end + 1;
+                selected_pos[1] = strtol(second, &pos_end, 10);
+                pos_valid = pos_valid && pos_end != second;
+                n_selected_pos = 2;
+            }
+            if ((all_layers ||
+                 (layer_end != layer_env && *layer_end == '\0' &&
+                  parsed_layer >= 0 && parsed_layer < (long)DS4_N_LAYER)) &&
+                pos_valid && *pos_end == '\0' &&
+                selected_pos[0] >= 0 &&
+                (n_selected_pos == 1 || selected_pos[1] >= 0)) {
+                selected_layer = parsed_layer;
+            } else {
+                fprintf(stderr,
+                        "ds4: invalid TP FFN reference selector layer=%s pos=%s\n",
+                        layer_env, pos_env);
+                selected_layer = -1;
+                n_selected_pos = 0;
+            }
+        }
+    }
+    int selected_pos_index = -1;
+    for (uint32_t i = 0; i < n_selected_pos; i++) {
+        if (selected_pos[i] == (long)pos) selected_pos_index = (int)i;
+    }
+    if (!g || g->tp_world != 2 ||
+        (selected_layer != -2 && selected_layer != (long)il) ||
+        selected_pos_index < 0 || reported[il][selected_pos_index]) {
+        return true;
+    }
+    reported[il][selected_pos_index] = true;
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    float *gpu_after_attn = xmalloc((size_t)hc_dim * sizeof(float));
+    float *gpu_ffn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_ffn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_ffn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_ffn_peer = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+    float *gpu_after_ffn = xmalloc((size_t)hc_dim * sizeof(float));
+    int gpu_selected[DS4_MAX_EXPERT_USED];
+    float gpu_weights[DS4_MAX_EXPERT_USED];
+    float *cpu_after_ffn = xmalloc((size_t)hc_dim * sizeof(float));
+    int cpu_selected[DS4_MAX_EXPERT_USED];
+    float cpu_weights[DS4_MAX_EXPERT_USED];
+
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t selected_bytes =
+        (uint64_t)DS4_N_EXPERT_USED * sizeof(gpu_selected[0]);
+    const uint64_t weights_bytes =
+        (uint64_t)DS4_N_EXPERT_USED * sizeof(gpu_weights[0]);
+    const char *failed_read = NULL;
+    bool ok = ds4_gpu_synchronize() != 0;
+#define TP_FFN_REFERENCE_READ(label, tensor, destination, bytes) do {       \
+        const ds4_gpu_tensor *read_tensor = (tensor);                       \
+        if (ok && (!read_tensor ||                                          \
+                   ds4_gpu_tensor_read(read_tensor, 0, destination, bytes) == 0)) { \
+            failed_read = label;                                            \
+            ok = false;                                                     \
+        }                                                                   \
+    } while (0)
+    TP_FFN_REFERENCE_READ("after_attn_hc", metal_graph_after_attn_hc(g),
+                          gpu_after_attn, hc_dim * sizeof(float));
+    TP_FFN_REFERENCE_READ("ffn_cur", metal_graph_ffn_cur(g),
+                          gpu_ffn_cur, embd_bytes);
+    TP_FFN_REFERENCE_READ("ffn_norm", metal_graph_ffn_norm(g),
+                          gpu_ffn_norm, embd_bytes);
+    TP_FFN_REFERENCE_READ("router_selected", metal_graph_router_selected(g),
+                          gpu_selected, selected_bytes);
+    TP_FFN_REFERENCE_READ("router_weights", metal_graph_router_weights(g),
+                          gpu_weights, weights_bytes);
+    const uint32_t tp_slot =
+        il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
+    TP_FFN_REFERENCE_READ("tp_ffn_local", g->tp_out[tp_slot],
+                          gpu_ffn_out, embd_bytes);
+    TP_FFN_REFERENCE_READ("tp_ffn_peer", g->tp_in[tp_slot],
+                          gpu_ffn_peer, embd_bytes);
+    TP_FFN_REFERENCE_READ("after_ffn_hc", metal_graph_after_ffn_hc(g),
+                          gpu_after_ffn, hc_dim * sizeof(float));
+#undef TP_FFN_REFERENCE_READ
+
+    if (ok) {
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+            gpu_ffn_out[i] += gpu_ffn_peer[i];
+        }
+    }
+
+    ds4_cpu_decode_scratch scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    if (ok) {
+        cpu_decode_scratch_init(&scratch, pos + 1u);
+        layer_ffn_one_decode_scratch(cpu_after_ffn, model, layer,
+                                     gpu_after_attn, il, token,
+                                     NULL, 0.0f, &scratch);
+        if (layer->ffn_gate_tid2eid) {
+            layer_hash_selected_experts(cpu_selected, model, layer, token);
+            layer_hash_router_weights_one(cpu_weights, model, layer,
+                                          scratch.ffn_norm, cpu_selected);
+        } else {
+            layer_topk_selected_experts(cpu_selected, cpu_weights, model,
+                                        layer, scratch.ffn_norm);
+        }
+
+        fprintf(stderr,
+                "ds4: TP FFN reference rank=%d layer=%u pos=%u token=%d "
+                "pre_max=%.9g pre_rms=%.9g norm_max=%.9g norm_rms=%.9g "
+                "weights_max=%.9g ffn_max=%.9g ffn_rms=%.9g "
+                "hc_max=%.9g hc_rms=%.9g selected_match=%d\n",
+                g->tp_rank, il, pos, token,
+                max_abs_diff(scratch.ffn_cur, gpu_ffn_cur, DS4_N_EMBD),
+                rms_abs_diff(scratch.ffn_cur, gpu_ffn_cur, DS4_N_EMBD),
+                max_abs_diff(scratch.ffn_norm, gpu_ffn_norm, DS4_N_EMBD),
+                rms_abs_diff(scratch.ffn_norm, gpu_ffn_norm, DS4_N_EMBD),
+                max_abs_diff(cpu_weights, gpu_weights, DS4_N_EXPERT_USED),
+                max_abs_diff(scratch.ffn_out, gpu_ffn_out, DS4_N_EMBD),
+                rms_abs_diff(scratch.ffn_out, gpu_ffn_out, DS4_N_EMBD),
+                max_abs_diff(cpu_after_ffn, gpu_after_ffn, hc_dim),
+                rms_abs_diff(cpu_after_ffn, gpu_after_ffn, hc_dim),
+                memcmp(cpu_selected, gpu_selected,
+                       DS4_N_EXPERT_USED * sizeof(cpu_selected[0])) == 0);
+        fprintf(stderr, "ds4: TP FFN reference selected cpu=[");
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            fprintf(stderr, "%s%d", i ? "," : "", cpu_selected[i]);
+        }
+        fprintf(stderr, "] gpu=[");
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            fprintf(stderr, "%s%d", i ? "," : "", gpu_selected[i]);
+        }
+        fprintf(stderr, "]\n");
+        cpu_decode_scratch_free(&scratch);
+    } else {
+        fprintf(stderr,
+                "ds4: TP FFN reference failed rank=%d layer=%u pos=%u "
+                "read=%s\n",
+                g ? (int)g->tp_rank : -1, il, pos,
+                failed_read ? failed_read : "synchronize");
+    }
+
+    free(cpu_after_ffn);
+    free(gpu_after_ffn);
+    free(gpu_ffn_peer);
+    free(gpu_ffn_out);
+    free(gpu_ffn_norm);
+    free(gpu_ffn_cur);
+    free(gpu_after_attn);
+
+    if (ds4_gpu_begin_commands() == 0) {
+        fprintf(stderr,
+                "ds4: failed to resume ROCm commands after TP FFN reference "
+                "layer=%u pos=%u\n", il, pos);
+        return false;
+    }
+    return ok;
+#else
+    (void)g;
+    (void)model;
+    (void)layer;
+    (void)il;
+    (void)pos;
+    (void)token;
+    return true;
+#endif
+}
+
+#else
+
+static inline bool metal_graph_debug_wants(
+        const char *name, uint32_t il, uint32_t pos) {
+    (void)name;
+    (void)il;
+    (void)pos;
+    return false;
+}
+
+static inline void metal_graph_debug_dump_tensor(
+        const char *name, ds4_gpu_tensor *t, uint64_t n_f32,
+        uint32_t il, uint32_t pos) {
+    (void)name; (void)t; (void)n_f32; (void)il; (void)pos;
+}
+
+static inline void metal_graph_debug_dump_f16_tensor(
+        const char *name, ds4_gpu_tensor *t, uint64_t n_f16,
+        uint32_t il, uint32_t pos) {
+    (void)name; (void)t; (void)n_f16; (void)il; (void)pos;
+}
+
+static inline void metal_graph_debug_dump_i32_tensor(
+        const char *name, ds4_gpu_tensor *t, uint64_t n_i32,
+        uint32_t il, uint32_t pos) {
+    (void)name; (void)t; (void)n_i32; (void)il; (void)pos;
+}
+
+static inline bool metal_graph_debug_compare_tp_ffn_reference(
+        ds4_gpu_graph *g, const ds4_model *model,
+        const ds4_layer_weights *layer, uint32_t il, uint32_t pos,
+        int token) {
+    (void)g; (void)model; (void)layer; (void)il; (void)pos; (void)token;
+    return true;
+}
+
+#endif
 
 static bool metal_graph_needs_ffn_out(const ds4_gpu_graph *g, uint32_t il, uint32_t pos) {
     return metal_graph_directional_steering_ffn_enabled(g) ||
@@ -17738,10 +18009,10 @@ static bool metal_graph_stream_decode_layer_batch_enabled(
                                    "DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") ||
             glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE",
                                   "DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE")) &&
-           !glm_graph_env_present("DS4_ROCM_DECODE_STAGE_PROFILE",
-                                  "DS4_METAL_DECODE_STAGE_PROFILE") &&
-           !glm_graph_env_present("DS4_ROCM_GRAPH_DUMP_PREFIX",
-                                  "DS4_METAL_GRAPH_DUMP_PREFIX");
+           !DS4_PROFILE_ENV_PRESENT("DS4_ROCM_DECODE_STAGE_PROFILE",
+                                    "DS4_METAL_DECODE_STAGE_PROFILE") &&
+           !DS4_PROFILE_ENV_PRESENT("DS4_ROCM_GRAPH_DUMP_PREFIX",
+                                    "DS4_METAL_GRAPH_DUMP_PREFIX");
 }
 
 static void metal_graph_stream_readahead_range_impl(
@@ -19835,8 +20106,27 @@ static uint32_t metal_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph 
 static bool metal_graph_env_flag(const char *name, int *cache) {
     if (*cache == -1) {
 #ifdef DS4_ROCM_BUILD
-        (void)name;
-        *cache = 0;
+        static const char metal_prefix[] = "DS4_METAL_";
+        char rocm_name[128];
+        const char *env = NULL;
+
+        /* The graph is shared by Metal and ROCm, including its unfused
+         * reference implementations.  Historically ROCm forced every one of
+         * these diagnostic selectors off, which made --quality unable to
+         * isolate graph-level fusion errors.  Give ROCm an explicitly named
+         * switch without letting a Metal setting unexpectedly alter it. */
+        if (!strncmp(name, metal_prefix, sizeof(metal_prefix) - 1)) {
+            int n = snprintf(rocm_name, sizeof(rocm_name), "DS4_ROCM_%s",
+                             name + sizeof(metal_prefix) - 1);
+            if (n > 0 && (size_t)n < sizeof(rocm_name)) {
+                env = DS4_PROFILE_ENV(rocm_name);
+            }
+        }
+        *cache = env && env[0] && strcmp(env, "0") != 0;
+        if (*cache) {
+            fprintf(stderr, "ds4: ROCm graph reference selector active: %s\n",
+                    rocm_name);
+        }
 #else
         const char *env = getenv(name);
         *cache = env && env[0] && strcmp(env, "0") != 0;
@@ -22846,6 +23136,7 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         ds4_gpu_tensor *peer_heads = cuda_tp_attn_peer_read ?
             metal_graph_heads(g) : g->heads_by_tier[cuda_tp_partner_tier];
+        ds4_gpu_tensor peer_heads_owned_view;
         ok = (cuda_tp_attn_heads_active || cuda_tp_attn_peer_read || peer_heads_dst) &&
              peer_heads_src && peer_heads &&
              g->attn_low_by_tier[cuda_tp_partner_tier] &&
@@ -22856,6 +23147,16 @@ static bool metal_graph_encode_decode_layer_phase(
                                           tp_heads_bytes) != 0;
         } else if (ok && cuda_tp_attn_peer_read) {
             ok = ds4_gpu_tensor_wait_xdev(peer_heads_src, cuda_tp_partner_tier) != 0;
+        }
+        if (ok) {
+            /* The TP projection API consumes owned heads compactly. The
+             * optional same-process partner path stores its upper half in a
+             * full-width staging tensor, so present that half as a compact
+             * view rather than applying group0 twice. */
+            ok = metal_graph_borrow_tensor_view(&peer_heads_owned_view,
+                                                peer_heads,
+                                                tp_heads_off,
+                                                tp_heads_bytes);
         }
         if (ok) ok = ds4_gpu_set_current_device(cuda_tp_partner_tier) == 0;
         if (ok) {
@@ -22872,7 +23173,7 @@ static bool metal_graph_encode_decode_layer_phase(
                     tp_groups,
                     tp_groups,
                     DS4_N_EMBD,
-                    peer_heads) != 0;
+                    &peer_heads_owned_view) != 0;
         }
         if (ok) ok = ds4_gpu_set_current_device(cuda_tp_home_tier) == 0;
         if (ok && fuse_tp_attn_out_hc) {
@@ -23010,7 +23311,22 @@ static bool metal_graph_encode_decode_layer_phase(
         DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_ATTN_GATE);
         if (ok) {
             ds4_gpu_tensor *first = g->tp_rank == 0 ? g->tp_out[slot] : g->tp_in[slot];
-            if (metal_graph_directional_steering_attn_enabled(g)) {
+            bool materialize_tp_attn = false;
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+            static int materialize_tp_attn_cached = -1;
+            if (materialize_tp_attn_cached == -1) {
+                const char *env = getenv("DS4_ROCM_TP_MATERIALIZE_ATTN_OUT");
+                materialize_tp_attn_cached =
+                    env && env[0] && strcmp(env, "0") != 0;
+                if (materialize_tp_attn_cached) {
+                    fprintf(stderr,
+                            "ds4: ROCm TP diagnostic: materializing attention reductions\n");
+                }
+            }
+            materialize_tp_attn = materialize_tp_attn_cached != 0;
+#endif
+            if (metal_graph_directional_steering_attn_enabled(g) ||
+                materialize_tp_attn) {
                 ds4_gpu_tensor *second = g->tp_rank == 0 ? g->tp_in[slot] : g->tp_out[slot];
                 ok = ds4_gpu_add_tensor(metal_graph_attn_out(g), first, second, DS4_N_EMBD) != 0;
             } else {
@@ -24378,6 +24694,10 @@ static bool metal_graph_encode_decode_layer_phase(
 #undef DS4_ROCM_DECODE_ATTN_EVENT
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
+    }
+    if (ok) {
+        ok = metal_graph_debug_compare_tp_ffn_reference(
+                g, model, layer, il, pos, token);
     }
     return ok;
 }
@@ -27125,6 +27445,8 @@ static bool metal_graph_indexer_stage_profile_boundary(
     return ds4_gpu_begin_commands() != 0;
 }
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+
 static bool metal_graph_env_value_eq(const char *v,
                                      size_t      n,
                                      const char *literal) {
@@ -27169,7 +27491,6 @@ static bool metal_graph_stage_profile_enabled_for_layer(
         const char *flag_env_name,
         const char *layer_env_name,
         uint32_t    il) {
-#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     size_t flag_len = 0;
     const char *flag = metal_graph_env_trim(getenv(flag_env_name), &flag_len);
     if (!flag) return false;
@@ -27195,13 +27516,21 @@ static bool metal_graph_stage_profile_enabled_for_layer(
     }
 
     return metal_graph_profile_layer_value_match(layer_env, il);
+}
+
 #else
+
+static inline bool metal_graph_stage_profile_enabled_for_layer(
+        const char *flag_env_name,
+        const char *layer_env_name,
+        uint32_t    il) {
     (void)flag_env_name;
     (void)layer_env_name;
     (void)il;
     return false;
-#endif
 }
+
+#endif
 
 static bool metal_graph_layer_stage_profile_enabled(uint32_t il) {
     return metal_graph_stage_profile_enabled_for_layer(
@@ -31998,6 +32327,8 @@ static bool metal_graph_encode_dspark_next_stage_draft_input_from(
                                (uint64_t)dw->block_size * hc_bytes) != 0;
 }
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+
 static bool metal_graph_profile_layer_env_match(const char *env_name, uint32_t il) {
     const char *layer_env = getenv(env_name);
     if (!layer_env || !layer_env[0]) return true;
@@ -32011,15 +32342,19 @@ static bool metal_graph_profile_layer_env_match(const char *env_name, uint32_t i
 }
 
 static bool metal_graph_dspark_stage_profile_enabled(uint32_t stage) {
-#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     return getenv("DS4_DSPARK_STAGE_PROFILE") != NULL &&
            metal_graph_profile_layer_env_match("DS4_DSPARK_STAGE_PROFILE_STAGE",
                                                stage);
+}
+
 #else
+
+static inline bool metal_graph_dspark_stage_profile_enabled(uint32_t stage) {
     (void)stage;
     return false;
-#endif
 }
+
+#endif
 
 static uint32_t metal_graph_dspark_support_topk(void) {
     const char *env = getenv("DS4_DSPARK_SUPPORT_TOPK");
@@ -60792,12 +61127,20 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
-int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
-    if (!s || !s->logits) return -1;
-    const bool tp_top2 = s->engine && s->engine->tp.active &&
-        s->engine->tp.rank == 0 && s->tp_peer_top2_valid &&
+static bool ds4_session_tp_greedy_top2(const ds4_session *s) {
+    return s && s->engine && s->engine->tp.active &&
+        s->engine->tp.rank == 0 &&
         (ds4_tp_runtime_features(s->engine->tp.ctx) &
          DS4_TP_FEATURE_GREEDY_TOP2) != 0u;
+}
+
+int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+    if (!s || !s->logits) return -1;
+    const bool tp_top2 = ds4_session_tp_greedy_top2(s);
+    /* In this negotiated mode rank 0 intentionally materializes only its
+     * lower vocab half.  Never fall back to scanning the stale upper half if
+     * the worker candidate frame is absent. */
+    if (tp_top2 && !s->tp_peer_top2_valid) return -1;
     const uint32_t limit = tp_top2 ? DS4_N_VOCAB / 2u : DS4_N_VOCAB;
     int best = -1;
     float best_logit = DS4_NEG_INF;
@@ -60840,12 +61183,21 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    if (!s || !s->logits) return -1;
+    /* GREEDY_TOP2 is a compact representation, not a complete logits row:
+     * rank 0 owns its lower half plus rank 1's two best candidates.  Greedy
+     * argmax can consume it exactly, while probabilistic sampling cannot. */
+    if (ds4_session_tp_greedy_top2(s)) {
+        if (temperature <= 0.0f) return ds4_session_argmax(s);
+        return -1;
+    }
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
+    if (ds4_session_tp_greedy_top2(s)) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -60883,6 +61235,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+    if (ds4_session_tp_greedy_top2(s)) return 0;
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -60905,6 +61258,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+    if (ds4_session_tp_greedy_top2(s)) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
 }
@@ -67324,6 +67678,7 @@ void ds4_session_invalidate(ds4_session *s) {
     }
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
+    s->tp_peer_top2_valid = false;
     s->mtp_draft_valid = false;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
@@ -67339,6 +67694,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
+    s->tp_peer_top2_valid = false;
     s->mtp_draft_valid = false;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU

@@ -11454,6 +11454,12 @@ decode_again:
         }
         int token = ds4_session_sample(slot->session, temperature, top_k,
                                        top_p, min_p, &rng);
+        if (token < 0) {
+            snprintf(err, sizeof(err),
+                     "sampling policy is unavailable for the active TP logits mode");
+            finish = "error";
+            break;
+        }
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {

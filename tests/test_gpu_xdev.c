@@ -15,7 +15,12 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 
+#ifdef DS4_ROCM_BUILD
+#include <hip/hip_runtime.h>
+#define cudaGetDeviceCount hipGetDeviceCount
+#else
 #include <cuda_runtime.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1653,6 +1658,12 @@ static int run_attention_output_tp(void) {
     CHECK(ds4_gpu_tensor_write(&heads, 0, host_heads,
                                (uint64_t)n_groups * group_dim * sizeof(float)),
           "attention_tp write heads");
+    ds4_gpu_tensor *heads0 = ds4_gpu_tensor_view(
+            &heads, 0, (uint64_t)group_cnt * group_dim * sizeof(float));
+    ds4_gpu_tensor *heads1 = ds4_gpu_tensor_view(
+            &heads, (uint64_t)group_cnt * group_dim * sizeof(float),
+            (uint64_t)group_cnt * group_dim * sizeof(float));
+    CHECK(heads0 && heads1, "attention_tp compact head views");
 
     int ok = ds4_gpu_attention_output_q8_batch_tensor(&full, &low, NULL, NULL,
                                                       model, model_size,
@@ -1665,13 +1676,13 @@ static int run_attention_output_tp(void) {
                                                    0, b_off,
                                                    group_dim, rank,
                                                    n_groups, 0, group_cnt,
-                                                   out_dim, &heads) &&
+                                                   out_dim, heads0) &&
              ds4_gpu_attention_output_q8_tp_tensor(&p1, &low1,
                                                    model, model_size,
                                                    0, b_off,
                                                    group_dim, rank,
                                                    n_groups, group_cnt, group_cnt,
-                                                   out_dim, &heads) &&
+                                                   out_dim, heads1) &&
              ds4_gpu_add_tensor(&sum, &p0, &p1, (uint32_t)out_dim) &&
              ds4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
              ds4_gpu_tensor_read(&sum, 0, host_sum, out_dim * sizeof(float));
@@ -1686,6 +1697,8 @@ static int run_attention_output_tp(void) {
         }
     }
 
+    ds4_gpu_tensor_free(heads0);
+    ds4_gpu_tensor_free(heads1);
     ds4_gpu_tensor_free_in_place(&heads);
     ds4_gpu_tensor_free_in_place(&low);
     ds4_gpu_tensor_free_in_place(&low0);
@@ -1785,6 +1798,12 @@ static int run_attention_output_tp_peer_read(void) {
     CHECK(ds4_gpu_tensor_write(&heads, 0, host_heads,
                                (uint64_t)n_groups * group_dim * sizeof(float)),
           "attention_peer write heads");
+    ds4_gpu_tensor *heads0 = ds4_gpu_tensor_view(
+            &heads, 0, (uint64_t)group_cnt * group_dim * sizeof(float));
+    ds4_gpu_tensor *heads1 = ds4_gpu_tensor_view(
+            &heads, (uint64_t)group_cnt * group_dim * sizeof(float),
+            (uint64_t)group_cnt * group_dim * sizeof(float));
+    CHECK(heads0 && heads1, "attention_peer compact head views");
 
     int ok = ds4_gpu_attention_output_q8_batch_tensor(&full, &low, NULL, NULL,
                                                       model, model_size,
@@ -1797,7 +1816,7 @@ static int run_attention_output_tp_peer_read(void) {
                                                    0, b_off,
                                                    group_dim, rank,
                                                    n_groups, 0, group_cnt,
-                                                   out_dim, &heads) &&
+                                                   out_dim, heads0) &&
              ds4_gpu_tensor_wait_xdev(&heads, 1) &&
              ds4_gpu_set_current_device(1) == 0 &&
              ds4_gpu_attention_output_q8_tp_tensor(&p1, &low1,
@@ -1805,7 +1824,7 @@ static int run_attention_output_tp_peer_read(void) {
                                                    0, b_off,
                                                    group_dim, rank,
                                                    n_groups, group_cnt, group_cnt,
-                                                   out_dim, &heads) &&
+                                                   out_dim, heads1) &&
              ds4_gpu_set_current_device(0) == 0 &&
              ds4_gpu_add_xdev_tensor(&sum, &p0, &p1, &staging, (uint32_t)out_dim) &&
              ds4_gpu_tensor_read(&full, 0, host_full, out_dim * sizeof(float)) &&
@@ -1821,6 +1840,8 @@ static int run_attention_output_tp_peer_read(void) {
         }
     }
 
+    ds4_gpu_tensor_free(heads0);
+    ds4_gpu_tensor_free(heads1);
     ds4_gpu_tensor_free_in_place(&heads);
     ds4_gpu_tensor_free_in_place(&low);
     ds4_gpu_tensor_free_in_place(&low0);

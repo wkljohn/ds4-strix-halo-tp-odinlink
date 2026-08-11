@@ -1150,6 +1150,8 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
     return tp_rdma_drain_cq_observe(tp, 0, NULL, NULL, NULL);
 }
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+
 typedef struct {
     uint64_t gates;
     uint64_t send_cqe_seen;
@@ -1199,7 +1201,6 @@ static void tp_rdma_gate_profile_print(void) {
 }
 
 static int tp_rdma_gate_profile_is_enabled(const ds4_tp *tp) {
-#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_tp_rdma_gate_profile_enabled < 0) {
         const char *s = getenv("DS4_TP_RDMA_GATE_PROFILE");
         g_tp_rdma_gate_profile_enabled =
@@ -1212,11 +1213,16 @@ static int tp_rdma_gate_profile_is_enabled(const ds4_tp *tp) {
         }
     }
     return g_tp_rdma_gate_profile_enabled;
+}
+
 #else
+
+static inline int tp_rdma_gate_profile_is_enabled(const ds4_tp *tp) {
     (void)tp;
     return 0;
-#endif
 }
+
+#endif
 
 /* Arm the receive for gate seq: UC delivery order pairs the peer's seq'th
  * send with our seq'th posted recv, landing it in the in-slot the combine
@@ -1261,8 +1267,10 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const int gate_profile = gate < 2u && tp_rdma_gate_profile_is_enabled(tp);
     const double profile_start = gate_profile ? tp_now_sec() : 0.0;
+#endif
     /* DS4-TP-gfx1151 (patch 17): getenv is a linear scan of environ and this is
      * on the per-gate path. Cache it. */
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
@@ -1280,16 +1288,22 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     }
     const uintptr_t send_base =
         (uintptr_t)(tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes);
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const double lock_start = gate_profile ? tp_now_sec() : 0.0;
+#endif
     pthread_mutex_lock(&r->post_lock);
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const double lock_end = gate_profile ? tp_now_sec() : 0.0;
+#endif
     int ok = 1;
     if (!r->recv_window_active) {
         for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
             ok = tp_rdma_post_gate_recv(tp, s);
         if (ok) r->recv_window_active = true;
     }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const double post_send_start = gate_profile ? tp_now_sec() : 0.0;
+#endif
     for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
         const uint64_t len = tp->vec_bytes - off > r->decode_max_msg ?
             r->decode_max_msg : tp->vec_bytes - off;
@@ -1312,15 +1326,20 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         }
         off += len;
     }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const double post_send_end = gate_profile ? tp_now_sec() : 0.0;
+#endif
 
     double deadline = 0.0;
     uint32_t peer_poll = 0;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     uint32_t profile_cqes = 0;
     uint64_t profile_poll_calls = 0;
     int profile_send_seen = 0;
     double profile_send_seen_at = 0.0;
+#endif
     while (ok && r->recv_done < seq) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
         int saw_send = 0;
         if (gate_profile) {
             profile_poll_calls++;
@@ -1333,6 +1352,9 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         } else {
             ok = tp_rdma_drain_cq(tp);
         }
+#else
+        ok = tp_rdma_drain_cq(tp);
+#endif
         if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
             fprintf(stderr, "ds4-tp: peer disconnected during RDMA gate\n");
             ok = 0;
@@ -1344,12 +1366,17 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             ok = 0;
         }
     }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const double peer_recv_end = gate_profile ? tp_now_sec() : 0.0;
     const double replenish_start = gate_profile ? tp_now_sec() : 0.0;
+#endif
     if (ok) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const double replenish_end = gate_profile ? tp_now_sec() : 0.0;
+#endif
     if (ok) r->last_gate_seq = seq;
     pthread_mutex_unlock(&r->post_lock);
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (gate_profile && ok) {
         ds4_tp_rdma_gate_profile_stat *s = &g_tp_rdma_gate_profile[gate];
         s->gates++;
@@ -1365,6 +1392,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         s->replenish_s += replenish_end - replenish_start;
         s->total_s += tp_now_sec() - profile_start;
     }
+#endif
     return ok;
 }
 

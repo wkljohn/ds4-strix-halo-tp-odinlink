@@ -8570,6 +8570,12 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 status_greedy_sampling = greedy_sampling;
             }
             int token = worker_sample_with_mode(w, cfg, greedy_sampling, &rng);
+            if (token < 0) {
+                agent_dsml_parser_free(&dsml);
+                agent_set_error(w,
+                                "sampling policy is unavailable for the active TP logits mode");
+                return 1;
+            }
             if (ds4_token_is_stop_for_think_mode(w->engine, token, think_mode)) {
                 if (tool_syntax == AGENT_TOOL_SYNTAX_GLM &&
                     token != ds4_token_eos(w->engine)) {
@@ -8813,6 +8819,12 @@ static int worker_run_raw_prompt(agent_worker *w, const char *user_text) {
                                        cfg->gen.top_p,
                                        cfg->gen.min_p,
                                        &rng);
+        if (token < 0) {
+            agent_set_error(w,
+                            "sampling policy is unavailable for the active TP logits mode");
+            ds4_tokens_free(&prompt);
+            return 1;
+        }
         if (ds4_token_is_stop(w->engine, token)) break;
 
         size_t text_len = 0;

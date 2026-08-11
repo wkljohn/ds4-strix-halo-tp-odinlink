@@ -2,7 +2,7 @@
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
 Thunderbolt RDMA. The validated cache-free Q4_K production path reaches
-**161.60 t/s prefill** and **12.16 t/s decode** at 2,048 tokens of live
+**165.16 t/s prefill** and **12.40 t/s decode** at 2,048 tokens of live
 context. It computes full output logits on rank 0 and rejects trajectory-
 changing benchmark shortcuts. Metal, CUDA, generic verbs, and single-node
 modes remain available.
@@ -17,15 +17,25 @@ modes remain available.
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration run | **30.38 t/s** | **7.58 t/s** | baseline |
 | **Current Q2_K** | same workload | — | — | revalidation pending |
-| **Current Q4_K** | 46/54 split, exact rank-0 full logits | **161.60 t/s** | **12.16 t/s** | **production; fingerprint `cee523f4fc8b1608`** |
+| **Current Q4_K** | balanced 50/50, exact rank-0 full logits | **165.16 t/s** | **12.40 t/s** | **production; fingerprint `752795b2398ef49c`** |
 | **Current Q4_K + DSpark** | 46/54 split, diagnostic run | 168.65 t/s | 11.41 t/s | experimental; target fingerprint mismatch |
 
 These are `ds4-bench-tp` results over mandatory RDMA. The current Q4_K row is
-the latest completed production-validation run. Older 14.31 t/s ordinary and
+the fastest valid post-repair production-validation run; a fresh fail-closed
+replay measured 156.41/12.21 t/s with the same fingerprint. Older 14.31 t/s ordinary and
 16.22 t/s DSpark claims are intentionally withdrawn: their configurations do
 not pass the token-fingerprint gate. DSpark remains available for research but
 is not the deployment default until its verified trajectory matches target-only
 decode.
+
+For greedy decoding only, the repaired split-head switch
+`DS4_TP_GREEDY_TOP2=1` measured **154.40 t/s prefill and 12.54 t/s decode** on
+the same 2,048+300 workload and reproduced fingerprint `752795b2398ef49c`.
+Its immediately preceding full-head control measured 154.88/12.32 t/s, so
+prefill was unchanged within 0.31% while decode improved 1.79%.
+It keeps rank 0's local logits half and receives rank 1's two best candidates.
+The mode deliberately fails closed for temperature sampling and logprob/full-
+logit APIs, so the general production default remains rank-0 full logits.
 
 Q2_K and Q4_K use the cache-free default. Experimental DSpark optionally keeps
 its Q8 drafter on rank 0 and warns before reserving the additional 10.15 GiB.
@@ -48,15 +58,31 @@ candidates must also match a known exact token fingerprint:
 
 ```sh
 DS4_BENCH_CANDIDATE=1 \
-DS4_BENCH_EXPECT_FNV64=cee523f4fc8b1608 \
+DS4_BENCH_EXPECT_FNV64=752795b2398ef49c \
   ./run-tp-ds4-bench.sh q4-candidate \
+  /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
+
+# Optional exact greedy-only output-head split
+DS4_BENCH_CANDIDATE=1 \
+DS4_BENCH_EXPECT_FNV64=752795b2398ef49c \
+  ./run-tp-ds4-bench.sh q4-greedy-top2 \
   /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf \
-  DS4_TP_EXPERT_SPLIT=118
+  DS4_TP_GREEDY_TOP2=1
 ```
 
-That fingerprint is specific to the documented model, prompt, 118/138 split,
-and 300-token workload. A mismatch, short generation, transport error, or RDMA
-fallback makes the run fail instead of becoming a performance candidate.
+That fingerprint is specific to the documented model, prompt, balanced 128/128
+split, and 300-token workload. It is a deterministic self-regression gate, not
+proof of exact llama.cpp numerical parity. A mismatch, short generation,
+transport error, or RDMA fallback makes the run fail instead of becoming a
+performance candidate. Candidate mode also runs a thinking semantic smoke in
+an isolated session and rejects profiling/dump instrumentation.
+
+An intentional numerical correction must be rebaselined rather than forced to
+match the old fingerprint: first pass the corrected 84-step teacher control,
+compare full logits at the first changed boundary, pass the thinking semantic
+suite, then record a new three-run candidate median and fingerprint. Ordinary
+decode remains balanced 128/128; the launcher supplies 118/138 only for
+DSpark.
 
 All Strix Halo acceleration is included in this fork—no external kernel patch
 is required. OdinLink-specific provider tuning is used only when its provider

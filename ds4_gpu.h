@@ -368,9 +368,10 @@ int ds4_gpu_tp_failed(void);
  * full projection.
  *
  * ds4_gpu_attention_output_q8_tp_tensor is the group-sliced attention output
- * pair: low projection for groups [group0, group0+group_cnt) plus the
+ * pair: low projection for weights [group0, group0+group_cnt) plus the
  * matching k-slice of the expand projection, producing this rank's partial
- * attention block output (n_tokens == 1 only). */
+ * attention block output (n_tokens == 1 only). The heads tensor is compact:
+ * it contains exactly group_cnt groups at offset zero. */
 int ds4_gpu_matmul_q8_0_kslice_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

@@ -15878,14 +15878,15 @@ extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
     const uint64_t k_off = (uint64_t)group0 * rank;
     const uint64_t k_cnt = (uint64_t)group_cnt * rank;
     if ((k_off % 32u) != 0 || (k_cnt % 32u) != 0) return 0;
-    if (heads->bytes < (uint64_t)(group0 + group_cnt) * group_dim * sizeof(float) ||
+    /* heads is the compact rank-local activation slice. group0 chooses the
+     * matching weight groups, not an additional activation offset. */
+    if (heads->bytes < (uint64_t)group_cnt * group_dim * sizeof(float) ||
         low->bytes < k_cnt * sizeof(float) ||
         out->bytes < out_dim * sizeof(float)) {
         return 0;
     }
 
     ds4_gpu_tensor heads_slice = *heads;
-    heads_slice.ptr = (char *)heads->ptr + (uint64_t)group0 * group_dim * sizeof(float);
     heads_slice.bytes = (uint64_t)group_cnt * group_dim * sizeof(float);
     heads_slice.owner = 0;
 

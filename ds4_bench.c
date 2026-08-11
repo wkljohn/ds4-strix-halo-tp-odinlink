@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <limits.h>
 #include <math.h>
 #include <stdbool.h>
@@ -63,12 +64,44 @@ typedef struct {
     bool dspark;
     bool dspark_strict;
     bool show_output;
+    bool semantic_smoke;
+    bool decode_self_check;
+    bool teacher_force_control;
 } bench_config;
 
 static double bench_now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+/* rocprofv3 --selected-regions keeps profiling overhead out of model loading
+ * and prefill. Resolve ROCTx dynamically so normal benchmark binaries do not
+ * acquire a profiler-library dependency. */
+static void bench_rocprof_selected_region(bool resume) {
+    if (getenv("DS4_BENCH_ROCPROF_SELECTED_REGIONS") == NULL) return;
+    typedef int (*control_fn)(uint64_t);
+    static int initialized;
+    static control_fn pause_fn;
+    static control_fn resume_fn;
+    static void *roctx_handle;
+    if (!initialized) {
+        initialized = 1;
+        roctx_handle = dlopen("librocprofiler-sdk-roctx.so",
+                             RTLD_NOW | RTLD_GLOBAL);
+        void *scope = roctx_handle ? roctx_handle : RTLD_DEFAULT;
+        pause_fn = (control_fn)dlsym(scope, "roctxProfilerPause");
+        resume_fn = (control_fn)dlsym(scope, "roctxProfilerResume");
+        if (!pause_fn || !resume_fn) {
+            fprintf(stderr,
+                    "ds4-bench: rocprof selected-region control unavailable\n");
+        }
+    }
+    control_fn fn = resume ? resume_fn : pause_fn;
+    if (fn && fn(0) != 0) {
+        fprintf(stderr, "ds4-bench: rocprof selected-region %s failed\n",
+                resume ? "resume" : "pause");
+    }
 }
 
 static uint64_t bench_token_hash_update(uint64_t hash, int token) {
@@ -367,6 +400,12 @@ static bench_config parse_options(int argc, char **argv) {
             c.warm_weights = true;
         } else if (!strcmp(arg, "--show-output")) {
             c.show_output = true;
+        } else if (!strcmp(arg, "--semantic-smoke")) {
+            c.semantic_smoke = true;
+        } else if (!strcmp(arg, "--decode-self-check")) {
+            c.decode_self_check = true;
+        } else if (!strcmp(arg, "--teacher-force-control")) {
+            c.teacher_force_control = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -415,6 +454,394 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     return c;
+}
+
+static bool semantic_answer_is_four(const char *text) {
+    static const char close_tag[] = "</think>";
+    const char *tail = NULL;
+    const char *scan = text ? text : "";
+    while ((scan = strstr(scan, close_tag)) != NULL) {
+        tail = scan + sizeof(close_tag) - 1;
+        scan = tail;
+    }
+    if (!tail) return false;
+    /* Judge the final numeric answer, not every digit in the explanation.
+     * Correct concise forms such as "2+2 = 4" must not fail merely because
+     * the operands are repeated after </think>. */
+    unsigned long last = 0;
+    bool have_number = false;
+    while (*tail) {
+        if (*tail < '0' || *tail > '9') {
+            tail++;
+            continue;
+        }
+        unsigned long value = 0;
+        do {
+            const unsigned digit = (unsigned)(*tail - '0');
+            if (value > (ULONG_MAX - digit) / 10u) return false;
+            value = value * 10u + digit;
+            tail++;
+        } while (*tail >= '0' && *tail <= '9');
+        last = value;
+        have_number = true;
+    }
+    return have_number && last == 4u;
+}
+
+static int run_semantic_smoke(ds4_engine *engine, ds4_session *session) {
+    static const char question[] = "What is 2+2? Answer clearly and briefly.";
+    enum { max_tokens = 256 };
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, NULL, question, DS4_THINK_HIGH, &prompt);
+
+    char err[256] = "";
+    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-bench: semantic smoke prefill failed: %s\n", err);
+        ds4_tokens_free(&prompt);
+        return 1;
+    }
+
+    if (getenv("DS4_BENCH_EXPECT_GREEDY_TOP2") != NULL) {
+        uint64_t probe_rng = UINT64_C(1);
+        ds4_token_score score[2];
+        const int vocab = ds4_engine_vocab_size(engine);
+        float *logits = malloc((size_t)vocab * sizeof(*logits));
+        const bool fail_closed = logits &&
+            ds4_session_sample(session, 0.7f, 0, 1.0f, 0.0f,
+                               &probe_rng) < 0 &&
+            ds4_session_top_logprobs(session, score, 2) == 0 &&
+            ds4_session_token_logprob(session, 0, &score[0]) == 0 &&
+            ds4_session_copy_logits(session, logits, vocab) == 0;
+        free(logits);
+        if (!fail_closed) {
+            fprintf(stderr,
+                    "ds4-bench: greedy top2 incomplete-logits consumers did not fail closed\n");
+            ds4_tokens_free(&prompt);
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4-bench: greedy top2 incomplete-logits consumers fail closed\n");
+    }
+
+    size_t text_len = 0;
+    size_t text_cap = 4096;
+    char *text = malloc(text_cap);
+    if (!text) {
+        fprintf(stderr, "ds4-bench: semantic smoke out of memory\n");
+        ds4_tokens_free(&prompt);
+        return 1;
+    }
+    text[0] = '\0';
+
+    uint64_t rng = UINT64_C(1);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    int generated = 0;
+    bool stopped = false;
+    const bool speculative =
+        ds4_engine_mtp_draft_tokens(engine) > 1 &&
+        getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+
+    while (generated < max_tokens && !stopped) {
+        int accepted[17];
+        int accepted_n = 1;
+        accepted[0] = ds4_session_sample(session, 0.0f, 0, 1.0f, 0.0f, &rng);
+        if (accepted[0] < 0) {
+            snprintf(err, sizeof(err), "sampling failed");
+            accepted_n = -1;
+        } else if (ds4_token_is_stop_for_think_mode(
+                       engine, accepted[0], DS4_THINK_HIGH)) {
+            stopped = true;
+            break;
+        } else if (speculative) {
+            accepted_n = ds4_session_eval_speculative_argmax(
+                session, accepted[0], max_tokens - generated,
+                ds4_token_eos(engine), accepted,
+                (int)(sizeof(accepted) / sizeof(accepted[0])),
+                err, sizeof(err));
+        }
+
+        if (accepted_n < 0) {
+            fprintf(stderr, "ds4-bench: semantic smoke decode failed: %s\n", err);
+            free(text);
+            ds4_tokens_free(&prompt);
+            return 1;
+        }
+
+        for (int i = 0; i < accepted_n && generated < max_tokens; i++) {
+            const int token = accepted[i];
+            if (ds4_token_is_stop_for_think_mode(engine, token, DS4_THINK_HIGH)) {
+                stopped = true;
+                break;
+            }
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(engine, token, &piece_len);
+            if (piece_len > SIZE_MAX - text_len - 1) {
+                free(piece);
+                free(text);
+                ds4_tokens_free(&prompt);
+                return 1;
+            }
+            if (text_len + piece_len + 1 > text_cap) {
+                size_t next_cap = text_cap;
+                while (next_cap < text_len + piece_len + 1) next_cap *= 2;
+                char *next = realloc(text, next_cap);
+                if (!next) {
+                    free(piece);
+                    free(text);
+                    ds4_tokens_free(&prompt);
+                    return 1;
+                }
+                text = next;
+                text_cap = next_cap;
+            }
+            if (piece_len) memcpy(text + text_len, piece, piece_len);
+            text_len += piece_len;
+            text[text_len] = '\0';
+            free(piece);
+            hash = bench_token_hash_update(hash, token);
+            generated++;
+        }
+
+        if (!speculative && !stopped && generated < max_tokens) {
+            if (ds4_session_eval(session, accepted[0], err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4-bench: semantic smoke decode failed: %s\n", err);
+                free(text);
+                ds4_tokens_free(&prompt);
+                return 1;
+            }
+        }
+    }
+
+    const bool valid = stopped && semantic_answer_is_four(text);
+    fprintf(stderr,
+            "ds4-bench: semantic smoke %s tokens=%d fnv64=%016llx output=\"%s\"\n",
+            valid ? "passed" : "FAILED",
+            generated,
+            (unsigned long long)hash,
+            text);
+    free(text);
+    ds4_tokens_free(&prompt);
+    return valid ? 0 : 1;
+}
+
+static int run_decode_self_check(ds4_engine *engine, ds4_session *incremental,
+                                 int ctx_size) {
+    static const char question[] = "What is 2+2? Answer clearly and briefly.";
+    static const int checkpoints[] = {1, 2, 4, 8, 16, 32, 64, 128, 256};
+    enum { steps = 256 };
+    const int ncheck = (int)(sizeof(checkpoints) / sizeof(checkpoints[0]));
+    const int vocab = ds4_engine_vocab_size(engine);
+    const size_t logits_per_check = (size_t)vocab;
+
+    ds4_tokens prompt = {0};
+    ds4_encode_chat_prompt(engine, NULL, question, DS4_THINK_HIGH, &prompt);
+    char err[256] = "";
+    if (ds4_session_sync(incremental, &prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-bench: decode self-check prefill failed: %s\n", err);
+        ds4_tokens_free(&prompt);
+        return 1;
+    }
+
+    int *tokens = malloc((size_t)steps * sizeof(tokens[0]));
+    float *incremental_logits = malloc((size_t)ncheck * logits_per_check *
+                                       sizeof(incremental_logits[0]));
+    float *batched_logits = malloc(logits_per_check * sizeof(batched_logits[0]));
+    if (!tokens || !incremental_logits || !batched_logits) {
+        fprintf(stderr, "ds4-bench: decode self-check out of memory\n");
+        free(tokens);
+        free(incremental_logits);
+        free(batched_logits);
+        ds4_tokens_free(&prompt);
+        return 1;
+    }
+
+    int check_index = 0;
+    for (int step = 1; step <= steps; step++) {
+        tokens[step - 1] = ds4_session_argmax(incremental);
+        if (tokens[step - 1] < 0 ||
+            ds4_session_eval(incremental, tokens[step - 1],
+                             err, sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: decode self-check incremental step %d failed: %s\n",
+                    step, err);
+            free(tokens);
+            free(incremental_logits);
+            free(batched_logits);
+            ds4_tokens_free(&prompt);
+            return 1;
+        }
+        if (check_index < ncheck && step == checkpoints[check_index]) {
+            if (ds4_session_copy_logits(
+                    incremental,
+                    incremental_logits + (size_t)check_index * logits_per_check,
+                    vocab) != vocab) {
+                fprintf(stderr,
+                        "ds4-bench: decode self-check could not copy incremental logits at %d\n",
+                        step);
+                free(tokens);
+                free(incremental_logits);
+                free(batched_logits);
+                ds4_tokens_free(&prompt);
+                return 1;
+            }
+            check_index++;
+        }
+    }
+
+    int argmax_mismatches = 0;
+    int first_argmax_mismatch = 0;
+    for (int ci = 0; ci < ncheck; ci++) {
+        ds4_tokens full = {0};
+        ds4_tokens_copy(&full, &prompt);
+        for (int i = 0; i < checkpoints[ci]; i++) {
+            ds4_tokens_push(&full, tokens[i]);
+        }
+
+        ds4_session *batched = NULL;
+        if (ds4_session_create(&batched, engine, ctx_size) != 0 ||
+            ds4_session_sync(batched, &full, err, sizeof(err)) != 0 ||
+            ds4_session_copy_logits(batched, batched_logits, vocab) != vocab) {
+            fprintf(stderr,
+                    "ds4-bench: decode self-check batched checkpoint %d failed: %s\n",
+                    checkpoints[ci], err);
+            ds4_session_free(batched);
+            ds4_tokens_free(&full);
+            free(tokens);
+            free(incremental_logits);
+            free(batched_logits);
+            ds4_tokens_free(&prompt);
+            return 1;
+        }
+
+        const float *inc = incremental_logits + (size_t)ci * logits_per_check;
+        double sum_sq = 0.0;
+        float max_abs = 0.0f;
+        int differing = 0;
+        int inc_argmax = -1;
+        float inc_best = -INFINITY;
+        for (int i = 0; i < vocab; i++) {
+            float d = fabsf(inc[i] - batched_logits[i]);
+            if (!isfinite(d)) d = INFINITY;
+            if (d > max_abs) max_abs = d;
+            sum_sq += (double)d * (double)d;
+            if (memcmp(&inc[i], &batched_logits[i], sizeof(float)) != 0) differing++;
+            if (inc_argmax < 0 || inc[i] > inc_best) {
+                inc_argmax = i;
+                inc_best = inc[i];
+            }
+        }
+        const int batch_argmax = ds4_session_argmax(batched);
+        if (inc_argmax != batch_argmax) {
+            argmax_mismatches++;
+            if (!first_argmax_mismatch) first_argmax_mismatch = checkpoints[ci];
+        }
+        fprintf(stderr,
+                "ds4-bench: decode self-check step=%d incremental_argmax=%d "
+                "batched_argmax=%d max_abs=%g rms=%g differing=%d\n",
+                checkpoints[ci], inc_argmax, batch_argmax, max_abs,
+                sqrt(sum_sq / (double)vocab), differing);
+
+        ds4_session_free(batched);
+        ds4_tokens_free(&full);
+    }
+    fprintf(stderr,
+            "ds4-bench: decode self-check complete steps=%d checkpoints=%d "
+            "argmax_mismatches=%d first_argmax_mismatch=%d\n",
+            steps, ncheck, argmax_mismatches, first_argmax_mismatch);
+
+    free(tokens);
+    free(incremental_logits);
+    free(batched_logits);
+    ds4_tokens_free(&prompt);
+    return 0;
+}
+
+static int run_teacher_force_control(ds4_engine *engine, ds4_session *session) {
+    static const char question[] = "What is 2+2? Answer clearly and briefly.";
+    static const char reference_text[] =
+        "1.  **Analyze the User's Request**:\n"
+        "    *   Question: \"What is 2+2?\"\n"
+        "    *   Constraint: \"Answer clearly and briefly.\"\n\n"
+        "2.  **Determine the Answer**:\n"
+        "    *   2 + 2 = 4.\n\n"
+        "3.  **Format the Output**:\n"
+        "    *   Keep it extremely brief and clear. No extra fluff."
+        "</think>4";
+
+    ds4_tokens prompt = {0};
+    ds4_tokens reference = {0};
+    ds4_encode_chat_prompt(engine, NULL, question, DS4_THINK_HIGH, &prompt);
+    ds4_tokenize_rendered_chat(engine, reference_text, &reference);
+    ds4_tokens_push(&reference, ds4_token_eos(engine));
+
+    if (getenv("DS4_BENCH_TRACE_TEACHER_TOKENS")) {
+        fprintf(stderr, "ds4-bench: teacher-force prompt tokens=%d ids=", prompt.len);
+        for (int i = 0; i < prompt.len; i++) {
+            fprintf(stderr, "%s%d", i ? "," : "", prompt.v[i]);
+        }
+        fprintf(stderr, "\n");
+        fprintf(stderr, "ds4-bench: teacher-force reference tokens=%d ids=", reference.len);
+        for (int i = 0; i < reference.len; i++) {
+            fprintf(stderr, "%s%d", i ? "," : "", reference.v[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    char err[256] = "";
+    if (ds4_session_sync(session, &prompt, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-bench: teacher-force control prefill failed: %s\n", err);
+        ds4_tokens_free(&prompt);
+        ds4_tokens_free(&reference);
+        return 1;
+    }
+
+    int mismatches = 0;
+    int first_mismatch = 0;
+    int near_tie_mismatches = 0;
+    float worst_teacher_gap = 0.0f;
+    for (int step = 0; step < reference.len; step++) {
+        ds4_token_score top[2];
+        ds4_token_score teacher;
+        if (ds4_session_top_logprobs(session, top, 2) != 2 ||
+            ds4_session_token_logprob(session, reference.v[step], &teacher) != 1) {
+            fprintf(stderr,
+                    "ds4-bench: teacher-force control could not read logits at step %d\n",
+                    step);
+            ds4_tokens_free(&prompt);
+            ds4_tokens_free(&reference);
+            return 1;
+        }
+        if (top[0].id != reference.v[step]) {
+            const float margin = top[0].logit - top[1].logit;
+            const float teacher_gap = top[0].logit - teacher.logit;
+            mismatches++;
+            if (!first_mismatch) first_mismatch = step + 1;
+            if (margin <= 0.25f || teacher_gap <= 0.25f) near_tie_mismatches++;
+            if (teacher_gap > worst_teacher_gap) worst_teacher_gap = teacher_gap;
+            fprintf(stderr,
+                    "ds4-bench: teacher-force mismatch step=%d teacher=%d top1=%d "
+                    "top2=%d top1_margin=%g teacher_gap=%g\n",
+                    step + 1, reference.v[step], top[0].id, top[1].id,
+                    margin, teacher_gap);
+        }
+        if (step + 1 < reference.len &&
+            ds4_session_eval(session, reference.v[step], err, sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: teacher-force control decode step %d failed: %s\n",
+                    step + 1, err);
+            ds4_tokens_free(&prompt);
+            ds4_tokens_free(&reference);
+            return 1;
+        }
+    }
+    fprintf(stderr,
+            "ds4-bench: teacher-force control complete tokens=%d mismatches=%d "
+            "first_mismatch=%d near_tie_mismatches=%d worst_teacher_gap=%g\n",
+            reference.len, mismatches, first_mismatch, near_tie_mismatches,
+            worst_teacher_gap);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&reference);
+    return 0;
 }
 
 static void json_write_string(FILE *fp, const char *s) {
@@ -739,6 +1166,44 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+    if (cfg.decode_self_check) {
+        const int self_check_rc =
+            run_decode_self_check(engine, session, cfg.ctx_alloc);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        if (tp_leader) ds4_tp_send_stop(tp_leader);
+        ds4_engine_close(engine);
+        return self_check_rc;
+    }
+    if (cfg.teacher_force_control) {
+        const int teacher_rc = run_teacher_force_control(engine, session);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        if (tp_leader) ds4_tp_send_stop(tp_leader);
+        ds4_engine_close(engine);
+        return teacher_rc;
+    }
+    if (cfg.semantic_smoke) {
+        if (run_semantic_smoke(engine, session) != 0) {
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            if (tp_leader) ds4_tp_send_stop(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        /* A preflight must not share KV/cache/session state with the measured
+         * workload.  Recreate the session while retaining resident weights. */
+        ds4_session_free(session);
+        session = NULL;
+        if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: failed to recreate session after semantic smoke\n");
+            ds4_tokens_free(&prompt);
+            if (tp_leader) ds4_tp_send_stop(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
     maybe_warn_distributed_step_shape(&cfg, session);
 
     FILE *out = stdout;
@@ -818,6 +1283,7 @@ int main(int argc, char **argv) {
             }
         }
 
+        bench_rocprof_selected_region(true);
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
@@ -887,6 +1353,7 @@ int main(int argc, char **argv) {
             }
         }
         const double gen_t1 = bench_now_sec();
+        bench_rocprof_selected_region(false);
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
             for (int i = 0; i < gen_token_count; i++) {
