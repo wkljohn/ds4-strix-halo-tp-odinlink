@@ -1992,6 +1992,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
         uint32_t n_expert,
+        uint32_t skip_zero_weight,
         uint32_t write_aux,
         float clamp) {
     uint32_t lane = threadIdx.x & 7u;
@@ -2000,7 +2001,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
     uint32_t tok = pair / n_expert;
     uint32_t slot = pair - tok * n_expert;
     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) {
+    const float route_weight = weights[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0 || (skip_zero_weight && route_weight == 0.0f)) {
         for (uint32_t rr = 0; rr < 4u; rr++) {
             const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
             if (row >= expert_mid_dim || lane != 0u) continue;
@@ -2039,7 +2041,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_qwarp32_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * route_weight;
         }
     }
 }
@@ -2065,6 +2067,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_staged_xq_kernel(
         uint32_t xq_blocks,
         uint32_t expert_mid_dim,
         uint32_t n_expert,
+        uint32_t skip_zero_weight,
         uint32_t write_aux,
         float clamp) {
     const uint32_t lane = threadIdx.x & 7u;
@@ -2073,7 +2076,8 @@ __global__ static void moe_gate_up_mid_decode_q4K_staged_xq_kernel(
     const uint32_t tok = pair / n_expert;
     const uint32_t slot = pair - tok * n_expert;
     const int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
-    if (expert_i < 0) {
+    const float route_weight = weights[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0 || (skip_zero_weight && route_weight == 0.0f)) {
         for (uint32_t rr = 0; rr < 4u; rr++) {
             const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
             if (row >= expert_mid_dim || lane != 0u) continue;
@@ -2124,8 +2128,7 @@ __global__ static void moe_gate_up_mid_decode_q4K_staged_xq_kernel(
                 gate_out[off] = gate;
                 up_out[off] = up;
             }
-            mid_out[off] = (gate / (1.0f + expf(-gate))) * up *
-                           weights[(uint64_t)tok * n_expert + slot];
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * route_weight;
         }
     }
 }
@@ -2358,14 +2361,17 @@ __global__ static void moe_down_iq2_sum_qwarp32_ptrs_batch_kernel(
 
 __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         float *out,
+        const float *add_in,
         const char *down_base,
         const cuda_block_q8_K *midq,
         const int32_t *selected,
+        const float *weights,
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t midq_blocks,
         uint32_t out_dim,
-        uint32_t n_expert) {
+        uint32_t n_expert,
+        uint32_t skip_zero_weight) {
     uint32_t lane = threadIdx.x & 7u;
     uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
     if (row >= out_dim) return;
@@ -2373,6 +2379,7 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     #pragma unroll
     for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
         if (slot >= n_expert) continue;
+        if (skip_zero_weight && weights[slot] == 0.0f) continue;
         int32_t expert_i = selected[slot];
         if (expert_i < 0) continue;
         const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
@@ -2382,7 +2389,7 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         acc = quarter_warp_sum_f32(acc, lane);
         if (lane == 0) total += acc;
     }
-    if (lane == 0) out[row] = total;
+    if (lane == 0) out[row] = add_in ? total + add_in[row] : total;
 }
 
 __global__ static void moe_down_q4K_qwarp32_kernel(

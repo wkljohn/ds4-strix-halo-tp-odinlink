@@ -1069,9 +1069,12 @@ static int routed_moe_launch(
         uint32_t n_expert,
         float clamp,
         const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *add_in,
+        int *add_fused_out,
         uint32_t layer_index,
         uint32_t n_tokens,
         bool force_resident) {
+    if (add_fused_out) *add_fused_out = 0;
     if (gate_type == 39u || down_type == 39u) {
         if (gate_type != 39u || down_type != 39u) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -1375,21 +1378,6 @@ static int routed_moe_launch(
                         pair_count);
                 ok = cuda_ok(cudaGetLastError(),
                              "routed_moe Q4_K L2 pair order launch");
-            }
-        }
-        /* A negative TP sentinel removes unowned pairs from sorted buckets.
-         * Clear their pair slots before valid pairs overwrite their own rows,
-         * preserving exact zero contribution on the general prefill path. */
-        if (ok && tp_skip_unowned && use_sorted_pairs) {
-            const uint64_t mid_zero_bytes =
-                pair_count64 * (uint64_t)expert_mid_dim * sizeof(float);
-            const uint64_t down_zero_bytes =
-                pair_count64 * (uint64_t)out_dim * sizeof(float);
-            ok = cuda_ok(cudaMemset(mid->ptr, 0, (size_t)mid_zero_bytes),
-                         "routed_moe TP skipped mid clear");
-            if (ok) {
-                ok = cuda_ok(cudaMemset(down->ptr, 0, (size_t)down_zero_bytes),
-                             "routed_moe TP skipped down clear");
             }
         }
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
@@ -1785,6 +1773,7 @@ static int routed_moe_launch(
                         xq_blocks,
                         expert_mid_dim,
                         n_expert,
+                        0u,
                         write_gate_up,
                         clamp);
             } else if (ok && sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts && tile_total && tile_experts && tile_starts) {
@@ -2000,6 +1989,7 @@ static int routed_moe_launch(
                         xq_blocks,
                         expert_mid_dim,
                         n_expert,
+                        tp_skip_unowned && n_tokens == 1u,
                         write_gate_up,
                         clamp);
                     } else {
@@ -2017,6 +2007,7 @@ static int routed_moe_launch(
                         xq_blocks,
                         expert_mid_dim,
                         n_expert,
+                        tp_skip_unowned && n_tokens == 1u,
                         write_gate_up,
                         clamp);
                     }
@@ -2143,7 +2134,8 @@ static int routed_moe_launch(
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts;
         if (ok && !use_iq2_q2_float_down) {
             dim3 midq_grid(midq_blocks, pair_count, 1);
-            q8_K_quantize_kernel<<<midq_grid, 256>>>(midq, (const float *)mid->ptr, expert_mid_dim, pair_count);
+            q8_K_quantize_kernel<<<midq_grid, 256>>>(
+                midq, (const float *)mid->ptr, expert_mid_dim, pair_count);
             ok = cuda_ok(cudaGetLastError(), "routed_moe mid quantize launch");
             if (ok && use_q4k_wmma) {
                 moe_q8_K_to_q8_1_mmq_kernel<<<dim3(pair_count, midq_blocks), 32>>>(
@@ -2225,16 +2217,24 @@ static int routed_moe_launch(
             if (use_direct_down_sum6) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 if (q4k_path) {
+                    const char *fuse_add_env =
+                        getenv("DS4_ROCM_Q4K_DECODE_FUSE_ADDEND");
+                    const uint32_t fuse_add = add_in && fuse_add_env &&
+                        fuse_add_env[0] == '1' && fuse_add_env[1] == '\0';
                     moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
+                        fuse_add ? (const float *)add_in->ptr : NULL,
                         down_w,
                         midq,
                         (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
                         down_expert_bytes,
                         down_row_bytes,
                         midq_blocks,
                         out_dim,
-                        n_expert);
+                        n_expert,
+                        tp_skip_unowned && n_tokens == 1u);
+                    if (fuse_add && add_fused_out) *add_fused_out = 1;
                 } else {
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
@@ -3302,18 +3302,20 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
         down_offset += v.down_off_delta;
         n_total_expert = v.n_total_expert;
     }
+    int add_fused = 0;
     int rc = routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             use_selected, use_weights, n_total_expert, n_expert, clamp, x, layer_index, 1,
+                             use_selected, use_weights, n_total_expert, n_expert,
+                             clamp, x, add_in, &add_fused, layer_index, 1,
                              force_resident);
     /* out_dim, not out->bytes/sizeof(float): the latter is the ALLOCATION size.
      * For the tp_out slab view they coincide, but it is a latent overrun for any
      * caller with a larger buffer. */
-    if (rc && add_in) {
+    if (rc && add_in && !add_fused) {
         if (!ds4_gpu_add_tensor(out, out, add_in, (uint32_t)out_dim)) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "routed MoE addend fold failed\n");
             return 0;
@@ -3369,7 +3371,8 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                                     down_expert_bytes, down_row_bytes,
                                     expert_in_dim, expert_mid_dim, out_dim,
                                     use_selected, use_weights, n_total_expert,
-                                    n_expert, clamp, x, layer_index, n_tokens,
+                                    n_expert, clamp, x, NULL, NULL,
+                                    layer_index, n_tokens,
                                     force_resident);
     if (!rc) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX

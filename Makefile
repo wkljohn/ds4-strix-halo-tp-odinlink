@@ -55,7 +55,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-tp-hello test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-tp-hello test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-q4k-skip-unowned dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
@@ -327,6 +327,16 @@ tests/test_rocm_attention_decode_mixed: tests/test_rocm_attention_decode_mixed.o
 
 test-rocm-attention-decode-mixed: tests/test_rocm_attention_decode_mixed
 	./tests/test_rocm_attention_decode_mixed
+
+tests/test_rocm_q4k_skip_unowned.o: tests/test_rocm_q4k_skip_unowned.cu ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_q4k_skip_unowned: tests/test_rocm_q4k_skip_unowned.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-q4k-skip-unowned: tests/test_rocm_q4k_skip_unowned
+	DS4_ROCM_Q4K_DECODE_STAGE_XQ=1 ./tests/test_rocm_q4k_skip_unowned
+	DS4_ROCM_Q4K_DECODE_STAGE_XQ=0 ./tests/test_rocm_q4k_skip_unowned
 
 tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<

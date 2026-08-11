@@ -1196,18 +1196,17 @@ extern "C" int ds4_gpu_tp_failed(void) { return ds4_tp_fail_get(); }
  * ------------------------------------------------------------------------ */
 __global__ void ds4_tp_shard_remap_kernel(int32_t *sel_dst, float *w_dst,
                                           const int32_t *sel_src, const float *w_src,
-                                          uint32_t n, int32_t lo, int32_t hi,
-                                          int32_t unowned_sentinel) {
+                                          uint32_t n, int32_t lo, int32_t hi) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int32_t e = sel_src[i];
     const bool own = (e >= lo && e < hi);
     /* Rebase onto the shard: the launcher is handed gate/up/down offsets that
      * already start at expert `lo`, so an owned expert must be addressed as
-     * e-lo. Normally unowned pairs get index 0 and weight 0. The experimental
-     * skip path uses -1 instead, allowing Q4_K kernels to avoid the known-zero
-     * dot products while preserving the same zero contribution. */
-    sel_dst[i] = own ? (e - lo) : unowned_sentinel;
+     * e-lo. Unowned pairs retain the validated expert-0/zero-weight encoding.
+     * Optional Q4_K decode skipping keys off that zero weight rather than
+     * introducing a negative expert sentinel into the shared launcher. */
+    sel_dst[i] = own ? (e - lo) : 0;
     w_dst[i]   = own ? w_src[i] : 0.0f;
 }
 
@@ -1254,19 +1253,18 @@ extern "C" int ds4_gpu_tp_expert_shard_remap(
 
     int32_t *sel_dst = (int32_t *)scratch;
     float   *w_dst   = (float *)(sel_dst + n_pairs);
+    const char *skip_env = getenv("DS4_ROCM_TP_SKIP_UNOWNED");
+    static bool logged_zero_weight_skip = false;
+    if (!logged_zero_weight_skip && skip_env &&
+        skip_env[0] == '1' && skip_env[1] == '\0') {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "experimental TP zero-weight Q4_K decode skipping enabled\n");
+        logged_zero_weight_skip = true;
+    }
     const uint32_t threads = 256u;
     const uint32_t blocks = (n_pairs + threads - 1u) / threads;
-    const char *skip_env = getenv("DS4_ROCM_TP_SKIP_UNOWNED");
-    const bool skip_unowned = skip_env && skip_env[0] == '1' && skip_env[1] == '\0';
-    static bool logged_skip_unowned = false;
-    if (skip_unowned && !logged_skip_unowned) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "experimental TP unowned Q4_K expert skipping enabled\n");
-        logged_skip_unowned = true;
-    }
     hipLaunchKernelGGL(ds4_tp_shard_remap_kernel, dim3(blocks), dim3(threads), 0, 0,
-                       sel_dst, w_dst, selected, weights, n_pairs, lo, hi,
-                       skip_unowned ? -1 : 0);
+                       sel_dst, w_dst, selected, weights, n_pairs, lo, hi);
     if (out_selected) *out_selected = sel_dst;
     if (out_weights)  *out_weights  = w_dst;
     if (out_base)     *out_base     = (uint32_t)lo;
