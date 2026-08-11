@@ -22,6 +22,11 @@ explicit RDMA. Native batched-session mode is intentionally not enabled because
 it disables speculative decoding. Profiling and DSpark statistics are also off
 in production.
 
+On the 96 GiB reference nodes this full profile settles near 97--98% reported
+VRAM use. That is expected but leaves little safety margin: do not add resident
+sessions or enable the Q8-to-FP16 weight cache. If another GPU workload must
+share either node, stop this service or lower `CONTEXT` first.
+
 Both nodes need the repository, target GGUF, drafter GGUF, and OdinLink
 provider at the absolute paths configured in `config.env.local`; their
 filesystems are not assumed to be shared. Logs are retained under
