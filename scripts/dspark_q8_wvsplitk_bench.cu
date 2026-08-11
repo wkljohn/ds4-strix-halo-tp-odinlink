@@ -1,6 +1,7 @@
 // Standalone gfx1151 oracle for the DSpark N=5 Q8_0 indexer projection.
 // Compares DS4's current block-per-output-row DP4A schedule with a persistent
-// wavefront-split-K schedule inspired by vLLM's skinny-GEMM design.
+// wavefront-split-K schedule inspired by vLLM's skinny-GEMM design and a
+// zero-persistent-cache, five-row padded FP16-WMMA alternative.
 //
 // Build:
 //   /opt/rocm/bin/hipcc -O3 -ffast-math -fno-finite-math-only \
@@ -53,6 +54,65 @@ __global__ void quantize_q8_0_f32(
     int q = __float2int_rn(xv * id);
     q = q > 127 ? 127 : (q < -128 ? -128 : q);
     xq[((uint64_t)t * blocks + b) * 32 + lane] = (int8_t)q;
+}
+
+typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
+typedef float __attribute__((ext_vector_type(8))) float8_t;
+
+/* Five-row matrix-core oracle. It pads activations to one 16-row tile and
+ * expands only the current Q8 block in registers; no persistent F16 weight
+ * image is allocated. */
+__launch_bounds__(128, 2)
+__global__ void wmma_q8_n5(
+        float *out, const uint8_t *w, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t blocks) {
+    constexpr uint32_t ntok = 5u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t lane = tid & 31u;
+    const uint32_t lane16 = lane & 15u;
+    const uint32_t row0 = (uint32_t)blockIdx.x * 64u;
+    const uint32_t warp_row = row0 + wave * 16u;
+    const uint32_t my_row = warp_row + lane16;
+    const uint32_t safe_row = my_row < out_dim ? my_row : out_dim - 1u;
+    const uint8_t *wr = w + (uint64_t)safe_row * blocks * 34u;
+    __shared__ _Float16 sx[16u * 32u];
+    float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f,
+                    0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint32_t b = 0; b < blocks; ++b) {
+        for (uint32_t j = tid; j < 16u * 32u; j += blockDim.x) {
+            const uint32_t t = j >> 5u;
+            const uint32_t k = j & 31u;
+            sx[j] = t < ntok ? (_Float16)x[(uint64_t)t * in_dim + b * 32u + k]
+                             : (_Float16)0.0f;
+        }
+        __syncthreads();
+        const uint8_t *bp = wr + (uint64_t)b * 34u;
+        _Float16 scale;
+        uint16_t scale_bits;
+        __builtin_memcpy(&scale_bits, bp, sizeof(scale_bits));
+        __builtin_memcpy(&scale, &scale_bits, sizeof(scale));
+        half16_t a0, a1;
+#pragma unroll
+        for (uint32_t i = 0; i < 16u; ++i) {
+            a0[i] = scale * (_Float16)(float)(int)((const int8_t *)(bp + 2u))[i];
+            a1[i] = scale * (_Float16)(float)(int)((const int8_t *)(bp + 18u))[i];
+        }
+        const _Float16 *xb = sx + lane16 * 32u;
+        const half16_t x0 = *(const half16_t *)(xb);
+        const half16_t x1 = *(const half16_t *)(xb + 16u);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, x0, acc);
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, x1, acc);
+        __syncthreads();
+    }
+    const uint32_t t = lane16;
+    if (t < ntok) {
+#pragma unroll
+        for (uint32_t j = 0; j < 8u; ++j) {
+            const uint32_t row = warp_row + 2u * j + (lane >> 4u);
+            if (row < out_dim) out[(uint64_t)t * out_dim + row] = acc[j];
+        }
+    }
 }
 
 template <uint32_t NTOK>
@@ -213,7 +273,7 @@ int main() {
         }
     }
 
-    float *dx, *dout0, *dout1;
+    float *dx, *dout0, *dout1, *dout_wmma;
     int8_t *dxq;
     float *dxs;
     uint8_t *dw;
@@ -223,6 +283,7 @@ int main() {
     HIP_OK(hipMalloc(&dxs, (size_t)ntok * blocks * sizeof(float)));
     HIP_OK(hipMalloc(&dout0, (size_t)ntok * out_dim * sizeof(float)));
     HIP_OK(hipMalloc(&dout1, (size_t)ntok * out_dim * sizeof(float)));
+    HIP_OK(hipMalloc(&dout_wmma, (size_t)ntok * out_dim * sizeof(float)));
     HIP_OK(hipMemcpy(dx, hx.data(), hx.size() * sizeof(float), hipMemcpyHostToDevice));
     HIP_OK(hipMemcpy(dw, hw.data(), hw.size(), hipMemcpyHostToDevice));
     quantize_q8_0_f32<<<dim3(blocks, ntok), 32>>>(dxq, dxs, dx, in_dim);
@@ -233,6 +294,16 @@ int main() {
             dout0, dw, dxq, dxs, blocks, out_dim);
     };
     const double t0 = time_kernel(current);
+    const double current_full_ms = time_kernel([&] {
+        quantize_q8_0_f32<<<dim3(blocks, ntok), 32>>>(
+            dxq, dxs, dx, in_dim);
+        current_dp4a<5><<<(out_dim + 7) / 8, 256>>>(
+            dout0, dw, dxq, dxs, blocks, out_dim);
+    });
+    const double wmma_ms = time_kernel([&] {
+        wmma_q8_n5<<<(out_dim + 63u) / 64u, 128>>>(
+            dout_wmma, dw, dx, in_dim, out_dim, blocks);
+    });
     double best = 1.0e30;
     uint32_t best_y = 0, best_grid = 0;
     for (uint32_t grid_mul : {1u, 2u, 4u}) {
@@ -271,10 +342,14 @@ int main() {
         persistent_dp4a_n5<4><<<best_grid, dim3(32, 16)>>>(
             dout1, dw, dxq, dxs, blocks, out_dim);
     }
+    wmma_q8_n5<<<(out_dim + 63u) / 64u, 128>>>(
+        dout_wmma, dw, dx, in_dim, out_dim, blocks);
     HIP_OK(hipDeviceSynchronize());
-    std::vector<float> h0((size_t)ntok * out_dim), h1(h0.size());
+    std::vector<float> h0((size_t)ntok * out_dim), h1(h0.size()), hw_out(h0.size());
     HIP_OK(hipMemcpy(h0.data(), dout0, h0.size() * sizeof(float), hipMemcpyDeviceToHost));
     HIP_OK(hipMemcpy(h1.data(), dout1, h1.size() * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_OK(hipMemcpy(hw_out.data(), dout_wmma,
+                     hw_out.size() * sizeof(float), hipMemcpyDeviceToHost));
     float max_abs = 0, max_rel = 0;
     size_t bit_diff = 0;
     for (size_t i = 0; i < h0.size(); ++i) {
@@ -286,9 +361,31 @@ int main() {
         std::memcpy(&b, &h1[i], 4);
         bit_diff += a != b;
     }
+    float wmma_max_abs = 0.0f;
+    double wmma_sum_sq = 0.0, ref_sum_sq = 0.0;
+    size_t wmma_bit_diff = 0;
+    for (size_t i = 0; i < h0.size(); ++i) {
+        if (std::memcmp(&h0[i], &hw_out[i], sizeof(float)) != 0) ++wmma_bit_diff;
+        const float d = std::fabs(h0[i] - hw_out[i]);
+        wmma_max_abs = std::max(wmma_max_abs, d);
+        wmma_sum_sq += (double)d * d;
+        ref_sum_sq += (double)h0[i] * h0[i];
+    }
     std::printf("current_ms=%.6f best_ms=%.6f best_y=%u best_grid=%u "
                 "speedup=%.3fx\n", t0, best, best_y, best_grid, t0 / best);
     std::printf("fidelity_best bit_diff=%zu/%zu max_abs=%.9g max_rel=%.9g\n",
                 bit_diff, h0.size(), max_abs, max_rel);
+    std::printf("wmma_n5_ms=%.6f current_full_ms=%.6f speedup=%.3fx "
+                "bit_diff=%zu/%zu max_abs=%.9g rel_rms=%.9g\n",
+                wmma_ms, current_full_ms, current_full_ms / wmma_ms,
+                wmma_bit_diff, h0.size(), wmma_max_abs,
+                ref_sum_sq == 0.0 ? 0.0 : std::sqrt(wmma_sum_sq / ref_sum_sq));
+    HIP_OK(hipFree(dout_wmma));
+    HIP_OK(hipFree(dout1));
+    HIP_OK(hipFree(dout0));
+    HIP_OK(hipFree(dxs));
+    HIP_OK(hipFree(dxq));
+    HIP_OK(hipFree(dw));
+    HIP_OK(hipFree(dx));
     return 0;
 }
