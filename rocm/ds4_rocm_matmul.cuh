@@ -82,6 +82,15 @@ static int attention_q_b_pack4_enabled(void) {
     return enabled && gfx1151;
 }
 
+static int attention_q_b_qnorm_rope_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_ROCM_ATTENTION_Q_B_QNORM_ROPE_FUSE");
+        enabled = value && strcmp(value, "1") == 0;
+    }
+    return enabled;
+}
+
 /* Diagnostic-only sweep for the decode compressor_proj kernel
  * (matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel), which measured as
  * the second-largest decode attention sub-stage (~131us). Pure launch-
@@ -845,6 +854,37 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
+}
+
+extern "C" int ds4_gpu_attention_q_b_qnorm_rope_q8_0_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint32_t n_head,
+        uint32_t head_dim, const ds4_gpu_tensor *x, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_ctx_orig, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, float eps) {
+    if (!attention_q_b_qnorm_rope_enabled()) return 0;
+    if (!out || !x || !model_map || in_dim != 1024u || n_head != 32u ||
+        head_dim != 512u || n_rot == 0u || n_rot > head_dim ||
+        (n_rot & 1u) || x->bytes < 1024u * sizeof(float) ||
+        out->bytes < (uint64_t)n_head * head_dim * sizeof(float)) return 0;
+    const uint64_t blocks = 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes =
+        (uint64_t)n_head * head_dim * row_bytes;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset)
+        return 0;
+    const char *wptr = cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "attention_q_b_fused");
+    if (!wptr) return 0;
+    attention_q_b_qnorm_rope_q8_0_head_kernel<<<n_head, 1024u, 7168u>>>(
+            (float *)out->ptr,
+            reinterpret_cast<const unsigned char *>(wptr),
+            (const float *)x->ptr,
+            n_head, row_bytes, n_rot, pos0, n_ctx_orig, freq_base,
+            freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
+    return cuda_ok(cudaGetLastError(),
+                   "attention q_b qnorm rope fused launch");
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_tensor(

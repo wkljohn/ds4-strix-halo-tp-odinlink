@@ -22349,21 +22349,34 @@ static bool metal_graph_encode_decode_layer_phase(
                                                    &tp_q_row_bytes);
     const uint64_t tp_q_rows_off =
         (uint64_t)tp_head0 * DS4_N_HEAD_DIM * tp_q_row_bytes;
-    if (ok) ok = metal_graph_matmul_dense_quant_abs(metal_graph_q(g),
-                                                    model,
-                                                    layer->attn_q_b,
-                                                    layer->attn_q_b->abs_offset + tp_q_rows_off,
-                                                    q_rank,
-                                                    (uint64_t)tp_heads * DS4_N_HEAD_DIM,
-                                                    metal_graph_qr_norm(g),
-                                                    1);
+    const bool decode_q_norm_debug = metal_graph_debug_wants("Qnorm", il, pos);
+    bool decode_q_norm_rope_fused = false;
+#ifdef DS4_ROCM_BUILD
+    if (ok && !decode_q_norm_debug) {
+        decode_q_norm_rope_fused =
+            ds4_gpu_attention_q_b_qnorm_rope_q8_0_tensor(
+                    metal_graph_q(g), model->map, model->size,
+                    layer->attn_q_b->abs_offset + tp_q_rows_off,
+                    q_rank, tp_heads, DS4_N_HEAD_DIM,
+                    metal_graph_qr_norm(g), DS4_N_ROT, pos,
+                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                    DS4_RMS_EPS) != 0;
+    }
+#endif
+    if (ok && !decode_q_norm_rope_fused) {
+        ok = metal_graph_matmul_dense_quant_abs(
+                metal_graph_q(g), model, layer->attn_q_b,
+                layer->attn_q_b->abs_offset + tp_q_rows_off,
+                q_rank, (uint64_t)tp_heads * DS4_N_HEAD_DIM,
+                metal_graph_qr_norm(g), 1);
+    }
     DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_Q_B_PROJ);
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", metal_graph_q(g), q_dim, il, pos);
     }
-    const bool decode_q_norm_debug = metal_graph_debug_wants("Qnorm", il, pos);
-    bool decode_q_norm_rope_fused = false;
-    if (ok && !decode_q_norm_debug) {
+    if (ok && !decode_q_norm_debug && !decode_q_norm_rope_fused) {
         decode_q_norm_rope_fused =
             ds4_gpu_head_rms_norm_rope_tail_tensor(metal_graph_q(g),
                                                    1,

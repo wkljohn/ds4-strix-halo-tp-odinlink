@@ -596,6 +596,108 @@ __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+/* TP=2 Q-B projection owned by one head per workgroup. The 32 waves compute
+ * the head's 512 exact Q8 rows into transient LDS, after which the first 256
+ * lanes reproduce the established head RMS reduction and RoPE-tail order. */
+__global__ static void attention_q_b_qnorm_rope_q8_0_head_kernel(
+        float *out, const unsigned char *w, const float *x,
+        uint32_t n_head, uint64_t row_bytes, uint32_t n_rot,
+        uint32_t pos0, uint32_t n_ctx_orig, float freq_base,
+        float freq_scale, float ext_factor, float attn_factor,
+        float beta_fast, float beta_slow, float eps) {
+    extern __shared__ float sh[];
+    float *shx = sh;
+    float *shq = shx + 1024u;
+    float *partial = shq + 512u;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t head = blockIdx.x;
+    for (uint32_t i = tid; i < 1024u; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+    if (head >= n_head) return;
+    for (uint32_t d = wave; d < 512u; d += 32u) {
+        const uint32_t subgroup = lane >> 3u;
+        const uint32_t lane8 = lane & 7u;
+        const unsigned char *wr =
+            w + ((uint64_t)head * 512u + d) * row_bytes;
+        float acc = 0.0f;
+        for (uint32_t b4 = 0u; b4 < 32u; b4 += 4u) {
+            const uint32_t b = b4 + subgroup;
+            const uint32_t elem = (b << 5u) + (lane8 << 2u);
+            const float4 xv = *reinterpret_cast<const float4 *>(shx + elem);
+            const unsigned char *blk = wr + (uint64_t)b * 34u;
+            const float scale = q8_0_scale_scalar(blk);
+            const int8_t *q =
+                reinterpret_cast<const int8_t *>(blk + 2u + (lane8 << 2u));
+            acc += scale * (float)q[0] * xv.x;
+            acc += scale * (float)q[1] * xv.y;
+            acc += scale * (float)q[2] * xv.z;
+            acc += scale * (float)q[3] * xv.w;
+        }
+        acc = warp_sum_f32(acc);
+        if (lane == 0u) shq[d] = acc;
+    }
+    __syncthreads();
+    if (tid < 256u) {
+        float sum = 0.0f;
+        float v = shq[tid];
+        sum += v * v;
+        v = shq[tid + 256u];
+        sum += v * v;
+        partial[tid] = sum;
+    }
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float norm_scale = rsqrtf(partial[0] / 512.0f + eps);
+    const uint32_t n_nope = 512u - n_rot;
+    float *out_head = out + (uint64_t)head * 512u;
+    if (tid < 256u) {
+        for (uint32_t i = tid; i < n_nope; i += 256u)
+            out_head[i] = shq[i] * norm_scale;
+        float corr0 = 0.0f, corr1 = 0.0f;
+        if (ext_factor != 0.0f) {
+            const float denom = 2.0f * logf(freq_base);
+            corr0 = floorf((float)n_rot *
+                           logf((float)n_ctx_orig /
+                                (beta_fast * 2.0f * (float)M_PI)) / denom);
+            corr1 = ceilf((float)n_rot *
+                          logf((float)n_ctx_orig /
+                               (beta_slow * 2.0f * (float)M_PI)) / denom);
+            corr0 = fmaxf(0.0f, corr0);
+            corr1 = fminf((float)(n_rot - 1u), corr1);
+        }
+        const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+        for (uint32_t pair = tid; pair < n_rot / 2u; pair += 256u) {
+            const uint32_t i = pair * 2u;
+            const float theta_extrap =
+                (float)pos0 * powf(theta_scale, (float)pair);
+            const float theta_interp = freq_scale * theta_extrap;
+            float theta = theta_interp;
+            float mscale = attn_factor;
+            if (ext_factor != 0.0f) {
+                const float ramp_y =
+                    ((float)((int)i / 2) - corr0) /
+                    fmaxf(0.001f, corr1 - corr0);
+                const float ramp_mix =
+                    (1.0f - fminf(1.0f, fmaxf(0.0f, ramp_y))) * ext_factor;
+                theta = theta_interp * (1.0f - ramp_mix) +
+                        theta_extrap * ramp_mix;
+                mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+            }
+            float c = cosf(theta) * mscale;
+            float s = sinf(theta) * mscale;
+            const float x0 = shq[n_nope + i] * norm_scale;
+            const float x1 = shq[n_nope + i + 1u] * norm_scale;
+            out_head[n_nope + i] = x0 * c - x1 * s;
+            out_head[n_nope + i + 1u] = x0 * s + x1 * c;
+        }
+    }
+}
+
 __global__ static void matmul_q8_0_f32_batch_warp8_kernel(
         float *out,
         const unsigned char *w,
