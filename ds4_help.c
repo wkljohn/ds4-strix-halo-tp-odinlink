@@ -164,6 +164,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     if (tool == DS4_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
+        opt(fp, c, "--default-temperature F", "Sampling temperature when clients omit it. Default: 1.0");
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");

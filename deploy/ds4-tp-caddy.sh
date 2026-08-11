@@ -13,7 +13,6 @@ CONFIG=${DS4_DEPLOY_CONFIG:-$SCRIPT_DIR/config.env.local}
 source "$CONFIG"
 
 : "${MODEL:?MODEL is required}"
-: "${MTP:?MTP is required}"
 : "${PEER_MGMT:?PEER_MGMT is required}"
 : "${PEER_REPO:?PEER_REPO is required}"
 : "${ODINLINK_ROOT:?ODINLINK_ROOT is required}"
@@ -21,6 +20,10 @@ source "$CONFIG"
 
 CONTEXT=${CONTEXT:-262144}
 PREFILL_CHUNK=${PREFILL_CHUNK:-4096}
+EXPERT_SPLIT=${EXPERT_SPLIT:-118}
+TP_TIMEOUT_SEC=${TP_TIMEOUT_SEC:-60}
+DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0}
+DSPARK=${DSPARK:-0}
 TP_PORT=${TP_PORT:-9000}
 API_HOST=${API_HOST:-127.0.0.1}
 API_PORT=${API_PORT:-8090}
@@ -36,11 +39,15 @@ SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
      -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS" "$PEER_MGMT")
 
 is_uint() { [[ $1 =~ ^[1-9][0-9]*$ ]]; }
-is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$TP_PORT" &&
+is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$EXPERT_SPLIT" &&
+  is_uint "$TP_TIMEOUT_SEC" && is_uint "$TP_PORT" &&
   is_uint "$API_PORT" || {
-    echo "error: context, chunk, and ports must be positive integers" >&2
+    echo "error: context, chunk, expert split, TP timeout, and ports must be positive integers" >&2
     exit 2
   }
+(( EXPERT_SPLIT < 256 )) || { echo "error: expert split must be in 1..255" >&2; exit 2; }
+[[ $DSPARK == 0 || $DSPARK == 1 ]] || { echo "error: DSPARK must be 0 or 1" >&2; exit 2; }
+if [[ $DSPARK == 1 ]]; then : "${MTP:?MTP is required when DSPARK=1}"; fi
 (( CONTEXT == 262144 )) || echo "warning: deployment context is $CONTEXT, not 262144" >&2
 
 sample_fingerprint() {
@@ -74,11 +81,11 @@ preflight() {
   [[ -x $REPO/ds4 && -x $REPO/ds4-server ]] || {
     echo "error: run 'make strix-halo' before deployment" >&2; exit 1;
   }
-  [[ -r $MODEL && -r $MTP && -r /dev/odl_tb5_0 && -r $VERBS_LIB ]] || {
-    echo "error: local model, drafter, OdinLink device, or provider is missing" >&2; exit 1;
+  [[ -r $MODEL && -r /dev/odl_tb5_0 && -r $VERBS_LIB ]] || {
+    echo "error: local model, OdinLink device, or provider is missing" >&2; exit 1;
   }
-  "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' -a -r '$MTP' -a -r /dev/odl_tb5_0 -a -r '$VERBS_LIB'" || {
-    echo "error: peer binary, artifacts, OdinLink device, or provider is missing" >&2; exit 1;
+  "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' -a -r /dev/odl_tb5_0 -a -r '$VERBS_LIB'" || {
+    echo "error: peer binary, model, OdinLink device, or provider is missing" >&2; exit 1;
   }
   local local_bin peer_bin
   local_bin=$(sha256sum "$REPO/ds4" | awk '{print $1}')
@@ -87,9 +94,14 @@ preflight() {
   [[ $(sample_fingerprint "$MODEL") == "$(remote_fingerprint "$MODEL")" ]] || {
     echo "error: target-model fingerprints differ" >&2; exit 1;
   }
-  [[ $(sample_fingerprint "$MTP") == "$(remote_fingerprint "$MTP")" ]] || {
-    echo "error: drafter fingerprints differ" >&2; exit 1;
-  }
+  if [[ $DSPARK == 1 ]]; then
+    [[ -r $MTP ]] && "${SSH[@]}" "test -r '$MTP'" || {
+      echo "error: local or peer drafter is missing" >&2; exit 1;
+    }
+    [[ $(sample_fingerprint "$MTP") == "$(remote_fingerprint "$MTP")" ]] || {
+      echo "error: drafter fingerprints differ" >&2; exit 1;
+    }
+  fi
   systemctl is-active --quiet caddy || { echo "error: Caddy is not active" >&2; exit 1; }
   caddy validate --config /etc/caddy/Caddyfile >/dev/null
   mkdir -p "$RUNTIME" "$(dirname -- "$LOCAL_LOG")"
@@ -108,28 +120,39 @@ start() {
     rc=$?; [[ $rc == 7 ]] && echo "error: owned worker is already running" >&2; exit "$rc";
   }
 
-  local -a common worker coordinator
+  local -a common worker coordinator decode_env support_args
   common=(env
-    DS4_TP_EXPERT_SPLIT=118
-    DS4_ROCM_TP_SKIP_UNOWNED=1
+    DS4_TP_EXPERT_SPLIT="$EXPERT_SPLIT"
+    DS4_TP_TIMEOUT_SEC="$TP_TIMEOUT_SEC"
     DS4_TP_ODINLINK_BATCH_ASYNC=1
     DS4_TP_VERBS_LIB="$VERBS_LIB"
     LD_LIBRARY_PATH="$ODL_LD_PATH"
-    DS4_TP_GREEDY_TOP2=1
-    DS4_DSPARK_SUPPORT_TOPK=6
-    DS4_DSPARK_MAX_DRAFT_TOKENS=5
-    DS4_ROCM_Q8_SMALL_BATCH_TILE=1
-    DS4_ROCM_Q8_SMALL_BATCH_DP4A=1
     DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
     DS4_ROCM_Q4K_DECODE_STAGE_XQ=1)
+  if [[ $DSPARK == 1 ]]; then
+    echo "warning: DSpark is experimental and is not target-fingerprint exact" >&2
+    decode_env=(
+      DS4_DSPARK_SUPPORT_TOPK=6
+      DS4_DSPARK_MAX_DRAFT_TOKENS=5
+      DS4_ROCM_Q8_SMALL_BATCH_TILE=1
+      DS4_ROCM_Q8_SMALL_BATCH_DP4A=1)
+    support_args=(--mtp "$MTP" --dspark)
+  else
+    decode_env=(DS4_TP_RANK0_FULL_LOGITS=1)
+    support_args=()
+  fi
+  common+=("${decode_env[@]}")
   worker=("${common[@]}" ./ds4 --role worker --tensor-parallel
     --coordinator "$COORDINATOR_RDMA_ADDR" "$TP_PORT" --transport rdma --rocm
     -m "$MODEL" -c "$CONTEXT" --prefill-chunk "$PREFILL_CHUNK"
-    --mtp "$MTP" --dspark)
-  coordinator=("${common[@]}" DS4_DSPARK_RESIDENT_Q8=1 ./ds4-server
+    "${support_args[@]}")
+  coordinator=("${common[@]}")
+  if [[ $DSPARK == 1 ]]; then coordinator+=(DS4_DSPARK_RESIDENT_Q8=1); fi
+  coordinator+=(./ds4-server
     --role coordinator --tensor-parallel --listen 0.0.0.0 "$TP_PORT"
     --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
-    --prefill-chunk "$PREFILL_CHUNK" --mtp "$MTP" --dspark
+    --prefill-chunk "$PREFILL_CHUNK" "${support_args[@]}"
+    --default-temperature "$DEFAULT_TEMPERATURE"
     --host "$API_HOST" --port "$API_PORT")
 
   local worker_q repo_q log_q pid_q
@@ -156,7 +179,7 @@ stop() {
 status() {
   if pid_matches "$LOCAL_PIDFILE" "ds4-server"; then echo "coordinator: running pid $(<"$LOCAL_PIDFILE")"; else echo "coordinator: stopped"; fi
   "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then echo worker-running-pid-\$p; else echo worker-stopped; fi; else echo worker-stopped; fi"
-  if curl --silent --show-error --fail --max-time 3 "http://$API_HOST:$API_PORT/v1/models" >/dev/null; then
+  if curl --silent --show-error --fail --max-time 3 "http://$API_HOST:$API_PORT/health" >/dev/null; then
     echo "api: ready on $API_HOST:$API_PORT"
   else
     echo "api: loading or unavailable"

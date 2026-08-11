@@ -28,15 +28,27 @@ OUT="$REPO/research-results/quant-comparison-2026-08-10"
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
 ROCPROF_RUNTIME=${DS4_BENCH_ROCPROF_RUNTIME:-1}
 SHOW_OUTPUT=${DS4_BENCH_SHOW_OUTPUT:-0}
+CANDIDATE=${DS4_BENCH_CANDIDATE:-0}
+EXPECTED_FNV64=${DS4_BENCH_EXPECT_FNV64:-}
+TP_TIMEOUT_SEC=${DS4_BENCH_TP_TIMEOUT_SEC:-60}
 PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2 "$PEER_MGMT")
 PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2)
 
 [[ $FRONTIER =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid frontier" >&2; exit 2; }
 [[ $TOKENS =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid generated-token count" >&2; exit 2; }
 (( CONTEXT > FRONTIER + TOKENS )) || { echo "error: context must exceed frontier + tokens" >&2; exit 2; }
+[[ $TP_TIMEOUT_SEC =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid TP timeout" >&2; exit 2; }
+if [[ $CANDIDATE == 1 ]]; then
+  [[ $EXPECTED_FNV64 =~ ^[0-9a-fA-F]{16}$ ]] || {
+    echo "error: candidate runs require DS4_BENCH_EXPECT_FNV64" >&2; exit 2;
+  }
+  SHOW_OUTPUT=1
+elif [[ $CANDIDATE != 0 ]]; then
+  echo "error: DS4_BENCH_CANDIDATE must be 0 or 1" >&2
+  exit 2
+fi
 
 CURRENT_OPT_ENV=(
-  DS4_TP_GREEDY_TOP2=1
   DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
 )
 if [[ $DSPARK == 1 ]]; then
@@ -46,13 +58,13 @@ if [[ $DSPARK == 1 ]]; then
   CURRENT_OPT_ENV+=(DS4_ROCM_Q8_DECODE_PAIR_DP4A=0)
 else
   CURRENT_OPT_ENV+=(
-    DS4_ROCM_Q8_DECODE_PAIR_DP4A=1
-    DS4_ROCM_Q8_DP4A_SHAPE_DISPATCH=1
+    DS4_TP_RANK0_FULL_LOGITS=1
+    DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
   )
 fi
 
 COMMON_ENV=(
-  DS4_ROCM_TP_SKIP_UNOWNED=1
+  DS4_TP_TIMEOUT_SEC="$TP_TIMEOUT_SEC"
   DS4_TP_ODINLINK_BATCH_ASYNC=1
   DS4_TP_VERBS_LIB=/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs/libodl_tb5_verbs.so.0.1.0
   LD_LIBRARY_PATH=/home/wkljohn/Desktop/cc/OdinLink-Five/build/lib:/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs
@@ -290,17 +302,7 @@ wait_worker 180 || {
 WORKER_STARTED=0
 trap - EXIT
 "${PEER_SCP[@]}" "$PEER_MGMT:$WORKER_LOG" "$WORKER_LOG"
-grep -q 'worker connected, transport=rdma' "$COORD_LOG" || {
-  echo "error: benchmark did not use RDMA; rejecting result" >&2; exit 1;
-}
-grep -q '"fallback_calls":0' "$COORD_LOG" || {
-  echo "error: RDMA provider reported fallback traffic; rejecting result" >&2; exit 1;
-}
-grep -q 'leader connected, transport=rdma' "$WORKER_LOG" || {
-  echo "error: worker did not confirm RDMA; rejecting result" >&2; exit 1;
-}
-grep -q '"fallback_calls":0' "$WORKER_LOG" || {
-  echo "error: worker RDMA provider reported fallback traffic; rejecting result" >&2; exit 1;
-}
+"$REPO/scripts/check-ds4-bench-result.sh" \
+  "$CSV" "$COORD_LOG" "$WORKER_LOG" "$EXPECTED_FNV64" "$TOKENS"
 cat "$CSV"
 echo RUN_DONE

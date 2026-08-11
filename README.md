@@ -1,10 +1,11 @@
 # DS4 Strix Halo TP over OdinLink
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
-Thunderbolt RDMA. At 2,048 tokens of live context, optimized Q4_K reaches a
-**166.56 t/s** prefill and **14.31 t/s** decode median; opt-in DSpark reaches
-**169.37 t/s** prefill and **16.22 t/s** decode. Metal, CUDA, generic verbs, and
-single-node modes remain available.
+Thunderbolt RDMA. The validated cache-free Q4_K production path reaches
+**161.60 t/s prefill** and **12.16 t/s decode** at 2,048 tokens of live
+context. It computes full output logits on rank 0 and rejects trajectory-
+changing benchmark shortcuts. Metal, CUDA, generic verbs, and single-node
+modes remain available.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
@@ -12,19 +13,22 @@ single-node modes remain available.
     TP rank 0                                           TP rank 1
 ```
 
-| TP=2 configuration | Long-context workload | Prefill | Decode | Change from original |
-|---|---|---:|---:|---:|
-| Original Q4_K baseline | fixed 2,048-token prefix + 300 generated tokens | **30.38 t/s** | **7.58 t/s** | baseline |
-| **Current Q2_K** | same fixed workload | **118.24 t/s** | **13.25 t/s** | **+289.2% / +74.8%** |
-| **Current Q4_K** | same fixed workload | **166.56 t/s** | **14.31 t/s** | **+448.3% / +88.8%** |
-| **Current Q4_K + DSpark** | same fixed workload; 46/54 expert split | **169.37 t/s** | **16.22 t/s** | **+457.5% / +114.0%** |
+| TP=2 configuration | Fixed 2,048 + 300-token workload | Prefill | Decode | Validation status |
+|---|---|---:|---:|---|
+| Original Q4_K baseline | archived pre-acceleration run | **30.38 t/s** | **7.58 t/s** | baseline |
+| **Current Q2_K** | same workload | — | — | revalidation pending |
+| **Current Q4_K** | 46/54 split, exact rank-0 full logits | **161.60 t/s** | **12.16 t/s** | **production; fingerprint `cee523f4fc8b1608`** |
+| **Current Q4_K + DSpark** | 46/54 split, diagnostic run | 168.65 t/s | 11.41 t/s | experimental; target fingerprint mismatch |
 
-All rows are three-run medians from the same `ds4-bench-tp` workload over
-mandatory RDMA. DSpark accepted 66.34% of proposed long-context draft tokens
-in all three current runs. Its benefit depends on prompt acceptance.
+These are `ds4-bench-tp` results over mandatory RDMA. The current Q4_K row is
+the latest completed production-validation run. Older 14.31 t/s ordinary and
+16.22 t/s DSpark claims are intentionally withdrawn: their configurations do
+not pass the token-fingerprint gate. DSpark remains available for research but
+is not the deployment default until its verified trajectory matches target-only
+decode.
 
-Q2_K and Q4_K use the cache-free default. DSpark optionally keeps its Q8
-drafter on rank 0 and warns before reserving the additional 10.15 GiB.
+Q2_K and Q4_K use the cache-free default. Experimental DSpark optionally keeps
+its Q8 drafter on rank 0 and warns before reserving the additional 10.15 GiB.
 
 Reproduce one fixed long-context run after placing each model at the same
 absolute path on both nodes:
@@ -39,7 +43,20 @@ DS4_BENCH_DSPARK=1 DS4_BENCH_MTP=/absolute/path/dspark-Q8_0.gguf \
 
 Use three distinct tags per configuration and report the median. The launcher
 starts both independent filesystems in balance, requires RDMA, checks matching
-binary/model artifacts, and rejects provider fallback traffic.
+binary/model artifacts, and rejects provider fallback traffic. Optimization
+candidates must also match a known exact token fingerprint:
+
+```sh
+DS4_BENCH_CANDIDATE=1 \
+DS4_BENCH_EXPECT_FNV64=cee523f4fc8b1608 \
+  ./run-tp-ds4-bench.sh q4-candidate \
+  /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf \
+  DS4_TP_EXPERT_SPLIT=118
+```
+
+That fingerprint is specific to the documented model, prompt, 118/138 split,
+and 300-token workload. A mismatch, short generation, transport error, or RDMA
+fallback makes the run fail instead of becoming a performance candidate.
 
 All Strix Halo acceleration is included in this fork—no external kernel patch
 is required. OdinLink-specific provider tuning is used only when its provider
@@ -405,12 +422,11 @@ free. Predictable continuations, especially code, tend to benefit most;
 low-yield prompts can be no faster or even slower. DSpark is therefore still
 experimental and explicitly opt-in.
 
-On the reference two-node Strix Halo/OdinLink setup, the current five-row
-DSpark path measured **16.22 generation tokens/s** at 2,048 tokens of live
-context, versus **14.31 tokens/s** without DSpark. Both are three-run medians
-over 300 generated tokens. This prompt accepted 66.34% of proposed draft
-tokens; other prompts can be faster or slower. The verifier kernel itself adds
-no persistent VRAM.
+On the reference two-node Strix Halo/OdinLink setup, the latest diagnostic
+five-row DSpark run measured **11.41 generation tokens/s** over 300 generated
+tokens and accepted 34.49% of proposed draft tokens. Its token fingerprint did
+not match target-only decode, so this is a research result rather than a
+production claim. The verifier kernel itself adds no persistent VRAM.
 
 The released DSpark checkpoint is packaged as a separate support GGUF. It is
 not a standalone model. The reference Q8_0 drafter occupies about 10.15 GiB
@@ -436,10 +452,12 @@ Run it with greedy decoding:
 ```
 
 `--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
-DSpark proposes the support model's fixed five-token block and commits only the
-prefix accepted by exact target verification. Sampled decoding does not use
-DSpark proposals. `--quality` and `--dspark-strict` also keep target-only
-decoding, which is useful for comparisons and correctness checks.
+DSpark proposes the support model's fixed five-token block and commits the
+prefix selected by target verification. The current ROCm TP verifier is still
+under exactness investigation; candidate runs must match a target-only token
+fingerprint before promotion. Sampled decoding does not use DSpark proposals.
+`--quality` and `--dspark-strict` keep target-only decoding, which is useful for
+comparisons and correctness checks.
 
 ## Speed
 
@@ -1354,9 +1372,19 @@ For **opencode**, add a provider and agent entry to
       "models": {
         "deepseek-v4-flash": {
           "name": "DeepSeek V4 Flash (ds4.c local)",
+          "tool_call": true,
+          "reasoning": true,
+          "interleaved": {
+            "field": "reasoning_content"
+          },
           "limit": {
             "context": 100000,
             "output": 384000
+          },
+          "options": {
+            "thinking": {
+              "type": "enabled"
+            }
           }
         }
       }
@@ -1371,6 +1399,13 @@ For **opencode**, add a provider and agent entry to
   }
 }
 ```
+
+The reasoning metadata is required for OpenCode to render the model's thinking
+separately and to preserve it across tool-call turns. It matches llama.cpp's
+DeepSeek-compatible streaming format, where thinking is returned in
+`delta.reasoning_content`. Restart OpenCode and begin a new session after
+changing these model capabilities; an existing session retains the old model
+metadata.
 
 For **Pi**, add a provider to `~/.pi/agent/models.json`:
 

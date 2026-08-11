@@ -27,6 +27,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -4781,6 +4782,21 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+/* Thinking prompts end with an opening <think> in the rendered prefix, so an
+ * unfinished generation normally contains only the body and no opening tag.
+ * If the request required thinking and no closing tag was sampled, everything
+ * generated is still reasoning.  Returning it as assistant content leaks chain
+ * of thought to clients and makes OpenAI-compatible UIs render it as the final
+ * answer. */
+static void split_unfinished_reasoning(const char *text,
+                                       char **content_out,
+                                       char **reasoning_out) {
+    const char *body = text ? text : "";
+    if (!strncmp(body, "<think>", 7)) body += 7;
+    *content_out = xstrdup("");
+    *reasoning_out = xstrdup(body);
+}
+
 static bool parse_deepseek_generated_message_ex(const char *text,
                                                 bool require_thinking_closed,
                                                 char **content_out,
@@ -4801,7 +4817,7 @@ static bool parse_deepseek_generated_message_ex(const char *text,
         if (!think_end) {
             /* Model did not close thinking, ignore any DSML in reasoning */
             fprintf(stderr, "ds4-server: thinking not closed, ignoring DSML in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            split_unfinished_reasoning(text, content_out, reasoning_out);
             return true;
         }
         tool_search = think_end + 8;
@@ -4986,7 +5002,7 @@ static bool parse_glm_generated_message_ex(const char *text,
         const char *think_end = find_last_substr(text, "</think>");
         if (!think_end) {
             fprintf(stderr, "ds4-server: thinking not closed, ignoring GLM tool calls in reasoning\n");
-            split_reasoning_content(text, strlen(text), content_out, reasoning_out);
+            split_unfinished_reasoning(text, content_out, reasoning_out);
             return true;
         }
         tool_search = think_end + 8;
@@ -5323,6 +5339,7 @@ static bool http_response(int fd, bool enable_cors, int code, const char *type, 
                          code == 400 ? "Bad Request" :
                          code == 404 ? "Not Found" :
                          code == 409 ? "Conflict" :
+                         code == 503 ? "Service Unavailable" :
                          code == 500 ? "Internal Server Error" : "Error";
     const size_t body_len = body ? strlen(body) : 0;
     buf h = {0};
@@ -8271,6 +8288,7 @@ struct server {
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
+    float default_temperature;
     kv_disk_cache kv;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
@@ -8291,12 +8309,48 @@ struct server {
     job *head;
     job *tail;
     bool stopping;
+    atomic_bool fatal_tp_failure;
     int clients;
     uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static void dispatch_jobs_locked(server *s);
+
+static bool server_tp_failed(const server *s) {
+    if (!s) return false;
+    if (atomic_load_explicit(&s->fatal_tp_failure, memory_order_acquire)) return true;
+    if (s->tp_leader && ds4_tp_failed(s->tp_leader)) return true;
+    return false;
+}
+
+static float server_request_temperature(const server *s, const request *r) {
+    if (r && r->temperature_set) return r->temperature;
+    return s ? s->default_temperature : DS4_DEFAULT_TEMPERATURE;
+}
+
+static void server_mark_fatal_tp_failure(server *s) {
+    if (!s || atomic_exchange_explicit(&s->fatal_tp_failure, true,
+                                        memory_order_acq_rel)) return;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: fatal tensor-parallel transport failure; withdrawing readiness and shutting down");
+#ifndef DS4_SERVER_TEST
+    pthread_mutex_lock(&s->mu);
+    s->stopping = true;
+    dispatch_jobs_locked(s);
+    pthread_cond_broadcast(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+    g_stop_requested = 1;
+    if (g_listen_fd >= 0) {
+        int fd = (int)g_listen_fd;
+        g_listen_fd = -1;
+        (void)shutdown(fd, SHUT_RDWR);
+        close(fd);
+    }
+#endif
+}
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
  * completion after it has written the response, so request data and the socket
@@ -11380,7 +11434,7 @@ decode_again:
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
             kv_cache_maybe_store_continued(s, slot);
         }
-        float temperature = j->req.temperature;
+        float temperature = server_request_temperature(s, &j->req);
         int top_k = j->req.top_k;
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
@@ -11389,7 +11443,8 @@ decode_again:
              * only for knobs the client left out: an explicit request value
              * (e.g. temperature 0 from a benchmark harness) must win, or the
              * same greedy request returns different text on every call. */
-            if (!j->req.temperature_set) temperature = DS4_DEFAULT_TEMPERATURE;
+            if (!j->req.temperature_set)
+                temperature = server_request_temperature(s, &j->req);
             if (!j->req.top_k_set) top_k = 0;
             if (!j->req.top_p_set) top_p = DS4_DEFAULT_TOP_P;
             if (!j->req.min_p_set) min_p = DS4_DEFAULT_MIN_P;
@@ -12028,6 +12083,7 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    if (server_tp_failed(s)) server_mark_fatal_tp_failure(s);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -12363,6 +12419,15 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static bool send_health(server *s, int fd) {
+    if (server_tp_failed(s)) {
+        return http_response(fd, s->enable_cors, 503, "application/json",
+                             "{\"status\":\"error\",\"reason\":\"tensor_parallel_transport_failed\"}\n");
+    }
+    return http_response(fd, s->enable_cors, 200, "application/json",
+                         "{\"status\":\"ok\"}\n");
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -12386,6 +12451,18 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "OPTIONS")) {
         http_response(fd, s->enable_cors, 204, NULL, "");
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/health")) {
+        send_health(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+
+    if (server_tp_failed(s)) {
+        http_error(fd, s->enable_cors, 503, "tensor parallel transport failed; restart required");
         http_request_free(&hr);
         goto done;
     }
@@ -12427,7 +12504,11 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok) {
+        if (!req.temperature_set)
+            req.temperature = server_request_temperature(s, &req);
+        req.raw_body = xstrndup(hr.body, hr.body_len);
+    }
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -12523,6 +12604,7 @@ typedef struct {
     int port;
     int ctx_size;
     int default_tokens;
+    float default_temperature;
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
@@ -12674,6 +12756,7 @@ static server_config parse_options(int argc, char **argv) {
         .port = 8000,
         .ctx_size = 32768,
         .default_tokens = 393216,
+        .default_temperature = DS4_DEFAULT_TEMPERATURE,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
     c.kv_cache = kv_cache_default_options();
@@ -12749,6 +12832,9 @@ static server_config parse_options(int argc, char **argv) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--default-temperature")) {
+            c.default_temperature =
+                parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 10.0f);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--chdir")) {
@@ -13025,6 +13111,7 @@ int main(int argc, char **argv) {
     s.batched_mode = cfg.batched_sessions > 0;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
+    s.default_temperature = cfg.default_temperature;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -13207,8 +13294,9 @@ int main(int argc, char **argv) {
                    i, tokens->len);
         kv_cache_store_current(&s, slot, "shutdown");
     }
+    const bool fatal_tp_failure = server_tp_failed(&s);
     server_close_resources(&s);
-    return 0;
+    return fatal_tp_failure ? 1 : 0;
 }
 #else
 
@@ -13641,6 +13729,46 @@ static void test_cors_headers_are_opt_in(void) {
         TEST_ASSERT(strstr(out, "Access-Control-Allow-Origin: *") != NULL);
         TEST_ASSERT(strstr(out, "Access-Control-Allow-Methods: GET, POST, OPTIONS") != NULL);
         TEST_ASSERT(strstr(out, "Access-Control-Allow-Headers: *") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
+static void test_server_health_and_temperature_policy(void) {
+    server s = {0};
+    s.default_temperature = 0.0f;
+    atomic_init(&s.fatal_tp_failure, false);
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    TEST_ASSERT(server_request_temperature(&s, &r) == 0.0f);
+    r.temperature = 0.75f;
+    r.temperature_set = true;
+    TEST_ASSERT(server_request_temperature(&s, &r) == 0.75f);
+    request_free(&r);
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(send_health(&s, sv[0]));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 200 OK") != NULL);
+        TEST_ASSERT(strstr(out, "\"status\":\"ok\"") != NULL);
+        free(out);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    atomic_store_explicit(&s.fatal_tp_failure, true, memory_order_release);
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        TEST_ASSERT(send_health(&s, sv[0]));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "HTTP/1.1 503 Service Unavailable") != NULL);
+        TEST_ASSERT(strstr(out, "tensor_parallel_transport_failed") != NULL);
         free(out);
         close(sv[0]);
         close(sv[1]);
@@ -15213,6 +15341,38 @@ static void test_thinking_dsml_is_not_executable_before_think_close(void) {
     TEST_ASSERT(reasoning && strstr(reasoning, DS4_TOOL_CALLS_START) != NULL);
     TEST_ASSERT(content && !strcmp(content, "Final answer."));
 
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
+
+static void test_unfinished_thinking_stays_in_reasoning_field(void) {
+    const char *deepseek =
+        "still working\n" DS4_TOOL_CALLS_START " tentative, not executable";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_DEEPSEEK, deepseek, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(reasoning && !strcmp(reasoning, deepseek));
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    const char *glm = "<think>still working <tool_call> tentative";
+    content = NULL;
+    reasoning = NULL;
+    TEST_ASSERT(parse_generated_message_ex_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, glm, true,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(content && content[0] == '\0');
+    TEST_ASSERT(reasoning && !strcmp(reasoning,
+                                     "still working <tool_call> tentative"));
+    TEST_ASSERT(calls.len == 0);
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
@@ -17509,6 +17669,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();
     test_context_length_error_uses_protocol_standard_shape();
+    test_server_health_and_temperature_policy();
     test_cors_headers_are_opt_in();
     test_cors_preflight_response_is_no_content();
     test_cors_sse_headers();
@@ -17535,6 +17696,7 @@ static void ds4_server_unit_tests_run(void) {
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
     test_invalid_glm_tool_error_suffix();
     test_thinking_dsml_is_not_executable_before_think_close();
+    test_unfinished_thinking_stays_in_reasoning_field();
     test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_glm_tool_checkpoint_suffix_is_canonical();
