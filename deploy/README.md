@@ -15,7 +15,8 @@ deploy/ds4-tp-caddy.sh status
 
 The launcher starts both independent model loads together, requires readable
 OdinLink devices, validates matching binary and sampled model fingerprints,
-and refuses to replace unrelated processes. It uses a 262,144-token context,
+and refuses to replace unrelated processes. It uses a 262,144-token context
+with a memory-safe 2,048-token prefill workspace,
 the server's single resident session, the benchmarked 46/54 expert split, and
 explicit RDMA. Native batched-session mode is intentionally not enabled because
 it disables speculative decoding. Profiling and DSpark statistics are also off
