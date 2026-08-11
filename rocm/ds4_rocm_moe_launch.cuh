@@ -179,6 +179,11 @@ static int routed_moe_q4k_wmma_enabled(
 
 enum {
     DS4_ROCM_Q4K_DECODE_EVENT_START = 0,
+    DS4_ROCM_Q4K_DECODE_EVENT_X_QUANT,
+    DS4_ROCM_Q4K_DECODE_EVENT_ROUTE_PREP,
+    DS4_ROCM_Q4K_DECODE_EVENT_GATE_WMMA,
+    DS4_ROCM_Q4K_DECODE_EVENT_UP_WMMA,
+    DS4_ROCM_Q4K_DECODE_EVENT_COLD,
     DS4_ROCM_Q4K_DECODE_EVENT_GATE_UP,
     DS4_ROCM_Q4K_DECODE_EVENT_MID_QUANT,
     DS4_ROCM_Q4K_DECODE_EVENT_DOWN,
@@ -197,13 +202,14 @@ typedef struct {
 typedef struct {
     cudaEvent_t events[DS4_ROCM_Q4K_DECODE_EVENT_COUNT];
     uint32_t valid_mask;
+    uint32_t n_tokens;
     int complete;
 } ds4_rocm_q4k_decode_event_slot;
 
 static ds4_rocm_q4k_decode_event_slot
     g_q4k_decode_event_slots[DS4_ROCM_Q4K_DECODE_EVENT_POOL_SIZE];
 static ds4_rocm_q4k_decode_event_stat
-    g_q4k_decode_event_stats[DS4_ROCM_Q4K_DECODE_EVENT_COUNT];
+    g_q4k_decode_event_stats[6][DS4_ROCM_Q4K_DECODE_EVENT_COUNT];
 static int g_q4k_decode_event_enabled = -1;
 static int g_q4k_decode_event_events_ready;
 static int g_q4k_decode_event_atexit_registered;
@@ -214,7 +220,8 @@ static uint64_t g_q4k_decode_event_dropped;
 
 static const char *const
 g_q4k_decode_event_names[DS4_ROCM_Q4K_DECODE_EVENT_COUNT] = {
-    "start", "gate_up", "mid_quant", "down"
+    "start", "x_quant", "route_prep", "gate_wmma", "up_wmma", "cold",
+    "epilogue", "mid_quant", "down"
 };
 
 static void routed_moe_q4k_decode_event_print(void) {
@@ -223,14 +230,19 @@ static void routed_moe_q4k_decode_event_print(void) {
             "Q4_K decode event profile samples=%llu dropped=%llu",
             (unsigned long long)g_q4k_decode_event_samples,
             (unsigned long long)g_q4k_decode_event_dropped);
-    for (uint32_t i = 1; i < DS4_ROCM_Q4K_DECODE_EVENT_COUNT; i++) {
-        const ds4_rocm_q4k_decode_event_stat *s = &g_q4k_decode_event_stats[i];
-        if (s->count == 0u) continue;
-        fprintf(stderr, " %s[n=%llu mean=%.3f min=%.3f max=%.3f]",
-                g_q4k_decode_event_names[i],
-                (unsigned long long)s->count,
-                s->sum_ms / (double)s->count,
-                (double)s->min_ms, (double)s->max_ms);
+    for (uint32_t n_tokens = 1; n_tokens <= 5; n_tokens++) {
+        if (g_q4k_decode_event_stats[n_tokens][1].count == 0u) continue;
+        fprintf(stderr, " width=%u", n_tokens);
+        for (uint32_t i = 1; i < DS4_ROCM_Q4K_DECODE_EVENT_COUNT; i++) {
+            const ds4_rocm_q4k_decode_event_stat *s =
+                &g_q4k_decode_event_stats[n_tokens][i];
+            if (s->count == 0u) continue;
+            fprintf(stderr, " %s[n=%llu mean=%.3f min=%.3f max=%.3f]",
+                    g_q4k_decode_event_names[i],
+                    (unsigned long long)s->count,
+                    s->sum_ms / (double)s->count,
+                    (double)s->min_ms, (double)s->max_ms);
+        }
     }
     fputc('\n', stderr);
 }
@@ -301,7 +313,9 @@ static int routed_moe_q4k_decode_event_harvest(
             g_q4k_decode_event_enabled = 0;
             return 0;
         }
-        ds4_rocm_q4k_decode_event_stat *stat = &g_q4k_decode_event_stats[stage];
+        if (slot->n_tokens == 0u || slot->n_tokens > 5u) return 0;
+        ds4_rocm_q4k_decode_event_stat *stat =
+            &g_q4k_decode_event_stats[slot->n_tokens][stage];
         if (stat->count == 0u || elapsed_ms < stat->min_ms) stat->min_ms = elapsed_ms;
         if (stat->count == 0u || elapsed_ms > stat->max_ms) stat->max_ms = elapsed_ms;
         stat->count++;
@@ -318,7 +332,8 @@ static int routed_moe_q4k_decode_event_harvest(
     return 1;
 }
 
-static void routed_moe_q4k_decode_event_record(uint32_t stage) {
+static void routed_moe_q4k_decode_event_record(
+        uint32_t stage, uint32_t n_tokens) {
     if (!routed_moe_q4k_decode_event_enabled() ||
         stage >= DS4_ROCM_Q4K_DECODE_EVENT_COUNT ||
         !routed_moe_q4k_decode_event_ensure_events()) {
@@ -334,6 +349,7 @@ static void routed_moe_q4k_decode_event_record(uint32_t stage) {
         }
         if (!g_q4k_decode_event_enabled) return;
         slot->valid_mask = 0u;
+        slot->n_tokens = n_tokens;
         slot->complete = 0;
         g_q4k_decode_event_active_slot = (int)g_q4k_decode_event_next_slot;
         g_q4k_decode_event_next_slot =
@@ -1320,15 +1336,19 @@ static int routed_moe_launch(
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
         const int q4k_decode_event_profile =
-            q4k_path && n_tokens == 1u &&
+            q4k_path && n_tokens <= 5u &&
             routed_moe_q4k_decode_event_enabled();
         if (q4k_decode_event_profile) {
             routed_moe_q4k_decode_event_record(
-                    DS4_ROCM_Q4K_DECODE_EVENT_START);
+                    DS4_ROCM_Q4K_DECODE_EVENT_START, n_tokens);
         }
         dim3 xq_grid(xq_blocks, n_tokens, 1);
         q8_K_quantize_kernel<<<xq_grid, 256>>>(xq, (const float *)x->ptr, expert_in_dim, n_tokens);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
+        if (ok && q4k_decode_event_profile) {
+            routed_moe_q4k_decode_event_record(
+                    DS4_ROCM_Q4K_DECODE_EVENT_X_QUANT, n_tokens);
+        }
         /* A negative TP sentinel removes unowned pairs from sorted buckets.
          * Clear their pair slots before valid pairs overwrite their own rows,
          * preserving exact zero contribution on the general prefill path. */
@@ -1621,6 +1641,10 @@ static int routed_moe_launch(
             f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(iq2_x_h, (const float *)x->ptr, xh_count);
             ok = cuda_ok(cudaGetLastError(), "routed_moe iq2 gate x f16 launch");
         }
+        if (ok && q4k_decode_event_profile) {
+            routed_moe_q4k_decode_event_record(
+                    DS4_ROCM_Q4K_DECODE_EVENT_ROUTE_PREP, n_tokens);
+        }
         int split_gateup_done = 0;
         if (ok && split_selected) {
             const int split_supported =
@@ -1733,6 +1757,11 @@ static int routed_moe_launch(
                             gate_expert_bytes, gate_row_bytes, wmma_min_count);
                         ok = cuda_ok(cudaGetLastError(),
                                      "routed_moe Q4_K gate WMMA launch");
+                        if (ok && q4k_decode_event_profile) {
+                            routed_moe_q4k_decode_event_record(
+                                    DS4_ROCM_Q4K_DECODE_EVENT_GATE_WMMA,
+                                    n_tokens);
+                        }
                         if (ok) {
                             moe_q4K_routed_wmma_kernel<16><<<wgrid, 256, wmma_smem>>>(
                                 up_w, q4k_q81,
@@ -1742,6 +1771,11 @@ static int routed_moe_launch(
                                 gate_expert_bytes, gate_row_bytes, wmma_min_count);
                             ok = cuda_ok(cudaGetLastError(),
                                          "routed_moe Q4_K up WMMA launch");
+                            if (ok && q4k_decode_event_profile) {
+                                routed_moe_q4k_decode_event_record(
+                                        DS4_ROCM_Q4K_DECODE_EVENT_UP_WMMA,
+                                        n_tokens);
+                            }
                         }
                         if (ok) {
                             dim3 cold_grid((expert_mid_dim + 31u) / 32u,
@@ -1754,6 +1788,11 @@ static int routed_moe_launch(
                                 expert_mid_dim, n_expert, wmma_min_count);
                             ok = cuda_ok(cudaGetLastError(),
                                          "routed_moe Q4_K DP4A cold launch");
+                            if (ok && q4k_decode_event_profile) {
+                                routed_moe_q4k_decode_event_record(
+                                        DS4_ROCM_Q4K_DECODE_EVENT_COLD,
+                                        n_tokens);
+                            }
                         }
                         if (ok) {
                             if (cuda_runtime_config()->moe_gate_up_epilogue_coalesced &&
@@ -1973,7 +2012,7 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe gate/up launch");
             if (ok && q4k_decode_event_profile) {
                 routed_moe_q4k_decode_event_record(
-                        DS4_ROCM_Q4K_DECODE_EVENT_GATE_UP);
+                        DS4_ROCM_Q4K_DECODE_EVENT_GATE_UP, n_tokens);
             }
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
             if (ok && use_iq2_gate_wmma && iq2_gate_hot_count != 0u) {
@@ -2066,7 +2105,7 @@ static int routed_moe_launch(
             }
             if (ok && q4k_decode_event_profile) {
                 routed_moe_q4k_decode_event_record(
-                        DS4_ROCM_Q4K_DECODE_EVENT_MID_QUANT);
+                        DS4_ROCM_Q4K_DECODE_EVENT_MID_QUANT, n_tokens);
             }
         }
         int direct_iq2_down_done = 0;
@@ -2363,7 +2402,7 @@ static int routed_moe_launch(
         }
         if (ok && q4k_decode_event_profile) {
             routed_moe_q4k_decode_event_record(
-                    DS4_ROCM_Q4K_DECODE_EVENT_DOWN);
+                    DS4_ROCM_Q4K_DECODE_EVENT_DOWN, n_tokens);
         }
         if (ok && compact_selected) ok = cuda_stream_selected_mark_inflight();
         return ok;
