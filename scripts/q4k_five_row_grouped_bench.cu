@@ -136,20 +136,34 @@ __global__ static void q4k_expert_major_grouped5(
     }
 }
 
-int main() {
+int main(int argc, char **argv) {
     int devices = 0;
     hip_check(hipGetDeviceCount(&devices), "get device count");
     if (devices < 1) return 2;
     hipDeviceProp_t prop{};
     hip_check(hipGetDeviceProperties(&prop, 0), "get device properties");
 
-    const int32_t captured[kPairs] = {
+    int32_t captured[kPairs] = {
         250, 45, 187, 129, 219, 38,
         129, 45, 187, 39, 174, 36,
         181, 45, 144, 110, 73, 4,
         45, 91, 4, 11, 187, 9,
         75, 115, 45, 0, 60, 187,
     };
+    if (argc > 1) {
+        FILE *route = fopen(argv[1], "rb");
+        if (!route) {
+            fprintf(stderr, "failed to open route capture: %s\n", argv[1]);
+            return 2;
+        }
+        const size_t got = fread(captured, sizeof(captured[0]), kPairs, route);
+        const int trailing = fgetc(route);
+        fclose(route);
+        if (got != kPairs || trailing != EOF) {
+            fprintf(stderr, "route capture must contain exactly %u int32 values\n", kPairs);
+            return 2;
+        }
+    }
     std::vector<int32_t> remapped(kPairs);
     std::vector<uint32_t> original;
     std::vector<uint32_t> counts(kPairs, 0u);
