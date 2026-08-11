@@ -4,6 +4,16 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *
     swiglu_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)gate->ptr, (const float *)up->ptr, n, clamp, weight);
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
+
+static int shared_gate_up_swiglu_sharedx_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_SHARED_GU_SWIGLU_FUSE");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -32,6 +42,36 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         !cuda_tensor_has_bytes(x, x_bytes) || !cuda_tensor_has_bytes(gate, out_bytes) ||
         !cuda_tensor_has_bytes(up, out_bytes) || !cuda_tensor_has_bytes(mid, out_bytes)) {
         return 0;
+    }
+    if (shared_gate_up_swiglu_sharedx_enabled() &&
+        in_dim == 4096u && out_dim == 1024u && blocks == 128u &&
+        cuda_model_range_fits(model_size, gate_offset, weight_bytes) &&
+        cuda_model_range_fits(model_size, up_offset, weight_bytes)) {
+        const char *wg = cuda_model_range_ptr(
+            model_map, gate_offset, weight_bytes, "shared_gate_q8_fused_sharedx");
+        const char *wu = cuda_model_range_ptr(
+            model_map, up_offset, weight_bytes, "shared_up_q8_fused_sharedx");
+        if (!wg || !wu) return 0;
+        const int store_gate_up =
+            (g_quality_mode || cuda_runtime_config()->graph_dump) ? 1 : 0;
+        const unsigned rows_per_block = 32u;
+        shared_gate_up_swiglu_q8_0_sharedx_rows_w32_kernel<<<
+                (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+                rows_per_block * 32u,
+                (size_t)in_dim * sizeof(float)>>>(
+                (float *)gate->ptr,
+                (float *)up->ptr,
+                (float *)mid->ptr,
+                reinterpret_cast<const unsigned char *>(wg),
+                reinterpret_cast<const unsigned char *>(wu),
+                (const float *)x->ptr,
+                (uint32_t)blocks,
+                out_dim,
+                row_bytes,
+                store_gate_up,
+                clamp);
+        return cuda_ok(cudaGetLastError(),
+                       "shared gate/up exact q8 fused swiglu launch");
     }
     if (in_dim == 4096u && (in_dim & 31u) == 0u &&
         cuda_model_range_fits(model_size, gate_offset, weight_bytes) &&

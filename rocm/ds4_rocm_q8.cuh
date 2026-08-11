@@ -1049,6 +1049,67 @@ __global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
     }
 }
 
+/* Exact one-token shared-expert gate/up path with a lane-0 SwiGLU epilogue.
+ * This retains the established F32 Q8_0 dot and wave-reduction order while
+ * avoiding a second pointwise launch and the gate/up round trip through
+ * global memory.  Only the input activation is staged (16 KiB for DFlash);
+ * weights remain in their original compact Q8_0 model storage. */
+__global__ static void shared_gate_up_swiglu_q8_0_sharedx_rows_w32_kernel(
+        float *gate,
+        float *up,
+        float *mid,
+        const unsigned char *wg,
+        const unsigned char *wu,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out_dim,
+        uint64_t row_bytes,
+        int store_gate_up,
+        float clamp) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *row_g = wg + row * row_bytes;
+    const unsigned char *row_u = wu + row * row_bytes;
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const float xv = shx[(b << 5u) + lane];
+        const unsigned char *bg = row_g + (uint64_t)b * 34u;
+        const unsigned char *bu = row_u + (uint64_t)b * 34u;
+        const float dg = q8_0_scale_broadcast_w32(bg);
+        const float du = q8_0_scale_broadcast_w32(bu);
+        const int8_t qg = ((const int8_t *)(bg + 2u))[lane];
+        const int8_t qu = ((const int8_t *)(bu + 2u))[lane];
+        acc_g += dg * (float)qg * xv;
+        acc_u += du * (float)qu * xv;
+    }
+    const float g = warp_sum_f32(acc_g);
+    const float u = warp_sum_f32(acc_u);
+    if (lane == 0u) {
+        if (store_gate_up) {
+            gate[row] = g;
+            up[row] = u;
+        }
+        float sg = g;
+        float su = u;
+        if (clamp > 1.0e-6f) {
+            sg = fminf(sg, clamp);
+            su = fminf(fmaxf(su, -clamp), clamp);
+        }
+        const float s = sg / (1.0f + expf(-sg));
+        mid[row] = s * su;
+    }
+}
+
 __global__ static void shared_gate_up_swiglu_q8_0_rows_w32_kernel(
         float *gate,
         float *up,
