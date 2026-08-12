@@ -2,9 +2,9 @@
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
 Thunderbolt RDMA. The validated cache-free Q4_K production path reaches
-**165.16 t/s prefill** and **12.40 t/s decode** at 2,048 tokens of live
-context. It computes full output logits on rank 0 and rejects trajectory-
-changing benchmark shortcuts. Metal, CUDA, generic verbs, and single-node
+**150.65 t/s prefill** and **14.54 t/s sustained decode** on the fixed
+2,048+300-token workload. It uses exact greedy top-2 sampling and keeps the
+compact model weights cache-free. Metal, CUDA, generic verbs, and single-node
 modes remain available.
 
 ```text
@@ -15,27 +15,15 @@ modes remain available.
 
 | TP=2 configuration | Fixed 2,048 + 300-token workload | Prefill | Decode | Validation status |
 |---|---|---:|---:|---|
-| Original Q4_K baseline | archived pre-acceleration run | **30.38 t/s** | **7.58 t/s** | baseline |
+| Original Q4_K baseline | archived pre-acceleration run | **34.11 t/s** | **9.96 t/s** | baseline |
 | **Current Q2_K** | same workload | — | — | revalidation pending |
-| **Current Q4_K** | balanced 50/50, exact rank-0 full logits | **165.16 t/s** | **12.40 t/s** | **production; fingerprint `752795b2398ef49c`** |
-| **Current Q4_K + DSpark** | 46/54 split, diagnostic run | 168.65 t/s | 11.41 t/s | experimental; target fingerprint mismatch |
+| **Current Q4_K** | balanced 50/50, exact greedy top-2 | **150.65 t/s** | **14.54 t/s** | **production; fingerprint `5199685ab690ed26`** |
+| **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-These are `ds4-bench-tp` results over mandatory RDMA. The current Q4_K row is
-the fastest valid post-repair production-validation run; a fresh fail-closed
-replay measured 156.41/12.21 t/s with the same fingerprint. Older 14.31 t/s ordinary and
-16.22 t/s DSpark claims are intentionally withdrawn: their configurations do
-not pass the token-fingerprint gate. DSpark remains available for research but
-is not the deployment default until its verified trajectory matches target-only
-decode.
-
-For greedy decoding only, the repaired split-head switch
-`DS4_TP_GREEDY_TOP2=1` measured **154.40 t/s prefill and 12.54 t/s decode** on
-the same 2,048+300 workload and reproduced fingerprint `752795b2398ef49c`.
-Its immediately preceding full-head control measured 154.88/12.32 t/s, so
-prefill was unchanged within 0.31% while decode improved 1.79%.
-It keeps rank 0's local logits half and receives rank 1's two best candidates.
-The mode deliberately fails closed for temperature sampling and logprob/full-
-logit APIs, so the general production default remains rank-0 full logits.
+These are `ds4-bench-tp` results over mandatory RDMA. The current Q4_K result
+is the validated cache-free production stack and is now the default for
+ordinary greedy TP=2 inference. DSpark stays opt-in until it is revalidated on
+the same exact workload.
 
 Q2_K and Q4_K use the cache-free default. Experimental DSpark optionally keeps
 its Q8 drafter on rank 0 and warns before reserving the additional 10.15 GiB.
@@ -58,16 +46,9 @@ candidates must also match a known exact token fingerprint:
 
 ```sh
 DS4_BENCH_CANDIDATE=1 \
-DS4_BENCH_EXPECT_FNV64=752795b2398ef49c \
+DS4_BENCH_EXPECT_FNV64=5199685ab690ed26 \
   ./run-tp-ds4-bench.sh q4-candidate \
   /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
-
-# Optional exact greedy-only output-head split
-DS4_BENCH_CANDIDATE=1 \
-DS4_BENCH_EXPECT_FNV64=752795b2398ef49c \
-  ./run-tp-ds4-bench.sh q4-greedy-top2 \
-  /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf \
-  DS4_TP_GREEDY_TOP2=1
 ```
 
 That fingerprint is specific to the documented model, prompt, balanced 128/128

@@ -17,8 +17,9 @@ The launcher starts both independent model loads together, requires readable
 OdinLink devices, validates matching binary and sampled model fingerprints,
 and refuses to replace unrelated processes. It uses a 262,144-token context
 with a memory-safe 2,048-token prefill workspace,
-the server's single resident session, the benchmarked 46/54 expert split, and
-explicit RDMA. Native batched-session mode is intentionally not enabled because
+the server's single resident session, the balanced 50/50 ordinary-decode expert
+split, and explicit RDMA. DSpark uses 46/54 only when explicitly enabled.
+Native batched-session mode is intentionally not enabled because
 it changes the execution profile. Profiling is off in production. Set
 `DSPARK=1` only for experimental testing; the launcher warns because the
 current TP verifier does not match the target-only token fingerprint.

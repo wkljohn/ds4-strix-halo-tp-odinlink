@@ -152,8 +152,10 @@ int main(void) {
     CHECK(alloc_tensor(&x, IN_DIM * sizeof(float)), "allocate input");
     CHECK(alloc_tensor(&add_in, OUT_DIM * sizeof(float)), "allocate addend");
 
-    const int32_t route[N_USED] = {0, 1, 2, 3, 4, 5};
-    const float route_weights[N_USED] = {0.31f, 0.23f, 0.17f, 0.13f, 0.09f, 0.07f};
+    /* A representative TP rank owns about half of the six selected experts.
+     * Remapping uses expert 0 plus a zero route weight for unowned slots. */
+    const int32_t route[N_USED] = {0, 1, 2, 0, 0, 0};
+    const float route_weights[N_USED] = {0.31f, 0.23f, 0.17f, 0.0f, 0.0f, 0.0f};
     float hx[IN_DIM], hadd[OUT_DIM];
     for (uint32_t i = 0; i < IN_DIM; i++)
         hx[i] = (float)((int)(i % 31u) - 15) * 0.03125f;
@@ -165,9 +167,6 @@ int main(void) {
     CHECK(upload(&add_in, hadd, sizeof(hadd)), "upload addend");
     CHECK(setenv("DS4_ROCM_TP_SKIP_UNOWNED", "1", 1) == 0,
           "enable exact unowned skip");
-    CHECK(setenv("DS4_ROCM_Q4K_DECODE_FUSE_ADDEND", "1", 1) == 0,
-          "enable production fused addend");
-
     for (uint32_t i = 0; i < WARMUP; i++) {
         CHECK(run_one(&out, &gate, &up, &mid, &down, &selected, &weights,
                       &x, &add_in, model, model_bytes, gate_off, up_off,
