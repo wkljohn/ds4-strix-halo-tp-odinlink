@@ -91,6 +91,30 @@ static int attention_q_b_qnorm_rope_enabled(void) {
     return enabled;
 }
 
+static int q8_pair_f32_pack4_enabled(void) {
+    static int enabled = -1;
+    static int gfx1151;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_ROCM_Q8_PAIR_F32_PACK4");
+        /* Explicit 0 is a testable fallback without latching the one-time
+         * dispatch cache, so the focused test can compare both kernels. */
+        if (value && strcmp(value, "0") == 0) return 0;
+        /* This is the exact compact-weight gfx1151 decode path. It does not
+         * allocate a repacked or expanded weight cache. */
+        enabled = !value || strcmp(value, "1") == 0;
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+            gfx1151 = strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return enabled && gfx1151;
+}
+
 /* Diagnostic-only sweep for the decode compressor_proj kernel
  * (matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel), which measured as
  * the second-largest decode attention sub-stage (~131us). Pure launch-
@@ -1045,6 +1069,25 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     if ((in_dim & 31u) == 0u && in_dim <= 8192u) {
         const unsigned rows_per_block = 32u;
         const unsigned threads = rows_per_block * 32u;
+        if (q8_pair_f32_pack4_enabled() && in_dim == 4096u &&
+            out0_dim == 1024u && out1_dim == 512u) {
+            matmul_q8_0_pair_f32_sharedx_warp_rows_w32_pack4_kernel<<<
+                    (unsigned)((max_out + rows_per_block - 1u) /
+                               rows_per_block),
+                    threads,
+                    (size_t)in_dim * sizeof(float)>>>(
+                (float *)out0->ptr,
+                (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                (const float *)x->ptr,
+                (uint32_t)blocks,
+                out0_dim,
+                out1_dim,
+                row_bytes);
+            return cuda_ok(cudaGetLastError(),
+                           "matmul_q8_0 pair f32 pack4 launch");
+        }
         matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel<<<
                 (unsigned)((max_out + rows_per_block - 1u) / rows_per_block),
                 threads,

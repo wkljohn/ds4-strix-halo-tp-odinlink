@@ -1151,6 +1151,70 @@ __global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
     }
 }
 
+/* Exact-F32 packed-four pair projection for gfx1151 decode. Four eight-lane
+ * subgroups consume four Q8 blocks per wave iteration, retaining both pair
+ * accumulators and the original compact weights. No activation quantization
+ * or persistent repack/cache is involved. */
+__global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_pack4_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t subgroup = lane >> 3u;
+    const uint32_t lane8 = lane & 7u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out0_dim && row >= out1_dim) return;
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * row_bytes : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * row_bytes : NULL;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t b4 = 0; b4 < n_blocks; b4 += 4u) {
+        const uint32_t b = b4 + subgroup;
+        const uint32_t elem = (b << 5u) + (lane8 << 2u);
+        const float4 xv = *reinterpret_cast<const float4 *>(shx + elem);
+        if (wr0) {
+            const unsigned char *blk = wr0 + (uint64_t)b * 34u;
+            const float d = q8_0_scale_scalar(blk);
+            const int8_t *q =
+                reinterpret_cast<const int8_t *>(blk + 2u + (lane8 << 2u));
+            acc0 += d * (float)q[0] * xv.x;
+            acc0 += d * (float)q[1] * xv.y;
+            acc0 += d * (float)q[2] * xv.z;
+            acc0 += d * (float)q[3] * xv.w;
+        }
+        if (wr1) {
+            const unsigned char *blk = wr1 + (uint64_t)b * 34u;
+            const float d = q8_0_scale_scalar(blk);
+            const int8_t *q =
+                reinterpret_cast<const int8_t *>(blk + 2u + (lane8 << 2u));
+            acc1 += d * (float)q[0] * xv.x;
+            acc1 += d * (float)q[1] * xv.y;
+            acc1 += d * (float)q[2] * xv.z;
+            acc1 += d * (float)q[3] * xv.w;
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0u) {
+        if (row < out0_dim) out0[row] = acc0;
+        if (row < out1_dim) out1[row] = acc1;
+    }
+}
+
 /* Exact one-token shared-expert gate/up path with a lane-0 SwiGLU epilogue.
  * This retains the established F32 Q8_0 dot and wave-reduction order while
  * avoiding a second pointwise launch and the gate/up round trip through
