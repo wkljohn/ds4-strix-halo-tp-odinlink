@@ -339,6 +339,17 @@ __global__ static void ds4_tp_ffn_range_kernel(
  * null-stream compute kernels (legacy null-stream implicit sync), so the
  * gate's blocking semantics are preserved. */
 static hipStream_t              g_tp_stream = NULL;
+/* ROCm documents stream wait-value memory as hipMallocSignalMemory.  gfx1151
+ * on the current ROCm build cannot allocate it; mapped host memory passes
+ * short probes, but sustained production decode has lost stream-write
+ * arrivals on either rank.  In that case use a host-synchronous gate: record
+ * the preceding default-stream work, wait on the host, execute the transport
+ * callback, then let the caller enqueue dependent GPU work.  This preserves
+ * gate ordering without persistent weight memory or an unsupported GPU wait. */
+static int                      g_tp_host_sync = 0;
+static hipEvent_t               g_tp_host_sync_event = NULL;
+static int                      g_tp_thread_started = 0;
+static uint64_t                 g_tp_host_sync_timeout_ns = 300000000000ull;
 /* ds4_tp.c is plain C; declare the hook setter with C linkage rather than
  * including ds4_tp.h into this .cu. Must match ds4_tp.h exactly. */
 extern "C" {
@@ -866,6 +877,13 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
     g_tp_split_rank = rank;
     g_tp_split_world = 2;   /* ds4 TP is always a two-way split */
     memset(g_tp_ffn_range_total, 0, sizeof(g_tp_ffn_range_total));
+    {
+        const char *timeout = getenv("DS4_TP_TIMEOUT_SEC");
+        char *end = NULL;
+        unsigned long sec = timeout ? strtoul(timeout, &end, 10) : 300ul;
+        if (!timeout || end == timeout || *end || sec == 0) sec = 300ul;
+        g_tp_host_sync_timeout_ns = (uint64_t)sec * 1000000000ull;
+    }
 
     unsigned char *base = (unsigned char *)slab->ptr;
     /* Two arrival words. ds4_tp.c sizes this region as slots*4; we use the
@@ -898,8 +916,12 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
             return 0;
         }
         g_tp_sig_is_host = 1;
+        g_tp_host_sync = 1;
         fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "tp_init: hipMallocSignalMemory unavailable, using host memory\n");
+                "tp_init: hipMallocSignalMemory unavailable; using reliable "
+                "host-synchronous gates\n");
+    } else {
+        g_tp_host_sync = 0;
     }
     g_tp_sig_alloc = sig;
     g_tp_chan[0].cpu_flag = (volatile uint64_t *)sig;
@@ -949,6 +971,17 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
         g_tp_sig_alloc = NULL;
         return 0;
     }
+    if (g_tp_host_sync &&
+        hipEventCreateWithFlags(&g_tp_host_sync_event,
+                                hipEventDisableTiming) != hipSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "tp_init: host-synchronous gate event create failed\n");
+        (void)hipStreamDestroy(g_tp_stream);
+        g_tp_stream = NULL;
+        if (g_tp_sig_is_host) hipHostFree(sig); else hipFree(sig);
+        g_tp_sig_alloc = NULL;
+        return 0;
+    }
     if (ds4_tp_ffn_range_enabled()) {
         for (int ch = 0; ch < 2; ch++) {
             void *host = NULL;
@@ -974,7 +1007,9 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
         }
     }
     g_tp_run = 1;
-    if (pthread_create(&g_tp_thread, NULL, ds4_tp_service_thread, NULL) != 0) {
+    g_tp_thread_started = 0;
+    if (!g_tp_host_sync &&
+        pthread_create(&g_tp_thread, NULL, ds4_tp_service_thread, NULL) != 0) {
         g_tp_run = 0;
         if (g_tp_sig_is_host) hipHostFree(sig); else hipFree(sig);
         g_tp_sig_alloc = NULL;
@@ -987,10 +1022,11 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tp_init: service thread failed\n");
         return 0;
     }
+    g_tp_thread_started = !g_tp_host_sync;
     g_tp_thread_live = 1;
     {
         const char *pin_cpu_str = getenv("DS4_TP_SERVICE_THREAD_PIN_CPU");
-        if (pin_cpu_str && *pin_cpu_str) {
+        if (g_tp_thread_started && pin_cpu_str && *pin_cpu_str) {
             int pin_cpu = atoi(pin_cpu_str);
             cpu_set_t cpuset;
             CPU_ZERO(&cpuset);
@@ -1001,14 +1037,15 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
         }
     }
     fprintf(stderr, DS4_GPU_LOG_PREFIX
-            "ROCm TP rank %u ready (2 channels, HIP stream wait-value)\n", rank);
+            "ROCm TP rank %u ready (2 channels, %s gates)\n", rank,
+            g_tp_host_sync ? "host-synchronous" : "HIP stream wait-value");
     return 1;
 }
 
 extern "C" void ds4_gpu_tp_shutdown(void) {
     if (!g_tp_thread_live) return;
     g_tp_run = 0;
-    pthread_join(g_tp_thread, NULL);        /* drains before returning */
+    if (g_tp_thread_started) pthread_join(g_tp_thread, NULL); /* drains */
     hipDeviceSynchronize();                 /* no pending WaitValue on the word */
     if (ds4_tp_ffn_range_enabled()) {
         ds4_tp_ffn_range_print("decode-row", -1, &g_tp_ffn_range_total[0]);
@@ -1018,6 +1055,10 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
     ds4_tp_set_devcopy(NULL);
     if (g_tp_copy_stream) { (void)hipStreamDestroy(g_tp_copy_stream); g_tp_copy_stream = NULL; }
     if (g_tp_stream) { (void)hipStreamDestroy(g_tp_stream); g_tp_stream = NULL; }
+    if (g_tp_host_sync_event) {
+        (void)hipEventDestroy(g_tp_host_sync_event);
+        g_tp_host_sync_event = NULL;
+    }
     if (g_tp_sig_alloc) {
         if (g_tp_sig_is_host) hipHostFree(g_tp_sig_alloc); else hipFree(g_tp_sig_alloc);
         g_tp_sig_alloc = NULL;
@@ -1029,6 +1070,8 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
         g_tp_ffn_range_device[ch] = NULL;
     }
     g_tp_fn = NULL; g_tp_ud = NULL;
+    g_tp_host_sync = 0;
+    g_tp_thread_started = 0;
 }
 
 /* DIAGNOSTIC ONLY (DECODE-PROFILER-STALL.md): opt-in probe for the stage-
@@ -1067,6 +1110,77 @@ static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
     }
     c->ring[seq % DS4_TP_RING] = *req;
     if (ds4_tp_fail_get()) return 0;
+
+    if (g_tp_host_sync) {
+        /* All production compute kernels use the legacy default stream.  The
+         * event is therefore the producer-ready boundary that the async gate
+         * encoded as StreamWriteValue64.  Because this call does not return
+         * until RDMA completes, dependent kernels cannot be submitted early
+         * and no device-side release wait is required. */
+        hipError_t err = hipEventRecord(g_tp_host_sync_event, NULL);
+        const uint64_t started_ns = ds4_tp_monotonic_ns();
+        uint32_t polls = 0;
+        while (err == hipSuccess) {
+            err = hipEventQuery(g_tp_host_sync_event);
+            if (err == hipSuccess) break;
+            if (err != hipErrorNotReady) break;
+            err = hipSuccess;
+            for (int i = 0; i < 64; i++) __builtin_ia32_pause();
+            if ((++polls & 255u) == 0) {
+                if (ds4_tp_monotonic_ns() - started_ns >=
+                    g_tp_host_sync_timeout_ns) {
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX
+                            "TP gate: producer timeout rank=%u ch=%d kind=%u "
+                            "layer=%u seq=%llu\n",
+                            g_tp_split_rank, ch, req->kind, req->layer,
+                            (unsigned long long)seq);
+                    ds4_tp_fail_release_gpu_waits();
+                    return 0;
+                }
+                sched_yield();
+            }
+        }
+        if (err != hipSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "TP gate: host-sync producer event failed: %s\n",
+                    hipGetErrorString(err));
+            ds4_tp_fail_release_gpu_waits();
+            return 0;
+        }
+        __atomic_store_n(c->gpu_flag, seq, __ATOMIC_RELEASE);
+        if (tp_trace()) {
+            fprintf(stderr,
+                    "[tp] host-sync ch=%d seq=%llu kind=%d layer=%u producer-ready\n",
+                    ch, (unsigned long long)seq, (int)req->kind, req->layer);
+        }
+        ds4_tp_ffn_range_consume(ch, seq, req);
+        int ok = 0;
+        switch (req->kind) {
+        case DS4_TP_ROW:
+            ok = g_tp_fn ? g_tp_fn(g_tp_ud, req->layer, req->gate, seq) : 0;
+            break;
+        case DS4_TP_BATCH:
+            ok = g_tp_batch_fn ?
+                 g_tp_batch_fn(g_tp_ud, req->layer, req->rows, seq) : 0;
+            break;
+        case DS4_TP_BIG:
+            ok = (g_tp_big_fn && req->out_ptr && req->in_ptr) ?
+                 g_tp_big_fn(g_tp_ud, req->layer, seq, req->out_ptr,
+                             req->in_ptr, req->bytes) : 0;
+            break;
+        default:
+            break;
+        }
+        if (!ok) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "TP host-sync exchange failed (kind %u layer %u seq %llu)\n",
+                    req->kind, req->layer, (unsigned long long)seq);
+            ds4_tp_fail_release_gpu_waits();
+            return 0;
+        }
+        __atomic_store_n(c->cpu_flag, seq, __ATOMIC_RELEASE);
+        return 1;
+    }
 
     if (tp_trace()) fprintf(stderr, "[tp] encode ch=%d seq=%llu kind=%d layer=%u -> enqueue\n",
                             ch, (unsigned long long)seq, (int)req->kind, req->layer);
