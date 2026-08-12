@@ -74,6 +74,12 @@ for env_kv in "${EXTRA_ENV[@]}"; do
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
     exit 2
   }
+  case $env_kv in
+    DS4_ROCM_ENABLE_Q8_F16_CACHE=*|DS4_ROCM_STREAM_Q8_F16_CACHE_GB=*)
+      echo "error: ds4-bench-tp results must not use the memory-heavy Q8-to-FP16 cache" >&2
+      exit 2
+      ;;
+  esac
   if [[ $env_kv == DS4_TP_EXPERT_SPLIT=* && $DSPARK == 0 ]]; then
     if [[ $CANDIDATE == 1 || $ALLOW_NONSTANDARD_SPLIT != 1 ]]; then
       echo "error: non-DSpark production/candidate runs require the balanced 128/128 expert split" >&2

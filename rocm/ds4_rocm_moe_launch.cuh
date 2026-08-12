@@ -76,6 +76,15 @@ static int routed_moe_q4k_decode_stage_xq_enabled(void) {
     return enabled;
 }
 
+static int routed_moe_q4k_decode_split_gate_up_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
 static int routed_moe_q4k_l2_pair_order_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -1973,7 +1982,32 @@ static int routed_moe_launch(
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (q4k_path) {
-                    if (routed_moe_q4k_decode_stage_xq_enabled()) {
+                    if (routed_moe_q4k_decode_split_gate_up_enabled() &&
+                        !write_gate_up) {
+                        dim3 split_grid((expert_mid_dim + 127u) / 128u,
+                                        pair_count, 1);
+                        moe_gate_or_up_decode_q4K_staged_xq_kernel<8, false>
+                            <<<split_grid, 128>>>(
+                            (float *)gate->ptr, NULL, gate_w, xq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            gate_expert_bytes, gate_row_bytes, xq_blocks,
+                            expert_mid_dim, n_expert,
+                            tp_skip_unowned && n_tokens == 1u, clamp);
+                        ok = cudaGetLastError() == cudaSuccess;
+                        if (ok) {
+                            moe_gate_or_up_decode_q4K_staged_xq_kernel<8, true>
+                                <<<split_grid, 128>>>(
+                                (float *)mid->ptr,
+                                (const float *)gate->ptr, up_w, xq,
+                                (const int32_t *)selected_exec->ptr,
+                                (const float *)weights->ptr,
+                                gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                expert_mid_dim, n_expert,
+                                tp_skip_unowned && n_tokens == 1u, clamp);
+                            ok = cudaGetLastError() == cudaSuccess;
+                        }
+                    } else if (routed_moe_q4k_decode_stage_xq_enabled()) {
                     moe_gate_up_mid_decode_q4K_staged_xq_kernel<false><<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
