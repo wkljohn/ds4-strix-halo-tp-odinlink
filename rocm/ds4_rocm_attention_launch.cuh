@@ -37,6 +37,27 @@ static int attention_output_low_pack4_enabled(void) {
     return enabled && gfx1151;
 }
 
+static int attention_prefill_static_flash_enabled(void) {
+    const char *value = getenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH");
+    if (value != NULL) return strcmp(value, "1") == 0;
+    const char *disable = getenv("DS4_ROCM_DISABLE_ATTENTION_PREFILL_STATIC_FLASH");
+    if (disable != NULL && strcmp(disable, "1") == 0) return 0;
+    static int gfx1151 = -1;
+    if (gfx1151 < 0) {
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        gfx1151 = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+            gfx1151 = strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return gfx1151;
+}
+
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
@@ -873,7 +894,21 @@ static int attention_prefill_mixed_launch(
         !g_quality_mode &&
         ((window != 0u ? window : n_tokens) + n_comp <= 768u)) {
         dim3 grid(n_q, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+        if (attention_prefill_static_flash_enabled()) {
+            attention_static_mixed_heads8_flash_kernel<<<grid, 256>>>((float *)heads->ptr,
+                                                                      sinks,
+                                                                      (const float *)q->ptr,
+                                                                      (const float *)raw_kv->ptr,
+                                                                      n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                      n_q,
+                                                                      q_row0,
+                                                                      n_comp,
+                                                                      window,
+                                                                      ratio,
+                                                                      n_head,
+                                                                      head_dim);
+        } else {
+            attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,
                                                                    (const float *)q->ptr,
                                                                    (const float *)raw_kv->ptr,
@@ -885,6 +920,7 @@ static int attention_prefill_mixed_launch(
                                                                    ratio,
                                                                    n_head,
                                                                    head_dim);
+        }
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
