@@ -76,8 +76,9 @@ static double bench_now_sec(void) {
 }
 
 /* rocprofv3 --selected-regions keeps profiling overhead out of model loading
- * and prefill. Resolve ROCTx dynamically so normal benchmark binaries do not
- * acquire a profiler-library dependency. */
+ * and, by default, prefill.  DS4_BENCH_ROCPROF_REGION=prefill selects only the
+ * measured prefill instead.  Resolve ROCTx dynamically so normal benchmark
+ * binaries do not acquire a profiler-library dependency. */
 static void bench_rocprof_selected_region(bool resume) {
     if (getenv("DS4_BENCH_ROCPROF_SELECTED_REGIONS") == NULL) return;
     typedef int (*control_fn)(uint64_t);
@@ -102,6 +103,12 @@ static void bench_rocprof_selected_region(bool resume) {
         fprintf(stderr, "ds4-bench: rocprof selected-region %s failed\n",
                 resume ? "resume" : "pause");
     }
+}
+
+static bool bench_rocprof_region_is(const char *region) {
+    const char *selected = getenv("DS4_BENCH_ROCPROF_REGION");
+    if (!selected || !*selected) selected = "decode";
+    return strcmp(selected, region) == 0;
 }
 
 static uint64_t bench_token_hash_update(uint64_t hash, int token) {
@@ -1241,6 +1248,9 @@ int main(int argc, char **argv) {
             .cap = frontier,
         };
 
+        if (bench_rocprof_region_is("prefill")) {
+            bench_rocprof_selected_region(true);
+        }
         const double prefill_t0 = bench_now_sec();
         if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
             fprintf(stderr, "ds4-bench: prefill to %d failed: %s\n", frontier, err);
@@ -1248,6 +1258,9 @@ int main(int argc, char **argv) {
             break;
         }
         const double prefill_t1 = bench_now_sec();
+        if (bench_rocprof_region_is("prefill")) {
+            bench_rocprof_selected_region(false);
+        }
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
 
@@ -1283,7 +1296,9 @@ int main(int argc, char **argv) {
             }
         }
 
-        bench_rocprof_selected_region(true);
+        if (bench_rocprof_region_is("decode")) {
+            bench_rocprof_selected_region(true);
+        }
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
@@ -1353,7 +1368,9 @@ int main(int argc, char **argv) {
             }
         }
         const double gen_t1 = bench_now_sec();
-        bench_rocprof_selected_region(false);
+        if (bench_rocprof_region_is("decode")) {
+            bench_rocprof_selected_region(false);
+        }
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
             fprintf(stderr, "ds4-bench: gen[ctx=%d] decoded text: \"", frontier);
             for (int i = 0; i < gen_token_count; i++) {

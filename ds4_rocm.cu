@@ -244,6 +244,43 @@ static uint32_t                 g_tp_split_rank = 0;
 static uint32_t                 g_tp_split_world = 1;
 static void                    *g_tp_sig_alloc = NULL;
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+struct ds4_tp_host_sync_profile_stat {
+    uint64_t count;
+    uint64_t producer_ns;
+    uint64_t exchange_ns;
+};
+static ds4_tp_host_sync_profile_stat g_tp_host_sync_profile[3];
+static int g_tp_host_sync_profile_enabled = -1;
+
+static inline int ds4_tp_host_sync_profile_is_enabled(void) {
+    if (g_tp_host_sync_profile_enabled < 0) {
+        const char *env = getenv("DS4_TP_HOST_SYNC_PROFILE");
+        g_tp_host_sync_profile_enabled =
+            env && env[0] && strcmp(env, "0") != 0;
+    }
+    return g_tp_host_sync_profile_enabled;
+}
+
+static void ds4_tp_host_sync_profile_print(void) {
+    static const char *kind_names[3] = {"row", "batch", "big"};
+    if (!ds4_tp_host_sync_profile_is_enabled()) return;
+    for (uint32_t kind = 0; kind < 3; kind++) {
+        const ds4_tp_host_sync_profile_stat *s =
+            &g_tp_host_sync_profile[kind];
+        if (!s->count) continue;
+        fprintf(stderr,
+                "{\"ds4_tp_host_sync_profile\":true,\"rank\":%u,"
+                "\"kind\":\"%s\",\"count\":%llu,"
+                "\"producer_us\":%.3f,\"exchange_us\":%.3f}\n",
+                g_tp_split_rank, kind_names[kind],
+                (unsigned long long)s->count,
+                (double)s->producer_ns / (double)s->count / 1000.0,
+                (double)s->exchange_ns / (double)s->count / 1000.0);
+    }
+}
+#endif
+
 /* Diagnostic-only range reduction for the F32 partial sum immediately before
  * an FFN TP gate.  Each invocation writes one compact host-mapped record; the
  * service thread consumes it only after the gate arrival word is visible. */
@@ -1047,6 +1084,9 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
     g_tp_run = 0;
     if (g_tp_thread_started) pthread_join(g_tp_thread, NULL); /* drains */
     hipDeviceSynchronize();                 /* no pending WaitValue on the word */
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    ds4_tp_host_sync_profile_print();
+#endif
     if (ds4_tp_ffn_range_enabled()) {
         ds4_tp_ffn_range_print("decode-row", -1, &g_tp_ffn_range_total[0]);
         ds4_tp_ffn_range_print("prefill-big", -1, &g_tp_ffn_range_total[1]);
@@ -1147,6 +1187,12 @@ static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
             ds4_tp_fail_release_gpu_waits();
             return 0;
         }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+        const int host_sync_profile =
+            ds4_tp_host_sync_profile_is_enabled();
+        const uint64_t producer_ready_ns =
+            host_sync_profile ? ds4_tp_monotonic_ns() : 0;
+#endif
         __atomic_store_n(c->gpu_flag, seq, __ATOMIC_RELEASE);
         if (tp_trace()) {
             fprintf(stderr,
@@ -1178,6 +1224,15 @@ static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
             ds4_tp_fail_release_gpu_waits();
             return 0;
         }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+        if (host_sync_profile && req->kind < 3u) {
+            ds4_tp_host_sync_profile_stat *s =
+                &g_tp_host_sync_profile[req->kind];
+            s->count++;
+            s->producer_ns += producer_ready_ns - started_ns;
+            s->exchange_ns += ds4_tp_monotonic_ns() - producer_ready_ns;
+        }
+#endif
         __atomic_store_n(c->cpu_flag, seq, __ATOMIC_RELEASE);
         return 1;
     }

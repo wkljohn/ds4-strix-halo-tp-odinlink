@@ -28,6 +28,7 @@ MTP=${DS4_BENCH_MTP:-/home/wkljohn/Desktop/cc/models/Huihui-DeepSeek-V4-Flash-07
 OUT="$REPO/research-results/quant-comparison-2026-08-10"
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
 ROCPROF_RUNTIME=${DS4_BENCH_ROCPROF_RUNTIME:-1}
+ROCPROF_REGION=${DS4_BENCH_ROCPROF_REGION:-decode}
 SHOW_OUTPUT=${DS4_BENCH_SHOW_OUTPUT:-0}
 CANDIDATE=${DS4_BENCH_CANDIDATE:-0}
 EXPECTED_FNV64=${DS4_BENCH_EXPECT_FNV64:-}
@@ -51,6 +52,10 @@ if [[ $ROCPROF == 1 && -z $TP_TIMEOUT_EXPLICIT ]]; then
   # Coordinator-only tracing can delay one rank substantially. This affects
   # diagnostics only; production retains the 60-second fail-closed timeout.
   TP_TIMEOUT_SEC=300
+fi
+if [[ $ROCPROF_REGION != decode && $ROCPROF_REGION != prefill ]]; then
+  echo "error: DS4_BENCH_ROCPROF_REGION must be decode or prefill" >&2
+  exit 2
 fi
 if [[ -n ${DS4_TP_EXPERT_SPLIT+x} ]]; then
   echo "error: ambient DS4_TP_EXPERT_SPLIT is not accepted; pass inference settings as trailing NAME=VALUE arguments" >&2
@@ -349,7 +354,8 @@ if [[ $ROCPROF == 1 ]]; then
   ROCPROF_OUT="$OUT/rocprof-$TAG"
   mkdir -p "$ROCPROF_OUT"
   ROCPROF_TRACE=(--runtime-trace --selected-regions)
-  COORD_ENV+=(DS4_BENCH_ROCPROF_SELECTED_REGIONS=1)
+  COORD_ENV+=(DS4_BENCH_ROCPROF_SELECTED_REGIONS=1
+             DS4_BENCH_ROCPROF_REGION="$ROCPROF_REGION")
   if [[ $ROCPROF_RUNTIME == 1 ]]; then
     # Gate-A diagnostics need both GPU dispatch intervals and the host HIP API
     # calls which submitted them. Runtime tracing is heavy and its timing is
