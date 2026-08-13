@@ -29,6 +29,7 @@ OUT="$REPO/research-results/quant-comparison-2026-08-10"
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
 ROCPROF_RUNTIME=${DS4_BENCH_ROCPROF_RUNTIME:-1}
 ROCPROF_REGION=${DS4_BENCH_ROCPROF_REGION:-decode}
+ROCPROF_RANK=${DS4_BENCH_ROCPROF_RANK:-coordinator}
 SHOW_OUTPUT=${DS4_BENCH_SHOW_OUTPUT:-0}
 CANDIDATE=${DS4_BENCH_CANDIDATE:-0}
 EXPECTED_FNV64=${DS4_BENCH_EXPECT_FNV64:-}
@@ -55,6 +56,14 @@ if [[ $ROCPROF == 1 && -z $TP_TIMEOUT_EXPLICIT ]]; then
 fi
 if [[ $ROCPROF_REGION != decode && $ROCPROF_REGION != prefill ]]; then
   echo "error: DS4_BENCH_ROCPROF_REGION must be decode or prefill" >&2
+  exit 2
+fi
+if [[ $ROCPROF_RANK != coordinator && $ROCPROF_RANK != worker ]]; then
+  echo "error: DS4_BENCH_ROCPROF_RANK must be coordinator or worker" >&2
+  exit 2
+fi
+if [[ $ROCPROF == 1 && $ROCPROF_RUNTIME != 1 ]]; then
+  echo "error: kernel-only rocprof is unsafe for asymmetric TP; use DS4_BENCH_ROCPROF_RUNTIME=1" >&2
   exit 2
 fi
 if [[ -n ${DS4_TP_EXPERT_SPLIT+x} ]]; then
@@ -331,17 +340,30 @@ echo "=== ds4-bench $TAG ==="
 echo "model: $MODEL"
 echo "workload: frontier=$FRONTIER generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK"
 if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
-if [[ $ROCPROF == 1 ]]; then echo "rocprof: kernel trace (diagnostic; timing is not benchmark evidence)"; fi
+if [[ $ROCPROF == 1 ]]; then echo "rocprof: rank=$ROCPROF_RANK kernel trace (diagnostic; timing is not benchmark evidence)"; fi
 echo "ds4_sha256: $LOCAL_DS4_HASH"
 echo "ds4_bench_tp_sha256: $LOCAL_BENCH_HASH"
 echo "model_sample_sha256: $LOCAL_MODEL_FINGERPRINT"
 if [[ $DSPARK == 1 ]]; then echo "mtp_sample_sha256: $LOCAL_MTP_FINGERPRINT resident_q8=1"; fi
 
-WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}" ./ds4
+WORKER_APP=(./ds4
   --role worker --tensor-parallel --coordinator "$COORDINATOR_ADDR" 9000
   --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
   --prefill-chunk "$PREFILL_CHUNK"
   "${WORKER_ARGS[@]}")
+WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}" "${WORKER_APP[@]}")
+if [[ $ROCPROF == 1 && $ROCPROF_RANK == worker ]]; then
+  ROCPROF_OUT="$OUT/rocprof-$TAG-worker"
+  printf -v ROCPROF_OUT_Q '%q' "$ROCPROF_OUT"
+  "${PEER_SSH[@]}" "mkdir -p $ROCPROF_OUT_Q"
+  # The worker has no benchmark-level ROCTx boundary. Trace its complete
+  # runtime and separate prefill by kernel family/count; model residency is
+  # dominated by page warming and copies rather than these compute kernels.
+  WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}"
+              rocprofv3 --runtime-trace --stats --summary
+              --summary-units usec --output-directory "$ROCPROF_OUT" --
+              "${WORKER_APP[@]}")
+fi
 printf -v WORKER_CMD_Q '%q ' "${WORKER_CMD[@]}"
 printf -v PEER_REPO_Q '%q' "$PEER_REPO"
 printf -v WORKER_LOG_Q '%q' "$WORKER_LOG"
@@ -350,29 +372,16 @@ printf -v WORKER_PIDFILE_Q '%q' "$WORKER_PIDFILE"
 WORKER_STARTED=1
 
 COORD_CMD=("$REPO/ds4-bench-tp")
-if [[ $ROCPROF == 1 ]]; then
+if [[ $ROCPROF == 1 && $ROCPROF_RANK == coordinator ]]; then
   ROCPROF_OUT="$OUT/rocprof-$TAG"
   mkdir -p "$ROCPROF_OUT"
   ROCPROF_TRACE=(--runtime-trace --selected-regions)
   COORD_ENV+=(DS4_BENCH_ROCPROF_SELECTED_REGIONS=1
              DS4_BENCH_ROCPROF_REGION="$ROCPROF_REGION")
-  if [[ $ROCPROF_RUNTIME == 1 ]]; then
-    # Gate-A diagnostics need both GPU dispatch intervals and the host HIP API
-    # calls which submitted them. Runtime tracing is heavy and its timing is
-    # never accepted as benchmark evidence, but unlike one-sided kernel-only
-    # tracing it has completed safely with the asymmetric TP launch protocol.
-    :
-  elif [[ $ROCPROF_RUNTIME == 0 ]]; then
-    echo "error: kernel-only rocprof is unsafe for asymmetric TP; use DS4_BENCH_ROCPROF_RUNTIME=1" >&2
-    exit 2
-  else
-    echo "error: DS4_BENCH_ROCPROF_RUNTIME must be 1" >&2
-    exit 2
-  fi
   COORD_CMD=(rocprofv3 "${ROCPROF_TRACE[@]}"
              --stats --summary --summary-units usec
              --output-directory "$ROCPROF_OUT" -- "$REPO/ds4-bench-tp")
-elif [[ $ROCPROF != 0 ]]; then
+elif [[ $ROCPROF != 0 && $ROCPROF != 1 ]]; then
   echo "error: DS4_BENCH_ROCPROF must be 0 or 1" >&2
   exit 2
 fi
