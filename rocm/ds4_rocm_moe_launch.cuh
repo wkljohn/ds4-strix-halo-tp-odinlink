@@ -1336,7 +1336,20 @@ static int routed_moe_launch(
         const uint32_t routing_tile_m = use_q4k_wmma ? 16u : expert_tile_m;
         const uint32_t write_gate_up = 0u;
         const uint32_t use_p2_sorted = 0u;
-        const uint32_t use_atomic_down = use_expert_tiles && n_tokens >= 128u;
+        const char *tp_prefill_skip_env =
+            getenv("DS4_ROCM_TP_PREFILL_SKIP_UNOWNED");
+        const uint32_t tp_prefill_skip_unowned =
+            n_tokens > 5u && tp_prefill_skip_env &&
+            tp_prefill_skip_env[0] == '1' &&
+            tp_prefill_skip_env[1] == '\0';
+        /* Removing zero-weight TP routes changes which expert tiles race to
+         * atomicAdd the same token row.  Preserve deterministic arithmetic by
+         * materializing pair-major down outputs and summing the six slots in
+         * their canonical order.  The down workspace already exists; this
+         * changes no persistent allocation. */
+        const uint32_t use_atomic_down =
+            use_expert_tiles && n_tokens >= 128u &&
+            !tp_prefill_skip_unowned;
         const uint32_t use_gate_row2048 = !q4k_path && use_expert_tiles && n_tokens >= 128u;
         const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && n_tokens >= 128u;
         const uint32_t use_decode_lut_gate =
@@ -2479,7 +2492,16 @@ static int routed_moe_launch(
         if (ok && !direct_iq2_down_done && !use_atomic_down &&
             !use_direct_down_sum6 && !use_iq2_q2_float_down) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            moe_sum_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)down->ptr, out_dim, n_expert, n_tokens);
+            if (tp_prefill_skip_unowned) {
+                moe_sum_skip_negative_kernel<<<(n + 255) / 256, 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr,
+                    (const int32_t *)selected_exec->ptr,
+                    out_dim, n_expert, n_tokens);
+            } else {
+                moe_sum_kernel<<<(n + 255) / 256, 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr,
+                    out_dim, n_expert, n_tokens);
+            }
             ok = cuda_ok(cudaGetLastError(), "routed_moe sum launch");
         }
         if (ok && q4k_decode_event_profile) {

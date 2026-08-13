@@ -1357,25 +1357,24 @@ extern "C" int ds4_gpu_tp_failed(void) { return ds4_tp_fail_get(); }
  * DS4 sets norm_topk_prob, but the normalisation survives because the two
  * partial sums recombine; neither rank renormalises.
  *
- * COST: no memory saving and no compute saving - both ranks still map all
- * experts and evaluate all six. Phase C's ~73 GB/node footprint does NOT
- * follow from this, and decode does not get faster. This buys a CORRECT TP=2
- * run, which is the prerequisite for judging whether the optimisation is worth
- * building.
+ * The default expert-0/zero-weight representation remains valid for every
+ * backend path. The opt-in sorted-prefill path below uses a negative sentinel
+ * to omit peer-owned routes before expert tiling; it does not change model
+ * residency or add a weight cache.
  * ------------------------------------------------------------------------ */
 __global__ void ds4_tp_shard_remap_kernel(int32_t *sel_dst, float *w_dst,
                                           const int32_t *sel_src, const float *w_src,
-                                          uint32_t n, int32_t lo, int32_t hi) {
+                                          uint32_t n, int32_t lo, int32_t hi,
+                                          uint32_t skip_unowned) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int32_t e = sel_src[i];
     const bool own = (e >= lo && e < hi);
     /* Rebase onto the shard: the launcher is handed gate/up/down offsets that
      * already start at expert `lo`, so an owned expert must be addressed as
-     * e-lo. Unowned pairs retain the validated expert-0/zero-weight encoding.
-     * Optional Q4_K decode skipping keys off that zero weight rather than
-     * introducing a negative expert sentinel into the shared launcher. */
-    sel_dst[i] = own ? (e - lo) : 0;
+     * e-lo. Unless prefill omission is explicitly selected, unowned pairs
+     * retain the validated expert-0/zero-weight encoding used by decode. */
+    sel_dst[i] = own ? (e - lo) : (skip_unowned ? -1 : 0);
     w_dst[i]   = own ? w_src[i] : 0.0f;
 }
 
@@ -1423,6 +1422,15 @@ extern "C" int ds4_gpu_tp_expert_shard_remap(
     int32_t *sel_dst = (int32_t *)scratch;
     float   *w_dst   = (float *)(sel_dst + n_pairs);
     const char *skip_env = getenv("DS4_ROCM_TP_SKIP_UNOWNED");
+    const char *prefill_skip_env = getenv("DS4_ROCM_TP_PREFILL_SKIP_UNOWNED");
+    /* Decode already has kernel-local zero-weight skipping.  The sorted
+     * prefill path instead needs a negative routing sentinel so the device
+     * count/scatter stage omits unowned pairs before building expert tiles.
+     * Keep the experiment explicitly gated and away from tiny verifier/decode
+     * batches until its full-model signature has been validated. */
+    const uint32_t prefill_skip_unowned =
+        n_pairs > 32u && prefill_skip_env &&
+        prefill_skip_env[0] == '1' && prefill_skip_env[1] == '\0';
     static bool logged_zero_weight_skip = false;
     if (!logged_zero_weight_skip && skip_env &&
         skip_env[0] == '1' && skip_env[1] == '\0') {
@@ -1433,7 +1441,8 @@ extern "C" int ds4_gpu_tp_expert_shard_remap(
     const uint32_t threads = 256u;
     const uint32_t blocks = (n_pairs + threads - 1u) / threads;
     hipLaunchKernelGGL(ds4_tp_shard_remap_kernel, dim3(blocks), dim3(threads), 0, 0,
-                       sel_dst, w_dst, selected, weights, n_pairs, lo, hi);
+                       sel_dst, w_dst, selected, weights, n_pairs, lo, hi,
+                       prefill_skip_unowned);
     if (out_selected) *out_selected = sel_dst;
     if (out_weights)  *out_weights  = w_dst;
     if (out_base)     *out_base     = (uint32_t)lo;

@@ -993,7 +993,7 @@ __global__ static void moe_count_sorted_pairs_kernel(
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) return;
     if ((uint32_t)expert_i >= n_total_expert) return;
     atomicAdd(counts + (uint32_t)expert_i, 1u);
 }
@@ -1023,7 +1023,7 @@ __global__ static void moe_scatter_sorted_pairs_kernel(
     uint32_t pair = (uint32_t)((uint64_t)blockIdx.x * blockDim.x + threadIdx.x);
     if (pair >= pair_count) return;
     int32_t expert_i = selected[pair];
-    if (expert_i < 0) expert_i = 0;
+    if (expert_i < 0) return;
     if ((uint32_t)expert_i >= n_total_expert) return;
     uint32_t pos = atomicAdd(cursors + (uint32_t)expert_i, 1u);
     sorted_pairs[pos] = pair;
@@ -1042,7 +1042,7 @@ __global__ static void moe_scatter_sorted_pairs_deterministic_kernel(
     uint32_t pos = offsets[expert];
     for (uint32_t pair = 0; pair < pair_count; pair++) {
         int32_t expert_i = selected[pair];
-        if (expert_i < 0) expert_i = 0;
+        if (expert_i < 0) continue;
         if ((uint32_t)expert_i == expert) sorted_pairs[pos++] = pair;
     }
 }
@@ -3101,6 +3101,33 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     uint32_t row = gid - (uint64_t)tok * out_dim;
     float acc = 0.0f;
     for (uint32_t e = 0; e < n_expert; e++) acc += down[((uint64_t)tok * n_expert + e) * out_dim + row];
+    out[gid] = acc;
+}
+
+/* Sum pair-major down rows in canonical route-slot order while omitting the
+ * negative sentinel used for TP routes owned by the peer. Owned rows are
+ * fully written by the down kernels, so skipped rows need neither clearing
+ * nor reading. */
+__global__ static void moe_sum_skip_negative_kernel(
+        float *out,
+        const float *down,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    const uint32_t tok = gid / out_dim;
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim);
+    const uint64_t pair0 = (uint64_t)tok * n_expert;
+    float acc = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = pair0 + slot;
+        if (selected[pair] >= 0) {
+            acc += down[pair * out_dim + row];
+        }
+    }
     out[gid] = acc;
 }
 
