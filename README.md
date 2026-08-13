@@ -2,7 +2,7 @@
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
 Thunderbolt RDMA. The validated cache-free Q4_K production path reaches
-**154.29 t/s prefill** and **14.80 t/s sustained decode** on the fixed
+**190.11 t/s median prefill** and **15.03 t/s sustained decode** on the fixed
 2,048+300-token workload. It uses exact greedy top-2 sampling and keeps the
 compact model weights cache-free. Metal, CUDA, generic verbs, and single-node
 modes remain available.
@@ -17,20 +17,26 @@ modes remain available.
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration run | **34.11 t/s** | **9.96 t/s** | baseline |
 | **Current Q2_K** | same workload | — | — | revalidation pending |
-| **Current Q4_K** | balanced 50/50, exact greedy top-2 | **154.29 t/s** | **14.80 t/s** | **production; three-run median, fingerprint `5199685ab690ed26`** |
+| **Current Q4_K** | balanced 50/50, exact greedy top-2 | **190.11 t/s** | **15.03 t/s** | **production; three-run median, fingerprint `5f8a983422299d76`** |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 These are `ds4-bench-tp` results over mandatory RDMA. The current Q4_K result
 is the validated cache-free production stack and is now the default for
-ordinary greedy TP=2 inference. DSpark stays opt-in until it is revalidated on
-the same exact workload.
+ordinary greedy TP=2 inference. Its three valid runs measured 203.85/15.04,
+190.11/15.03, and 188.18/14.99 prefill/decode t/s. DSpark stays opt-in until it
+is revalidated on the same exact workload.
 
 On ROCm builds where documented HIP signal memory is unavailable, TP gates use
 a bounded host-synchronous producer event before the same explicit RDMA
 exchange. This avoids rare lost stream-signal arrivals seen during sustained
-tool-heavy decode, adds no persistent model memory, and retains the exact token
-trajectory. The validated three runs measured 154.83/14.84, 151.23/14.78, and
-154.29/14.80 prefill/decode t/s.
+tool-heavy decode and adds no persistent model memory.
+
+For Q4_K prefill, each rank now omits peer-owned routed-expert work before
+building expert tiles. Static mixed attention uses a single-pass online
+softmax on gfx1151, reducing per-block LDS from about 32 KiB to 8 KiB and
+reading each KV row once. Both changes add no persistent model memory or wire
+traffic. The online reduction changes the deterministic token trajectory; the
+new fingerprint passed the built-in semantic smoke and repeat validation.
 
 Q2_K and Q4_K use the cache-free default. Experimental DSpark optionally keeps
 its Q8 drafter on rank 0 and warns before reserving the additional 10.15 GiB.
@@ -53,7 +59,7 @@ candidates must also match a known exact token fingerprint:
 
 ```sh
 DS4_BENCH_CANDIDATE=1 \
-DS4_BENCH_EXPECT_FNV64=5199685ab690ed26 \
+DS4_BENCH_EXPECT_FNV64=5f8a983422299d76 \
   ./run-tp-ds4-bench.sh q4-candidate \
   /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
 ```
