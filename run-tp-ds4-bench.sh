@@ -13,8 +13,9 @@ EXTRA_ENV=("$@")
   exit 2
 }
 
-REPO=/home/wkljohn/Desktop/cc/ds4-strix-halo-tp
-PEER_REPO=/home/wkljohn/Desktop/cc/ds4-strix-halo-tp
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO=${DS4_BENCH_REPO:-$SCRIPT_DIR}
+PEER_REPO=${DS4_PEER_REPO:-$REPO}
 PEER_MGMT=${DS4_PEER_MGMT:-wkljohn@10.10.0.216}
 COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-10.10.0.181}
 PROMPT_FILE=${DS4_BENCH_PROMPT_FILE:-$REPO/research-results/2026-08-06/prompts/codex-attn-rowsplit-implement-brief.md}
