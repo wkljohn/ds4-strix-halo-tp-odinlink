@@ -1,5 +1,7 @@
 #include "ds4.h"
+#include "ds4_distributed.h"
 #include "ds4_ssd.h"
+#include "ds4_tp.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -21,7 +23,9 @@ static void usage(const char *prog) {
             "usage: %s MODEL manifest.tsv OUT.tsv [ctx] "
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
-            "[--ssd-streaming-preload-experts N]\n",
+            "[--ssd-streaming-preload-experts N] [--max-cases N] "
+            "[--role coordinator --tensor-parallel --listen HOST PORT "
+            "--transport rdma]\n",
             prog);
 }
 
@@ -522,9 +526,34 @@ int main(int argc, char **argv) {
     uint32_t ssd_streaming_cache_experts = 0;
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
+    int max_cases = 0;
+    ds4_distributed_options dist = {0};
+    ds4_tp_options tp = {0};
 
     for (int i = 4; i < argc; i++) {
         const char *arg = argv[i];
+        char dist_err[256] = {0};
+        const ds4_dist_cli_parse_result dist_parse =
+            ds4_dist_parse_cli_arg(arg, &i, argc, argv, &dist,
+                                   dist_err, sizeof(dist_err));
+        if (dist_parse == DS4_DIST_CLI_ERROR) {
+            fprintf(stderr, "score_official: %s\n",
+                    dist_err[0] ? dist_err : "invalid distributed option");
+            return 2;
+        }
+        if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
+
+        char tp_err[256] = {0};
+        const ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg, &i, argc, argv, &tp,
+                                 tp_err, sizeof(tp_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr, "score_official: %s\n",
+                    tp_err[0] ? tp_err : "invalid tensor-parallel option");
+            return 2;
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "--ssd-streaming")) {
             ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -542,6 +571,11 @@ int main(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
             ssd_streaming_preload_experts =
                 (uint32_t)parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--max-cases")) {
+            max_cases = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--rocm")) {
+            /* DS4_BACKEND_CUDA names both CUDA and the ROCm compatibility
+             * backend; the build selects the implementation. */
         } else if (arg[0] != '-' && !ctx_set) {
             ctx_size = parse_positive_int(arg, "ctx");
             ctx_set = true;
@@ -551,6 +585,17 @@ int main(int argc, char **argv) {
         }
     }
     if (ctx_size < 1024) ctx_size = 1024;
+    char tp_err[256] = {0};
+    if (!ds4_tp_adopt_distributed_options(&tp, &dist,
+                                          tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "score_official: %s\n", tp_err);
+        return 2;
+    }
+    if (dist.role == DS4_DISTRIBUTED_WORKER) {
+        fprintf(stderr,
+                "score_official: start TP workers with ./ds4, not this scorer\n");
+        return 2;
+    }
 
     ds4_engine_options opt = {
         .model_path = model_path,
@@ -560,6 +605,7 @@ int main(int argc, char **argv) {
         .backend = DS4_BACKEND_CUDA,
 #endif
         .n_threads = 0,
+        .context_size = ctx_size,
         .ssd_streaming_cache_experts = ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = ssd_streaming_cache_bytes,
         .ssd_streaming_preload_experts = ssd_streaming_preload_experts,
@@ -567,10 +613,50 @@ int main(int argc, char **argv) {
         .quality = false,
         .ssd_streaming = ssd_streaming,
         .ssd_streaming_cold = ssd_streaming_cold,
+        .distributed = dist,
+        .tp = tp,
     };
+
+    char dist_err[256] = {0};
+    if (ds4_dist_prepare_engine_options(&dist, &opt,
+                                        dist_err, sizeof(dist_err)) != 0) {
+        fprintf(stderr, "score_official: %s\n", dist_err);
+        return 2;
+    }
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "score_official: %s\n", tp_err);
+        return 2;
+    }
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) die("failed to open model");
+
+    ds4_tp *tp_leader = NULL;
+    if (tp.role == DS4_TP_LEADER) {
+        ds4_tp_identity tp_id = {
+            .gguf_bytes = ds4_engine_model_bytes(engine),
+            .model_id = (uint32_t)ds4_engine_model_id(engine),
+            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+            .ctx_size = (uint32_t)ctx_size,
+            .runtime_features = ds4_engine_tp_runtime_features(engine),
+        };
+        ds4_engine_tp_gate_schedule(engine,
+                                    &tp_id.gate_slot_start,
+                                    &tp_id.gate_slot_step,
+                                    &tp_id.gates_per_token);
+        if (!ds4_tp_create(&tp_leader, &tp, &tp_id,
+                           tp_err, sizeof(tp_err)) ||
+            !ds4_engine_tp_bind(engine, tp_leader,
+                                tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "score_official: %s\n", tp_err);
+            ds4_tp_free(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) die("failed to create session");
@@ -611,6 +697,7 @@ int main(int argc, char **argv) {
     while (fgets(line, sizeof(line), mf)) {
         strip_newline(line);
         if (!line[0] || line[0] == '#') continue;
+        if (max_cases > 0 && case_n >= max_cases) break;
 
         char *id = strtok(line, "\t");
         char *prompt_path = strtok(NULL, "\t");
@@ -835,6 +922,12 @@ int main(int argc, char **argv) {
     fclose(mf);
     free(logits);
     ds4_session_free(session);
+    if (tp_leader) {
+        ds4_tp_send_stop(tp_leader);
+    }
+    /* A successful ds4_engine_tp_bind() transfers TP ownership to the
+     * engine.  ds4_engine_close() releases the transport after its GPU/MR
+     * teardown, matching the CLI, server, and benchmark lifetimes. */
     ds4_engine_close(engine);
     return 0;
 }

@@ -112,6 +112,22 @@ Use `data/flash/manifest.tsv` for Flash GGUFs,
 which model produced the manifest; the manifest path selects the continuation
 set.
 
+For the two-node gfx1151 fork, build and run the fail-closed RDMA wrapper:
+
+```sh
+make -j8 strix-halo-quality-score
+
+./run-tp-quality-score.sh q2-current /absolute/path/model-Q2_K.gguf
+./run-tp-quality-score.sh q2-control /absolute/path/model-Q2_K.gguf \
+  DS4_ROCM_DISABLE_IQ2_I8_WMMA=1
+```
+
+The wrapper requires identical rank binaries and model sizes, explicit
+OdinLink devices, full-vocabulary RDMA logits, a balanced expert split, and
+zero transport fallbacks. `DS4_QUALITY_MAX_CASES=N` selects a pilot subset;
+the default is all 100 cases. Raw output is retained under
+`research-results/accuracy-acceleration-2026-08-14/`.
+
 For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:
 
