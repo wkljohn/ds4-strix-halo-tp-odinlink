@@ -14,7 +14,7 @@ cache-free. Metal, CUDA, generic verbs, and single-node modes remain available.
     TP rank 0                                           TP rank 1
 ```
 
-| TP=2 configuration | Fixed 2,048 + 300-token workload | Prefill | Decode | Validation status |
+| DeepSeek V4 0731 TP=2 configuration | Fixed 2,048 + 300-token workload | Prefill | Decode | Validation status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration run | **34.11 t/s** | **9.96 t/s** | baseline |
 | **Current Q2_K** | balanced 50/50, hybrid IQ2_XXS/Q2_K experts | **162.78 t/s** | **14.68 t/s** | **production; three-run median, fingerprint `f9cb3a8a17e95c71`** |
