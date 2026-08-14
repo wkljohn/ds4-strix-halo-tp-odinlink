@@ -62,9 +62,10 @@ enum {
 };
 
 struct ds4_gpu_tensor {
-    void *ptr;
+    void *ptr;      /* GPU-visible address used by kernels. */
     uint64_t bytes;
-    int owner;
+    int owner;      /* 0=view, 1=hipMalloc, 2=hipHostMallocMapped. */
+    void *host_ptr; /* Optional host VA for mapped RDMA allocations. */
 };
 
 typedef struct {

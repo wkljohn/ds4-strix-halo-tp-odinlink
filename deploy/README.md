@@ -1,7 +1,8 @@
 # 256K TP=2 deployment behind Caddy
 
-This profile runs one cache-free Q4_K or hybrid-Q2 target across two Strix Halo nodes,
-uses exact ordinary decode by default, and exposes DS4 only on
+This profile runs one cache-free Q4_K or hybrid-Q2 target across two Strix Halo
+nodes over OdinLink or mlx5 RoCE v2, uses exact ordinary decode by default,
+and exposes DS4 only on
 `127.0.0.1:8090`. Caddy remains responsible for TLS, authentication, and the
 public hostname.
 
@@ -13,8 +14,8 @@ deploy/ds4-tp-caddy.sh start
 deploy/ds4-tp-caddy.sh status
 ```
 
-The launcher starts both independent model loads together, requires readable
-OdinLink devices, validates matching binary and sampled model fingerprints,
+The launcher starts both independent model loads together, validates the
+selected RDMA provider plus matching binary and sampled model fingerprints,
 and refuses to replace unrelated processes. It uses a 262,144-token context
 with a memory-safe 2,048-token prefill workspace,
 the server's single resident session, the balanced 50/50 ordinary-decode expert
@@ -32,11 +33,21 @@ decode has more headroom. Do not add resident sessions or enable the
 Q8-to-FP16 weight cache without rechecking memory. If another GPU workload must
 share either node, stop this service or lower `CONTEXT` first.
 
-Both nodes need the repository, target GGUF, and OdinLink provider at the
-absolute paths configured in `config.env.local`. Experimental DSpark also
+Both nodes need the repository and target GGUF at the absolute paths configured
+in `config.env.local`; the OdinLink profile also needs its provider.
+Experimental DSpark additionally
 requires the drafter GGUF on both nodes. Their filesystems are not assumed to
 be shared. Logs are retained under
 `research-results/deployment/` and are excluded from Git.
+
+Set `RDMA_PROFILE=roce-v2`, `COORDINATOR_RDMA_ADDR=192.168.99.1`,
+`LOCAL_RDMA_DEVICE=mlx5_0`, `PEER_RDMA_DEVICE=mlx5_1`, and
+`RDMA_GID_INDEX=3` for Mellanox. `ODINLINK_ROOT` is then unnecessary.
+RoCE also requires passwordless `sudo` for the launcher: the coordinator runs
+as the system transient service `ds4-tp-coordinator.service` with an actually
+unlimited locked-memory limit. The launcher verifies that effective process
+limit and checks the peer's SSH-session limit before model loading. OdinLink
+retains its transient user service and does not acquire this requirement.
 
 Useful commands:
 

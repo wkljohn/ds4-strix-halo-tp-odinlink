@@ -55,7 +55,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-tp-hello test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-tp-hello test-roce-v2-mr test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
 
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
@@ -65,6 +65,13 @@ tests/test_tp_hello: tests/test_tp_hello.c tests/ds4_tp_hello_test.o ds4_tp.h ds
 
 test-tp-hello: tests/test_tp_hello
 	./tests/test_tp_hello
+
+tests/roce_v2_mr_probe: tests/roce_v2_mr_probe.cpp
+	$(HIPCC) -O2 -o $@ $< -libverbs
+
+test-roce-v2-mr: tests/roce_v2_mr_probe
+	@test -n "$(RDMA_DEVICE)" || { echo "error: set RDMA_DEVICE=mlx5_N" >&2; exit 2; }
+	./tests/roce_v2_mr_probe "$(RDMA_DEVICE)"
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent

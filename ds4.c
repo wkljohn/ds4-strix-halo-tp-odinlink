@@ -58604,8 +58604,14 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     }
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
+    const uint64_t slab_bytes = ds4_tp_alloc_slab_bytes(tp);
+#ifdef DS4_ROCM_BUILD
+    e->tp.slab = ds4_tp_requires_host_slab(tp)
+                     ? ds4_gpu_tensor_alloc_rdma_host(slab_bytes)
+                     : ds4_gpu_tensor_alloc(slab_bytes);
+#else
     e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
+#endif
     e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
     e->tp.out_views = calloc(slots, sizeof(*e->tp.out_views));
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));

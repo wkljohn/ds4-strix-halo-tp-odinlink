@@ -167,6 +167,9 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+/* True only when the selected provider requires a host-pinned GPU-visible
+ * slab for NIC registration. OdinLink keeps its existing device allocation. */
+bool ds4_tp_requires_host_slab(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 uint32_t ds4_tp_runtime_features(const ds4_tp *tp);
 #ifdef DS4_TP_TEST_HOOKS
@@ -201,6 +204,8 @@ void ds4_tp_mark_failed(ds4_tp *tp);
  *
  * vec_bytes = n_embd * 4 (f32 partials, never quantized on the wire). */
 uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd);
+/* Provider-adjusted size after ds4_tp_create() selects a verbs device. */
+uint64_t ds4_tp_alloc_slab_bytes(const ds4_tp *tp);
 uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);

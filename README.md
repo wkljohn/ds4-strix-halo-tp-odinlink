@@ -1,15 +1,16 @@
-# DS4 Strix Halo TP over OdinLink
+# DS4 Strix Halo TP over OdinLink or RoCE v2
 
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
-Thunderbolt RDMA. The validated cache-free Q4_K production path reaches
+Thunderbolt RDMA or standard mlx5 RoCE v2. The validated cache-free Q4_K
+production path reaches
 **190.11 t/s median prefill** and **15.03 t/s sustained decode** on the fixed
 2,048+300-token workload; the hybrid Q2_K path reaches **162.78/14.68 t/s**.
 Both use exact greedy top-2 sampling and keep the compact model weights
 cache-free. Metal, CUDA, generic verbs, and single-node modes remain available.
 
 ```text
- Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
-  Strix Halo #1       <== Thunderbolt RDMA ==>        Strix Halo #2
+ Ryzen AI MAX+ 395       OdinLink or RoCE v2         Ryzen AI MAX+ 395
+  Strix Halo #1             <== RDMA ==>               Strix Halo #2
     TP rank 0                                           TP rank 1
 ```
 
@@ -18,6 +19,7 @@ cache-free. Metal, CUDA, generic verbs, and single-node modes remain available.
 | Original Q4_K baseline | archived pre-acceleration run | **34.11 t/s** | **9.96 t/s** | baseline |
 | **Current Q2_K** | balanced 50/50, hybrid IQ2_XXS/Q2_K experts | **162.78 t/s** | **14.68 t/s** | **production; three-run median, fingerprint `f9cb3a8a17e95c71`** |
 | **Current Q4_K** | balanced 50/50, exact greedy top-2 | **190.11 t/s** | **15.03 t/s** | **production; three-run median, fingerprint `5f8a983422299d76`** |
+| **Current Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **222.76 t/s** | **17.08 t/s** | **validated two-run midpoint, same fingerprint** |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 These are `ds4-bench-tp` results over mandatory RDMA. The current Q4_K result
@@ -25,6 +27,13 @@ is the validated cache-free production stack and is now the default for
 ordinary greedy TP=2 inference. Its three valid runs measured 203.85/15.04,
 190.11/15.03, and 188.18/14.99 prefill/decode t/s. DSpark stays opt-in until it
 is revalidated on the same exact workload.
+
+The ConnectX-4 Lx RoCE v2 row uses the same Q4_K model, binary,
+2,048+300-token workload, and fingerprint. Its two runs measured
+224.05/16.98 and 221.47/17.18 t/s. Against matched OdinLink runs at the same
+2,048-token prefill chunk, RoCE v2 improved the two-run midpoint by
+**13.9% prefill and 14.9% decode**. It replaces only the TP communication slab
+with a 77.4 MiB mapped allocation and adds no model-weight cache.
 
 The Q2_K median comes from 160.38/14.68, 162.78/13.77, and 164.07/14.73
 prefill/decode t/s. Its IQ2_XXS gate/up path expands compact codebook groups
@@ -63,6 +72,9 @@ absolute path on both nodes:
 
 ```sh
 ./run-tp-ds4-bench.sh q4-r1 /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
+DS4_BENCH_RDMA_PROFILE=roce-v2 \
+  ./run-tp-ds4-bench.sh q4-roce-r1 \
+  /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
 ./run-tp-ds4-bench.sh q2-r1 /absolute/path/DeepSeek-V4-Flash-Q2_K.gguf
 DS4_BENCH_DSPARK=1 DS4_BENCH_MTP=/absolute/path/dspark-Q8_0.gguf \
   ./run-tp-ds4-bench.sh q4-dspark-r1 \
@@ -112,8 +124,8 @@ DSpark.
 
 All Strix Halo acceleration is included in this fork—no external kernel patch
 is required. OdinLink-specific provider tuning is used only when its provider
-is selected; Mellanox and other standard verbs devices retain the generic
-transport path. Detailed kernel and validation reports are under
+is selected. mlx5 uses system libibverbs, RoCE v2, RC reliability, and its own
+registerable slab layout. Detailed kernel and validation reports are under
 [`docs/`](docs/).
 
 ## Reproduce the Strix Halo setup
@@ -244,6 +256,60 @@ grep odl_wc_stream_copy_summary coordinator.log worker.log
 The optimized summaries must report `"enabled":true`, nonzero
 `stream_calls`, and no unexplained fallback traffic. See [ODINLINK.md](ODINLINK.md)
 for the complete validation record and provider-isolation details.
+
+## RoCE v2 / Mellanox setup
+
+Install system verbs on both nodes and leave the OdinLink provider variables
+unset:
+
+```sh
+sudo apt install rdma-core ibverbs-utils perftest libibverbs-dev
+unset DS4_TP_VERBS_LIB ODL_VERBS_WC_STREAM_COPY DS4_TP_ODINLINK_BATCH_ASYNC
+```
+
+Configure the directly connected interfaces. The reference node 1 uses
+`mlx5_0` / `ens1f0np0` / `192.168.99.1`; node 2 uses `mlx5_1` /
+`ens1f1np1` / `192.168.99.2`:
+
+```sh
+# Node 1
+sudo ip link set ens1f0np0 mtu 9000 up
+sudo ip addr replace 192.168.99.1/24 dev ens1f0np0
+
+# Node 2
+sudo ip link set ens1f1np1 mtu 9000 up
+sudo ip addr replace 192.168.99.2/24 dev ens1f1np1
+```
+
+Verify GID index 3 reports `RoCE v2` and prove that mlx5 can register DS4's
+mapped communication slab:
+
+```sh
+cat /sys/class/infiniband/mlx5_0/ports/1/gid_attrs/types/3  # node 1
+cat /sys/class/infiniband/mlx5_1/ports/1/gid_attrs/types/3  # node 2
+make tests/roce_v2_mr_probe
+./tests/roce_v2_mr_probe mlx5_0                            # node 1
+./tests/roce_v2_mr_probe mlx5_1                            # node 2
+```
+
+The probe first reports the expected `hipMalloc` registration rejection, then
+must pass the mapped-host, three-MR layout. Run the fixed benchmark with:
+
+```sh
+DS4_BENCH_RDMA_PROFILE=roce-v2 \
+DS4_LOCAL_RDMA_DEVICE=mlx5_0 \
+DS4_PEER_RDMA_DEVICE=mlx5_1 \
+DS4_RDMA_GID_INDEX=3 \
+  ./run-tp-ds4-bench.sh q4-roce-r1 \
+  /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
+```
+
+The launcher uses system `libibverbs`, pins both devices and GID 3, requires
+RC/RoCE v2 proof in both logs, and defaults to a 2,048-token prefill chunk
+within the validated ConnectX-4 Lx registration budget. The two filesystems
+remain independent: install the same commit and model path on both nodes.
+See [`research-results/roce-v2-2026-08-14/`](research-results/roce-v2-2026-08-14/)
+for the allocator pitfall and A/B evidence.
 
 ## Following canonical DS4 updates
 

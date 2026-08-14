@@ -15,11 +15,29 @@ source "$CONFIG"
 : "${MODEL:?MODEL is required}"
 : "${PEER_MGMT:?PEER_MGMT is required}"
 : "${PEER_REPO:?PEER_REPO is required}"
-: "${ODINLINK_ROOT:?ODINLINK_ROOT is required}"
 : "${COORDINATOR_RDMA_ADDR:?COORDINATOR_RDMA_ADDR is required}"
 
+RDMA_PROFILE=${RDMA_PROFILE:-odinlink}
+case $RDMA_PROFILE in
+  odinlink)
+    : "${ODINLINK_ROOT:?ODINLINK_ROOT is required for OdinLink}"
+    LOCAL_RDMA_DEVICE=${LOCAL_RDMA_DEVICE:-odl_tb5_0}
+    PEER_RDMA_DEVICE=${PEER_RDMA_DEVICE:-odl_tb5_0}
+    ;;
+  roce-v2)
+    LOCAL_RDMA_DEVICE=${LOCAL_RDMA_DEVICE:-mlx5_0}
+    PEER_RDMA_DEVICE=${PEER_RDMA_DEVICE:-mlx5_1}
+    RDMA_GID_INDEX=${RDMA_GID_INDEX:-3}
+    ;;
+  *)
+    echo "error: RDMA_PROFILE must be odinlink or roce-v2" >&2
+    exit 2
+    ;;
+esac
 CONTEXT=${CONTEXT:-262144}
-PREFILL_CHUNK=${PREFILL_CHUNK:-4096}
+if [[ -z ${PREFILL_CHUNK:-} ]]; then
+  if [[ $RDMA_PROFILE == roce-v2 ]]; then PREFILL_CHUNK=2048; else PREFILL_CHUNK=4096; fi
+fi
 TP_TIMEOUT_SEC=${TP_TIMEOUT_SEC:-60}
 DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0}
 DSPARK=${DSPARK:-0}
@@ -32,11 +50,14 @@ API_PORT=${API_PORT:-8090}
 PEER_HOST_KEY_ALIAS=${PEER_HOST_KEY_ALIAS:-$PEER_MGMT}
 RUNTIME=$SCRIPT_DIR/runtime
 LOCAL_PIDFILE=$RUNTIME/coordinator.pid
+COORD_UNIT=${COORD_UNIT:-ds4-tp-coordinator}
 WORKER_PIDFILE=$PEER_REPO/research-results/deployment/worker.pid
 LOCAL_LOG=$REPO/research-results/deployment/coordinator.log
 WORKER_LOG=$PEER_REPO/research-results/deployment/worker.log
-VERBS_LIB=$ODINLINK_ROOT/build/verbs/libodl_tb5_verbs.so.0.1.0
-ODL_LD_PATH=$ODINLINK_ROOT/build/lib:$ODINLINK_ROOT/build/verbs
+if [[ $RDMA_PROFILE == odinlink ]]; then
+  VERBS_LIB=$ODINLINK_ROOT/build/verbs/libodl_tb5_verbs.so.0.1.0
+  ODL_LD_PATH=$ODINLINK_ROOT/build/lib:$ODINLINK_ROOT/build/verbs
+fi
 SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
      -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS" "$PEER_MGMT")
 
@@ -79,16 +100,62 @@ pid_matches() {
   tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq -- "$needle"
 }
 
+coord_is_active() {
+  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+    sudo -n systemctl is-active --quiet "$COORD_UNIT.service"
+  else
+    systemctl --user is-active --quiet "$COORD_UNIT.service"
+  fi
+}
+
+coord_main_pid() {
+  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+    sudo -n systemctl show -p MainPID --value "$COORD_UNIT.service"
+  else
+    systemctl --user show -p MainPID --value "$COORD_UNIT.service"
+  fi
+}
+
+coord_stop_service() {
+  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+    sudo -n systemctl stop "$COORD_UNIT.service"
+  else
+    systemctl --user stop "$COORD_UNIT.service"
+  fi
+}
+
 preflight() {
   [[ -x $REPO/ds4 && -x $REPO/ds4-server ]] || {
     echo "error: run 'make strix-halo' before deployment" >&2; exit 1;
   }
-  [[ -r $MODEL && -r /dev/odl_tb5_0 && -r $VERBS_LIB ]] || {
-    echo "error: local model, OdinLink device, or provider is missing" >&2; exit 1;
-  }
-  "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' -a -r /dev/odl_tb5_0 -a -r '$VERBS_LIB'" || {
-    echo "error: peer binary, model, OdinLink device, or provider is missing" >&2; exit 1;
-  }
+  [[ -r $MODEL ]] || { echo "error: local model is missing" >&2; exit 1; }
+  if [[ $RDMA_PROFILE == odinlink ]]; then
+    [[ -r /dev/odl_tb5_0 && -r $VERBS_LIB ]] || {
+      echo "error: local OdinLink device or provider is missing" >&2; exit 1;
+    }
+    "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' -a -r /dev/odl_tb5_0 -a -r '$VERBS_LIB'" || {
+      echo "error: peer binary, model, OdinLink device, or provider is missing" >&2; exit 1;
+    }
+  else
+    sudo -n true || {
+      echo "error: passwordless sudo is required to give the RoCE service unlimited memlock" >&2
+      exit 1
+    }
+    grep -qx 'RoCE v2' \
+      "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX" || {
+      echo "error: local mlx5 GID is not available as RoCE v2" >&2; exit 1;
+    }
+    "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX')\" = 'RoCE v2'" || {
+      echo "error: peer binary/model or RoCE v2 GID is unavailable" >&2; exit 1;
+    }
+    local peer_memlock
+    peer_memlock=$("${SSH[@]}" 'ulimit -l')
+    if [[ $peer_memlock != unlimited ]] &&
+       { [[ ! $peer_memlock =~ ^[0-9]+$ ]] || (( peer_memlock < 131072 )); }; then
+      echo "error: peer locked-memory limit is ${peer_memlock} KiB; RoCE deployment requires at least 128 MiB" >&2
+      exit 1
+    fi
+  fi
   local local_bin peer_bin
   local_bin=$(sha256sum "$REPO/ds4" | awk '{print $1}')
   peer_bin=$("${SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}')
@@ -115,6 +182,9 @@ start() {
   pid_matches "$LOCAL_PIDFILE" "ds4-server" && {
     echo "error: owned coordinator is already running" >&2; exit 1;
   }
+  coord_is_active && {
+    echo "error: coordinator service $COORD_UNIT is already running" >&2; exit 1;
+  }
   ss -ltnH "sport = :$API_PORT" | grep -q . && {
     echo "error: API port $API_PORT is already listening" >&2; exit 1;
   }
@@ -123,13 +193,26 @@ start() {
   }
 
   local -a common worker coordinator decode_env support_args
+  local -a worker_rdma_args coordinator_rdma_args
   local routed_family tp_prefill_skip_unowned
-  common=(env
+  if [[ $RDMA_PROFILE == odinlink ]]; then
+    common=(env
+      DS4_TP_ODINLINK_BATCH_ASYNC=1
+      DS4_TP_VERBS_LIB="$VERBS_LIB"
+      LD_LIBRARY_PATH="$ODL_LD_PATH")
+    worker_rdma_args=(--rdma-device "$PEER_RDMA_DEVICE")
+    coordinator_rdma_args=(--rdma-device "$LOCAL_RDMA_DEVICE")
+  else
+    common=(env -u DS4_TP_VERBS_LIB -u ODL_VERBS_WC_STREAM_COPY
+                -u DS4_TP_ODINLINK_BATCH_ASYNC)
+    worker_rdma_args=(--rdma-device "$PEER_RDMA_DEVICE"
+                      --rdma-gid-index "$RDMA_GID_INDEX")
+    coordinator_rdma_args=(--rdma-device "$LOCAL_RDMA_DEVICE"
+                           --rdma-gid-index "$RDMA_GID_INDEX")
+  fi
+  common+=(
     DS4_TP_EXPERT_SPLIT="$EXPERT_SPLIT"
     DS4_TP_TIMEOUT_SEC="$TP_TIMEOUT_SEC"
-    DS4_TP_ODINLINK_BATCH_ASYNC=1
-    DS4_TP_VERBS_LIB="$VERBS_LIB"
-    LD_LIBRARY_PATH="$ODL_LD_PATH"
     DS4_ROCM_ENABLE_Q8_F16_CACHE=0
     DS4_ROCM_STREAM_Q8_F16_CACHE_GB=0
     DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
@@ -172,12 +255,14 @@ start() {
   worker=("${common[@]}" ./ds4 --role worker --tensor-parallel
     --coordinator "$COORDINATOR_RDMA_ADDR" "$TP_PORT" --transport rdma --rocm
     -m "$MODEL" -c "$CONTEXT" --prefill-chunk "$PREFILL_CHUNK"
+    "${worker_rdma_args[@]}"
     "${support_args[@]}")
   coordinator=("${common[@]}")
   if [[ $DSPARK == 1 ]]; then coordinator+=(DS4_DSPARK_RESIDENT_Q8=1); fi
   coordinator+=(./ds4-server
     --role coordinator --tensor-parallel --listen 0.0.0.0 "$TP_PORT"
     --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
+    "${coordinator_rdma_args[@]}"
     --prefill-chunk "$PREFILL_CHUNK" "${support_args[@]}"
     --default-temperature "$DEFAULT_TEMPERATURE"
     --host "$API_HOST" --port "$API_PORT")
@@ -191,20 +276,62 @@ start() {
   # POSIX shells background the whole AND-list and `$!` names a wrapper shell.
   "${SSH[@]}" "cd $repo_q || exit 1; nohup setsid $worker_q >$log_q 2>&1 </dev/null & p=\$!; echo \$p >$pid_q"
 
-  (cd "$REPO"; nohup setsid "${coordinator[@]}" >"$LOCAL_LOG" 2>&1 </dev/null & echo $! >"$LOCAL_PIDFILE")
-  echo "started both ranks; model loading can take several minutes"
+  # RoCE registration needs more than the user manager's inherited 8 MiB hard
+  # memlock limit. A system transient unit can genuinely raise that limit;
+  # `systemctl --user show` only reports the requested, not effective, value.
+  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+    sudo -n systemd-run --unit="$COORD_UNIT" --collect --service-type=exec \
+      --uid="$(id -u)" --gid="$(id -g)" \
+      --property="WorkingDirectory=$REPO" \
+      --property="LimitMEMLOCK=infinity" \
+      --property="StandardOutput=append:$LOCAL_LOG" \
+      --property="StandardError=append:$LOCAL_LOG" \
+      "${coordinator[@]}" >/dev/null
+  else
+    systemd-run --user --unit="$COORD_UNIT" --collect --service-type=exec \
+      --property="WorkingDirectory=$REPO" \
+      --property="StandardOutput=append:$LOCAL_LOG" \
+      --property="StandardError=append:$LOCAL_LOG" \
+      "${coordinator[@]}" >/dev/null
+  fi
+  local coord_pid
+  coord_pid=$(coord_main_pid)
+  [[ $coord_pid =~ ^[1-9][0-9]*$ ]] || {
+    echo "error: coordinator service failed to start" >&2
+    return 1
+  }
+  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+    local effective_memlock
+    effective_memlock=$(awk '$1 == "Max" && $2 == "locked" && $3 == "memory" { print $4 }' "/proc/$coord_pid/limits")
+    [[ $effective_memlock == unlimited ]] || {
+      echo "error: coordinator effective memlock is $effective_memlock, expected unlimited" >&2
+      coord_stop_service
+      return 1
+    }
+  fi
+  printf '%s\n' "$coord_pid" >"$LOCAL_PIDFILE"
+  echo "started both ranks over $RDMA_PROFILE; model loading can take several minutes"
   echo "follow: $0 logs"
 }
 
 stop() {
-  if pid_matches "$LOCAL_PIDFILE" "ds4-server"; then
+  if coord_is_active; then
+    coord_stop_service
+    echo "stopped coordinator service $COORD_UNIT"
+  elif pid_matches "$LOCAL_PIDFILE" "ds4-server"; then
     pid=$(<"$LOCAL_PIDFILE"); kill -TERM "$pid"; echo "stopped coordinator $pid"
   fi
   "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 0;; esac; if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then kill -TERM \"\$p\"; echo stopped-worker-\$p; fi; fi"
 }
 
 status() {
-  if pid_matches "$LOCAL_PIDFILE" "ds4-server"; then echo "coordinator: running pid $(<"$LOCAL_PIDFILE")"; else echo "coordinator: stopped"; fi
+  if coord_is_active; then
+    echo "coordinator: running pid $(coord_main_pid)"
+  elif pid_matches "$LOCAL_PIDFILE" "ds4-server"; then
+    echo "coordinator: running pid $(<"$LOCAL_PIDFILE")"
+  else
+    echo "coordinator: stopped"
+  fi
   "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then echo worker-running-pid-\$p; else echo worker-stopped; fi; else echo worker-stopped; fi"
   if curl --silent --show-error --fail --max-time 3 "http://$API_HOST:$API_PORT/health" >/dev/null; then
     echo "api: ready on $API_HOST:$API_PORT"

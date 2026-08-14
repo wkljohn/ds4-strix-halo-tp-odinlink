@@ -6474,6 +6474,33 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     return t;
 }
 
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_rdma_host(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    void *host = NULL;
+    void *device = NULL;
+    cudaError_t err = hipHostMalloc(&host, (size_t)bytes, hipHostMallocMapped);
+    if (err == hipSuccess)
+        err = hipHostGetDevicePointer(&device, host, 0);
+    if (err != hipSuccess || !host || !device) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "RDMA host slab allocation failed: %s\n",
+                hipGetErrorString(err));
+        if (host) (void)hipHostFree(host);
+        free(t);
+        return NULL;
+    }
+    t->ptr = device;
+    t->host_ptr = host;
+    t->bytes = bytes;
+    t->owner = 2;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+            "using mapped host-pinned TP slab for generic RDMA (%.2f MiB)\n",
+            (double)bytes / 1048576.0);
+    return t;
+}
+
 static uint64_t cuda_managed_kv_reserve_bytes(uint64_t total_bytes) {
     const uint64_t min_reserve = 8ull * 1073741824ull;
     const uint64_t max_reserve = 40ull * 1073741824ull;
@@ -6515,6 +6542,8 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
     ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->ptr = (char *)base->ptr + offset;
+    if (base->host_ptr)
+        t->host_ptr = (char *)base->host_ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
     return t;
@@ -6522,7 +6551,10 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
 
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
-    if (tensor->owner && tensor->ptr) (void)cudaFree(tensor->ptr);
+    if (tensor->owner == 2 && tensor->host_ptr)
+        (void)hipHostFree(tensor->host_ptr);
+    else if (tensor->owner == 1 && tensor->ptr)
+        (void)cudaFree(tensor->ptr);
     free(tensor);
 }
 
@@ -6533,7 +6565,7 @@ extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
 extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     (void)cudaDeviceSynchronize();
-    return tensor->ptr;
+    return tensor->host_ptr ? tensor->host_ptr : tensor->ptr;
 }
 
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {

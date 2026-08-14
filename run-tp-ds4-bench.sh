@@ -1,5 +1,5 @@
 #!/bin/bash
-# Fixed-frontier, fixed-token TP=2 benchmark over mandatory OdinLink RDMA.
+# Fixed-frontier, fixed-token TP=2 benchmark over mandatory RDMA.
 #
 # Usage: ./run-tp-ds4-bench.sh <tag> <model.gguf> [EXTRA_ENV=1 ...]
 set -euo pipefail
@@ -17,15 +17,37 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO=${DS4_BENCH_REPO:-$SCRIPT_DIR}
 PEER_REPO=${DS4_PEER_REPO:-$REPO}
 PEER_MGMT=${DS4_PEER_MGMT:-wkljohn@10.10.0.216}
-COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-10.10.0.181}
+RDMA_PROFILE=${DS4_BENCH_RDMA_PROFILE:-odinlink}
+PREFILL_CHUNK_EXPLICIT=${DS4_BENCH_PREFILL_CHUNK+x}
+case $RDMA_PROFILE in
+  odinlink)
+    COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-10.10.0.181}
+    LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-odl_tb5_0}
+    PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-odl_tb5_0}
+    ;;
+  roce-v2)
+    COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-192.168.99.1}
+    LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
+    PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
+    ;;
+  *)
+    echo "error: DS4_BENCH_RDMA_PROFILE must be odinlink or roce-v2" >&2
+    exit 2
+    ;;
+esac
 PROMPT_FILE=${DS4_BENCH_PROMPT_FILE:-$REPO/bench-prompts/codex-attn-rowsplit-implement-brief.md}
 FRONTIER=${DS4_BENCH_FRONTIER:-2048}
 TOKENS=${DS4_BENCH_TOKENS:-300}
 CONTEXT=${DS4_BENCH_CONTEXT:-4096}
 PREFILL_CHUNK=${DS4_BENCH_PREFILL_CHUNK:-4096}
+if [[ $RDMA_PROFILE == roce-v2 && -z $PREFILL_CHUNK_EXPLICIT ]]; then
+  # ConnectX-4 Lx registers the 2048-row mapped slab but exhausts its
+  # pin/translation resources with the 4096-row direct layout.
+  PREFILL_CHUNK=2048
+fi
 DSPARK=${DS4_BENCH_DSPARK:-0}
 MTP=${DS4_BENCH_MTP:-/home/wkljohn/Desktop/cc/models/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf}
-OUT="$REPO/research-results/quant-comparison-2026-08-10"
+OUT=${DS4_BENCH_OUT:-"$REPO/research-results/quant-comparison-2026-08-10"}
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
 ROCPROF_RUNTIME=${DS4_BENCH_ROCPROF_RUNTIME:-1}
 ROCPROF_REGION=${DS4_BENCH_ROCPROF_REGION:-decode}
@@ -193,13 +215,20 @@ if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
   exit 0
 fi
 
-COMMON_ENV=(
-  DS4_TP_TIMEOUT_SEC="$TP_TIMEOUT_SEC"
-  DS4_TP_ODINLINK_BATCH_ASYNC=1
-  DS4_TP_VERBS_LIB=/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs/libodl_tb5_verbs.so.0.1.0
-  LD_LIBRARY_PATH=/home/wkljohn/Desktop/cc/OdinLink-Five/build/lib:/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs
-  "${CURRENT_OPT_ENV[@]}"
-)
+COMMON_ENV=(DS4_TP_TIMEOUT_SEC="$TP_TIMEOUT_SEC" "${CURRENT_OPT_ENV[@]}")
+RDMA_ARGS=(--rdma-device "$LOCAL_RDMA_DEVICE")
+WORKER_RDMA_ARGS=(--rdma-device "$PEER_RDMA_DEVICE")
+if [[ $RDMA_PROFILE == odinlink ]]; then
+  COMMON_ENV+=(
+    DS4_TP_ODINLINK_BATCH_ASYNC=1
+    DS4_TP_VERBS_LIB=/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs/libodl_tb5_verbs.so.0.1.0
+    LD_LIBRARY_PATH=/home/wkljohn/Desktop/cc/OdinLink-Five/build/lib:/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs
+  )
+else
+  RDMA_GID_INDEX=${DS4_RDMA_GID_INDEX:-3}
+  RDMA_ARGS+=(--rdma-gid-index "$RDMA_GID_INDEX")
+  WORKER_RDMA_ARGS+=(--rdma-gid-index "$RDMA_GID_INDEX")
+fi
 WORKER_ENV=("${COMMON_ENV[@]}")
 COORD_ENV=("${COMMON_ENV[@]}")
 if [[ $CANDIDATE == 1 && $EXPECT_GREEDY_TOP2 == 1 ]]; then
@@ -285,10 +314,23 @@ if [[ $DSPARK == 1 && ! -r $MTP ]]; then
   echo "error: missing local DSpark model: $MTP" >&2
   exit 1
 fi
-[[ -r /dev/odl_tb5_0 ]] || { echo "error: local OdinLink device unavailable" >&2; exit 1; }
-"${PEER_SSH[@]}" "test -r '$MODEL' -a -r /dev/odl_tb5_0" || {
-  echo "error: peer model or OdinLink device unavailable" >&2; exit 1;
-}
+if [[ $RDMA_PROFILE == odinlink ]]; then
+  [[ -r /dev/odl_tb5_0 ]] || { echo "error: local OdinLink device unavailable" >&2; exit 1; }
+  "${PEER_SSH[@]}" "test -r '$MODEL' -a -r /dev/odl_tb5_0" || {
+    echo "error: peer model or OdinLink device unavailable" >&2; exit 1;
+  }
+else
+  [[ -r /sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX ]] || {
+    echo "error: local mlx5 RoCE device unavailable: $LOCAL_RDMA_DEVICE" >&2; exit 1;
+  }
+  grep -qx 'RoCE v2' \
+    "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX" || {
+    echo "error: local GID index $RDMA_GID_INDEX is not RoCE v2" >&2; exit 1;
+  }
+  "${PEER_SSH[@]}" "test -r '$MODEL' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX')\" = 'RoCE v2'" || {
+    echo "error: peer model or RoCE v2 GID unavailable" >&2; exit 1;
+  }
+fi
 if [[ $DSPARK == 1 ]]; then
   "${PEER_SSH[@]}" "test -r '$MTP'" || { echo "error: peer DSpark model missing" >&2; exit 1; }
   LOCAL_MTP_SIZE=$(stat -c %s "$MTP")
@@ -390,6 +432,7 @@ done
 echo "=== ds4-bench $TAG ==="
 echo "model: $MODEL"
 echo "workload: frontier=$FRONTIER generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK"
+echo "rdma_profile: $RDMA_PROFILE coordinator_device=$LOCAL_RDMA_DEVICE worker_device=$PEER_RDMA_DEVICE"
 if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
 if [[ $DSPARK == 0 ]]; then echo "routed_expert_family: $ROUTED_FAMILY"; fi
 if [[ $ROCPROF == 1 ]]; then echo "rocprof: rank=$ROCPROF_RANK kernel trace (diagnostic; timing is not benchmark evidence)"; fi
@@ -402,6 +445,7 @@ WORKER_APP=(./ds4
   --role worker --tensor-parallel --coordinator "$COORDINATOR_ADDR" 9000
   --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
   --prefill-chunk "$PREFILL_CHUNK"
+  "${WORKER_RDMA_ARGS[@]}"
   "${WORKER_ARGS[@]}")
 WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}" "${WORKER_APP[@]}")
 if [[ $ROCPROF == 1 && $ROCPROF_RANK == worker ]]; then
@@ -441,6 +485,7 @@ fi
 "${CLEAN_ENV[@]}" "${COORD_ENV[@]}" "${COORD_CMD[@]}" \
   --role coordinator --tensor-parallel --listen 0.0.0.0 9000 \
   --transport rdma --rocm -m "$MODEL" --prompt-file "$PROMPT_FILE" \
+  "${RDMA_ARGS[@]}" \
   --ctx-start "$FRONTIER" --ctx-max "$FRONTIER" --ctx-alloc "$CONTEXT" \
   --prefill-chunk "$PREFILL_CHUNK" --gen-tokens "$TOKENS" --csv "$CSV" \
   "${CANDIDATE_ARGS[@]}" \
@@ -460,6 +505,7 @@ if [[ $DECODE_SELF_CHECK == 1 || $TEACHER_FORCE_CONTROL == 1 ]]; then
   exit 0
 fi
 "$REPO/scripts/check-ds4-bench-result.sh" \
-  "$CSV" "$COORD_LOG" "$WORKER_LOG" "$EXPECTED_FNV64" "$TOKENS" "$CANDIDATE"
+  "$CSV" "$COORD_LOG" "$WORKER_LOG" "$EXPECTED_FNV64" "$TOKENS" "$CANDIDATE" \
+  "$RDMA_PROFILE"
 cat "$CSV"
 echo RUN_DONE

@@ -46,6 +46,11 @@ void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
+#ifdef DS4_ROCM_BUILD
+/* Mapped pinned host allocation used only for NIC-registered TP slabs on
+ * providers that cannot register hipMalloc memory (notably mlx5 on gfx1151). */
+ds4_gpu_tensor *ds4_gpu_tensor_alloc_rdma_host(uint64_t bytes);
+#endif
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);

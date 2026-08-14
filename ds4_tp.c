@@ -94,6 +94,11 @@ typedef struct {
     uint32_t decode_max_msg;
 } ds4_tp_rdma_info;
 
+/* Provider-specific behavior must not silently change OdinLink's control
+ * frame. Bump/version the protocol deliberately if this ever needs to move. */
+_Static_assert(sizeof(ds4_tp_rdma_info) == 48,
+               "ds4_tp_rdma_info wire layout changed");
+
 /* TCP gate frames carry a small header so a desynchronized pair fails loudly
  * instead of silently mixing partials. */
 typedef struct {
@@ -118,6 +123,10 @@ typedef struct {
     int (*query_device)(struct ibv_context *, struct ibv_device_attr *);
     int (*query_port)(struct ibv_context *, uint8_t, struct ibv_port_attr *);
     int (*query_gid)(struct ibv_context *, uint8_t, int, union ibv_gid *);
+#if defined(__linux__)
+    int (*query_gid_ex)(struct ibv_context *, uint32_t, uint32_t,
+                        struct ibv_gid_entry *, uint32_t, size_t);
+#endif
     struct ibv_pd *(*alloc_pd)(struct ibv_context *);
     int (*dealloc_pd)(struct ibv_pd *);
     struct ibv_mr *(*reg_mr)(struct ibv_pd *, void *, size_t, int);
@@ -152,12 +161,18 @@ typedef struct {
     struct ibv_cq *cq;
     struct ibv_qp *qp;
     struct ibv_mr *mr;
+    struct ibv_mr *mr_big_out;
+    struct ibv_mr *mr_big_in;
     struct ibv_port_attr port;
     union ibv_gid gid;
+    char device_name[64];
     int gid_index;
+    int gid_type;
     uint32_t max_inline;
     uint32_t decode_max_msg;
     bool is_odinlink;
+    bool is_mlx5;
+    bool use_rc;
     ds4_tp_rdma_info peer;
     uint32_t send_outstanding;  /* signaled sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
@@ -195,6 +210,48 @@ static uint32_t tp_rdma_negotiate_decode_max_msg(uint32_t local,
                                                   uint32_t peer) {
     return peer < local ? peer : local;
 }
+
+static int tp_rdma_gid_is_ipv4_mapped(const union ibv_gid *gid) {
+    uint64_t hi;
+    uint16_t mid, v4tag;
+    memcpy(&hi, &gid->raw[0], 8);
+    memcpy(&mid, &gid->raw[8], 2);
+    memcpy(&v4tag, &gid->raw[10], 2);
+    return hi == 0 && mid == 0 && v4tag == 0xffff;
+}
+
+#if defined(__linux__)
+static int tp_rdma_gid_type_sysfs(const char *device_name, int index) {
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path),
+                 "/sys/class/infiniband/%s/ports/1/gid_attrs/types/%d",
+                 device_name, index) >= (int)sizeof(path))
+        return -1;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char type[32] = "";
+    const int ok = fscanf(fp, "%31[^\n]", type) == 1;
+    fclose(fp);
+    if (!ok) return -1;
+    if (strcmp(type, "RoCE v2") == 0) return 2;
+    if (strcmp(type, "IB/RoCE v1") == 0) return 1;
+    return -1;
+}
+
+static int tp_rdma_query_gid_type(ds4_tp_rdma *r, int index,
+                                  union ibv_gid *gid) {
+    if (r->api.query_gid_ex) {
+        struct ibv_gid_entry entry = {0};
+        if (r->api.query_gid_ex(r->ctx, 1, (uint32_t)index, &entry, 0,
+                                sizeof(entry)) == 0) {
+            *gid = entry.gid;
+            return (int)entry.gid_type;
+        }
+    }
+    if (r->api.query_gid(r->ctx, 1, index, gid) != 0) return -1;
+    return tp_rdma_gid_type_sysfs(r->device_name, index);
+}
+#endif
 
 #ifdef DS4_TP_TEST_HOOKS
 uint32_t ds4_tp_test_rdma_provider_decode_max_msg(const char *device_name) {
@@ -754,10 +811,21 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
     tp->big_capacity_rows = tp_big_direct_max_rows();
+#ifdef DS4_TP_HAVE_VERBS
+    /* ConnectX-4 Lx on the reference gfx1151 nodes can pin/register the
+     * 152 MiB 2048-row layout but rejects the 270/481 MiB 4096/8192-row
+     * layouts with ENOMEM. OdinLink does not have this restriction. */
+    if (tp->rdma.is_mlx5 && tp->big_capacity_rows > 2048u)
+        tp->big_capacity_rows = 2048u;
+#endif
     tp->big_out_off = tp->batch_in_off +
                      (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
     tp->big_in_off = tp->big_out_off + (uint64_t)tp->big_capacity_rows * vec;
     tp->slab_bytes = tp->big_in_off + (uint64_t)tp->big_capacity_rows * vec;
+}
+
+uint64_t ds4_tp_alloc_slab_bytes(const ds4_tp *tp) {
+    return tp ? tp->slab_bytes : 0;
 }
 
 uint64_t ds4_tp_slab_big_out_offset(const ds4_tp *tp) { return tp->big_out_off; }
@@ -841,6 +909,10 @@ static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     TP_SYM(query_device, "ibv_query_device");
     TP_SYM(query_port, "ibv_query_port");
     TP_SYM(query_gid, "ibv_query_gid");
+#if defined(__linux__)
+    api->query_gid_ex = (__typeof__(api->query_gid_ex))
+            dlsym(h, "_ibv_query_gid_ex");
+#endif
     TP_SYM(alloc_pd, "ibv_alloc_pd");
     TP_SYM(dealloc_pd, "ibv_dealloc_pd");
     TP_SYM(reg_mr, "ibv_reg_mr");
@@ -889,6 +961,8 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
             r->ctx = ctx;
             r->port = pa;
             r->is_odinlink = strncmp(name, "odl_tb5_", 8) == 0;
+            r->is_mlx5 = strncmp(name, "mlx5_", 5) == 0;
+            snprintf(r->device_name, sizeof(r->device_name), "%s", name);
             r->decode_max_msg = tp_rdma_decode_max_msg_override(
                     tp_rdma_provider_decode_max_msg(name));
             fprintf(stderr, "ds4-tp: rdma device %s (port state %d)\n", name, (int)pa.state);
@@ -910,14 +984,20 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
                    "and rdma_ctl enabled on both machines?", states);
         return 0;
     }
-    /* The driver only connects through the IPv4-mapped GID
-     * (::ffff:a.b.c.d), which exists only when the Thunderbolt member
-     * interface carries an IPv4 address (the bridge's address does not
-     * count). */
+    /* OdinLink uses its IPv4-mapped GID.  mlx5 Ethernet ports can expose the
+     * same IPv4 address as both RoCE v1 and v2; prefer v2 explicitly instead
+     * of silently taking the first IPv4-mapped entry. */
     r->gid_index = -1;
+    r->gid_type = -1;
     if (tp->opt.rdma_gid_index_set) {
         r->gid_index = tp->opt.rdma_gid_index;
+#if defined(__linux__)
+        r->gid_type = tp_rdma_query_gid_type(r, r->gid_index, &r->gid);
+        if (r->gid_type < 0 &&
+            r->api.query_gid(r->ctx, 1, r->gid_index, &r->gid) != 0) {
+#else
         if (r->api.query_gid(r->ctx, 1, r->gid_index, &r->gid) != 0) {
+#endif
             tp_set_err(err, errlen, "tp rdma: query_gid(%d): %s",
                        r->gid_index, strerror(errno));
             return 0;
@@ -925,15 +1005,17 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     } else {
         for (int i = 0; i < r->port.gid_tbl_len; i++) {
             union ibv_gid tmp;
+#if defined(__linux__)
+            const int gid_type = tp_rdma_query_gid_type(r, i, &tmp);
+#else
+            const int gid_type = -1;
             if (r->api.query_gid(r->ctx, 1, i, &tmp) != 0) continue;
-            uint64_t hi;
-            uint16_t mid, v4tag;
-            memcpy(&hi, &tmp.raw[0], 8);
-            memcpy(&mid, &tmp.raw[8], 2);
-            memcpy(&v4tag, &tmp.raw[10], 2);
-            if (hi == 0 && mid == 0 && v4tag == 0xffff) {
+#endif
+            if (tp_rdma_gid_is_ipv4_mapped(&tmp) &&
+                (!r->is_mlx5 || gid_type == 2)) {
                 r->gid = tmp;
                 r->gid_index = i;
+                r->gid_type = gid_type;
                 break;
             }
         }
@@ -945,6 +1027,14 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
             return 0;
         }
     }
+    if (r->is_mlx5 && r->gid_type != 2) {
+        tp_set_err(err, errlen,
+                   "tp rdma: mlx5 device %s GID index %d is not RoCE v2",
+                   r->device_name, r->gid_index);
+        return 0;
+    }
+    fprintf(stderr, "ds4-tp: rdma GID index %d%s\n", r->gid_index,
+            r->is_mlx5 ? " (RoCE v2)" : "");
     r->pd = r->api.alloc_pd(r->ctx);
     if (!r->pd) {
         tp_set_err(err, errlen, "tp rdma: alloc_pd failed");
@@ -962,14 +1052,14 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
      * provider rejects everything except IBV_QPT_RC
      * (odl_tb5_verbs_qp.c:250). RC keeps the connected, in-order semantics
      * this transport depends on and merely adds reliability. */
-    qia.qp_type = IBV_QPT_UC;
+    qia.qp_type = r->is_mlx5 ? IBV_QPT_RC : IBV_QPT_UC;
     qia.cap.max_send_wr = 256;
     qia.cap.max_recv_wr = 64;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
-    if (!r->qp) {
+    if (!r->qp && !r->is_mlx5) {
         /* DS4-TP-gfx1151 (patch 8): providers that support only RC. */
         qia.qp_type = IBV_QPT_RC;
         r->qp = r->api.create_qp(r->pd, &qia);
@@ -978,9 +1068,13 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
         }
     }
     if (!r->qp) {
-        tp_set_err(err, errlen, "tp rdma: create_qp(UC and RC): %s", strerror(errno));
+        tp_set_err(err, errlen, "tp rdma: create_qp(%s): %s",
+                   r->is_mlx5 ? "RC" : "UC and RC", strerror(errno));
         return 0;
     }
+    r->use_rc = qia.qp_type == IBV_QPT_RC;
+    if (r->is_mlx5)
+        fprintf(stderr, "ds4-tp: mlx5 queue pair uses RC\n");
     r->max_inline = qia.cap.max_inline_data;
 
     pthread_mutex_init(&r->post_lock, NULL);
@@ -991,12 +1085,40 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq);
 
 static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
-    r->mr = r->api.reg_mr(r->pd, tp->slab, tp->slab_bytes,
-                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                          IBV_ACCESS_REMOTE_WRITE);
+    const int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                       IBV_ACCESS_REMOTE_WRITE;
+    /* ConnectX-4 Lx cannot register this gfx1151 hipMalloc allocation at all,
+     * and its MTT budget also rejects the complete ~481 MiB mapped-host slab
+     * as one MR. The slab already has natural core/big-out/big-in regions.
+     * Register those independently on mlx5; two-sided SEND/RECV only needs
+     * the local lkey for each SGE, so the wire frame remains unchanged. */
+    const uint64_t core_bytes =
+        r->is_mlx5 && tp->big_capacity_rows ? tp->big_out_off : tp->slab_bytes;
+    r->mr = r->api.reg_mr(r->pd, tp->slab, core_bytes,
+                          access);
+    if (r->mr && r->is_mlx5 && tp->big_capacity_rows) {
+        const uint64_t big_bytes =
+            (uint64_t)tp->big_capacity_rows * tp->vec_bytes;
+        r->mr_big_out = r->api.reg_mr(
+                r->pd, tp->slab + tp->big_out_off, big_bytes, access);
+        r->mr_big_in = r->api.reg_mr(
+                r->pd, tp->slab + tp->big_in_off, big_bytes, access);
+        if (!r->mr_big_out || !r->mr_big_in) {
+            tp_set_err(err, errlen,
+                       "tp rdma: segmented mlx5 reg_mr(core=%llu big=%llu): %s",
+                       (unsigned long long)core_bytes,
+                       (unsigned long long)big_bytes, strerror(errno));
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4-tp: mlx5 registered host slab as 3 MRs "
+                "(core %.2f MiB, big %.2f MiB each)\n",
+                (double)core_bytes / 1048576.0,
+                (double)big_bytes / 1048576.0);
+    }
     if (!r->mr) {
         tp_set_err(err, errlen, "tp rdma: reg_mr(%llu bytes): %s",
-                   (unsigned long long)tp->slab_bytes, strerror(errno));
+                   (unsigned long long)core_bytes, strerror(errno));
         return 0;
     }
     ds4_tp_rdma_info mine = {0};
@@ -1054,17 +1176,31 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     a.ah_attr.is_global = 1;
     memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
     a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
-    a.ah_attr.grh.hop_limit = 1;
-    if (r->api.modify_qp(r->qp, &a,
-            IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
-            IBV_QP_RQ_PSN) != 0) {
+    a.ah_attr.grh.hop_limit = r->is_mlx5 ? 64 : 1;
+    int rtr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                   IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
+    if (r->is_mlx5) {
+        a.max_dest_rd_atomic = 1;
+        a.min_rnr_timer = 12;
+        rtr_mask |= IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+    }
+    if (r->api.modify_qp(r->qp, &a, rtr_mask) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
         return 0;
     }
     memset(&a, 0, sizeof(a));
     a.qp_state = IBV_QPS_RTS;
     a.sq_psn = mine.psn;
-    if (r->api.modify_qp(r->qp, &a, IBV_QP_STATE | IBV_QP_SQ_PSN) != 0) {
+    int rts_mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
+    if (r->is_mlx5) {
+        a.timeout = 14;
+        a.retry_cnt = 7;
+        a.rnr_retry = 7;
+        a.max_rd_atomic = 1;
+        rts_mask |= IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                    IBV_QP_MAX_QP_RD_ATOMIC;
+    }
+    if (r->api.modify_qp(r->qp, &a, rts_mask) != 0) {
         tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
         return 0;
     }
@@ -1097,6 +1233,26 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         return 0;
     }
     return 1;
+}
+
+static uint32_t tp_rdma_lkey(const ds4_tp *tp, const void *ptr,
+                            uint64_t bytes) {
+    const ds4_tp_rdma *r = &tp->rdma;
+    const uintptr_t p = (uintptr_t)ptr;
+    const uintptr_t slab = (uintptr_t)tp->slab;
+    if (r->mr_big_out) {
+        const uintptr_t begin = slab + tp->big_out_off;
+        const uint64_t span = (uint64_t)tp->big_capacity_rows * tp->vec_bytes;
+        if (p >= begin && p <= begin + span && bytes <= begin + span - p)
+            return r->mr_big_out->lkey;
+    }
+    if (r->mr_big_in) {
+        const uintptr_t begin = slab + tp->big_in_off;
+        const uint64_t span = (uint64_t)tp->big_capacity_rows * tp->vec_bytes;
+        if (p >= begin && p <= begin + span && bytes <= begin + span - p)
+            return r->mr_big_in->lkey;
+    }
+    return r->mr ? r->mr->lkey : 0;
 }
 
 /* ibv_wc_status_str lives in librdma; resolve lazily to keep the dlopen-only
@@ -1247,7 +1403,7 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
         memset(&wr, 0, sizeof(wr));
         sge.addr = base + off;
         sge.length = (uint32_t)len;
-        sge.lkey = r->mr->lkey;
+        sge.lkey = tp_rdma_lkey(tp, (void *)(uintptr_t)sge.addr, sge.length);
         wr.wr_id = last ? seq : 0;
         wr.sg_list = &sge;
         wr.num_sge = 1;
@@ -1312,7 +1468,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         memset(&wr, 0, sizeof(wr));
         sge.addr = send_base + off;
         sge.length = (uint32_t)len;
-        sge.lkey = r->mr->lkey;
+        sge.lkey = tp_rdma_lkey(tp, (void *)(uintptr_t)sge.addr, sge.length);
         wr.wr_id = seq;
         wr.sg_list = &sge;
         wr.num_sge = 1;
@@ -1428,7 +1584,7 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
             sge[wi] = (struct ibv_sge) {
                 .addr = (uintptr_t)(scratch + off),
                 .length = (uint32_t)len,
-                .lkey = r->mr->lkey,
+                .lkey = tp_rdma_lkey(tp, scratch + off, len),
             };
             wr[wi].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)wi + 1u);
             wr[wi].sg_list = &sge[wi];
@@ -1581,7 +1737,11 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 .addr = direct ? in_lo + off + chunk_off[i] :
                                  (uintptr_t)(stage_recv + chunk_off[i]),
                 .length = lens[i],
-                .lkey = r->mr->lkey,
+                .lkey = tp_rdma_lkey(tp,
+                                     (void *)(uintptr_t)(direct ?
+                                         in_lo + off + chunk_off[i] :
+                                         (uintptr_t)(stage_recv + chunk_off[i])),
+                                     lens[i]),
             };
             recv_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
             recv_wr[i].sg_list = &recv_sge[i];
@@ -1605,7 +1765,11 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 .addr = direct ? out_lo + off + chunk_off[i] :
                                  (uintptr_t)(stage_send + chunk_off[i]),
                 .length = lens[i],
-                .lkey = r->mr->lkey,
+                .lkey = tp_rdma_lkey(tp,
+                                     (void *)(uintptr_t)(direct ?
+                                         out_lo + off + chunk_off[i] :
+                                         (uintptr_t)(stage_send + chunk_off[i])),
+                                     lens[i]),
             };
             send_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
             send_wr[i].sg_list = &send_sge[i];
@@ -1752,11 +1916,14 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
 static void tp_rdma_close(ds4_tp *tp) {
     ds4_tp_rdma *r = &tp->rdma;
     if (r->qp) r->api.destroy_qp(r->qp);
+    if (r->mr_big_in) r->api.dereg_mr(r->mr_big_in);
+    if (r->mr_big_out) r->api.dereg_mr(r->mr_big_out);
     if (r->mr) r->api.dereg_mr(r->mr);
     if (r->cq) r->api.destroy_cq(r->cq);
     if (r->pd) r->api.dealloc_pd(r->pd);
     if (r->ctx) r->api.close_device(r->ctx);
-    r->qp = NULL; r->mr = NULL; r->cq = NULL; r->pd = NULL; r->ctx = NULL;
+    r->qp = NULL; r->mr = NULL; r->mr_big_out = NULL; r->mr_big_in = NULL;
+    r->cq = NULL; r->pd = NULL; r->ctx = NULL;
 }
 
 #endif /* DS4_TP_HAVE_VERBS */
@@ -1886,6 +2053,8 @@ int ds4_tp_create(
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) {
         if (!tp_rdma_open(tp, err, errlen)) goto fail;
+        /* Provider selection can constrain the registerable slab layout. */
+        tp_slab_layout(tp);
     }
 #endif
     {
@@ -1940,6 +2109,14 @@ void ds4_tp_free(ds4_tp *tp) {
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
+bool ds4_tp_requires_host_slab(const ds4_tp *tp) {
+#ifdef DS4_TP_HAVE_VERBS
+    return tp && tp->rdma_active && tp->rdma.is_mlx5;
+#else
+    (void)tp;
+    return false;
+#endif
+}
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 uint32_t ds4_tp_runtime_features(const ds4_tp *tp) {
     return tp ? tp->runtime_features : 0;

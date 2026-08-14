@@ -8,6 +8,7 @@ WORKER_LOG=${3:?missing worker log}
 EXPECTED_FNV64=${4:-}
 EXPECTED_TOKENS=${5:?missing expected generated-token count}
 REQUIRE_SEMANTIC=${6:-0}
+RDMA_PROFILE=${7:-odinlink}
 
 for path in "$CSV" "$COORD_LOG" "$WORKER_LOG"; do
   [[ -r $path ]] || { echo "error: missing benchmark evidence: $path" >&2; exit 1; }
@@ -49,12 +50,35 @@ grep -q 'worker connected, transport=rdma' "$COORD_LOG" || {
 grep -q 'leader connected, transport=rdma' "$WORKER_LOG" || {
   echo "error: benchmark did not use worker RDMA; rejecting result" >&2; exit 1;
 }
-grep -q '"fallback_calls":0' "$COORD_LOG" || {
-  echo "error: coordinator provider reported fallback traffic; rejecting result" >&2; exit 1;
-}
-grep -q '"fallback_calls":0' "$WORKER_LOG" || {
-  echo "error: worker provider reported fallback traffic; rejecting result" >&2; exit 1;
-}
+case $RDMA_PROFILE in
+  odinlink)
+    grep -q '"fallback_calls":0' "$COORD_LOG" || {
+      echo "error: coordinator OdinLink provider reported fallback traffic; rejecting result" >&2; exit 1;
+    }
+    grep -q '"fallback_calls":0' "$WORKER_LOG" || {
+      echo "error: worker OdinLink provider reported fallback traffic; rejecting result" >&2; exit 1;
+    }
+    ;;
+  roce-v2)
+    for log in "$COORD_LOG" "$WORKER_LOG"; do
+      grep -q 'rdma device mlx5_' "$log" &&
+      grep -q 'rdma GID index .* (RoCE v2)' "$log" &&
+      grep -q 'mlx5 queue pair uses RC' "$log" &&
+      grep -q 'mlx5 registered host slab as 3 MRs' "$log" || {
+        echo "error: log does not prove mlx5 RoCE v2 RC with segmented MR: $log" >&2
+        exit 1
+      }
+      ! grep -q 'rdma device odl_tb5_' "$log" || {
+        echo "error: RoCE benchmark unexpectedly used OdinLink: $log" >&2
+        exit 1
+      }
+    done
+    ;;
+  *)
+    echo "error: unknown RDMA profile: $RDMA_PROFILE" >&2
+    exit 2
+    ;;
+esac
 if grep -Eqi 'timeout waiting|transport failed|decode .* failed|kernel (launch )?failed|nan detected' \
      "$COORD_LOG" "$WORKER_LOG"; then
   echo "error: benchmark logs contain a transport, decode, or kernel failure; rejecting result" >&2
