@@ -1347,6 +1347,21 @@ static int routed_moe_launch(
                                         gate_row_bytes, gate_w, up_w, xq,
                                         out_dim, down_expert_bytes,
                                         down_row_bytes, down_w);
+        const char *q4k_layer_log_env =
+            getenv("DS4_ROCM_Q4K_WMMA_LAYER_LOG");
+        if (use_q4k_wmma && q4k_layer_log_env &&
+            q4k_layer_log_env[0] == '1' && q4k_layer_log_env[1] == '\0') {
+            static uint64_t logged_q4k_layers;
+            if (layer_index < 64u &&
+                (logged_q4k_layers & (UINT64_C(1) << layer_index)) == 0u) {
+                logged_q4k_layers |= UINT64_C(1) << layer_index;
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "Q4_K WMMA layer active layer=%u tokens=%u "
+                        "in=%u mid=%u out=%u\n",
+                        layer_index, n_tokens, expert_in_dim,
+                        expert_mid_dim, out_dim);
+            }
+        }
         const uint32_t routing_tile_m = use_q4k_wmma ? 16u : expert_tile_m;
         const uint32_t write_gate_up = 0u;
         const uint32_t use_p2_sorted = 0u;
