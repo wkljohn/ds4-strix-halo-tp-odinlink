@@ -3,9 +3,9 @@
 Run DS4 across two Ryzen AI MAX+ 395 Strix Halo systems over OdinLink
 Thunderbolt RDMA. The validated cache-free Q4_K production path reaches
 **190.11 t/s median prefill** and **15.03 t/s sustained decode** on the fixed
-2,048+300-token workload. It uses exact greedy top-2 sampling and keeps the
-compact model weights cache-free. Metal, CUDA, generic verbs, and single-node
-modes remain available.
+2,048+300-token workload; the hybrid Q2_K path reaches **162.78/14.68 t/s**.
+Both use exact greedy top-2 sampling and keep the compact model weights
+cache-free. Metal, CUDA, generic verbs, and single-node modes remain available.
 
 ```text
  Ryzen AI MAX+ 395             OdinLink              Ryzen AI MAX+ 395
@@ -16,7 +16,7 @@ modes remain available.
 | TP=2 configuration | Fixed 2,048 + 300-token workload | Prefill | Decode | Validation status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration run | **34.11 t/s** | **9.96 t/s** | baseline |
-| **Current Q2_K** | balanced 50/50, hybrid IQ2_XXS/Q2_K experts | **128.95 t/s** | **14.60 t/s** | **production; three-run median, fingerprint `c000c594c5ea0328`** |
+| **Current Q2_K** | balanced 50/50, hybrid IQ2_XXS/Q2_K experts | **162.78 t/s** | **14.68 t/s** | **production; three-run median, fingerprint `f9cb3a8a17e95c71`** |
 | **Current Q4_K** | balanced 50/50, exact greedy top-2 | **190.11 t/s** | **15.03 t/s** | **production; three-run median, fingerprint `5f8a983422299d76`** |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
@@ -26,13 +26,22 @@ ordinary greedy TP=2 inference. Its three valid runs measured 203.85/15.04,
 190.11/15.03, and 188.18/14.99 prefill/decode t/s. DSpark stays opt-in until it
 is revalidated on the same exact workload.
 
-The Q2_K median comes from 130.28/14.60, 128.47/14.62, and 128.95/14.52
-prefill/decode t/s. Its safe-schedule zero-weight tile path skips computation
-inside peer-only IQ2/Q2 and Q4-subset tiles without changing expert counts,
-launch geometry, or the validated token trajectory. The more aggressive
-hybrid-Q2 route omission remains rejected because it changed full logits and
-the 300-token fingerprint. The launcher reads GGUF tensor metadata rather than
-guessing from the filename; unknown layouts fail closed.
+The Q2_K median comes from 160.38/14.68, 162.78/13.77, and 164.07/14.73
+prefill/decode t/s. Its IQ2_XXS gate/up path expands compact codebook groups
+directly into tile-local INT8, reuses dynamically quantized Q8_1 activations,
+and executes native gfx1151 integer WMMA before the fused SwiGLU epilogue. It
+adds no expanded-weight cache; the 2,048-token run needs about 9 MiB of reusable
+temporary scratch per rank. The exact TP hello feature bit prevents the two
+independently launched ranks from selecting different arithmetic, and all
+other GPU architectures and non-TP paths retain their previous kernels. Set
+`DS4_ROCM_DISABLE_IQ2_I8_WMMA=1` on both ranks for the rollback path.
+
+The safe-schedule zero-weight tile path still skips computation inside
+peer-only IQ2/Q2 and Q4-subset tiles without changing expert counts or launch
+geometry. The more aggressive hybrid-Q2 route omission remains rejected
+because it changed full logits and the 300-token fingerprint. The launcher
+reads GGUF tensor metadata rather than guessing from the filename; unknown
+layouts fail closed.
 
 On ROCm builds where documented HIP signal memory is unavailable, TP gates use
 a bounded host-synchronous producer event before the same explicit RDMA
@@ -72,7 +81,7 @@ DS4_BENCH_EXPECT_FNV64=5f8a983422299d76 \
   /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
 
 DS4_BENCH_CANDIDATE=1 \
-DS4_BENCH_EXPECT_FNV64=c000c594c5ea0328 \
+DS4_BENCH_EXPECT_FNV64=f9cb3a8a17e95c71 \
   ./run-tp-ds4-bench.sh q2-candidate \
   /absolute/path/DeepSeek-V4-Flash-Q2_K.gguf
 ```
@@ -84,6 +93,15 @@ transport error, or RDMA fallback makes the run fail instead of becoming a
 performance candidate. Candidate mode also runs isolated arithmetic and
 1,532-token retrieval semantic cases and rejects profiling/dump
 instrumentation.
+
+Before merging a performance change, run the combined two-model gate. It also
+tests fail-closed TP feature negotiation and requires the IQ2 integer-WMMA path
+to engage on both ranks:
+
+```sh
+./scripts/pre-main-tp-smoke.sh /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf \
+  /absolute/path/DeepSeek-V4-Flash-Q2_K.gguf
+```
 
 An intentional numerical correction must be rebaselined rather than forced to
 match the old fingerprint: first pass the corrected 84-step teacher control,

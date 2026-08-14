@@ -57,6 +57,10 @@ enum {
     /* Exact greedy mode: retain the row-sharded output head and exchange the
      * worker's best two (id, value) pairs instead of its full FP32 half. */
     DS4_TP_FEATURE_GREEDY_TOP2 = UINT32_C(1) << 5,
+    /* gfx1151 IQ2_XXS gate/up uses dynamically quantized Q8_1 activations and
+     * native integer WMMA.  Keep this in the exact-matched hello word: an
+     * independently launched rank must never select different MoE arithmetic. */
+    DS4_TP_FEATURE_IQ2_I8_WMMA = UINT32_C(1) << 6,
     /* Bits 8..15 carry the first expert owned by rank 1.  Including the
      * ownership boundary in the already exact-matched hello features makes
      * an asymmetric placement fail closed if the two independent nodes were

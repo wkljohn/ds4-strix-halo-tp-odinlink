@@ -4782,6 +4782,242 @@ __global__ static void moe_q4K_routed_wmma_kernel(
     }
 }
 
+/*
+ * IQ2_XXS gate/up integer-MMQ experiment for gfx1151.
+ *
+ * The load-tile arithmetic follows llama.cpp's IQ2_XXS Q8_0 SRAM layout:
+ * codebook values and signs expand once per 64-row weight tile, while each
+ * 32-value IQ2 scale remains separate from the signed int8 tile.  DS4's
+ * validated Q4_K Q8_1 activation layout and RDNA3.5 WMMA fragment mapping are
+ * reused, but the routed operation remains fused: gate and up share the same
+ * activation tile and the SwiGLU/router epilogue writes mid directly.  This
+ * avoids inheriting Q4_K's two projection launches and global epilogue pass.
+ *
+ * J=16 is one hot-expert pair tile.  I=64 gives four compute waves.  Four
+ * additional waves cooperatively expand the two compact weight matrices.
+ */
+__device__ __forceinline__ static void ds4_iq2_xxs_expand_mmq_group(
+        const cuda_block_iq2_xxs &w,
+        int32_t group,
+        int32_t values[8],
+        float *scale) {
+    const uint16_t *q = w.qs + group * 4;
+    const uint32_t grids = (uint32_t)q[0] | ((uint32_t)q[1] << 16);
+    const uint32_t aux = (uint32_t)q[2] | ((uint32_t)q[3] << 16);
+
+#pragma unroll
+    for (int32_t g = 0; g < 4; g++) {
+        dev_iq2_i8x8_lut(cuda_iq2xxs_grid, cuda_ksigns_iq2xs,
+                         (uint8_t)(grids >> (8 * g)),
+                         (aux >> (7 * g)) & 127u,
+                         &values[2 * g], &values[2 * g + 1]);
+    }
+
+    *scale = dev_f16_to_f32(w.d) *
+             (float)(2u * (aux >> 28) + 1u) * 0.125f;
+}
+
+template <int J, bool OUT_F16>
+__launch_bounds__(256)
+__global__ static void moe_gate_up_mid_iq2_i8_hotlist_wmma_kernel(
+        float *mid_out,
+        half *mid_out_h,
+        const char *gate_base,
+        const char *up_base,
+        const ds4_q8_1_mmq_block *acts,
+        const float *weights,
+        const uint32_t *counts,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        const uint32_t *hot_experts,
+        uint32_t hot_count,
+        uint32_t ntokens,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        float clamp,
+        uint32_t skip_zero_weight_blocks) {
+    static_assert(J == 16,
+                  "IQ2_XXS integer WMMA is validated only for J=16");
+    constexpr int I = 64;
+    constexpr int XS = 84; /* llama.cpp Q8_0 MMQ SRAM stride */
+    constexpr int YS = 36; /* DS4 Q8_1 MMQ SRAM stride */
+
+    extern __shared__ int32_t smem[];
+    int32_t *sy = smem;
+    int32_t *sxg = sy + J * YS;
+    int32_t *sxu = sxg + I * XS;
+    const int32_t tid = (int32_t)threadIdx.x;
+    const int32_t wave = tid >> 5;
+    const int32_t lane = tid & 31;
+    const uint32_t hot_idx = (uint32_t)blockIdx.z;
+    if (hot_idx >= hot_count) return;
+
+    const uint32_t expert = hot_experts[hot_idx];
+    const uint32_t count = counts[expert];
+    const uint32_t start = (uint32_t)blockIdx.y * (uint32_t)J;
+    if (start >= count) return;
+    const uint32_t row0 = (uint32_t)blockIdx.x * (uint32_t)I;
+
+    __shared__ uint32_t sh_pair[J];
+    __shared__ uint32_t sh_active[J];
+    __shared__ uint32_t sh_any_active;
+    if (tid == 0) sh_any_active = 0u;
+    if (tid < J) {
+        const uint32_t local = start + (uint32_t)tid;
+        const uint32_t pair = local < count
+            ? pairs[offsets[expert] + local] : UINT32_MAX;
+        const uint32_t active = pair != UINT32_MAX &&
+            (!skip_zero_weight_blocks || weights[pair] != 0.0f);
+        sh_pair[tid] = pair;
+        sh_active[tid] = active;
+        if (active) atomicExch(&sh_any_active, 1u);
+    }
+    __syncthreads();
+
+    if (sh_any_active == 0u) {
+        for (uint32_t idx = (uint32_t)tid;
+             idx < (uint32_t)J * (uint32_t)I;
+             idx += (uint32_t)blockDim.x) {
+            const uint32_t j = idx / (uint32_t)I;
+            const uint32_t row = row0 + idx - j * (uint32_t)I;
+            const uint32_t pair = sh_pair[j];
+            if (pair != UINT32_MAX && row < expert_mid_dim) {
+                if (OUT_F16) {
+                    mid_out_h[(uint64_t)pair * expert_mid_dim + row] =
+                        __float2half(0.0f);
+                } else {
+                    mid_out[(uint64_t)pair * expert_mid_dim + row] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
+
+    float accg[8] = {};
+    float accu[8] = {};
+    const char *expert_gate =
+        gate_base + (uint64_t)expert * gate_expert_bytes;
+    const char *expert_up =
+        up_base + (uint64_t)expert * gate_expert_bytes;
+
+    for (uint32_t kb = 0; kb < xq_blocks; kb++) {
+        for (int32_t idx = tid; idx < I * 8; idx += (int32_t)blockDim.x) {
+            const int32_t local_row = idx / 8;
+            const int32_t group = idx - local_row * 8;
+            const uint32_t row = row0 + (uint32_t)local_row;
+            int32_t gv[8] = {};
+            int32_t uv[8] = {};
+            float gs = 0.0f;
+            float us = 0.0f;
+            if (row < expert_mid_dim) {
+                const cuda_block_iq2_xxs &gw =
+                    reinterpret_cast<const cuda_block_iq2_xxs *>(
+                        expert_gate + (uint64_t)row * gate_row_bytes)[kb];
+                const cuda_block_iq2_xxs &uw =
+                    reinterpret_cast<const cuda_block_iq2_xxs *>(
+                        expert_up + (uint64_t)row * gate_row_bytes)[kb];
+                ds4_iq2_xxs_expand_mmq_group(gw, group, gv, &gs);
+                ds4_iq2_xxs_expand_mmq_group(uw, group, uv, &us);
+            }
+#pragma unroll
+            for (int32_t i = 0; i < 8; i++) {
+                sxg[local_row * XS + group * 8 + i] = gv[i];
+                sxu[local_row * XS + group * 8 + i] = uv[i];
+            }
+            reinterpret_cast<float *>(sxg + local_row * XS + 64)[group] = gs;
+            reinterpret_cast<float *>(sxu + local_row * XS + 64)[group] = us;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int32_t half = 0; half < 2; half++) {
+            for (int32_t idx = tid; idx < J * YS;
+                 idx += (int32_t)blockDim.x) {
+                const int32_t j = idx / YS;
+                const int32_t e = idx - j * YS;
+                if (sh_active[j]) {
+                    const uint32_t token = sh_pair[j] / n_expert;
+                    const int32_t *src = reinterpret_cast<const int32_t *>(
+                        &acts[((uint64_t)kb * 2u + (uint32_t)half) *
+                              ntokens + token]);
+                    sy[idx] = src[e];
+                } else {
+                    sy[idx] = 0;
+                }
+            }
+            __syncthreads();
+
+            if (wave < 4) {
+#pragma unroll
+                for (int32_t kk = 0; kk < 4; kk++) {
+                    const int32_t group = half * 4 + kk;
+                    const ds4_q4k_wmma_ab_frag ag =
+                        ds4_q4k_load_rdna3_mirrored_16x8(
+                            sxg + wave * 16 * XS + group * 8, XS);
+                    const ds4_q4k_wmma_ab_frag au =
+                        ds4_q4k_load_rdna3_mirrored_16x8(
+                            sxu + wave * 16 * XS + group * 8, XS);
+                    const ds4_q4k_wmma_ab_frag b =
+                        ds4_q4k_load_rdna3_mirrored_16x8(
+                            sy + 4 + kk * 8, YS);
+                    ds4_q4k_i32x8 cg = {};
+                    ds4_q4k_i32x8 cu = {};
+                    cg = ds4_q4k_wmma_i8_16x16x16(ag, b, cg);
+                    cu = ds4_q4k_wmma_i8_16x16x16(au, b, cu);
+
+#pragma unroll
+                    for (int32_t l = 0; l < 8; l++) {
+                        const int32_t row = wave * 16 + 2 * l + lane / 16;
+                        const int32_t j = lane & 15;
+                        const float act_scale = __half2float(
+                            reinterpret_cast<const half2 *>(
+                                sy + j * YS)[kk].x);
+                        const float gate_scale =
+                            reinterpret_cast<const float *>(
+                                sxg + row * XS + 64)[group];
+                        const float up_scale =
+                            reinterpret_cast<const float *>(
+                                sxu + row * XS + 64)[group];
+                        accg[l] += gate_scale * act_scale * (float)cg[l];
+                        accu[l] += up_scale * act_scale * (float)cu[l];
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (wave < 4) {
+#pragma unroll
+        for (int32_t l = 0; l < 8; l++) {
+            const uint32_t row = row0 +
+                (uint32_t)(wave * 16 + 2 * l + lane / 16);
+            const uint32_t j = (uint32_t)(lane & 15);
+            const uint32_t pair = sh_pair[j];
+            if (pair != UINT32_MAX && row < expert_mid_dim) {
+                float gate = accg[l];
+                float up = accu[l];
+                if (clamp > 1.0e-6f) {
+                    if (gate > clamp) gate = clamp;
+                    if (up > clamp) up = clamp;
+                    if (up < -clamp) up = -clamp;
+                }
+                const float value =
+                    moe_silu_oldhip(gate) * up * weights[pair];
+                if (OUT_F16) {
+                    mid_out_h[(uint64_t)pair * expert_mid_dim + row] =
+                        __float2half(value);
+                } else {
+                    mid_out[(uint64_t)pair * expert_mid_dim + row] = value;
+                }
+            }
+        }
+    }
+}
+
 /* Q4_K down projection over the same 16-pair routing descriptors as gate/up.
  * Activations are pair-major, unlike moe_q4K_routed_wmma_kernel above. */
 template <int J, bool ATOMIC_OUT>

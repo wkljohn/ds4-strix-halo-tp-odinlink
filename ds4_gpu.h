@@ -209,6 +209,14 @@ uint32_t ds4_gpu_q4k_wmma_runtime_features(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         const void *down_w);
+uint32_t ds4_gpu_iq2_i8_wmma_runtime_features(
+        int iq2_weights,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        const void *gate_w,
+        const void *up_w);
 void ds4_gpu_set_tp_runtime_features(uint32_t rank, uint32_t features);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);

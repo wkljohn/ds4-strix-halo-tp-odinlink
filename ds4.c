@@ -51284,7 +51284,9 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
 #else
     if (!e || !e->metal_ready) return placement_features;
     uint32_t q4k_features = DS4_TP_FEATURE_Q4K_WMMA;
+    uint32_t iq2_features = DS4_TP_FEATURE_IQ2_I8_WMMA;
     bool saw_q4k_layer = false;
+    bool saw_iq2_layer = false;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         const ds4_tensor *up = e->weights.layer[il].ffn_up_exps;
@@ -51295,6 +51297,18 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
          * IQ2/Q2 layers.  Require every fully-Q4_K candidate to satisfy the
          * shared WMMA contract; the per-layer launcher still repeats the
          * exact type, shape, alignment, and local-buffer checks before use. */
+        if (gate->type == DS4_TENSOR_IQ2_XXS &&
+            up->type == DS4_TENSOR_IQ2_XXS) {
+            saw_iq2_layer = true;
+            const uint64_t iq2_row_bytes =
+                (gate->dim[0] / gguf_types[gate->type].block_elems) *
+                gguf_types[gate->type].block_bytes;
+            iq2_features &= ds4_gpu_iq2_i8_wmma_runtime_features(
+                1, (uint32_t)gate->dim[0], (uint32_t)gate->dim[1],
+                gate->dim[1] * iq2_row_bytes, iq2_row_bytes,
+                (const uint8_t *)e->model.map + gate->abs_offset,
+                (const uint8_t *)e->model.map + up->abs_offset);
+        }
         if (gate->type != DS4_TENSOR_Q4_K ||
             up->type != DS4_TENSOR_Q4_K ||
             down->type != DS4_TENSOR_Q4_K) {
@@ -51319,7 +51333,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
                 down->dim[1] * down_row_bytes, down_row_bytes,
                 (const uint8_t *)e->model.map + down->abs_offset);
     }
-    return (saw_q4k_layer ? q4k_features : 0u) | placement_features;
+    return (saw_q4k_layer ? q4k_features : 0u) |
+           (saw_iq2_layer ? iq2_features : 0u) | placement_features;
 #endif
 }
 
