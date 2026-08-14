@@ -123,6 +123,7 @@ start() {
   }
 
   local -a common worker coordinator decode_env support_args
+  local routed_family tp_prefill_skip_unowned
   common=(env
     DS4_TP_EXPERT_SPLIT="$EXPERT_SPLIT"
     DS4_TP_TIMEOUT_SEC="$TP_TIMEOUT_SEC"
@@ -142,10 +143,28 @@ start() {
       DS4_ROCM_Q8_SMALL_BATCH_DP4A=1)
     support_args=(--mtp "$MTP" --dspark)
   else
+    routed_family=$(python3 "$REPO/scripts/gguf_tensor_types.py" --routed-family "$MODEL") || {
+      echo "error: unable to inspect routed-expert quantization in $MODEL" >&2
+      exit 1
+    }
+    case $routed_family in
+      Q4_K)
+        tp_prefill_skip_unowned=1
+        ;;
+      HYBRID_Q2)
+        tp_prefill_skip_unowned=0
+        common+=(DS4_ROCM_TP_ZERO_WEIGHT_TILE_SKIP=1)
+        ;;
+      *)
+        echo "error: unsupported routed-expert quantization: $routed_family" >&2
+        exit 1
+        ;;
+    esac
     decode_env=(
       DS4_TP_GREEDY_TOP2=1
       DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1
       DS4_ROCM_TP_SKIP_UNOWNED=1
+      DS4_ROCM_TP_PREFILL_SKIP_UNOWNED="$tp_prefill_skip_unowned"
       DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1)
     support_args=()
   fi

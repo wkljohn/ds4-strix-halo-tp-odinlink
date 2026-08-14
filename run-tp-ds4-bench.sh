@@ -18,7 +18,7 @@ REPO=${DS4_BENCH_REPO:-$SCRIPT_DIR}
 PEER_REPO=${DS4_PEER_REPO:-$REPO}
 PEER_MGMT=${DS4_PEER_MGMT:-wkljohn@10.10.0.216}
 COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-10.10.0.181}
-PROMPT_FILE=${DS4_BENCH_PROMPT_FILE:-$REPO/research-results/2026-08-06/prompts/codex-attn-rowsplit-implement-brief.md}
+PROMPT_FILE=${DS4_BENCH_PROMPT_FILE:-$REPO/bench-prompts/codex-attn-rowsplit-implement-brief.md}
 FRONTIER=${DS4_BENCH_FRONTIER:-2048}
 TOKENS=${DS4_BENCH_TOKENS:-300}
 CONTEXT=${DS4_BENCH_CONTEXT:-4096}
@@ -39,6 +39,8 @@ DECODE_SELF_CHECK=${DS4_BENCH_DECODE_SELF_CHECK:-0}
 TEACHER_FORCE_CONTROL=${DS4_BENCH_TEACHER_FORCE_CONTROL:-0}
 QUALITY=${DS4_BENCH_QUALITY:-0}
 ALLOW_NONSTANDARD_SPLIT=${DS4_BENCH_ALLOW_NONSTANDARD_SPLIT:-0}
+VALIDATE_CONFIG_ONLY=${DS4_BENCH_VALIDATE_CONFIG_ONLY:-0}
+DUMP_FRONTIER_LOGITS_DIR=${DS4_BENCH_DUMP_FRONTIER_LOGITS_DIR:-}
 EXPECT_GREEDY_TOP2=0
 CANDIDATE_ARGS=()
 CLEAN_ENV=(env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8)
@@ -80,10 +82,18 @@ if [[ $CANDIDATE == 1 ]]; then
     echo "error: candidate timing cannot run under rocprof" >&2
     exit 2
   fi
+  if [[ -n $DUMP_FRONTIER_LOGITS_DIR ]]; then
+    echo "error: candidate timing cannot dump frontier logits" >&2
+    exit 2
+  fi
 elif [[ $CANDIDATE != 0 ]]; then
   echo "error: DS4_BENCH_CANDIDATE must be 0 or 1" >&2
   exit 2
 fi
+[[ $VALIDATE_CONFIG_ONLY == 0 || $VALIDATE_CONFIG_ONLY == 1 ]] || {
+  echo "error: DS4_BENCH_VALIDATE_CONFIG_ONLY must be 0 or 1" >&2
+  exit 2
+}
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
@@ -155,6 +165,18 @@ else
       exit 1
       ;;
   esac
+  if [[ $ROUTED_FAMILY == HYBRID_Q2 ]]; then
+    CURRENT_OPT_ENV+=(DS4_ROCM_TP_ZERO_WEIGHT_TILE_SKIP=1)
+    if [[ $CANDIDATE == 1 ]]; then
+      for env_kv in "${EXTRA_ENV[@]}"; do
+        if [[ $env_kv == DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=* &&
+              $env_kv != DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=0 ]]; then
+          echo "error: hybrid Q2 candidate cannot enable trajectory-changing peer-route omission" >&2
+          exit 2
+        fi
+      done
+    fi
+  fi
   CURRENT_OPT_ENV+=(
     DS4_TP_GREEDY_TOP2=1
     DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
@@ -164,6 +186,11 @@ else
     DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1
   )
   EXPECT_GREEDY_TOP2=1
+fi
+
+if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
+  echo "validated_config routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
+  exit 0
 fi
 
 COMMON_ENV=(
@@ -192,6 +219,17 @@ if [[ $SHOW_OUTPUT == 1 ]]; then
 elif [[ $SHOW_OUTPUT != 0 ]]; then
   echo "error: DS4_BENCH_SHOW_OUTPUT must be 0 or 1" >&2
   exit 2
+fi
+if [[ -n $DUMP_FRONTIER_LOGITS_DIR ]]; then
+  case $DUMP_FRONTIER_LOGITS_DIR/ in
+    "$REPO/research-results/"*) ;;
+    *)
+      echo "error: frontier logits directory must be under $REPO/research-results" >&2
+      exit 2
+      ;;
+  esac
+  mkdir -p "$DUMP_FRONTIER_LOGITS_DIR"
+  COORD_ARGS+=(--dump-frontier-logits-dir "$DUMP_FRONTIER_LOGITS_DIR")
 fi
 if [[ $DSPARK == 1 ]]; then
   DSPARK_ENV=(

@@ -61,12 +61,12 @@ if grep -Eqi 'timeout waiting|transport failed|decode .* failed|kernel (launch )
   exit 1
 fi
 if [[ $REQUIRE_SEMANTIC == 1 ]]; then
-  grep -q 'ds4-bench: semantic smoke passed ' "$COORD_LOG" || {
-    echo "error: candidate did not pass the thinking semantic smoke; rejecting result" >&2
+  grep -q 'ds4-bench: semantic suite passed cases=2' "$COORD_LOG" || {
+    echo "error: candidate did not pass the complete semantic suite; rejecting result" >&2
     exit 1
   }
-  if grep -q 'ds4-bench: semantic smoke FAILED ' "$COORD_LOG"; then
-    echo "error: candidate logged a failed thinking semantic smoke; rejecting result" >&2
+  if grep -q 'ds4-bench: semantic case .* FAILED ' "$COORD_LOG"; then
+    echo "error: candidate logged a failed semantic case; rejecting result" >&2
     exit 1
   fi
 fi

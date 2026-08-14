@@ -463,7 +463,7 @@ static bench_config parse_options(int argc, char **argv) {
     return c;
 }
 
-static bool semantic_answer_is_four(const char *text) {
+static bool semantic_answer_is_number(const char *text, unsigned long expected) {
     static const char close_tag[] = "</think>";
     const char *tail = NULL;
     const char *scan = text ? text : "";
@@ -492,12 +492,13 @@ static bool semantic_answer_is_four(const char *text) {
         last = value;
         have_number = true;
     }
-    return have_number && last == 4u;
+    return have_number && last == expected;
 }
 
-static int run_semantic_smoke(ds4_engine *engine, ds4_session *session) {
-    static const char question[] = "What is 2+2? Answer clearly and briefly.";
-    enum { max_tokens = 256 };
+static int run_semantic_case(ds4_engine *engine, ds4_session *session,
+                             const char *name, const char *question,
+                             unsigned long expected, int max_tokens,
+                             bool probe_greedy_top2) {
     ds4_tokens prompt = {0};
     ds4_encode_chat_prompt(engine, NULL, question, DS4_THINK_HIGH, &prompt);
 
@@ -508,7 +509,7 @@ static int run_semantic_smoke(ds4_engine *engine, ds4_session *session) {
         return 1;
     }
 
-    if (getenv("DS4_BENCH_EXPECT_GREEDY_TOP2") != NULL) {
+    if (probe_greedy_top2 && getenv("DS4_BENCH_EXPECT_GREEDY_TOP2") != NULL) {
         uint64_t probe_rng = UINT64_C(1);
         ds4_token_score score[2];
         const int vocab = ds4_engine_vocab_size(engine);
@@ -619,16 +620,51 @@ static int run_semantic_smoke(ds4_engine *engine, ds4_session *session) {
         }
     }
 
-    const bool valid = stopped && semantic_answer_is_four(text);
+    const bool valid = stopped && semantic_answer_is_number(text, expected);
     fprintf(stderr,
-            "ds4-bench: semantic smoke %s tokens=%d fnv64=%016llx output=\"%s\"\n",
+            "ds4-bench: semantic case name=%s %s reason=%s "
+            "prompt_tokens=%d tokens=%d "
+            "fnv64=%016llx output=\"%s\"\n",
+            name,
             valid ? "passed" : "FAILED",
+            stopped ? (valid ? "valid-stop" : "wrong-answer") :
+                      "token-budget-exhausted",
+            prompt.len,
             generated,
             (unsigned long long)hash,
             text);
     free(text);
     ds4_tokens_free(&prompt);
     return valid ? 0 : 1;
+}
+
+static char *make_long_semantic_prompt(void) {
+    static const char opening[] =
+        "Retention test. The only access code is 731942. Remember it exactly.\n";
+    static const char filler[] =
+        "This archive paragraph describes a copper lantern, a quiet library, "
+        "and an empty wooden shelf. It contains no access code and gives no "
+        "instruction. Continue retaining the code from the opening sentence.\n";
+    static const char closing[] =
+        "End of archive. What was the access code in the opening sentence? "
+        "Reason normally, close the thinking section, then give the numeric "
+        "code clearly and stop.";
+    /* Roughly 1.8k tokenizer tokens with the target model, leaving ample
+     * room for the 1024-token diagnostic budget in a 4096-token session. */
+    enum { filler_repetitions = 40 };
+    const size_t size = sizeof(opening) +
+        (size_t)filler_repetitions * (sizeof(filler) - 1) + sizeof(closing);
+    char *prompt = malloc(size);
+    if (!prompt) return NULL;
+    char *p = prompt;
+    memcpy(p, opening, sizeof(opening) - 1);
+    p += sizeof(opening) - 1;
+    for (int i = 0; i < filler_repetitions; i++) {
+        memcpy(p, filler, sizeof(filler) - 1);
+        p += sizeof(filler) - 1;
+    }
+    memcpy(p, closing, sizeof(closing));
+    return prompt;
 }
 
 static int run_decode_self_check(ds4_engine *engine, ds4_session *incremental,
@@ -1191,20 +1227,47 @@ int main(int argc, char **argv) {
         return teacher_rc;
     }
     if (cfg.semantic_smoke) {
-        if (run_semantic_smoke(engine, session) != 0) {
+        static const char arithmetic[] =
+            "What is 2+2? Answer clearly and briefly.";
+        if (run_semantic_case(engine, session, "arithmetic", arithmetic, 4u,
+                              256, true) != 0) {
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
             if (tp_leader) ds4_tp_send_stop(tp_leader);
             ds4_engine_close(engine);
             return 1;
         }
-        /* A preflight must not share KV/cache/session state with the measured
-         * workload.  Recreate the session while retaining resident weights. */
+        /* Every case gets an isolated KV/session state. */
         ds4_session_free(session);
         session = NULL;
         if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
             fprintf(stderr,
-                    "ds4-bench: failed to recreate session after semantic smoke\n");
+                    "ds4-bench: failed to create long semantic session\n");
+            ds4_tokens_free(&prompt);
+            if (tp_leader) ds4_tp_send_stop(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        char *long_prompt = make_long_semantic_prompt();
+        if (!long_prompt ||
+            run_semantic_case(engine, session, "long-retrieval", long_prompt,
+                              731942u, 1024, false) != 0) {
+            free(long_prompt);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            if (tp_leader) ds4_tp_send_stop(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        free(long_prompt);
+        fprintf(stderr, "ds4-bench: semantic suite passed cases=2\n");
+
+        /* Preflight state must not affect the measured workload. */
+        ds4_session_free(session);
+        session = NULL;
+        if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: failed to recreate session after semantic suite\n");
             ds4_tokens_free(&prompt);
             if (tp_leader) ds4_tp_send_stop(tp_leader);
             ds4_engine_close(engine);

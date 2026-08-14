@@ -1,6 +1,6 @@
 # 256K TP=2 deployment behind Caddy
 
-This profile runs one cache-free Q4_K target across two Strix Halo nodes,
+This profile runs one cache-free Q4_K or hybrid-Q2 target across two Strix Halo nodes,
 uses exact ordinary decode by default, and exposes DS4 only on
 `127.0.0.1:8090`. Caddy remains responsible for TLS, authentication, and the
 public hostname.
@@ -20,7 +20,9 @@ with a memory-safe 2,048-token prefill workspace,
 the server's single resident session, the balanced 50/50 ordinary-decode expert
 split, and explicit RDMA. DSpark uses 46/54 only when explicitly enabled.
 Native batched-session mode is intentionally not enabled because
-it changes the execution profile. Profiling is off in production. Set
+it changes the execution profile. Profiling is off in production. The launcher
+inspects routed-expert quantization and selects the same safe Q4_K or Q2
+prefill defaults enforced by the pre-main benchmark gate. Set
 `DSPARK=1` only for experimental testing; the launcher warns because the
 current TP verifier does not match the target-only token fingerprint.
 

@@ -16,7 +16,7 @@ modes remain available.
 | TP=2 configuration | Fixed 2,048 + 300-token workload | Prefill | Decode | Validation status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration run | **34.11 t/s** | **9.96 t/s** | baseline |
-| **Current Q2_K** | balanced 50/50, hybrid IQ2_XXS/Q2_K experts | **116.02 t/s** | **14.60 t/s** | **production; three-run median, fingerprint `c000c594c5ea0328`** |
+| **Current Q2_K** | balanced 50/50, hybrid IQ2_XXS/Q2_K experts | **128.95 t/s** | **14.60 t/s** | **production; three-run median, fingerprint `c000c594c5ea0328`** |
 | **Current Q4_K** | balanced 50/50, exact greedy top-2 | **190.11 t/s** | **15.03 t/s** | **production; three-run median, fingerprint `5f8a983422299d76`** |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
@@ -26,12 +26,13 @@ ordinary greedy TP=2 inference. Its three valid runs measured 203.85/15.04,
 190.11/15.03, and 188.18/14.99 prefill/decode t/s. DSpark stays opt-in until it
 is revalidated on the same exact workload.
 
-The Q2_K median comes from 119.66/14.71, 113.96/14.60, and 116.02/14.42
-prefill/decode t/s. Its hybrid routed-expert layout cannot use the Q4-only
-peer-owned-work omission: doing so produced a fast but invalid repeated-BOS
-trajectory. The benchmark launcher now reads GGUF tensor metadata and enables
-that optimization only for pure Q4_K routed experts. Unknown layouts fail
-closed instead of being guessed from the filename.
+The Q2_K median comes from 130.28/14.60, 128.47/14.62, and 128.95/14.52
+prefill/decode t/s. Its safe-schedule zero-weight tile path skips computation
+inside peer-only IQ2/Q2 and Q4-subset tiles without changing expert counts,
+launch geometry, or the validated token trajectory. The more aggressive
+hybrid-Q2 route omission remains rejected because it changed full logits and
+the 300-token fingerprint. The launcher reads GGUF tensor metadata rather than
+guessing from the filename; unknown layouts fail closed.
 
 On ROCm builds where documented HIP signal memory is unavailable, TP gates use
 a bounded host-synchronous producer event before the same explicit RDMA
@@ -80,13 +81,14 @@ Each fingerprint is specific to the documented model, prompt, balanced 128/128
 split, and 300-token workload. They are deterministic self-regression gates, not
 proof of exact llama.cpp numerical parity. A mismatch, short generation,
 transport error, or RDMA fallback makes the run fail instead of becoming a
-performance candidate. Candidate mode also runs a thinking semantic smoke in
-an isolated session and rejects profiling/dump instrumentation.
+performance candidate. Candidate mode also runs isolated arithmetic and
+1,532-token retrieval semantic cases and rejects profiling/dump
+instrumentation.
 
 An intentional numerical correction must be rebaselined rather than forced to
 match the old fingerprint: first pass the corrected 84-step teacher control,
-compare full logits at the first changed boundary, pass the thinking semantic
-suite, then record a new three-run candidate median and fingerprint. Ordinary
+compare full logits at the first changed boundary, pass the semantic suite,
+then record a new three-run candidate median and fingerprint. Ordinary
 decode remains balanced 128/128; the launcher supplies 118/138 only for
 DSpark.
 
