@@ -16,7 +16,7 @@ modes remain available.
 | TP=2 configuration | Fixed 2,048 + 300-token workload | Prefill | Decode | Validation status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration run | **34.11 t/s** | **9.96 t/s** | baseline |
-| **Current Q2_K** | same workload | — | — | revalidation pending |
+| **Current Q2_K** | balanced 50/50, hybrid IQ2_XXS/Q2_K experts | **116.02 t/s** | **14.60 t/s** | **production; three-run median, fingerprint `c000c594c5ea0328`** |
 | **Current Q4_K** | balanced 50/50, exact greedy top-2 | **190.11 t/s** | **15.03 t/s** | **production; three-run median, fingerprint `5f8a983422299d76`** |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
@@ -25,6 +25,13 @@ is the validated cache-free production stack and is now the default for
 ordinary greedy TP=2 inference. Its three valid runs measured 203.85/15.04,
 190.11/15.03, and 188.18/14.99 prefill/decode t/s. DSpark stays opt-in until it
 is revalidated on the same exact workload.
+
+The Q2_K median comes from 119.66/14.71, 113.96/14.60, and 116.02/14.42
+prefill/decode t/s. Its hybrid routed-expert layout cannot use the Q4-only
+peer-owned-work omission: doing so produced a fast but invalid repeated-BOS
+trajectory. The benchmark launcher now reads GGUF tensor metadata and enables
+that optimization only for pure Q4_K routed experts. Unknown layouts fail
+closed instead of being guessed from the filename.
 
 On ROCm builds where documented HIP signal memory is unavailable, TP gates use
 a bounded host-synchronous producer event before the same explicit RDMA
@@ -38,7 +45,7 @@ reading each KV row once. Both changes add no persistent model memory or wire
 traffic. The online reduction changes the deterministic token trajectory; the
 new fingerprint passed the built-in semantic smoke and repeat validation.
 
-Q2_K and Q4_K use the cache-free default. Experimental DSpark optionally keeps
+Q2_K and Q4_K use cache-free defaults. Experimental DSpark optionally keeps
 its Q8 drafter on rank 0 and warns before reserving the additional 10.15 GiB.
 
 Reproduce one fixed long-context run after placing each model at the same
@@ -62,10 +69,15 @@ DS4_BENCH_CANDIDATE=1 \
 DS4_BENCH_EXPECT_FNV64=5f8a983422299d76 \
   ./run-tp-ds4-bench.sh q4-candidate \
   /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
+
+DS4_BENCH_CANDIDATE=1 \
+DS4_BENCH_EXPECT_FNV64=c000c594c5ea0328 \
+  ./run-tp-ds4-bench.sh q2-candidate \
+  /absolute/path/DeepSeek-V4-Flash-Q2_K.gguf
 ```
 
-That fingerprint is specific to the documented model, prompt, balanced 128/128
-split, and 300-token workload. It is a deterministic self-regression gate, not
+Each fingerprint is specific to the documented model, prompt, balanced 128/128
+split, and 300-token workload. They are deterministic self-regression gates, not
 proof of exact llama.cpp numerical parity. A mismatch, short generation,
 transport error, or RDMA fallback makes the run fail instead of becoming a
 performance candidate. Candidate mode also runs a thinking semantic smoke in

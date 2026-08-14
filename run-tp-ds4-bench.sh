@@ -133,6 +133,7 @@ if [[ $DECODE_SELF_CHECK == 1 && $TEACHER_FORCE_CONTROL == 1 ]]; then
   exit 2
 fi
 
+[[ -r $MODEL && -r $PROMPT_FILE ]] || { echo "error: missing local model or prompt" >&2; exit 1; }
 CURRENT_OPT_ENV=(
   DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
 )
@@ -142,12 +143,24 @@ if [[ $DSPARK == 1 ]]; then
   # DSpark path; the runtime independently enforces this safety invariant.
   CURRENT_OPT_ENV+=(DS4_ROCM_Q8_DECODE_PAIR_DP4A=0)
 else
+  ROUTED_FAMILY=$(python3 "$REPO/scripts/gguf_tensor_types.py" --routed-family "$MODEL") || {
+    echo "error: unable to inspect routed-expert quantization in $MODEL" >&2
+    exit 1
+  }
+  case $ROUTED_FAMILY in
+    Q4_K) TP_PREFILL_SKIP_UNOWNED=1 ;;
+    HYBRID_Q2) TP_PREFILL_SKIP_UNOWNED=0 ;;
+    *)
+      echo "error: unsupported routed-expert quantization: $ROUTED_FAMILY" >&2
+      exit 1
+      ;;
+  esac
   CURRENT_OPT_ENV+=(
     DS4_TP_GREEDY_TOP2=1
     DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
     DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1
     DS4_ROCM_TP_SKIP_UNOWNED=1
-    DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=1
+    DS4_ROCM_TP_PREFILL_SKIP_UNOWNED="$TP_PREFILL_SKIP_UNOWNED"
     DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1
   )
   EXPECT_GREEDY_TOP2=1
@@ -230,7 +243,6 @@ remote_sample_fingerprint() {
   "${PEER_SSH[@]}" "p=$quoted; s=\$(stat -c %s \"\$p\"); h=\$((s / 2 > 4194304 ? s / 2 - 4194304 : 0)); t=\$((s > 8388608 ? s - 8388608 : 0)); { printf '%s\\n' \"\$s\"; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=0 count=8388608 status=none; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=\"\$h\" count=8388608 status=none; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=\"\$t\" count=8388608 status=none; } | sha256sum | awk '{print \$1}'"
 }
 
-[[ -r $MODEL && -r $PROMPT_FILE ]] || { echo "error: missing local model or prompt" >&2; exit 1; }
 if [[ $DSPARK == 1 && ! -r $MTP ]]; then
   echo "error: missing local DSpark model: $MTP" >&2
   exit 1
@@ -341,6 +353,7 @@ echo "=== ds4-bench $TAG ==="
 echo "model: $MODEL"
 echo "workload: frontier=$FRONTIER generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK"
 if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
+if [[ $DSPARK == 0 ]]; then echo "routed_expert_family: $ROUTED_FAMILY"; fi
 if [[ $ROCPROF == 1 ]]; then echo "rocprof: rank=$ROCPROF_RANK kernel trace (diagnostic; timing is not benchmark evidence)"; fi
 echo "ds4_sha256: $LOCAL_DS4_HASH"
 echo "ds4_bench_tp_sha256: $LOCAL_BENCH_HASH"
