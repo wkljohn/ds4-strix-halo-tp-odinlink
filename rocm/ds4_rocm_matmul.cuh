@@ -139,6 +139,28 @@ static unsigned compressor_proj_rows_per_block(void) {
     return rows;
 }
 
+static int f16_pair_temporal_supported(void) {
+    static int initialized;
+    static int gfx1151;
+    if (!initialized) {
+        initialized = 1;
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+            gfx1151 = strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        } else {
+            (void)cudaGetLastError();
+        }
+    }
+    return gfx1151 && !g_quality_mode && !cuda_runtime_config()->graph_dump;
+}
+
+extern "C" int ds4_gpu_f16_pair_temporal_supported(void) {
+    return f16_pair_temporal_supported();
+}
+
 static int f16_pair_five_row_enabled(void) {
     static int enabled = -1;
     static int gfx1151;
@@ -1351,6 +1373,65 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
                                       (const float *)x->ptr,
                                       in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
+}
+
+extern "C" int ds4_gpu_matmul_f16_pair_temporal_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    if (!out0 || !out1 || !x || !model_map ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+    const int temporal_shape = n_tok >= 2u && n_tok <= 4u && in_dim == 4096u &&
+        (out_dim == 256u || out_dim == 512u || out_dim == 1024u);
+    if (!temporal_shape || !f16_pair_temporal_supported()) return 0;
+    uint64_t weight_bytes = 0, x_bytes = 0, out_bytes = 0;
+    if (weight0_offset > model_size || weight1_offset > model_size ||
+        !cuda_u64_mul3_checked(out_dim, in_dim, sizeof(uint16_t), &weight_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+        weight_bytes > model_size - weight0_offset ||
+        weight_bytes > model_size - weight1_offset ||
+        x->bytes < x_bytes || out0->bytes < out_bytes || out1->bytes < out_bytes) {
+        return 0;
+    }
+    const __half *w0 = (const __half *)cuda_model_range_ptr(
+            model_map, weight0_offset, weight_bytes, "f16_pair_temporal_0");
+    const __half *w1 = (const __half *)cuda_model_range_ptr(
+            model_map, weight1_offset, weight_bytes, "f16_pair_temporal_1");
+    if (!w0 || !w1) return 0;
+    const uint32_t rows_per_block = compressor_proj_rows_per_block();
+    const dim3 grid(((uint32_t)out_dim + rows_per_block - 1u) / rows_per_block);
+    const dim3 block(rows_per_block * 32u);
+    const size_t shared_bytes = (size_t)n_tok * (size_t)in_dim * sizeof(float);
+    switch ((uint32_t)n_tok) {
+        case 2u:
+            matmul_f16_pair_f32_temporal_rows_w32_kernel<2u><<<grid, block, shared_bytes>>>(
+                    (float *)out0->ptr, (float *)out1->ptr, w0, w1,
+                    (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim);
+            break;
+        case 3u:
+            matmul_f16_pair_f32_temporal_rows_w32_kernel<3u><<<grid, block, shared_bytes>>>(
+                    (float *)out0->ptr, (float *)out1->ptr, w0, w1,
+                    (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim);
+            break;
+        case 4u:
+            matmul_f16_pair_f32_temporal_rows_w32_kernel<4u><<<grid, block, shared_bytes>>>(
+                    (float *)out0->ptr, (float *)out1->ptr, w0, w1,
+                    (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim);
+            break;
+        default:
+            return 0;
+    }
+    return cuda_ok(cudaGetLastError(), "matmul_f16_pair temporal launch");
 }
 
 extern "C" int ds4_gpu_matmul_f16_pair_tensor(

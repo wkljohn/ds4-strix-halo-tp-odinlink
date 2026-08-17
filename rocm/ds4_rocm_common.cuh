@@ -298,6 +298,75 @@ __global__ static void matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel(
     }
 }
 
+/* Exact temporal compressor projection.  Each token keeps an independent
+ * FP32 accumulator and observes the same k-order and wave reduction as the
+ * ordinary one-row kernel above.  Reusing the two F16 weight rows across up
+ * to four activation rows removes repeated cold model-weight reads without
+ * creating an expanded or repacked weight cache. */
+template <uint32_t TOKENS>
+__global__ static void matmul_f16_pair_f32_temporal_rows_w32_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    for (uint32_t i = tid; i < TOKENS * in_dim; i += blockDim.x) {
+        shx[i] = x[i];
+    }
+    __syncthreads();
+
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const __half *wr0 = w0 + (uint64_t)row * in_dim;
+    const __half *wr1 = w1 + (uint64_t)row * in_dim;
+    float acc0[TOKENS] = {};
+    float acc1[TOKENS] = {};
+    uint32_t i = lane;
+    for (; i + 224u < in_dim; i += 256u) {
+#pragma unroll
+        for (uint32_t u = 0; u < 8u; u++) {
+            const uint32_t k = i + u * 32u;
+            const float fw0 = __half2float(wr0[k]);
+            const float fw1 = __half2float(wr1[k]);
+#pragma unroll
+            for (uint32_t t = 0; t < TOKENS; t++) {
+                const float xv = shx[(uint64_t)t * in_dim + k];
+                acc0[t] += fw0 * xv;
+                acc1[t] += fw1 * xv;
+            }
+        }
+    }
+    for (; i < in_dim; i += 32u) {
+        const float fw0 = __half2float(wr0[i]);
+        const float fw1 = __half2float(wr1[i]);
+#pragma unroll
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            const float xv = shx[(uint64_t)t * in_dim + i];
+            acc0[t] += fw0 * xv;
+            acc1[t] += fw1 * xv;
+        }
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < TOKENS; t++) {
+        acc0[t] = warp_sum_f32(acc0[t]);
+        acc1[t] = warp_sum_f32(acc1[t]);
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOKENS; t++) {
+            out0[(uint64_t)t * out_dim + row] = acc0[t];
+            out1[(uint64_t)t * out_dim + row] = acc1[t];
+        }
+    }
+}
+
 /* DSpark verifier microbatch: reuse each pair of compressor weights across
  * all five rows.  hipBLAS handles these as two skinny GEMMs; on gfx1151 their
  * launch/setup cost and poor N=5 utilization dominate.  The input is converted
