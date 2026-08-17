@@ -2,7 +2,7 @@
 
 Status: research only, nothing implemented. Dispatched Codex to do a
 structured 3-round sweep (broad inventory -> filter/deepen -> rank) across
-local vLLM upstream (`/home/wkljohn/Desktop/cc/vllm-upstream`, real git
+local vLLM upstream checkout (a real git
 checkout, one caveat: partial/promisor clone with some scheduler/RDNA
 kernel blobs unfetchable), local llama.cpp upstream + project forks
 (`llama.cpp-upstream-latest`, `llama.cpp-strix-halo-RCCL-RDMA`,

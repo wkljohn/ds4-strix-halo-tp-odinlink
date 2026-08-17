@@ -3,7 +3,8 @@
 # The `strix-halo` Makefile target passes -B (force full rebuild); this runs the
 # same inner make WITHOUT -B so only stale objects recompile.
 set -euo pipefail
-cd /home/wkljohn/Desktop/cc/ds4-strix-halo-tp
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR"
 
 HIPCC=$(command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 

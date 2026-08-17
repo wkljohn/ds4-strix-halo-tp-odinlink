@@ -27,12 +27,16 @@ if (($# != 0)); then
 fi
 
 PEER_HOST=${ODL_PEER_MGMT_HOST:-}
-LOCAL_ROOT=${ODL_DRIVER_ROOT:-/home/wkljohn/Desktop/cc/OdinLink-Five}
-PEER_ROOT=${ODL_PEER_DRIVER_ROOT:-/home/wkljohn/Desktop/cc/OdinLink-Five}
-SSH_USER=${ODL_PEER_MGMT_USER:-wkljohn}
+LOCAL_ROOT=${ODL_DRIVER_ROOT:-}
+PEER_ROOT=${ODL_PEER_DRIVER_ROOT:-}
+SSH_USER=${ODL_PEER_MGMT_USER:-$(id -un)}
 
 if [[ -z $PEER_HOST ]]; then
     echo "error: ODL_PEER_MGMT_HOST is required; the OdinLink data address is not a management path" >&2
+    exit 1
+fi
+if [[ -z $LOCAL_ROOT || -z $PEER_ROOT ]]; then
+    echo "error: ODL_DRIVER_ROOT and ODL_PEER_DRIVER_ROOT are required" >&2
     exit 1
 fi
 

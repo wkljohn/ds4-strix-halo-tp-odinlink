@@ -12,9 +12,9 @@ identical warm runs in one loaded process and require the warm median to exceed
 
 ## Repository and machine layout
 
-- Local repository: `/home/wkljohn/Desktop/cc/ds4-strix-halo-tp`
+- Local repository: `/absolute/path/ds4-strix-halo-tp-odinlink`
 - Peer alias: `peer`
-- Peer repository: `/home/wkljohn/Desktop/cc/ds4-strix-halo-tp`
+- Peer repository: `/absolute/path/ds4-strix-halo-tp-odinlink`
 - The filesystems are **not shared**. Copy changed sources or the exact binary
   to the peer and verify hashes before every two-node test.
 - Start worker and coordinator immediately/concurrently. Never wait for the
@@ -26,8 +26,8 @@ identical warm runs in one loaded process and require the warm median to exceed
 OdinLink environment:
 
 ```bash
-DS4_TP_VERBS_LIB=/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs/libodl_tb5_verbs.so.0.1.0
-LD_LIBRARY_PATH=/home/wkljohn/Desktop/cc/OdinLink-Five/build/lib:/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs
+DS4_TP_VERBS_LIB=/absolute/path/OdinLink-Five/build/verbs/libodl_tb5_verbs.so.0.1.0
+LD_LIBRARY_PATH=/absolute/path/OdinLink-Five/build/lib:/absolute/path/OdinLink-Five/build/verbs
 ```
 
 Do not use `LD_PRELOAD`. Keep OdinLink-specific behavior gated so generic
@@ -248,9 +248,9 @@ in this worktree:
 
 ```bash
 make -j4 strix-halo
-scp -q ds4 peer:/home/wkljohn/Desktop/cc/ds4-strix-halo-tp/ds4
+scp -q ds4 node2:/absolute/path/ds4-strix-halo-tp-odinlink/ds4
 sha256sum ds4
-ssh peer 'sha256sum /home/wkljohn/Desktop/cc/ds4-strix-halo-tp/ds4'
+ssh node2 'sha256sum /absolute/path/ds4-strix-halo-tp-odinlink/ds4'
 ```
 
 Start the peer worker detached with `setsid -f`, then immediately start the

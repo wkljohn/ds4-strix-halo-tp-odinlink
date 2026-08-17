@@ -268,7 +268,7 @@ drafting.**
 
 ## 3.4 MEASURED: baseline and chain-cycles on the current build (2026-08-07)
 
-Both measured with `run-dspark-bench.sh`, three identical `/reset` repetitions in one
+Both were measured with the historical DSpark harness, using three identical `/reset` repetitions in one
 loaded process, on the build with the DP4A launch reverted to 8 waves / 256 threads.
 Logs in `research-results/dspark-17tps-2026-08-07/`.
 

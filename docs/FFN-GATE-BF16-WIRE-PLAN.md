@@ -140,7 +140,7 @@ This is intentionally conditional. The real tensor range has not yet been measur
 
 ### llama.cpp precedent
 
-The requested file exists at `/home/wkljohn/Desktop/cc/llama.cpp-tq3-hip-new/ggml/src/ggml-cuda/allreduce.cu`.
+The reference file is `ggml/src/ggml-cuda/allreduce.cu` in the inspected llama.cpp checkout.
 
 Its chunked all-reduce explicitly supports a destination type different from the wire type, including F32 destination with BF16 wire, to halve PCIe bytes (`llama.cpp-tq3-hip-new/ggml/src/ggml-cuda/allreduce.cu:79-99`). It performs an ordinary cast from the destination type to the wire type (`llama.cpp-tq3-hip-new/ggml/src/ggml-cuda/allreduce.cu:133-146`). On reduction it rounds both the local and peer operands through the same wire type before adding, specifically so both GPUs produce bit-equivalent results (`llama.cpp-tq3-hip-new/ggml/src/ggml-cuda/allreduce.cu:95-99`, `llama.cpp-tq3-hip-new/ggml/src/ggml-cuda/allreduce.cu:174-178`).
 
@@ -150,7 +150,7 @@ That symmetric local rounding is relevant here. If DS4 decompresses only the pee
 
 ### AMD QuickReduce precedent
 
-A local AMD QuickReduce implementation exists under `/home/wkljohn/Desktop/cc/vllm-work/vllm/csrc/quickreduce`.
+The inspected AMD QuickReduce implementation is under `vllm/csrc/quickreduce` in the vLLM checkout.
 
 It is not a BF16/F16 narrowing codec for F32 inputs. Its public wrapper accepts Half or BF16 tensors and dispatches either an unquantized F16/BF16 codec or block-scaled INT8, INT6, or INT4 codecs (`vllm/csrc/custom_quickreduce.cu:58-84`, `vllm/csrc/quickreduce/quick_reduce.h:62-67`, `vllm/csrc/quickreduce/quick_reduce.h:164-190`).
 

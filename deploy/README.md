@@ -60,3 +60,13 @@ caddy validate --config /etc/caddy/Caddyfile
 The local Caddy route should proxy to `127.0.0.1:8090` with streaming flush
 enabled and a response timeout long enough for initial model loading. Keep
 port 8090 loopback-only; do not bypass Caddy's authentication at the firewall.
+
+## Agent-client completion limits
+
+Set an explicit `max_tokens` or `max_completion_tokens` in agent clients. A
+4,096–8,192 token limit is a practical starting point. The server repairs a
+simple unterminated DSML tool call when generation reaches the request limit;
+a 32,000-token client limit can therefore spend tens of minutes decoding a
+malformed tool argument before the repair runs. This is a model-output/API
+failure mode, not evidence that RDMA stopped making progress. Health checks
+remain responsive after the affected request completes.

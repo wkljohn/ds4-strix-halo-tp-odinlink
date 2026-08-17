@@ -767,8 +767,8 @@ PATCHES = [
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tree", default="/home/wkljohn/Desktop/cc/ds4-upstream",
-                    help="path to a stock ds4 checkout")
+    ap.add_argument("--tree", default=".",
+                    help="path to a stock ds4 checkout (default: current directory)")
     ap.add_argument("--check", action="store_true",
                     help="dry run: report what would change, write nothing")
     a = ap.parse_args()

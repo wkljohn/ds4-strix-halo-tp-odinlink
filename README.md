@@ -157,6 +157,11 @@ deploy/ds4-tp-caddy.sh status
 See [deploy/README.md](deploy/README.md) for the required Caddy route, RoCE
 memlock handling, logs, and stop/restart commands.
 
+Agent clients should send an explicit completion limit. A practical starting
+point is 4,096–8,192 tokens: if the model leaves a DSML tool call open, DS4
+repairs it at the request limit, so an unnecessarily large limit can look like
+a stalled request even while decode is progressing.
+
 ## Research and maintenance
 
 - [TP optimization and validation record](research-results/strix-halo-tp-validation-2026-08/)

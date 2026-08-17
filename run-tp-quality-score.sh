@@ -10,9 +10,13 @@ EXTRA_ENV=("$@")
 [[ $TAG =~ ^[A-Za-z0-9._-]+$ ]] || { echo "error: invalid tag" >&2; exit 2; }
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+BENCH_CONFIG=${DS4_BENCH_CONFIG:-$REPO/bench.env.local}
+[[ ! -r $BENCH_CONFIG ]] || source "$BENCH_CONFIG"
 PEER_REPO=${DS4_PEER_REPO:-$REPO}
-PEER_MGMT=${DS4_PEER_MGMT:-wkljohn@10.10.0.216}
-COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-10.10.0.181}
+PEER_MGMT=${DS4_PEER_MGMT:-}
+PEER_HOST_KEY_ALIAS=${DS4_PEER_HOST_KEY_ALIAS:-${PEER_MGMT#*@}}
+COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
+ODINLINK_ROOT=${DS4_ODINLINK_ROOT:-}
 PORT=${DS4_QUALITY_PORT:-9002}
 CONTEXT=${DS4_QUALITY_CONTEXT:-4096}
 MAX_CASES=${DS4_QUALITY_MAX_CASES:-100}
@@ -23,8 +27,16 @@ COORD_LOG=$OUT/coordinator-$TAG.log
 WORKER_LOG=$OUT/worker-$TAG.log
 SCORES=$OUT/$TAG.tsv
 WORKER_PIDFILE=$OUT/worker-$TAG.pid
-PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2 "$PEER_MGMT")
-PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2)
+PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes
+  -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS" "$PEER_MGMT")
+PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes
+  -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS")
+VERBS_LIB=$ODINLINK_ROOT/build/verbs/libodl_tb5_verbs.so.0.1.0
+ODL_LD_PATH=$ODINLINK_ROOT/build/lib:$ODINLINK_ROOT/build/verbs
+
+for required in PEER_MGMT COORDINATOR_ADDR ODINLINK_ROOT; do
+  [[ -n ${!required} ]] || { echo "error: set $required in bench.env.local or the environment" >&2; exit 2; }
+done
 
 [[ $PORT =~ ^[1-9][0-9]*$ && $CONTEXT =~ ^[1-9][0-9]*$ && $MAX_CASES =~ ^[1-9][0-9]*$ ]] || {
   echo "error: invalid port, context, or max-case count" >&2; exit 2;
@@ -40,8 +52,8 @@ for kv in "${EXTRA_ENV[@]}"; do
       echo "error: the accuracy baseline requires the balanced 128/128 split" >&2; exit 2 ;;
   esac
 done
-[[ -r $MODEL && -r $MANIFEST && -x $SCORER && -x $REPO/ds4 ]] || {
-  echo "error: missing model, manifest, scorer, or ds4 binary" >&2; exit 1;
+[[ -r $MODEL && -r $MANIFEST && -x $SCORER && -x $REPO/ds4 && -r $VERBS_LIB ]] || {
+  echo "error: missing model, manifest, scorer, ds4 binary, or OdinLink provider" >&2; exit 1;
 }
 [[ -r /dev/odl_tb5_0 ]] || { echo "error: local OdinLink device unavailable" >&2; exit 1; }
 "${PEER_SSH[@]}" "test -r '$MODEL' -a -r /dev/odl_tb5_0 -a -x '$PEER_REPO/ds4'" || {
@@ -87,8 +99,8 @@ COMMON_ENV=(
   DS4_TP_TIMEOUT_SEC=60
   DS4_TP_ODINLINK_BATCH_ASYNC=1
   DS4_TP_RDMA_LOGITS=1
-  DS4_TP_VERBS_LIB=/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs/libodl_tb5_verbs.so.0.1.0
-  LD_LIBRARY_PATH=/home/wkljohn/Desktop/cc/OdinLink-Five/build/lib:/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs
+  DS4_TP_VERBS_LIB="$VERBS_LIB"
+  LD_LIBRARY_PATH="$ODL_LD_PATH"
   DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
   DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
   DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1

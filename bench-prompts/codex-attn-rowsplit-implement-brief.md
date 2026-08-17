@@ -1,6 +1,6 @@
 # Implement the TP=2 prefill attention row split (raw-range + static-mixed-range)
 
-Repo: `/home/wkljohn/Desktop/cc/ds4-upstream`. This is real implementation
+Repo: a clean checkout of this fork. This is real implementation
 work with a genuine correctness risk (silent wrong causal masking) - read
 this brief in full before starting, and follow the validation plan at the
 end exactly. Unrelated to the down-projection WMMA fix, decode profiling

@@ -13,12 +13,18 @@ CTX="${2:?need ctx}"
 shift 2
 EXTRA=("$@")
 
-REPO=/home/wkljohn/Desktop/cc/ds4-strix-halo-tp
-MODELS=/home/wkljohn/Desktop/cc/models/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF
-MODEL="$MODELS/DeepSeek-V4-Flash-Q2_K-0731.gguf"
-OUT="$REPO/research-results/q2k-singlenode-2026-08-07"
+REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+MODEL=${DS4_BENCH_MODEL:-}
+OUT=${DS4_BENCH_OUT:-$REPO/research-results/q2k-singlenode}
+[[ -r $MODEL ]] || {
+  echo "error: set DS4_BENCH_MODEL to the local Q2_K GGUF" >&2
+  exit 2
+}
 mkdir -p "$OUT"
 LOG="$OUT/q2k-$TAG-ctx$CTX.log"
+DRIVER_DIR=$(mktemp -d)
+DRIVER=$DRIVER_DIR/q2k-driver.txt
+trap 'rmdir "$DRIVER_DIR" 2>/dev/null || true' EXIT
 
 # No DSpark drafter here: it costs 10.15 GiB resident and the margin is already
 # thin. Establish plain target-only decode first, then decide.
@@ -30,8 +36,10 @@ ENVV=(
 
 echo "=== q2k single-node: tag=$TAG ctx=$CTX ==="
 echo "env: ${EXTRA[*]:-<none>}"
-pkill -x ds4 2>/dev/null
-sleep 2
+if pgrep -x ds4 >/dev/null; then
+  echo "error: another ds4 process is running; refusing to stop it" >&2
+  exit 1
+fi
 
 {
   for i in 1 2 3; do
@@ -39,11 +47,15 @@ sleep 2
     echo "Write a Python function that returns the factorial of a non-negative integer."
   done
   echo "/quit"
-} > /tmp/claude-1000/q2k-driver-$TAG.txt
+} > "$DRIVER"
 
 env "${ENVV[@]}" ./ds4 --rocm -m "$MODEL" \
     -c "$CTX" --temp 0 --seed 42 --nothink -n 60 \
-    < /tmp/claude-1000/q2k-driver-$TAG.txt > "$LOG" 2>&1
+    < "$DRIVER" > "$LOG" 2>&1
+
+rm -f "$DRIVER"
+rmdir "$DRIVER_DIR"
+trap - EXIT
 
 echo "=== complete ==="
 grep -E "prefill: |generation: |q2k|Q2_K|OOM|out of memory|error" "$LOG" | tail -12

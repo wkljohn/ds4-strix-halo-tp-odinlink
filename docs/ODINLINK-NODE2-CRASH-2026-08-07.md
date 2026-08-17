@@ -62,7 +62,7 @@ this kernel race.
 The driver fix is in:
 
 ```text
-/home/wkljohn/Desktop/cc/OdinLink-Five/driver/odl_tb5_ring_dma.c
+/absolute/path/OdinLink-Five/driver/odl_tb5_ring_dma.c
 ```
 
 Because the nodes do not share files and currently run different kernels, the
@@ -82,7 +82,7 @@ compiler-name warning is cosmetic: both the kernel and module used GCC 15.2.0.
 ## Validation completed
 
 - Both node-specific kernel modules compiled successfully.
-- Node two remains reachable over Wi-Fi at `10.10.0.216`.
+- Node two remains reachable over its independent management network.
 - Node two's crash dump remains preserved.
 - Node two has no OdinLink module, device, DS4 process, or CLI process active.
 - Node one has no OdinLink device, DS4 process, or CLI process active. Its old
