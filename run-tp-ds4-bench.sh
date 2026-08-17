@@ -310,6 +310,7 @@ COORD_ENV+=("${EXTRA_ENV[@]}")
 COORD_LOG="$OUT/coordinator-$TAG.log"
 WORKER_LOG="$OUT/worker-$TAG.log"
 CSV="$OUT/$TAG.csv"
+MANIFEST="$OUT/$TAG.manifest"
 WORKER_PIDFILE="$OUT/worker-$TAG.pid"
 mkdir -p "$OUT"
 
@@ -384,6 +385,53 @@ PEER_DS4_HASH=$("${PEER_SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}'
   echo "error: worker binary hashes differ" >&2; exit 1;
 }
 LOCAL_BENCH_HASH=$(sha256sum "$REPO/ds4-bench-tp" | awk '{print $1}')
+PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
+PROMPT_SIZE=$(stat -c %s "$PROMPT_FILE")
+
+# Preserve the complete non-secret control configuration beside every run.
+# Performance numbers without this record are not eligible for a baseline or
+# candidate comparison because a single environment drift can change both the
+# token trajectory and the selected kernel path.
+SOURCE_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+if git -C "$REPO" diff --quiet --ignore-submodules -- 2>/dev/null &&
+   git -C "$REPO" diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
+  SOURCE_DIRTY=0
+else
+  SOURCE_DIRTY=1
+fi
+printf -v COMMON_ENV_Q '%q ' "${COMMON_ENV[@]}"
+printf -v WORKER_ENV_Q '%q ' "${WORKER_ENV[@]}"
+printf -v COORD_ENV_Q '%q ' "${COORD_ENV[@]}"
+printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
+{
+  printf 'tag=%s\n' "$TAG"
+  printf 'source_commit=%s\n' "$SOURCE_COMMIT"
+  printf 'source_dirty=%s\n' "$SOURCE_DIRTY"
+  printf 'ds4_sha256=%s\n' "$LOCAL_DS4_HASH"
+  printf 'peer_ds4_sha256=%s\n' "$PEER_DS4_HASH"
+  printf 'ds4_bench_tp_sha256=%s\n' "$LOCAL_BENCH_HASH"
+  printf 'model=%s\n' "$MODEL"
+  printf 'model_size=%s\n' "$LOCAL_MODEL_SIZE"
+  printf 'model_sample_sha256=%s\n' "$LOCAL_MODEL_FINGERPRINT"
+  printf 'prompt=%s\n' "$PROMPT_FILE"
+  printf 'prompt_size=%s\n' "$PROMPT_SIZE"
+  printf 'prompt_sha256=%s\n' "$PROMPT_HASH"
+  printf 'frontier=%s\n' "$FRONTIER"
+  printf 'generated_tokens=%s\n' "$TOKENS"
+  printf 'context=%s\n' "$CONTEXT"
+  printf 'prefill_chunk=%s\n' "$PREFILL_CHUNK"
+  printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
+  printf 'coordinator_rdma_device=%s\n' "$LOCAL_RDMA_DEVICE"
+  printf 'worker_rdma_device=%s\n' "$PEER_RDMA_DEVICE"
+  printf 'rdma_gid_index=%s\n' "${RDMA_GID_INDEX:-n/a}"
+  printf 'candidate=%s\n' "$CANDIDATE"
+  printf 'expected_fnv64=%s\n' "${EXPECTED_FNV64,,}"
+  printf 'dspark=%s\n' "$DSPARK"
+  printf 'common_env=%s\n' "$COMMON_ENV_Q"
+  printf 'worker_env=%s\n' "$WORKER_ENV_Q"
+  printf 'coordinator_env=%s\n' "$COORD_ENV_Q"
+  printf 'extra_env=%s\n' "$EXTRA_ENV_Q"
+} > "$MANIFEST"
 
 if pgrep -af '[d]s4-bench-tp.*--role coordinator.*--tensor-parallel' >/dev/null; then
   echo "error: a TP benchmark coordinator is already running; refusing to kill it" >&2
