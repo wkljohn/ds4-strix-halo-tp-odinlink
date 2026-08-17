@@ -40,6 +40,7 @@ __pycache__/
 /misc/
 /research-results/
 /deploy/config.env.local
+/bench.env.local
 /deploy/runtime/
 /.rocprofv3/
 .*.swp

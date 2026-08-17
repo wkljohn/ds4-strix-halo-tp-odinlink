@@ -2,6 +2,7 @@
 # Fixed-frontier, fixed-token TP=2 benchmark over mandatory RDMA.
 #
 # Usage: ./run-tp-ds4-bench.sh <tag> <model.gguf> [EXTRA_ENV=1 ...]
+# Copy bench.env.example to bench.env.local before the first real run.
 set -euo pipefail
 
 TAG="${1:?usage: run-tp-ds4-bench.sh <tag> <model.gguf> [EXTRA_ENV=1 ...]}"
@@ -14,19 +15,25 @@ EXTRA_ENV=("$@")
 }
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+BENCH_CONFIG=${DS4_BENCH_CONFIG:-$SCRIPT_DIR/bench.env.local}
+if [[ -r $BENCH_CONFIG ]]; then
+  # shellcheck disable=SC1090
+  source "$BENCH_CONFIG"
+fi
 REPO=${DS4_BENCH_REPO:-$SCRIPT_DIR}
 PEER_REPO=${DS4_PEER_REPO:-$REPO}
-PEER_MGMT=${DS4_PEER_MGMT:-wkljohn@10.10.0.216}
+PEER_MGMT=${DS4_PEER_MGMT:-}
+PEER_HOST_KEY_ALIAS=${DS4_PEER_HOST_KEY_ALIAS:-${PEER_MGMT#*@}}
 RDMA_PROFILE=${DS4_BENCH_RDMA_PROFILE:-odinlink}
 PREFILL_CHUNK_EXPLICIT=${DS4_BENCH_PREFILL_CHUNK+x}
 case $RDMA_PROFILE in
   odinlink)
-    COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-10.10.0.181}
+    COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
     LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-odl_tb5_0}
     PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-odl_tb5_0}
     ;;
   roce-v2)
-    COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-192.168.99.1}
+    COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
     LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
     PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
     ;;
@@ -46,8 +53,8 @@ if [[ $RDMA_PROFILE == roce-v2 && -z $PREFILL_CHUNK_EXPLICIT ]]; then
   PREFILL_CHUNK=2048
 fi
 DSPARK=${DS4_BENCH_DSPARK:-0}
-MTP=${DS4_BENCH_MTP:-/home/wkljohn/Desktop/cc/models/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/dspark-abliterated/dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf}
-OUT=${DS4_BENCH_OUT:-"$REPO/research-results/quant-comparison-2026-08-10"}
+MTP=${DS4_BENCH_MTP:-}
+OUT=${DS4_BENCH_OUT:-"$REPO/research-results/bench-runs"}
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
 ROCPROF_RUNTIME=${DS4_BENCH_ROCPROF_RUNTIME:-1}
 ROCPROF_REGION=${DS4_BENCH_ROCPROF_REGION:-decode}
@@ -66,8 +73,10 @@ DUMP_FRONTIER_LOGITS_DIR=${DS4_BENCH_DUMP_FRONTIER_LOGITS_DIR:-}
 EXPECT_GREEDY_TOP2=0
 CANDIDATE_ARGS=()
 CLEAN_ENV=(env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8)
-PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2 "$PEER_MGMT")
-PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=10.4.0.2)
+PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes
+          -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS" "$PEER_MGMT")
+PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes
+          -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS")
 
 [[ $FRONTIER =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid frontier" >&2; exit 2; }
 [[ $TOKENS =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid generated-token count" >&2; exit 2; }
@@ -215,14 +224,27 @@ if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
   exit 0
 fi
 
+[[ -n $PEER_MGMT ]] || {
+  echo "error: set DS4_PEER_MGMT in bench.env.local" >&2; exit 2;
+}
+[[ -n $COORDINATOR_ADDR ]] || {
+  echo "error: set DS4_COORDINATOR_ADDR in bench.env.local" >&2; exit 2;
+}
+
 COMMON_ENV=(DS4_TP_TIMEOUT_SEC="$TP_TIMEOUT_SEC" "${CURRENT_OPT_ENV[@]}")
 RDMA_ARGS=(--rdma-device "$LOCAL_RDMA_DEVICE")
 WORKER_RDMA_ARGS=(--rdma-device "$PEER_RDMA_DEVICE")
 if [[ $RDMA_PROFILE == odinlink ]]; then
+  ODINLINK_ROOT=${DS4_ODINLINK_ROOT:-}
+  [[ -n $ODINLINK_ROOT ]] || {
+    echo "error: set DS4_ODINLINK_ROOT in bench.env.local" >&2; exit 2;
+  }
+  VERBS_LIB=$ODINLINK_ROOT/build/verbs/libodl_tb5_verbs.so.0.1.0
+  ODL_LD_PATH=$ODINLINK_ROOT/build/lib:$ODINLINK_ROOT/build/verbs
   COMMON_ENV+=(
     DS4_TP_ODINLINK_BATCH_ASYNC=1
-    DS4_TP_VERBS_LIB=/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs/libodl_tb5_verbs.so.0.1.0
-    LD_LIBRARY_PATH=/home/wkljohn/Desktop/cc/OdinLink-Five/build/lib:/home/wkljohn/Desktop/cc/OdinLink-Five/build/verbs
+    DS4_TP_VERBS_LIB="$VERBS_LIB"
+    LD_LIBRARY_PATH="$ODL_LD_PATH"
   )
 else
   RDMA_GID_INDEX=${DS4_RDMA_GID_INDEX:-3}
@@ -310,14 +332,16 @@ remote_sample_fingerprint() {
   "${PEER_SSH[@]}" "p=$quoted; s=\$(stat -c %s \"\$p\"); h=\$((s / 2 > 4194304 ? s / 2 - 4194304 : 0)); t=\$((s > 8388608 ? s - 8388608 : 0)); { printf '%s\\n' \"\$s\"; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=0 count=8388608 status=none; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=\"\$h\" count=8388608 status=none; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=\"\$t\" count=8388608 status=none; } | sha256sum | awk '{print \$1}'"
 }
 
-if [[ $DSPARK == 1 && ! -r $MTP ]]; then
+if [[ $DSPARK == 1 && ( -z $MTP || ! -r $MTP ) ]]; then
   echo "error: missing local DSpark model: $MTP" >&2
   exit 1
 fi
 if [[ $RDMA_PROFILE == odinlink ]]; then
-  [[ -r /dev/odl_tb5_0 ]] || { echo "error: local OdinLink device unavailable" >&2; exit 1; }
-  "${PEER_SSH[@]}" "test -r '$MODEL' -a -r /dev/odl_tb5_0" || {
-    echo "error: peer model or OdinLink device unavailable" >&2; exit 1;
+  [[ -r /dev/odl_tb5_0 && -r $VERBS_LIB ]] || {
+    echo "error: local OdinLink device or provider unavailable" >&2; exit 1;
+  }
+  "${PEER_SSH[@]}" "test -r '$MODEL' -a -r /dev/odl_tb5_0 -a -r '$VERBS_LIB'" || {
+    echo "error: peer model, OdinLink device, or provider unavailable" >&2; exit 1;
   }
 else
   [[ -r /sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX ]] || {
