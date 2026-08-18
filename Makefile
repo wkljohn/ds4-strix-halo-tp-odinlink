@@ -55,7 +55,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-tp-hello test-roce-v2-mr test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-batch-row-shard test-rocm-q4k-row-shard-support dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-tp-hello test-tp-shared-balance test-roce-v2-mr test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-batch-row-shard test-rocm-q4k-row-shard-support dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
 
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
@@ -65,6 +65,13 @@ tests/test_tp_hello: tests/test_tp_hello.c tests/ds4_tp_hello_test.o ds4_tp.h ds
 
 test-tp-hello: tests/test_tp_hello
 	./tests/test_tp_hello
+
+tests/test_tp_shared_balance: tests/test_tp_shared_balance.c ds4_tp_shared_balance.h
+	$(CC) -O2 -g $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99 \
+		-fno-fast-math -frounding-math -I. -o $@ $< $(LDLIBS)
+
+test-tp-shared-balance: tests/test_tp_shared_balance
+	./tests/test_tp_shared_balance
 
 tests/roce_v2_mr_probe: tests/roce_v2_mr_probe.cpp
 	$(HIPCC) -O2 -o $@ $< -libverbs
