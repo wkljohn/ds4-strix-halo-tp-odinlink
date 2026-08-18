@@ -61,6 +61,10 @@ enum {
      * native integer WMMA.  Keep this in the exact-matched hello word: an
      * independently launched rank must never select different MoE arithmetic. */
     DS4_TP_FEATURE_IQ2_I8_WMMA = UINT32_C(1) << 6,
+    /* Both ranks must defer the same compressor projection rows.  A mismatch
+     * would preserve transport health while advancing different recurrent
+     * attention states. */
+    DS4_TP_FEATURE_TEMPORAL_COMPRESSOR = UINT32_C(1) << 7,
     /* Bits 8..15 carry the first expert owned by rank 1.  Including the
      * ownership boundary in the already exact-matched hello features makes
      * an asymmetric placement fail closed if the two independent nodes were

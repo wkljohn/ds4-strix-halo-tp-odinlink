@@ -882,6 +882,23 @@ int ds4_gpu_matmul_f16_pair_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+#ifdef DS4_ROCM_BUILD
+/* Explicit gfx1151 temporal-compressor primitive.  Unlike the generic paired
+ * API, this never changes unrelated prefill or verifier dispatch. */
+int ds4_gpu_f16_pair_temporal_supported(void);
+int ds4_gpu_matmul_f16_pair_temporal_tensor(
+        ds4_gpu_tensor       *out_a,
+        ds4_gpu_tensor       *out_b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_a_offset,
+        uint64_t                weight_b_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+#endif
+
 /* Optional Metal decode fusion. Returns 1 when the paired projection and
  * recurrent compressor-state store were encoded, 0 when the optimized path
  * is unavailable, and -1 on an attempted-path error. */

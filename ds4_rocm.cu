@@ -214,9 +214,10 @@ enum ds4_tp_kind { DS4_TP_ROW = 0, DS4_TP_BATCH = 1, DS4_TP_BIG = 2 };
 
 struct ds4_tp_req {
     uint32_t kind, layer, gate, rows;
+    uint32_t ch;
     const void           *out_ptr;
     void                 *in_ptr;
-    uint64_t              bytes;
+    uint64_t              bytes, seq, submitted_ns;
 };
 
 /* channel 0 = row gates, channel 1 = batch/big gates */
@@ -386,6 +387,12 @@ static hipStream_t              g_tp_stream = NULL;
  * gate ordering without persistent weight memory or an unsupported GPU wait. */
 static int                      g_tp_host_sync = 0;
 static hipEvent_t               g_tp_host_sync_event = NULL;
+/* Experimental row-gate scheduler. hipLaunchHostFunc orders the synchronous
+ * verbs callback between the producer kernels and dependent default-stream
+ * kernels. Unlike mapped stream signal words, this uses a documented HIP
+ * ordering primitive and does not depend on device-to-host signal visibility.
+ * Batch/big gates retain the conservative host-synchronous path. */
+static int                      g_tp_host_callback = 0;
 static int                      g_tp_thread_started = 0;
 static uint64_t                 g_tp_host_sync_timeout_ns = 300000000000ull;
 /* ds4_tp.c is plain C; declare the hook setter with C linkage rather than
@@ -1009,6 +1016,17 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
         g_tp_sig_alloc = NULL;
         return 0;
     }
+    if (g_tp_host_sync) {
+        const char *callback = getenv("DS4_TP_HOST_CALLBACK");
+        g_tp_host_callback = callback && strcmp(callback, "1") == 0;
+        if (g_tp_host_callback) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "tp: experimental ordered HIP host callbacks enabled "
+                    "for decode row gates\n");
+        }
+    }
+    /* Batch and big prefill gates intentionally remain host-synchronous even
+     * when decode row callbacks are enabled, so they still need this event. */
     if (g_tp_host_sync &&
         hipEventCreateWithFlags(&g_tp_host_sync_event,
                                 hipEventDisableTiming) != hipSuccess) {
@@ -1076,7 +1094,8 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
     }
     fprintf(stderr, DS4_GPU_LOG_PREFIX
             "ROCm TP rank %u ready (2 channels, %s gates)\n", rank,
-            g_tp_host_sync ? "host-synchronous" : "HIP stream wait-value");
+            g_tp_host_callback ? "ordered HIP host-callback" :
+            (g_tp_host_sync ? "host-synchronous" : "HIP stream wait-value"));
     return 1;
 }
 
@@ -1112,6 +1131,7 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
     }
     g_tp_fn = NULL; g_tp_ud = NULL;
     g_tp_host_sync = 0;
+    g_tp_host_callback = 0;
     g_tp_thread_started = 0;
 }
 
@@ -1132,6 +1152,47 @@ static inline int ds4_tp_gate_kick_enabled(void) {
     return g_tp_gate_kick;
 }
 
+/* A HIP host callback may not call HIP APIs. This callback deliberately uses
+ * only atomics, diagnostic bookkeeping, and the synchronous transport hook;
+ * decode row exchange is direct from the already registered TP slab. The
+ * callback is enqueued on the legacy default stream, so all producer kernels
+ * precede it and all consumers wait until the verbs exchange returns. */
+static void ds4_tp_host_callback_run(void *opaque) {
+    ds4_tp_req *req = (ds4_tp_req *)opaque;
+    if (!req || req->ch >= 2u) {
+        ds4_tp_fail_release_gpu_waits();
+        return;
+    }
+    struct ds4_tp_chan *c = &g_tp_chan[req->ch];
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const int host_sync_profile = ds4_tp_host_sync_profile_is_enabled();
+    const uint64_t producer_ready_ns =
+        host_sync_profile ? ds4_tp_monotonic_ns() : 0;
+#endif
+    if (ds4_tp_fail_get()) return;
+    __atomic_store_n(c->gpu_flag, req->seq, __ATOMIC_RELEASE);
+    ds4_tp_ffn_range_consume((int)req->ch, req->seq, req);
+    const int ok = g_tp_fn ?
+        g_tp_fn(g_tp_ud, req->layer, req->gate, req->seq) : 0;
+    if (!ok) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "TP host-callback exchange failed (layer %u gate %u seq %llu)\n",
+                req->layer, req->gate, (unsigned long long)req->seq);
+        ds4_tp_fail_release_gpu_waits();
+        return;
+    }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    if (host_sync_profile) {
+        ds4_tp_host_sync_profile_stat *s =
+            &g_tp_host_sync_profile[DS4_TP_ROW];
+        s->count++;
+        s->producer_ns += producer_ready_ns - req->submitted_ns;
+        s->exchange_ns += ds4_tp_monotonic_ns() - producer_ready_ns;
+    }
+#endif
+    __atomic_store_n(c->cpu_flag, req->seq, __ATOMIC_RELEASE);
+}
+
 /* Publish arrival on `ch`, then block the null stream until release. */
 static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
     if (!g_tp_thread_live) {
@@ -1150,7 +1211,29 @@ static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
         return 0;
     }
     c->ring[seq % DS4_TP_RING] = *req;
+    ds4_tp_req *queued = &c->ring[seq % DS4_TP_RING];
+    queued->ch = (uint32_t)ch;
+    queued->seq = seq;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    queued->submitted_ns = ds4_tp_host_sync_profile_is_enabled() ?
+        ds4_tp_monotonic_ns() : 0;
+#else
+    queued->submitted_ns = 0;
+#endif
     if (ds4_tp_fail_get()) return 0;
+
+    if (g_tp_host_callback && req->kind == DS4_TP_ROW) {
+        hipError_t err = hipLaunchHostFunc(NULL, ds4_tp_host_callback_run,
+                                           queued);
+        if (err != hipSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "TP gate: host callback enqueue failed: %s\n",
+                    hipGetErrorString(err));
+            ds4_tp_fail_release_gpu_waits();
+            return 0;
+        }
+        return 1;
+    }
 
     if (g_tp_host_sync) {
         /* All production compute kernels use the legacy default stream.  The

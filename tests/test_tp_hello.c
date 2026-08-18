@@ -90,6 +90,12 @@ int main(void) {
     ok &= check("hello mismatched-iq2-i8-wmma",
                 DS4_TP_FEATURE_IQ2_I8_WMMA, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00000040 peer=0x00000000)");
+    ok &= check("hello equal-temporal-compressor",
+                DS4_TP_FEATURE_TEMPORAL_COMPRESSOR,
+                DS4_TP_FEATURE_TEMPORAL_COMPRESSOR, 1, NULL);
+    ok &= check("hello mismatched-temporal-compressor",
+                DS4_TP_FEATURE_TEMPORAL_COMPRESSOR, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00000080 peer=0x00000000)");
     ok &= check("hello equal-batch-attn-head-split",
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);

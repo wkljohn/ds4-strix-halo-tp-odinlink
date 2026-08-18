@@ -1077,6 +1077,24 @@ static uint32_t ds4_layer_compress_ratio(uint32_t il) {
     return g_ds4_compress_ratios[il];
 }
 
+static bool ds4_rocm_temporal_compressor_requested(void) {
+#if defined(DS4_ROCM_BUILD)
+    const char *env = getenv("DS4_ROCM_TEMPORAL_COMPRESSOR");
+    return env && strcmp(env, "1") == 0;
+#else
+    return false;
+#endif
+}
+
+/* The temporal path retains only normalized activation rows, never expanded
+ * weights.  Keep this helper shared by runtime and placement accounting so a
+ * tight UMA layout cannot pass planning and then fail during graph creation. */
+static uint64_t ds4_temporal_compressor_ring_bytes(uint32_t il) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    return ratio == 0u ? 0u
+                       : (uint64_t)ratio * DS4_N_EMBD * sizeof(float);
+}
+
 static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
     if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
 
@@ -15104,6 +15122,12 @@ typedef struct {
     ds4_gpu_tensor *layer_attn_comp_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_MAX_LAYER];
+    /* Opt-in ROCm temporal compressor input rings.  They retain only FP32
+     * normalized activations until the layer's existing 4/128-token
+     * compressor boundary; no model weights are expanded or duplicated. */
+    ds4_gpu_tensor *layer_temporal_attn_norm[DS4_MAX_LAYER];
+    uint32_t layer_temporal_pending_start[DS4_MAX_LAYER];
+    uint32_t layer_temporal_pending_count[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
@@ -15345,6 +15369,7 @@ typedef struct {
     double decode_token_avg_sec;
     bool quality;
     bool mtp_enabled;
+    bool temporal_compressor_enabled;
     /* Metal-only prefill helpers retained alongside the CUDA tiered workspace. */
     ds4_gpu_tensor *batch_q_half;
     ds4_gpu_tensor *prefill_seed_router_selected;
@@ -15910,6 +15935,9 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_state_score[il]);
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(g->layer_temporal_attn_norm[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_index_comp_cache[il]);
@@ -17362,6 +17390,24 @@ static bool metal_graph_alloc_raw_cap(
          metal_graph_cuda_greedy_splitkv_fallback_requested()) ||
         (metal_graph_cuda_greedy_vec4_requested() &&
          metal_graph_cuda_greedy_vec4_fallback_requested());
+#if defined(DS4_ROCM_BUILD)
+    g->temporal_compressor_enabled =
+        ds4_rocm_temporal_compressor_requested() &&
+        ds4_gpu_f16_pair_temporal_supported() != 0;
+    const bool temporal_frontier_incompatible =
+        enable_splitkv_spec ||
+        (metal_graph_cuda_greedy_splitkv_requested() &&
+         metal_graph_cuda_greedy_splitkv_fallback_requested()) ||
+        (metal_graph_cuda_greedy_vec4_requested() &&
+         metal_graph_cuda_greedy_vec4_fallback_requested());
+    if (g->temporal_compressor_enabled && temporal_frontier_incompatible) {
+        fprintf(stderr,
+                "ds4: ROCm temporal compressor is incompatible with active "
+                "split-KV/vec4 frontier rollback\n");
+        metal_graph_free(g);
+        return false;
+    }
+#endif
     if (g->cuda_tp_decode && metal_graph_cuda_tp_partner_tier(0) < 0) {
         fprintf(stderr,
                 "ds4: CUDA tensor parallelism requires an even multi-GPU placement; "
@@ -17439,6 +17485,16 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t comp_width_max = 2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
         ? DS4_N_HEAD_DIM
         : DS4_N_INDEXER_HEAD_DIM);
+    uint64_t comp_work_elems = comp_width_max;
+    if (g->temporal_compressor_enabled) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0) continue;
+            const uint64_t width = (ratio == 4u ? 2ull : 1ull) * DS4_N_HEAD_DIM;
+            const uint64_t elems = (uint64_t)ratio * width;
+            if (elems > comp_work_elems) comp_work_elems = elems;
+        }
+    }
     const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
     const uint64_t pc = prefill_cap;
     uint64_t kv_cache_bytes = 0;
@@ -17564,6 +17620,11 @@ static bool metal_graph_alloc_raw_cap(
             }
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
+            if (g->temporal_compressor_enabled) {
+                g->layer_temporal_attn_norm[il] = ds4_gpu_tensor_alloc_ptr_on(
+                        layer_tier,
+                        (uint64_t)ratio * DS4_N_EMBD * sizeof(float));
+            }
             if (enable_frontier_snapshot) {
                 g->spec_attn_state_kv[il] =
                     ds4_gpu_tensor_alloc_ptr_on(layer_tier, attn_width * attn_rows * sizeof(float));
@@ -17626,8 +17687,8 @@ static bool metal_graph_alloc_raw_cap(
      * metal_graph_ensure_ffn_out (per-tier on first touch). */
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
         if (!used_tier[t]) continue;
-        g->comp_kv_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_width_max * sizeof(float));
-        g->comp_sc_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_width_max * sizeof(float));
+        g->comp_kv_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_work_elems * sizeof(float));
+        g->comp_sc_cur_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, comp_work_elems * sizeof(float));
         if (DS4_GPU_ATTN_COMP_CACHE_F16) {
             /* Upstream's F16-compressed attn staging buffer. Only allocated when
              * the F16-cache mode is enabled (the non-F16 path stages in-place). */
@@ -17837,6 +17898,8 @@ static bool metal_graph_alloc_raw_cap(
                               g->layer_attn_comp_cache_tp[il] != NULL) &&
                              g->layer_attn_state_kv[il] != NULL &&
                              g->layer_attn_state_score[il] != NULL &&
+                             (!g->temporal_compressor_enabled ||
+                              g->layer_temporal_attn_norm[il] != NULL) &&
                              (!enable_frontier_snapshot ||
                               (g->spec_attn_state_kv[il] != NULL &&
                                g->spec_attn_state_score[il] != NULL)) &&
@@ -22068,6 +22131,106 @@ static bool metal_graph_dspark_validate_copy_values(
         uint64_t              src_elem,
         uint64_t              n_elems);
 
+/* Project a contiguous pending compressor window in exact chunks of at most
+ * four rows, then replay the existing recurrent update one row at a time.
+ * The projection kernel reuses each cold F16 weight row; the recurrent state,
+ * position order, pooling, RoPE, and cache writes remain unchanged. */
+static bool metal_graph_temporal_project_update(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_tensor       *weight_kv,
+        const ds4_tensor       *weight_score,
+        const ds4_tensor       *ape,
+        const ds4_tensor       *norm,
+        ds4_gpu_tensor         *input_ring,
+        ds4_gpu_tensor         *state_kv,
+        ds4_gpu_tensor         *state_score,
+        ds4_gpu_tensor         *cache,
+        uint32_t                head_dim,
+        uint32_t                width,
+        uint32_t                ratio,
+        uint32_t                start_pos,
+        uint32_t                n_rows,
+        uint32_t                cache_row,
+        bool                    compressed,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor) {
+    if (!g || !model || !weight_kv || !weight_score || !ape || !norm ||
+        !input_ring || !state_kv || !state_score || !cache || n_rows == 0u ||
+        n_rows > ratio || (start_pos % ratio) + n_rows > ratio) {
+        return false;
+    }
+
+    uint32_t done = 0u;
+    while (done < n_rows) {
+        uint32_t chunk = n_rows - done;
+        if (chunk > 4u) chunk = 4u;
+        ds4_gpu_tensor *x = ds4_gpu_tensor_view(
+                input_ring,
+                (uint64_t)((start_pos % ratio) + done) * DS4_N_EMBD * sizeof(float),
+                (uint64_t)chunk * DS4_N_EMBD * sizeof(float));
+        ds4_gpu_tensor *out_kv = ds4_gpu_tensor_view(
+                metal_graph_comp_kv_cur(g),
+                (uint64_t)done * width * sizeof(float),
+                (uint64_t)chunk * width * sizeof(float));
+        ds4_gpu_tensor *out_score = ds4_gpu_tensor_view(
+                metal_graph_comp_sc_cur(g),
+                (uint64_t)done * width * sizeof(float),
+                (uint64_t)chunk * width * sizeof(float));
+        bool projected = false;
+        if (x && out_kv && out_score) {
+#if defined(DS4_ROCM_BUILD)
+            projected = (chunk == 1u
+                ? ds4_gpu_matmul_f16_pair_tensor(
+                        out_kv, out_score, model->map, model->size,
+                        weight_kv->abs_offset, weight_score->abs_offset,
+                        DS4_N_EMBD, width, x, chunk)
+                : ds4_gpu_matmul_f16_pair_temporal_tensor(
+                        out_kv, out_score, model->map, model->size,
+                        weight_kv->abs_offset, weight_score->abs_offset,
+                        DS4_N_EMBD, width, x, chunk)) != 0;
+#else
+            projected = ds4_gpu_matmul_f16_pair_tensor(
+                    out_kv, out_score, model->map, model->size,
+                    weight_kv->abs_offset, weight_score->abs_offset,
+                    DS4_N_EMBD, width, x, chunk) != 0;
+#endif
+        }
+        ds4_gpu_tensor_free(out_score);
+        ds4_gpu_tensor_free(out_kv);
+        ds4_gpu_tensor_free(x);
+        if (!projected) return false;
+        done += chunk;
+    }
+
+    for (uint32_t r = 0u; r < n_rows; r++) {
+        ds4_gpu_tensor *row_kv = ds4_gpu_tensor_view(
+                metal_graph_comp_kv_cur(g),
+                (uint64_t)r * width * sizeof(float),
+                (uint64_t)width * sizeof(float));
+        ds4_gpu_tensor *row_score = ds4_gpu_tensor_view(
+                metal_graph_comp_sc_cur(g),
+                (uint64_t)r * width * sizeof(float),
+                (uint64_t)width * sizeof(float));
+        const bool updated = row_kv && row_score &&
+            ds4_gpu_compressor_update_tensor(
+                    row_kv, row_score, state_kv, state_score, cache,
+                    model->map, model->size, ape->abs_offset, ape->type,
+                    norm->abs_offset, norm->type, head_dim, ratio,
+                    start_pos + r, cache_row, DS4_N_ROT,
+                    compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0u,
+                    freq_base, freq_scale, ext_factor, attn_factor,
+                    DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW,
+                    DS4_RMS_EPS, false) != 0;
+        ds4_gpu_tensor_free(row_score);
+        ds4_gpu_tensor_free(row_kv);
+        if (!updated) return false;
+    }
+    return true;
+}
+
 static bool metal_graph_encode_decode_layer_phase(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -22482,8 +22645,52 @@ static bool metal_graph_encode_decode_layer_phase(
             fprintf(stderr, "ds4: Metal graph compressed KV cache capacity exceeded at layer %u\n", il);
             ok = false;
         }
+        const bool temporal = g->temporal_compressor_enabled;
+        uint32_t temporal_start = g->layer_temporal_pending_start[il];
+        uint32_t temporal_count = g->layer_temporal_pending_count[il];
+        if (ok && temporal) {
+            if (temporal_count == 0u) {
+                temporal_start = pos;
+                g->layer_temporal_pending_start[il] = pos;
+            } else if (temporal_start + temporal_count != pos) {
+                fprintf(stderr,
+                        "ds4: ROCm temporal compressor position discontinuity "
+                        "at layer %u (%u + %u != %u)\n",
+                        il, temporal_start, temporal_count, pos);
+                ok = false;
+            }
+            if (ok) {
+                ok = ds4_gpu_tensor_copy(
+                        g->layer_temporal_attn_norm[il],
+                        (uint64_t)(pos % ratio) * DS4_N_EMBD * sizeof(float),
+                        metal_graph_attn_norm(g), 0,
+                        (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
+            }
+            if (ok) {
+                temporal_count++;
+                g->layer_temporal_pending_count[il] = temporal_count;
+            }
+        }
         bool comp_state_already_stored = false;
-        if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
+        if (ok && temporal) {
+            if (emit) {
+                ok = metal_graph_temporal_project_update(
+                        g, model,
+                        layer->attn_compressor_kv,
+                        layer->attn_compressor_gate,
+                        layer->attn_compressor_ape,
+                        layer->attn_compressor_norm,
+                        g->layer_temporal_attn_norm[il],
+                        g->layer_attn_state_kv[il],
+                        g->layer_attn_state_score[il],
+                        metal_graph_attn_comp_update_target(g, il),
+                        DS4_N_HEAD_DIM, comp_width, ratio,
+                        temporal_start, temporal_count,
+                        metal_graph_attn_comp_update_row(g->layer_n_comp[il]),
+                        compressed,
+                        freq_base, freq_scale, ext_factor, attn_factor);
+            }
+        } else if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
             const int fused_store =
                 ds4_gpu_matmul_f16_pair_compressor_store_tensor(
                         metal_graph_comp_kv_cur(g),
@@ -22530,7 +22737,7 @@ static bool metal_graph_encode_decode_layer_phase(
         DS4_METAL_PROFILE_DECODE_STAGE("compressor_proj");
         DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_COMPRESSOR_PROJ);
         const uint32_t comp_row = g->layer_n_comp[il];
-        if (ok) ok = ds4_gpu_compressor_update_tensor(metal_graph_comp_kv_cur(g),
+        if (ok && !temporal) ok = ds4_gpu_compressor_update_tensor(metal_graph_comp_kv_cur(g),
                                                         metal_graph_comp_sc_cur(g),
                                                         g->layer_attn_state_kv[il],
                                                         g->layer_attn_state_score[il],
@@ -22592,7 +22799,24 @@ static bool metal_graph_encode_decode_layer_phase(
                 ok = false;
             }
             bool index_state_already_stored = false;
-            if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
+            if (ok && temporal) {
+                if (emit) {
+                    ok = metal_graph_temporal_project_update(
+                            g, model,
+                            layer->indexer_compressor_kv,
+                            layer->indexer_compressor_gate,
+                            layer->indexer_compressor_ape,
+                            layer->indexer_compressor_norm,
+                            g->layer_temporal_attn_norm[il],
+                            g->layer_index_state_kv[il],
+                            g->layer_index_state_score[il],
+                            g->layer_index_comp_cache[il],
+                            DS4_N_INDEXER_HEAD_DIM, index_width, ratio,
+                            temporal_start, temporal_count,
+                            g->layer_n_index_comp[il], compressed,
+                            freq_base, freq_scale, ext_factor, attn_factor);
+                }
+            } else if (ok && !metal_graph_use_reference_compressor_pair_proj()) {
                 const int fused_store =
                     ds4_gpu_matmul_f16_pair_compressor_store_tensor(
                             metal_graph_comp_kv_cur(g),
@@ -22638,7 +22862,7 @@ static bool metal_graph_encode_decode_layer_phase(
             }
             DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_proj");
             const uint32_t index_row = g->layer_n_index_comp[il];
-            if (ok) ok = ds4_gpu_compressor_update_tensor(metal_graph_comp_kv_cur(g),
+            if (ok && !temporal) ok = ds4_gpu_compressor_update_tensor(metal_graph_comp_kv_cur(g),
                                                             metal_graph_comp_sc_cur(g),
                                                             g->layer_index_state_kv[il],
                                                             g->layer_index_state_score[il],
@@ -22820,6 +23044,10 @@ static bool metal_graph_encode_decode_layer_phase(
                         : g->layer_n_index_comp[il];
                 }
             }
+        }
+
+        if (ok && temporal && emit) {
+            g->layer_temporal_pending_count[il] = 0u;
         }
 
         n_comp = g->layer_n_comp[il];
@@ -34558,6 +34786,10 @@ static bool imatrix_collector_save(
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
+    memset(g->layer_temporal_pending_start, 0,
+           sizeof(g->layer_temporal_pending_start));
+    memset(g->layer_temporal_pending_count, 0,
+           sizeof(g->layer_temporal_pending_count));
     g->mtp_n_raw = 0;
     metal_graph_dspark_cache_reset(g);
     metal_graph_dspark_capture_invalidate(g);
@@ -49124,6 +49356,9 @@ static size_t engine_per_layer_kv_bytes_planner(uint32_t il,
             bytes += (size_t)layer_comp_cap * DS4_N_INDEXER_HEAD_DIM *
                      sizeof(float);
         }
+        if (ds4_rocm_temporal_compressor_requested()) {
+            bytes += (size_t)ds4_temporal_compressor_ring_bytes(il);
+        }
     }
 
     /* Per-tier scratch (indexer_scores_by_tier, comp_mask_by_tier,
@@ -49238,6 +49473,17 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
         2ull * (DS4_N_HEAD_DIM > DS4_N_INDEXER_HEAD_DIM
                 ? DS4_N_HEAD_DIM
                 : DS4_N_INDEXER_HEAD_DIM);
+    uint64_t comp_work_elems = comp_width_max;
+    if (ds4_rocm_temporal_compressor_requested()) {
+        for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            if (ratio == 0u) continue;
+            const uint64_t width =
+                (ratio == 4u ? 2ull : 1ull) * DS4_N_HEAD_DIM;
+            const uint64_t elems = (uint64_t)ratio * width;
+            if (elems > comp_work_elems) comp_work_elems = elems;
+        }
+    }
     const uint64_t indexer_q_dim  =
         (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
 
@@ -49289,8 +49535,8 @@ static size_t engine_per_tier_graph_overhead_bytes(const ds4_engine *e) {
     total += (uint64_t)DS4_N_HEAD_DIM * sizeof(float);     /* kv_by_tier */
 
     /* === Class P FFN / routed-expert state (mirrors ds4.c:10760-10800). === */
-    total += comp_width_max * sizeof(float);               /* comp_kv_cur_by_tier */
-    total += comp_width_max * sizeof(float);               /* comp_sc_cur_by_tier */
+    total += comp_work_elems * sizeof(float);              /* comp_kv_cur_by_tier */
+    total += comp_work_elems * sizeof(float);              /* comp_sc_cur_by_tier */
     if (DS4_PLANNER_ATTN_COMP_CACHE_F16) {
         total += (uint64_t)attn_comp_stage_cap *
                  DS4_N_HEAD_DIM * sizeof(float);           /* attn_comp_stage_by_tier */
@@ -50051,6 +50297,97 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
     return rows;
 }
 
+static bool session_temporal_compressor_pending(
+        const ds4_gpu_graph *g,
+        uint32_t layer_start,
+        uint32_t layer_end) {
+    if (!g || !g->temporal_compressor_enabled) return false;
+    if (layer_end >= DS4_N_LAYER) layer_end = DS4_N_LAYER - 1u;
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        if (g->layer_temporal_pending_count[il] != 0u) return true;
+    }
+    return false;
+}
+
+/* Materialize deferred non-emitting compressor rows before a durable state
+ * snapshot.  This makes the serialized recurrent frontier byte-equivalent to
+ * the established per-token path without waiting for the next 4/128-token
+ * emission boundary.  Pending ranges can never include an emit: decode
+ * consumes and clears them immediately at such a boundary. */
+static bool session_temporal_compressor_flush(
+        ds4_session *s,
+        uint32_t     layer_start,
+        uint32_t     layer_end) {
+    if (!s) return false;
+    ds4_gpu_graph *g = &s->graph;
+    if (!g->temporal_compressor_enabled) return true;
+    if (layer_end >= DS4_N_LAYER) layer_end = DS4_N_LAYER - 1u;
+    const ds4_model *model = &s->engine->model;
+    const ds4_weights *weights = &s->engine->weights;
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const uint32_t n_rows = g->layer_temporal_pending_count[il];
+        if (n_rows == 0u) continue;
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t start_pos = g->layer_temporal_pending_start[il];
+        if (ratio == 0u || n_rows >= ratio ||
+            (start_pos % ratio) + n_rows > ratio ||
+            ((start_pos + n_rows) % ratio) == 0u) {
+            return false;
+        }
+        if (g->placement &&
+            !metal_graph_set_active_tier_decode(g, g->placement[il + 1u])) {
+            return false;
+        }
+        const ds4_layer_weights *layer = &weights->layer[il];
+        const uint32_t coff = ratio == 4u ? 2u : 1u;
+        const uint32_t comp_width = coff * DS4_N_HEAD_DIM;
+        const float freq_base = layer_rope_freq_base(il);
+        const float freq_scale = layer_rope_freq_scale(il);
+        const float ext_factor = DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
+        float attn_factor = 1.0f;
+        if (ext_factor != 0.0f && freq_scale > 0.0f) {
+            attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        if (!metal_graph_temporal_project_update(
+                    g, model,
+                    layer->attn_compressor_kv,
+                    layer->attn_compressor_gate,
+                    layer->attn_compressor_ape,
+                    layer->attn_compressor_norm,
+                    g->layer_temporal_attn_norm[il],
+                    g->layer_attn_state_kv[il],
+                    g->layer_attn_state_score[il],
+                    metal_graph_attn_comp_update_target(g, il),
+                    DS4_N_HEAD_DIM, comp_width, ratio,
+                    start_pos, n_rows,
+                    metal_graph_attn_comp_update_row(g->layer_n_comp[il]),
+                    true, freq_base, freq_scale, ext_factor, attn_factor)) {
+            return false;
+        }
+        if (ratio == 4u) {
+            const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
+            if (!metal_graph_temporal_project_update(
+                        g, model,
+                        layer->indexer_compressor_kv,
+                        layer->indexer_compressor_gate,
+                        layer->indexer_compressor_ape,
+                        layer->indexer_compressor_norm,
+                        g->layer_temporal_attn_norm[il],
+                        g->layer_index_state_kv[il],
+                        g->layer_index_state_score[il],
+                        g->layer_index_comp_cache[il],
+                        DS4_N_INDEXER_HEAD_DIM, index_width, ratio,
+                        start_pos, n_rows,
+                        g->layer_n_index_comp[il],
+                        true, freq_base, freq_scale, ext_factor, attn_factor)) {
+                return false;
+            }
+        }
+        g->layer_temporal_pending_count[il] = 0u;
+    }
+    return true;
+}
+
 /* Return the exact engine-owned payload size, excluding the server's KVC file
  * header and observability text.  This is deliberately based on live row counts
  * rather than capacities so the disk cache scales with saved tokens, not with
@@ -50669,6 +51006,12 @@ int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
     payload_set_err(err, errlen, "graph backend support is not compiled in");
     return 1;
 #else
+    if (session_temporal_compressor_pending(&s->graph, layer_start, layer_end) &&
+        !session_temporal_compressor_flush(s, layer_start, layer_end)) {
+        payload_set_err(err, errlen,
+                "failed to flush temporal compressor before layer snapshot");
+        return 1;
+    }
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before layer snapshot");
         return 1;
@@ -51220,6 +51563,8 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
             const uint32_t il = layer_start + i;
             g->layer_n_comp[il] = n_comp[i];
             g->layer_n_index_comp[il] = n_index_comp[i];
+            g->layer_temporal_pending_start[il] = 0u;
+            g->layer_temporal_pending_count[il] = 0u;
         }
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
@@ -51267,6 +51612,12 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     const bool greedy_top2_enabled = greedy_top2_requested && e &&
         !e->mtp_ready &&
         !(e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+    const bool temporal_compressor_requested =
+        ds4_rocm_temporal_compressor_requested()
+#if defined(DS4_ROCM_BUILD)
+        && ds4_gpu_f16_pair_temporal_supported() != 0
+#endif
+        ;
     const uint32_t placement_features =
         ds4_tp_feature_expert_split(ds4_tp_expert_split_boundary()) |
         (batch_attn_head_split_requested ?
@@ -51277,7 +51628,9 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
              DS4_TP_FEATURE_RDMA_LOGITS : 0u) |
         (rank0_full_logits_requested && !greedy_top2_enabled ?
              DS4_TP_FEATURE_RANK0_FULL_LOGITS : 0u) |
-        (greedy_top2_enabled ? DS4_TP_FEATURE_GREEDY_TOP2 : 0u);
+        (greedy_top2_enabled ? DS4_TP_FEATURE_GREEDY_TOP2 : 0u) |
+        (temporal_compressor_requested ?
+             DS4_TP_FEATURE_TEMPORAL_COMPRESSOR : 0u);
 #if !defined(DS4_ROCM_BUILD)
     (void)e;
     return placement_features;
@@ -51814,6 +52167,12 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     payload_set_err(err, errlen, "graph backend support is not compiled in");
     return 1;
 #else
+    if (session_temporal_compressor_pending(&s->graph, 0u, DS4_N_LAYER - 1u) &&
+        !session_temporal_compressor_flush(s, 0u, DS4_N_LAYER - 1u)) {
+        payload_set_err(err, errlen,
+                "failed to flush temporal compressor before snapshot");
+        return 1;
+    }
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before snapshot");
         return 1;
@@ -52501,6 +52860,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_n_comp[il] = n_comp[il];
         g->layer_n_index_comp[il] = n_index_comp[il];
+        g->layer_temporal_pending_start[il] = 0u;
+        g->layer_temporal_pending_count[il] = 0u;
     }
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
@@ -59053,6 +59414,27 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         e->mtp_ready ||
         (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) ||
         e->tp.active; /* TP worker mirrors the leader's verify blocks */
+#if defined(DS4_ROCM_BUILD)
+    const bool temporal_compressor_requested =
+        ds4_rocm_temporal_compressor_requested();
+    if (temporal_compressor_requested &&
+        ds4_gpu_f16_pair_temporal_supported() == 0) {
+        fprintf(stderr,
+                "ds4: ROCm temporal compressor requires gfx1151 production "
+                "arithmetic (quality/graph-dump modes are unsupported)\n");
+        free(s);
+        return 1;
+    }
+    if (temporal_compressor_requested &&
+        (e->mtp_ready ||
+         (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark))) {
+        fprintf(stderr,
+                "ds4: ROCm temporal compressor is incompatible with active "
+                "MTP/DSpark verification\n");
+        free(s);
+        return 1;
+    }
+#endif
     const int *placement = e->multi_tier ? e->placement : NULL;
     const ds4_gpu_graph *shared_prefill_workspace =
         e->share_session_prefill_workspace &&
