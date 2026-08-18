@@ -2763,6 +2763,47 @@ __global__ static void moe_row_shard_groups_combine_kernel(
     out[row] = rounded0 + rounded1;
 }
 
+/* Batch form used by the row-shard oracle.  `down` is pair-major but contains
+ * only the local output-row span.  Keep the accepted prefill association:
+ * ascending route slots within each original ownership group, optional shared
+ * addend on that rank, then one explicit two-operand rank fold. */
+__global__ static void moe_batch_row_shard_groups_reduce_kernel(
+        float *out,
+        const float *down,
+        const float *rank0_add,
+        const float *rank1_add,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        uint32_t expert_split,
+        uint32_t row_base,
+        uint32_t row_count) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * row_count;
+    if (gid >= n) return;
+    const uint32_t token = (uint32_t)(gid / row_count);
+    const uint32_t local_row = (uint32_t)(gid - (uint64_t)token * row_count);
+    const uint32_t row = row_base + local_row;
+    const uint64_t pair0 = (uint64_t)token * n_expert;
+    float group0 = 0.0f;
+    float group1 = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = pair0 + slot;
+        const int32_t expert = selected[pair];
+        if (expert < 0) continue;
+        const float value = down[pair * row_count + local_row];
+        if ((uint32_t)expert < expert_split) group0 += value;
+        else group1 += value;
+    }
+    const uint64_t out_off = (uint64_t)token * out_dim + row;
+    if (rank0_add) group0 += rank0_add[out_off];
+    if (rank1_add) group1 += rank1_add[out_off];
+    volatile float rounded0 = group0;
+    volatile float rounded1 = group1;
+    out[out_off] = rounded0 + rounded1;
+}
+
 __global__ static void moe_down_q4K_qwarp32_kernel(
         float *down_out,
         const char *down_base,
