@@ -34,6 +34,9 @@ release checks measured 219.22/19.22 and 220.00/19.36 t/s and both reproduced
 `5f8a983422299d76`. The second is back inside the accepted decode band; the
 first is retained as an observed low sample rather than omitted. The published
 219.56/19.37 row remains the earlier controlled three-run median.
+The same release binary also passed Q2_K over RoCE v2 at 180.19/19.17 with
+`f9cb3a8a17e95c71`, and Q4_K over explicit OdinLink RDMA at 201.71/19.00 with
+`5f8a983422299d76`. Neither compatibility check used provider fallback.
 
 ## Kernel and scheduling changes
 
