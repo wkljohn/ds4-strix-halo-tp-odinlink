@@ -165,6 +165,95 @@ static int validate_packed_registry(
         DS4_GPU_Q4K_PACKED_GATE_UP,
         DS4_GPU_Q4K_PACKED_GATE_UP,
         DS4_GPU_Q4K_PACKED_DOWN};
+
+    /* Capture the exact full-row one-token reference before declarations
+     * deliberately make the original routed tensors unavailable to generic
+     * linear resolution. */
+    const uint64_t mid_full_bytes = (uint64_t)N_USED * MID_DIM * sizeof(float);
+    const uint64_t out_full_bytes = (uint64_t)OUT_DIM * sizeof(float);
+    const uint64_t xq_bytes = (uint64_t)(IN_DIM / QK_K) * Q8_K_BLOCK_BYTES;
+    const uint64_t midq_full_bytes =
+        (uint64_t)N_USED * (MID_DIM / QK_K) * Q8_K_BLOCK_BYTES;
+    const uint64_t batch_down_full_bytes =
+        (uint64_t)N_USED * OUT_DIM * sizeof(float);
+    int32_t selected_host[N_USED] = {0, 7, 2, 9, 4, 11};
+    float weights_host[N_USED] = {0.125f, 0.09375f, 0.15625f,
+                                  0.0625f, 0.109375f, 0.140625f};
+    float *x_host = (float *)malloc((size_t)IN_DIM * sizeof(float));
+    float *mid_expected = (float *)malloc((size_t)mid_full_bytes);
+    float *out_expected = (float *)malloc((size_t)out_full_bytes);
+    float *batch_mid_expected = (float *)malloc((size_t)mid_full_bytes);
+    float *batch_out_expected = (float *)malloc((size_t)out_full_bytes);
+    const uint64_t compact_host_bytes =
+        mid_full_bytes / 2u > out_full_bytes / 2u
+            ? mid_full_bytes / 2u : out_full_bytes / 2u;
+    float *compact_host = (float *)malloc((size_t)compact_host_bytes);
+    if (!x_host || !mid_expected || !out_expected ||
+        !batch_mid_expected || !batch_out_expected || !compact_host) {
+        FAIL("packed execution host allocation\n");
+    }
+    for (uint32_t i = 0; i < IN_DIM; i++) {
+        x_host[i] = (float)((int)((i * 7u) % 61u) - 30) / 512.0f;
+    }
+    ds4_gpu_tensor selected = {}, weights = {}, x = {}, xq = {};
+    ds4_gpu_tensor gate_full = {}, up_full = {}, mid_full = {}, midq_full = {};
+    ds4_gpu_tensor batch_down_full = {};
+    ds4_gpu_tensor out_full = {}, group0_full = {}, group1_full = {};
+    if (!alloc_tensor(&selected, sizeof(selected_host)) ||
+        !alloc_tensor(&weights, sizeof(weights_host)) ||
+        !alloc_tensor(&x, (uint64_t)IN_DIM * sizeof(float)) ||
+        !alloc_tensor(&xq, xq_bytes) ||
+        !alloc_tensor(&gate_full, mid_full_bytes) ||
+        !alloc_tensor(&up_full, mid_full_bytes) ||
+        !alloc_tensor(&mid_full, mid_full_bytes) ||
+        !alloc_tensor(&midq_full, midq_full_bytes) ||
+        !alloc_tensor(&batch_down_full, batch_down_full_bytes) ||
+        !alloc_tensor(&out_full, out_full_bytes) ||
+        !alloc_tensor(&group0_full, out_full_bytes) ||
+        !alloc_tensor(&group1_full, out_full_bytes) ||
+        !upload(&selected, selected_host, sizeof(selected_host)) ||
+        !upload(&weights, weights_host, sizeof(weights_host)) ||
+        !upload(&x, x_host, (uint64_t)IN_DIM * sizeof(float)) ||
+        !ds4_gpu_rocm_q4k_row_shard_gate_up_tensor(
+            &mid_full, &gate_full, &xq, model, model_bytes,
+            gate_off, up_off, (uint64_t)MID_DIM * gate_row_bytes,
+            gate_row_bytes, IN_DIM, MID_DIM, &selected, &weights,
+            N_TOTAL_EXPERT, N_USED, 0u, MID_DIM, 0.0f, &x) ||
+        !ds4_gpu_rocm_q8k_quantize_rows_tensor(
+            &midq_full, &mid_full, MID_DIM, N_USED) ||
+        !ds4_gpu_rocm_q4k_row_shard_down_tensor(
+            &out_full, &group0_full, &group1_full, NULL, NULL,
+            &midq_full, model, model_bytes, down_off,
+            (uint64_t)OUT_DIM * down_row_bytes, down_row_bytes,
+            MID_DIM, OUT_DIM, &selected, &weights, N_TOTAL_EXPERT,
+            N_USED, EXPERT_SPLIT, 0u, OUT_DIM) ||
+        !ds4_gpu_tensor_read(&mid_full, 0, mid_expected, mid_full_bytes) ||
+        !ds4_gpu_tensor_read(&out_full, 0, out_expected, out_full_bytes)) {
+        FAIL("packed execution full-row reference\n");
+    }
+    /* Batch kernels intentionally use a different WMMA/cold reduction tree
+     * than the one-token DP4A path.  Preserve a separate exact oracle rather
+     * than accepting a tolerance or comparing two different arithmetic
+     * contracts. */
+    if (!ds4_gpu_rocm_q4k_batch_row_shard_gate_up_tensor(
+            &gate_full, &up_full, &mid_full, &xq, model, model_bytes,
+            gate_off, up_off, (uint64_t)MID_DIM * gate_row_bytes,
+            gate_row_bytes, IN_DIM, MID_DIM, &selected, &weights,
+            N_TOTAL_EXPERT, N_USED, 1u, 0u, MID_DIM, 0.0f, &x) ||
+        !ds4_gpu_tensor_read(&mid_full, 0, batch_mid_expected,
+                             mid_full_bytes) ||
+        !ds4_gpu_rocm_q4k_batch_row_shard_down_tensor(
+            &batch_down_full, &midq_full, &mid_full, model, model_bytes,
+            down_off, (uint64_t)OUT_DIM * down_row_bytes, down_row_bytes,
+            MID_DIM, OUT_DIM, &selected, N_TOTAL_EXPERT, N_USED,
+            1u, 0u, OUT_DIM) ||
+        !ds4_gpu_rocm_q4k_batch_row_shard_reduce_tensor(
+            &out_full, &batch_down_full, NULL, NULL, &selected,
+            OUT_DIM, N_USED, 1u, EXPERT_SPLIT, 0u, OUT_DIM) ||
+        !ds4_gpu_tensor_read(&out_full, 0, batch_out_expected,
+                             out_full_bytes)) {
+        FAIL("packed execution full-row batch reference\n");
+    }
     uint64_t total_packed = 0;
     uint64_t combined_hash = 0;
     for (uint32_t tensor = 0; tensor < 3u; tensor++) {
@@ -208,6 +297,109 @@ static int validate_packed_registry(
              (unsigned long long)total_packed,
              (unsigned long long)ds4_gpu_q4k_packed_rows_bytes());
     }
+
+    /* Exercise the actual descriptor-backed compact decode functions.  No
+     * appended synthetic packed tensor offsets are passed here: the original
+     * GGUF offsets must resolve exclusively through the registry. */
+    const uint32_t mid_half = MID_DIM / 2u;
+    const uint32_t out_half = OUT_DIM / 2u;
+    const uint64_t mid_half_bytes =
+        (uint64_t)N_USED * mid_half * sizeof(float);
+    const uint64_t midq_half_bytes =
+        (uint64_t)N_USED * (mid_half / QK_K) * Q8_K_BLOCK_BYTES;
+    const uint64_t out_half_bytes = (uint64_t)out_half * sizeof(float);
+    ds4_gpu_tensor gate_half = {}, up_half = {};
+    ds4_gpu_tensor mid_half_t[2] = {}, midq_half[2] = {};
+    ds4_gpu_tensor out_half_t = {}, group0_half = {}, group1_half = {};
+    if (!alloc_tensor(&gate_half, mid_half_bytes) ||
+        !alloc_tensor(&up_half, mid_half_bytes) ||
+        !alloc_tensor(&mid_half_t[0], mid_half_bytes) ||
+        !alloc_tensor(&mid_half_t[1], mid_half_bytes) ||
+        !alloc_tensor(&midq_half[0], midq_half_bytes) ||
+        !alloc_tensor(&midq_half[1], midq_half_bytes) ||
+        !alloc_tensor(&out_half_t, out_half_bytes) ||
+        !alloc_tensor(&group0_half, out_half_bytes) ||
+        !alloc_tensor(&group1_half, out_half_bytes)) {
+        FAIL("packed execution compact allocation\n");
+    }
+    for (uint32_t half = 0; half < 2u; half++) {
+        const uint32_t row_base = half * mid_half;
+        if (!ds4_gpu_rocm_q4k_packed_row_gate_up_tensor(
+                &mid_half_t[half], &gate_half, &xq, model,
+                gate_off, up_off, gate_row_bytes, IN_DIM, MID_DIM,
+                &selected, &weights, N_TOTAL_EXPERT, N_USED,
+                row_base, mid_half, 0.0f, &x) ||
+            !ds4_gpu_rocm_q8k_quantize_rows_tensor(
+                &midq_half[half], &mid_half_t[half], mid_half, N_USED) ||
+            !ds4_gpu_tensor_read(&mid_half_t[half], 0, compact_host,
+                                 mid_half_bytes) ||
+            !compare_compact_half(half ? "packed-gate-high" :
+                                          "packed-gate-low",
+                                  1u, mid_expected, compact_host,
+                                  N_USED, MID_DIM, row_base, mid_half)) {
+            FAIL("packed execution gate/up half %u\n", half);
+        }
+    }
+    for (uint32_t half = 0; half < 2u; half++) {
+        const uint32_t row_base = half * out_half;
+        if (!ds4_gpu_rocm_q4k_packed_row_down_tensor(
+                &out_half_t, &group0_half, &group1_half, NULL, NULL,
+                &midq_half[0], &midq_half[1], model, down_off,
+                down_row_bytes, MID_DIM, OUT_DIM, &selected, &weights,
+                N_TOTAL_EXPERT, N_USED, EXPERT_SPLIT,
+                row_base, out_half) ||
+            !ds4_gpu_tensor_read(&out_half_t, 0, compact_host,
+                                 out_half_bytes) ||
+            memcmp(compact_host, out_expected + row_base,
+                   (size_t)out_half_bytes) != 0) {
+            FAIL("packed execution down half %u\n", half);
+        }
+    }
+    /* The batch entry point must resolve both descriptors and retain its own
+     * exact WMMA/cold compact-output arithmetic.  Re-quantize both compact
+     * halves only after the decode oracle above has consumed its DP4A data. */
+    for (uint32_t half = 0; half < 2u; half++) {
+        const uint32_t row_base = half * mid_half;
+        if (!ds4_gpu_rocm_q4k_batch_row_shard_gate_up_tensor(
+                &gate_half, &up_half, &mid_half_t[half], &xq,
+                model, model_bytes, gate_off, up_off,
+                (uint64_t)MID_DIM * gate_row_bytes, gate_row_bytes,
+                IN_DIM, MID_DIM, &selected, &weights,
+                N_TOTAL_EXPERT, N_USED, 1u, row_base, mid_half, 0.0f, &x) ||
+            !ds4_gpu_tensor_read(&mid_half_t[half], 0, compact_host,
+                                 mid_half_bytes) ||
+            !compare_compact_half(half ? "packed-batch-gate-high" :
+                                          "packed-batch-gate-low",
+                                  1u, batch_mid_expected, compact_host,
+                                  N_USED, MID_DIM, row_base, mid_half) ||
+            !ds4_gpu_rocm_q8k_quantize_rows_tensor(
+                &midq_half[half], &mid_half_t[half], mid_half, N_USED)) {
+            FAIL("packed execution batch gate/up half %u\n", half);
+        }
+    }
+    const uint64_t down_pairs_half_bytes =
+        (uint64_t)N_USED * out_half * sizeof(float);
+    ds4_gpu_tensor down_pairs_half = {}, stitched_midq = {};
+    if (!alloc_tensor(&down_pairs_half, down_pairs_half_bytes) ||
+        !alloc_tensor(&stitched_midq, midq_full_bytes) ||
+        !ds4_gpu_rocm_q4k_batch_packed_row_down_split_midq_tensor(
+            &down_pairs_half, &stitched_midq,
+            &midq_half[0], &midq_half[1], model, down_off,
+            down_row_bytes, MID_DIM, OUT_DIM, &selected,
+            N_TOTAL_EXPERT, N_USED, 1u, 0u, out_half) ||
+        !ds4_gpu_rocm_q4k_batch_row_shard_reduce_compact_add_tensor(
+            &out_half_t, &down_pairs_half, NULL, NULL, &selected,
+            N_USED, 1u, EXPERT_SPLIT, out_half) ||
+        !ds4_gpu_tensor_read(&out_half_t, 0, compact_host,
+                             out_half_bytes) ||
+        memcmp(compact_host, batch_out_expected,
+               (size_t)out_half_bytes) != 0) {
+        FAIL("packed execution batch split-mid down/reduce\n");
+    }
+    printf("packed_decode_primitives fnv64=%016llx exact=1 "
+           "batch_split_mid=1 linear_source_blocked=1\n",
+           (unsigned long long)fnv1a64(out_expected,
+                                       (size_t)out_full_bytes));
 
     /* A support/MTP map may replace the short-lived generic range-cache
      * identity. Packed target slabs deliberately follow model-image lifetime
@@ -253,6 +445,36 @@ static int validate_packed_registry(
            "linear_fail_closed=1 span_fail_closed=1 image_lifetime=1\n",
            (unsigned long long)total_packed,
            (unsigned long long)combined_hash);
+
+    ds4_gpu_tensor_free_in_place(&group1_half);
+    ds4_gpu_tensor_free_in_place(&group0_half);
+    ds4_gpu_tensor_free_in_place(&out_half_t);
+    ds4_gpu_tensor_free_in_place(&midq_half[1]);
+    ds4_gpu_tensor_free_in_place(&midq_half[0]);
+    ds4_gpu_tensor_free_in_place(&mid_half_t[1]);
+    ds4_gpu_tensor_free_in_place(&mid_half_t[0]);
+    ds4_gpu_tensor_free_in_place(&stitched_midq);
+    ds4_gpu_tensor_free_in_place(&down_pairs_half);
+    ds4_gpu_tensor_free_in_place(&up_half);
+    ds4_gpu_tensor_free_in_place(&gate_half);
+    ds4_gpu_tensor_free_in_place(&group1_full);
+    ds4_gpu_tensor_free_in_place(&group0_full);
+    ds4_gpu_tensor_free_in_place(&out_full);
+    ds4_gpu_tensor_free_in_place(&batch_down_full);
+    ds4_gpu_tensor_free_in_place(&midq_full);
+    ds4_gpu_tensor_free_in_place(&mid_full);
+    ds4_gpu_tensor_free_in_place(&up_full);
+    ds4_gpu_tensor_free_in_place(&gate_full);
+    ds4_gpu_tensor_free_in_place(&xq);
+    ds4_gpu_tensor_free_in_place(&x);
+    ds4_gpu_tensor_free_in_place(&weights);
+    ds4_gpu_tensor_free_in_place(&selected);
+    free(compact_host);
+    free(batch_out_expected);
+    free(batch_mid_expected);
+    free(out_expected);
+    free(mid_expected);
+    free(x_host);
     return 1;
 }
 

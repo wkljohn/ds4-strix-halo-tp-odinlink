@@ -679,6 +679,27 @@ static cuda_q4k_packed_rows *cuda_q4k_packed_rows_find(
     return NULL;
 }
 
+/* Exact production resolver for a nonlinear routed tensor.  Callers provide
+ * the original GGUF geometry and logical row span; only a loaded descriptor
+ * matching every field is accepted.  In particular, never turn a nearby
+ * declaration into an implicit row/expert offset adjustment. */
+static const cuda_q4k_packed_rows *cuda_q4k_packed_rows_resolve(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t n_expert, uint32_t full_rows, uint64_t row_bytes,
+        uint32_t row_base, uint32_t row_count,
+        ds4_gpu_q4k_packed_kind kind) {
+    cuda_q4k_packed_rows *p = cuda_q4k_packed_rows_find(
+        model_map, tensor_offset, row_base, row_count);
+    if (!p || !p->device_ptr || p->n_expert != n_expert ||
+        p->full_rows != full_rows || p->row_bytes != row_bytes ||
+        p->kind != kind ||
+        p->packed_expert_bytes != (uint64_t)row_count * row_bytes ||
+        p->packed_bytes != (uint64_t)n_expert * p->packed_expert_bytes) {
+        return NULL;
+    }
+    return p;
+}
+
 static cuda_q4k_packed_rows *cuda_q4k_packed_rows_intersection(
         const void *model_map, uint64_t offset, uint64_t bytes) {
     if (!model_map || bytes == 0u || offset > UINT64_MAX - bytes) return NULL;
