@@ -1326,6 +1326,32 @@ static int g_tp_rdma_gate_profile_enabled = -1;
 static int g_tp_rdma_gate_profile_registered;
 static int g_tp_rdma_gate_profile_rank = -1;
 
+#define DS4_TP_RDMA_GATE_SAMPLE_MAX 32768u
+typedef struct {
+    uint64_t seq;
+    uint32_t layer;
+    uint32_t gate;
+    double post_send_us;
+    double send_cqe_us;
+    double peer_recv_us;
+    double total_us;
+} ds4_tp_rdma_gate_sample;
+
+static ds4_tp_rdma_gate_sample
+    g_tp_rdma_gate_samples[DS4_TP_RDMA_GATE_SAMPLE_MAX];
+static uint32_t g_tp_rdma_gate_sample_count;
+static uint64_t g_tp_rdma_gate_sample_dropped;
+static int g_tp_rdma_gate_samples_enabled = -1;
+
+static int tp_rdma_gate_samples_are_enabled(void) {
+    if (g_tp_rdma_gate_samples_enabled < 0) {
+        const char *s = getenv("DS4_TP_RDMA_GATE_SAMPLES");
+        g_tp_rdma_gate_samples_enabled =
+            s && s[0] != '\0' && strcmp(s, "0") != 0;
+    }
+    return g_tp_rdma_gate_samples_enabled;
+}
+
 static void tp_rdma_gate_profile_print(void) {
     for (uint32_t gate = 0; gate < 2; gate++) {
         const ds4_tp_rdma_gate_profile_stat *s =
@@ -1354,13 +1380,37 @@ static void tp_rdma_gate_profile_print(void) {
                 s->replenish_s * scale,
                 s->total_s * scale);
     }
+    for (uint32_t i = 0; i < g_tp_rdma_gate_sample_count; i++) {
+        const ds4_tp_rdma_gate_sample *s = &g_tp_rdma_gate_samples[i];
+        fprintf(stderr,
+                "{\"ds4_tp_rdma_gate_sample\":true,\"rank\":%d,"
+                "\"seq\":%llu,\"layer\":%u,\"gate\":\"%s\","
+                "\"post_send_us\":%.3f,\"send_cqe_us\":%.3f,"
+                "\"peer_recv_us\":%.3f,\"total_us\":%.3f}\n",
+                g_tp_rdma_gate_profile_rank,
+                (unsigned long long)s->seq,
+                s->layer,
+                s->gate == DS4_TP_GATE_ATTN ? "attention" : "ffn",
+                s->post_send_us,
+                s->send_cqe_us,
+                s->peer_recv_us,
+                s->total_us);
+    }
+    if (g_tp_rdma_gate_sample_dropped) {
+        fprintf(stderr,
+                "{\"ds4_tp_rdma_gate_samples_dropped\":true,"
+                "\"rank\":%d,\"count\":%llu}\n",
+                g_tp_rdma_gate_profile_rank,
+                (unsigned long long)g_tp_rdma_gate_sample_dropped);
+    }
 }
 
 static int tp_rdma_gate_profile_is_enabled(const ds4_tp *tp) {
     if (g_tp_rdma_gate_profile_enabled < 0) {
         const char *s = getenv("DS4_TP_RDMA_GATE_PROFILE");
         g_tp_rdma_gate_profile_enabled =
-            s && s[0] != '\0' && strcmp(s, "0") != 0;
+            (s && s[0] != '\0' && strcmp(s, "0") != 0) ||
+            tp_rdma_gate_samples_are_enabled();
         if (g_tp_rdma_gate_profile_enabled &&
             !g_tp_rdma_gate_profile_registered) {
             g_tp_rdma_gate_profile_rank = tp->rank;
@@ -1547,6 +1597,24 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         s->peer_recv_s += peer_recv_end - post_send_end;
         s->replenish_s += replenish_end - replenish_start;
         s->total_s += tp_now_sec() - profile_start;
+        if (tp_rdma_gate_samples_are_enabled()) {
+            if (g_tp_rdma_gate_sample_count < DS4_TP_RDMA_GATE_SAMPLE_MAX) {
+                ds4_tp_rdma_gate_sample *sample =
+                    &g_tp_rdma_gate_samples[g_tp_rdma_gate_sample_count++];
+                sample->seq = seq;
+                sample->layer = layer;
+                sample->gate = gate;
+                sample->post_send_us =
+                    (post_send_end - post_send_start) * 1e6;
+                sample->send_cqe_us = profile_send_seen ?
+                    (profile_send_seen_at - post_send_end) * 1e6 : 0.0;
+                sample->peer_recv_us =
+                    (peer_recv_end - post_send_end) * 1e6;
+                sample->total_us = (tp_now_sec() - profile_start) * 1e6;
+            } else {
+                g_tp_rdma_gate_sample_dropped++;
+            }
+        }
     }
 #endif
     return ok;

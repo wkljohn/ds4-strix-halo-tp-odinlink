@@ -253,6 +253,7 @@ struct ds4_tp_host_sync_profile_stat {
     uint64_t exchange_ns;
 };
 static ds4_tp_host_sync_profile_stat g_tp_host_sync_profile[3];
+static ds4_tp_host_sync_profile_stat g_tp_host_callback_gate_profile[2];
 static int g_tp_host_sync_profile_enabled = -1;
 
 static inline int ds4_tp_host_sync_profile_is_enabled(void) {
@@ -276,6 +277,20 @@ static void ds4_tp_host_sync_profile_print(void) {
                 "\"kind\":\"%s\",\"count\":%llu,"
                 "\"producer_us\":%.3f,\"exchange_us\":%.3f}\n",
                 g_tp_split_rank, kind_names[kind],
+                (unsigned long long)s->count,
+                (double)s->producer_ns / (double)s->count / 1000.0,
+                (double)s->exchange_ns / (double)s->count / 1000.0);
+    }
+    for (uint32_t gate = 0; gate < 2; gate++) {
+        const ds4_tp_host_sync_profile_stat *s =
+            &g_tp_host_callback_gate_profile[gate];
+        if (!s->count) continue;
+        fprintf(stderr,
+                "{\"ds4_tp_host_callback_gate_profile\":true,"
+                "\"rank\":%u,\"gate\":\"%s\",\"count\":%llu,"
+                "\"producer_us\":%.3f,\"exchange_us\":%.3f}\n",
+                g_tp_split_rank,
+                gate == 0u ? "attention" : "ffn",
                 (unsigned long long)s->count,
                 (double)s->producer_ns / (double)s->count / 1000.0,
                 (double)s->exchange_ns / (double)s->count / 1000.0);
@@ -1185,9 +1200,17 @@ static void ds4_tp_host_callback_run(void *opaque) {
     if (host_sync_profile) {
         ds4_tp_host_sync_profile_stat *s =
             &g_tp_host_sync_profile[DS4_TP_ROW];
+        ds4_tp_host_sync_profile_stat *gate_s = req->gate < 2u ?
+            &g_tp_host_callback_gate_profile[req->gate] : NULL;
+        const uint64_t exchange_done_ns = ds4_tp_monotonic_ns();
         s->count++;
         s->producer_ns += producer_ready_ns - req->submitted_ns;
-        s->exchange_ns += ds4_tp_monotonic_ns() - producer_ready_ns;
+        s->exchange_ns += exchange_done_ns - producer_ready_ns;
+        if (gate_s) {
+            gate_s->count++;
+            gate_s->producer_ns += producer_ready_ns - req->submitted_ns;
+            gate_s->exchange_ns += exchange_done_ns - producer_ready_ns;
+        }
     }
 #endif
     __atomic_store_n(c->cpu_flag, req->seq, __ATOMIC_RELEASE);
