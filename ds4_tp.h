@@ -29,7 +29,11 @@ typedef struct ds4_tp ds4_tp;
 enum {
     DS4_TP_GATE_ATTN = 0,
     DS4_TP_GATE_FFN = 1,
-    DS4_TP_GATES_PER_LAYER = 2,
+    /* Reserved decode slot for the compact routed-MoE intermediate used by
+     * the Q4_K output-row shard.  Ordinary TP keeps firing ATTN then FFN;
+     * the negotiated row-shard schedule fires ATTN, MOE_MID, then FFN. */
+    DS4_TP_GATE_MOE_MID = 2,
+    DS4_TP_GATES_PER_LAYER = 3,
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
 };
@@ -94,6 +98,10 @@ enum {
     /* One-token Q4_K K-shard keeps six expert partials plus the shared
      * partial through one large exchange, then restores owner-group order. */
     DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT = UINT32_C(1) << 21,
+    /* Q4_K routed experts are packed by output row rather than expert id.
+     * This changes both the arithmetic and the decode gate schedule, so it
+     * must be an exact-matched hello capability. */
+    DS4_TP_FEATURE_Q4K_ROW_SHARD = UINT32_C(1) << 22,
 };
 
 static inline uint32_t ds4_tp_q4k_kshard_feature(
@@ -225,6 +233,10 @@ uint32_t ds4_tp_test_rdma_provider_decode_max_msg(const char *device_name);
 uint32_t ds4_tp_test_rdma_negotiate_decode_max_msg(uint32_t local,
                                                    uint32_t peer);
 uint64_t ds4_tp_test_connect_timeout_sec(void);
+uint32_t ds4_tp_test_gate_slot(uint32_t n_layer, uint32_t runtime_features,
+                               uint32_t gate_slot_start,
+                               uint32_t gate_slot_step,
+                               uint32_t gates_per_token, uint64_t seq);
 #endif
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
