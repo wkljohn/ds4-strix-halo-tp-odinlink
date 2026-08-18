@@ -29,6 +29,12 @@ only the TP communication slab with a 77.4 MiB mapped allocation; it adds no
 expanded model-weight cache. The allocator and transport evidence is in
 [`../roce-v2-2026-08-14/`](../roce-v2-2026-08-14/).
 
+After merging the accepted schedule onto `main`, two clean rebuilt-binary
+release checks measured 219.22/19.22 and 220.00/19.36 t/s and both reproduced
+`5f8a983422299d76`. The second is back inside the accepted decode band; the
+first is retained as an observed low sample rather than omitted. The published
+219.56/19.37 row remains the earlier controlled three-run median.
+
 ## Kernel and scheduling changes
 
 The hybrid Q2_K path expands IQ2_XXS codebook groups directly into tile-local
