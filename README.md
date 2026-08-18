@@ -21,9 +21,9 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Current Q2_K** | balanced 50/50, hybrid IQ2_XXS/Q2_K experts | **162.78 t/s** | **14.68 t/s** | three-run median |
-| **Current Q4_K over OdinLink** | balanced 50/50, exact greedy top-2 | **190.11 t/s** | **15.03 t/s** | three-run median |
-| **Current Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **222.76 t/s** | **17.08 t/s** | two-run midpoint, same fingerprint |
+| **Current Q2_K over RoCE v2** | balanced 50/50, hybrid IQ2_XXS/Q2_K experts | **179.24 t/s** | **19.11 t/s** | rebuilt production validation |
+| **Current Q4_K over OdinLink** | balanced 50/50, exact greedy top-2 | **199.91 t/s** | **19.01 t/s** | rebuilt production validation |
+| **Current Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **219.56 t/s** | **19.37 t/s** | three-run median, same fingerprint |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
@@ -31,6 +31,10 @@ generated tokens over mandatory RDMA. The Q4_K target is
 `DeepSeek-V4-Flash-Q4_K-0731.gguf` (164,633,502,592 bytes). It does not fit one
 node's current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node.
 Q2_K and Q4_K run without a persistent expanded-weight cache.
+
+The ordinary benchmark and deployment launchers enable the validated ordered
+ROCm TP callback and temporal-compressor schedule automatically. DSpark stays
+opt-in and does not inherit that target-only schedule.
 
 The table reports reproducible inference results, not a single-node scaling
 claim. Raw runs, fingerprints, kernel decisions, rejected candidates, memory

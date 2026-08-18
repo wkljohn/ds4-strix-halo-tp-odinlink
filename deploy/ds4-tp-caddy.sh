@@ -245,6 +245,8 @@ start() {
     esac
     decode_env=(
       DS4_TP_GREEDY_TOP2=1
+      DS4_TP_HOST_CALLBACK=1
+      DS4_ROCM_TEMPORAL_COMPRESSOR=1
       DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1
       DS4_ROCM_TP_SKIP_UNOWNED=1
       DS4_ROCM_TP_PREFILL_SKIP_UNOWNED="$tp_prefill_skip_unowned"

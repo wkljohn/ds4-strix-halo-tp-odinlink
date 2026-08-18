@@ -11,9 +11,9 @@ with mandatory RDMA and cache-free model weights.
 | DeepSeek V4 0731 configuration | Accepted runs, prefill/decode t/s | Reported result |
 |---|---|---|
 | Original Q4_K TP=2 baseline | archived 34.11/9.96 | 34.11/9.96 |
-| Current Q2_K | 160.38/14.68, 162.78/13.77, 164.07/14.73 | three-run median 162.78/14.68 |
-| Current Q4_K over OdinLink | 203.85/15.04, 190.11/15.03, 188.18/14.99 | three-run median 190.11/15.03 |
-| Current Q4_K over RoCE v2 | 224.05/16.98, 221.47/17.18 | two-run midpoint 222.76/17.08 |
+| Current Q2_K over RoCE v2 | rebuilt final 179.24/19.11 | production validation 179.24/19.11 |
+| Current Q4_K over OdinLink | rebuilt final 199.91/19.01 | production validation 199.91/19.01 |
+| Current Q4_K over RoCE v2 | 219.56/19.37, 219.34/19.37, 219.62/19.35 | three-run median 219.56/19.37 |
 
 The current Q4_K fingerprint is `5f8a983422299d76`; the current hybrid Q2_K
 fingerprint is `f9cb3a8a17e95c71`. Each fingerprint is specific to the
@@ -54,10 +54,12 @@ online reduction changes the deterministic trajectory, so it was accepted
 only after semantic smoke and repeat validation established the current
 fingerprint.
 
-Where documented HIP signal memory is unavailable, ROCm TP gates use a bounded
-host-synchronous producer event before the explicit RDMA exchange. This avoids
-rare lost stream-signal arrivals observed during sustained tool-heavy decode
-without adding persistent model memory.
+Where documented HIP signal memory is unavailable, ROCm TP gates use ordered
+HIP host callbacks before explicit RDMA exchange. The validated temporal
+compressor batches the repeated F16 projection at its natural four-token
+boundary. Together these exact, cache-free changes produced the current
+19.37 t/s Q4_K RoCE median. The benchmark and deployment launchers enable them
+for ordinary inference and negotiate the temporal feature between both ranks.
 
 Detailed reports:
 
@@ -157,3 +159,28 @@ off/on/on/off A/B with byte-identical generated output and required nonzero
 `stream_calls` with no unexplained fallback traffic. Its full provider
 isolation record is in [`../../ODINLINK.md`](../../ODINLINK.md). Current users
 should keep the optimized defaults rather than reproduce that experiment.
+
+## Rejected whole-half shared-expert balancing — Step 26
+
+The final decode experiment dynamically moved one canonical half of the Q8
+shared expert from the heavy routed-expert rank to the light rank only for 5/1
+and 6/0 route splits. A model-free oracle predicted 23.98 us/layer of net
+saving. Synthetic gfx1151 tests proved exact assigned-half arithmetic,
+fail-closed unassigned output, signed-zero behavior, and canonical rank-group
+reconstruction. The prototype used no weight cache, but required a negotiated
+feature, a variable 16/32 KiB FFN payload, GPU predicates, and reconstruction.
+
+Both mandatory-RDMA RoCE v2 runs passed their exact fingerprints:
+
+| Workload | Prefill | Decode | FNV64 |
+|---|---:|---:|---|
+| 2,048 + 100 smoke | 219.75 t/s | 19.53 t/s | `80a1a4084a25abca` |
+| 2,048 + 300 production | 220.55 t/s | 19.40 t/s | `5f8a983422299d76` |
+
+The production result improved decode by only 0.03 t/s (about 0.15%), inside
+the accepted run spread and below the predeclared 19.55 t/s promotion gate.
+It was therefore rejected without exposing Q2_K or OdinLink to unnecessary
+protocol risk. Research branch `research/q4k-hipgraph-20260818` preserves the
+experiment as commit `10f2463` followed by revert `6bd5db0`; model-free oracle
+commit `43e9d1a` remains available for a future architecture that can recover
+the balancing benefit without changing the wire protocol.

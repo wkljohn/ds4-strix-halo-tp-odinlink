@@ -26,6 +26,9 @@ inspects routed-expert quantization and selects the same safe Q4_K or Q2
 prefill defaults enforced by the pre-main benchmark gate. Set
 `DSPARK=1` only for experimental testing; the launcher warns because the
 current TP verifier does not match the target-only token fingerprint.
+Ordinary Q4_K/Q2_K launches also select the validated ordered ROCm TP callback
+and temporal-compressor schedule; no extra performance environment variables
+are required.
 
 On the 96 GiB reference nodes the optional resident DSpark profile settles near
 97--98% reported VRAM use and leaves little safety margin. Ordinary production
