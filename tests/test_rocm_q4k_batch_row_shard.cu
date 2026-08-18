@@ -153,6 +153,109 @@ static int compare_compact_half(const char *stage, uint32_t n_tokens,
     return 1;
 }
 
+static int validate_packed_registry(
+        const unsigned char *model, uint64_t model_bytes,
+        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        uint64_t gate_row_bytes, uint64_t down_row_bytes) {
+    const uint64_t offsets[3] = {gate_off, up_off, down_off};
+    const uint32_t full_rows[3] = {MID_DIM, MID_DIM, OUT_DIM};
+    const uint64_t row_bytes[3] = {
+        gate_row_bytes, gate_row_bytes, down_row_bytes};
+    const ds4_gpu_q4k_packed_kind kinds[3] = {
+        DS4_GPU_Q4K_PACKED_GATE_UP,
+        DS4_GPU_Q4K_PACKED_GATE_UP,
+        DS4_GPU_Q4K_PACKED_DOWN};
+    uint64_t total_packed = 0;
+    uint64_t combined_hash = 0;
+    for (uint32_t tensor = 0; tensor < 3u; tensor++) {
+        const uint32_t rows = full_rows[tensor] / 2u;
+        const uint64_t bytes =
+            (uint64_t)N_TOTAL_EXPERT * rows * row_bytes[tensor];
+        float *expected = (float *)malloc((size_t)bytes);
+        float *got = (float *)malloc((size_t)bytes);
+        if (!expected || !got) FAIL("packed registry host buffers\n");
+        for (uint32_t half = 0; half < 2u; half++) {
+            const uint32_t row_base = half * rows;
+            if (!ds4_gpu_q4k_packed_rows_declare(
+                    model, model_bytes, offsets[tensor], N_TOTAL_EXPERT,
+                    full_rows[tensor], row_bytes[tensor], row_base, rows,
+                    kinds[tensor]) ||
+                !ds4_gpu_q4k_packed_rows_load(
+                    model, offsets[tensor], row_base, rows)) {
+                FAIL("packed registry declare/load tensor=%u half=%u\n",
+                     tensor, half);
+            }
+            pack_q4k_row_span((unsigned char *)expected,
+                              model + offsets[tensor], N_TOTAL_EXPERT,
+                              full_rows[tensor], row_base, rows,
+                              row_bytes[tensor]);
+            if (!ds4_gpu_q4k_packed_rows_readback(
+                    model, offsets[tensor], row_base, rows, got, bytes) ||
+                memcmp(expected, got, (size_t)bytes) != 0) {
+                FAIL("packed registry bytes tensor=%u half=%u\n",
+                     tensor, half);
+            }
+            combined_hash ^= fnv1a64(got, (size_t)bytes) +
+                             UINT64_C(0x9e3779b97f4a7c15) *
+                                 (1u + tensor * 2u + half);
+            total_packed += bytes;
+        }
+        free(got);
+        free(expected);
+    }
+    if (ds4_gpu_q4k_packed_rows_bytes() != total_packed) {
+        FAIL("packed registry byte accounting ref=%llu got=%llu\n",
+             (unsigned long long)total_packed,
+             (unsigned long long)ds4_gpu_q4k_packed_rows_bytes());
+    }
+
+    /* A support/MTP map may replace the short-lived generic range-cache
+     * identity. Packed target slabs deliberately follow model-image lifetime
+     * and must remain readable across that transition. */
+    unsigned char alternate_map[64] = {};
+    const uint64_t first_half_bytes =
+        (uint64_t)N_TOTAL_EXPERT * (MID_DIM / 2u) * gate_row_bytes;
+    unsigned char *lifetime = (unsigned char *)malloc((size_t)first_half_bytes);
+    unsigned char *lifetime_expected =
+        (unsigned char *)malloc((size_t)first_half_bytes);
+    if (!lifetime || !lifetime_expected ||
+        !ds4_gpu_set_model_map(alternate_map, sizeof(alternate_map)) ||
+        !ds4_gpu_q4k_packed_rows_readback(
+            model, gate_off, 0u, MID_DIM / 2u,
+            lifetime, first_half_bytes)) {
+        FAIL("packed registry image lifetime transition\n");
+    }
+    pack_q4k_row_span(lifetime_expected, model + gate_off, N_TOTAL_EXPERT,
+                      MID_DIM, 0u, MID_DIM / 2u, gate_row_bytes);
+    if (memcmp(lifetime_expected, lifetime, (size_t)first_half_bytes) != 0 ||
+        !ds4_gpu_set_model_map(model, model_bytes)) {
+        FAIL("packed registry image lifetime bytes\n");
+    }
+    free(lifetime_expected);
+    free(lifetime);
+
+    /* Declarations must block every legacy path even if a linear image was
+     * already cached earlier by this synthetic arithmetic oracle. */
+    const uint64_t gate_bytes =
+        (uint64_t)N_TOTAL_EXPERT * MID_DIM * gate_row_bytes;
+    if (ds4_gpu_cache_model_range(model, model_bytes, gate_off, gate_bytes,
+                                  "packed-negative-linear")) {
+        FAIL("packed registry allowed legacy linear resolution\n");
+    }
+    const uint64_t span_off = gate_off;
+    const uint64_t span_size = gate_bytes;
+    if (ds4_gpu_set_model_map_spans(model, model_bytes,
+                                    &span_off, &span_size, 1u,
+                                    span_size)) {
+        FAIL("packed registry allowed intersecting model span\n");
+    }
+    printf("packed_row_registry bytes=%llu fnv64=%016llx "
+           "linear_fail_closed=1 span_fail_closed=1 image_lifetime=1\n",
+           (unsigned long long)total_packed,
+           (unsigned long long)combined_hash);
+    return 1;
+}
+
 static int run_batch_case(
         uint32_t n_tokens, const void *model, uint64_t model_bytes,
         uint64_t gate_off, uint64_t up_off, uint64_t down_off,
@@ -418,6 +521,10 @@ int main(void) {
                              down_expert_bytes, down_row_bytes),
               "exact production-kernel batch row-shard oracle");
     }
+    CHECK(validate_packed_registry(model, model_bytes,
+                                   gate_off, up_off, down_off,
+                                   gate_row_bytes, down_row_bytes),
+          "packed Q4_K row registry");
     free(model);
     ds4_gpu_cleanup();
     return 0;

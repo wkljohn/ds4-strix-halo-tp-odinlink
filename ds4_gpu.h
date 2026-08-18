@@ -160,6 +160,40 @@ int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+
+typedef enum {
+    DS4_GPU_Q4K_PACKED_GATE_UP = 1,
+    DS4_GPU_Q4K_PACKED_DOWN = 2,
+} ds4_gpu_q4k_packed_kind;
+
+/* Declare and materialize a nonlinear Q4_K routed-expert row slab.  A
+ * declaration immediately blocks ordinary linear model-range resolution for
+ * the source tensor; callers must use the packed descriptor path.  Loading is
+ * separate so generic dense spans can be installed first without ever
+ * allocating the original routed table. */
+int ds4_gpu_q4k_packed_rows_declare(
+        const void                 *model_map,
+        uint64_t                    model_size,
+        uint64_t                    tensor_offset,
+        uint32_t                    n_expert,
+        uint32_t                    full_rows,
+        uint64_t                    row_bytes,
+        uint32_t                    row_base,
+        uint32_t                    row_count,
+        ds4_gpu_q4k_packed_kind     kind);
+int ds4_gpu_q4k_packed_rows_load(
+        const void *model_map,
+        uint64_t    tensor_offset,
+        uint32_t    row_base,
+        uint32_t    row_count);
+int ds4_gpu_q4k_packed_rows_readback(
+        const void *model_map,
+        uint64_t    tensor_offset,
+        uint32_t    row_base,
+        uint32_t    row_count,
+        void       *dst,
+        uint64_t    bytes);
+uint64_t ds4_gpu_q4k_packed_rows_bytes(void);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
