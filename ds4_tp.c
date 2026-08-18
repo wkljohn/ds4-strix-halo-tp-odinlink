@@ -1263,15 +1263,47 @@ static const char *tp_wc_status_str(int status) {
     return buf;
 }
 
-/* Slab slot a given gate seq lands in.  DS4 fires every slot in order
- * (identity mapping); GLM's schedule from the hello skips dense layers
- * and the ATTN slots. */
+/* Slab slot a given gate seq lands in.  The ordinary DS4 schedule fires two
+ * gates per layer but reserves a third physical slot for the negotiated Q4_K
+ * row-shard path.  That path fires ATTN, MOE_MID, FFN; the unusual 0,2,1 slot
+ * order keeps the established FFN slot stable.  GLM retains its linear sparse
+ * schedule from the hello. */
 static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
     if (tp->gates_per_token == 0)
         return (uint32_t)((seq - 1) % tp->n_slots);
+    if (tp->gate_slot_start == 0u && tp->gate_slot_step == 1u &&
+        tp->n_layer != 0u) {
+        const bool row_shard =
+            (tp->runtime_features & DS4_TP_FEATURE_Q4K_ROW_SHARD) != 0u;
+        const uint32_t calls = row_shard ? 3u : 2u;
+        const uint32_t i = (uint32_t)((seq - 1u) % tp->gates_per_token);
+        const uint32_t phase = i % calls;
+        const uint32_t gate = row_shard
+            ? (phase == 0u ? DS4_TP_GATE_ATTN :
+               phase == 1u ? DS4_TP_GATE_MOE_MID : DS4_TP_GATE_FFN)
+            : phase;
+        return (i / calls) * DS4_TP_GATES_PER_LAYER + gate;
+    }
     return tp->gate_slot_start +
            (uint32_t)((seq - 1) % tp->gates_per_token) * tp->gate_slot_step;
 }
+
+#ifdef DS4_TP_TEST_HOOKS
+uint32_t ds4_tp_test_gate_slot(uint32_t n_layer, uint32_t runtime_features,
+                               uint32_t gate_slot_start,
+                               uint32_t gate_slot_step,
+                               uint32_t gates_per_token, uint64_t seq) {
+    ds4_tp tp;
+    memset(&tp, 0, sizeof(tp));
+    tp.n_layer = n_layer;
+    tp.n_slots = n_layer * DS4_TP_GATES_PER_LAYER;
+    tp.runtime_features = runtime_features;
+    tp.gate_slot_start = gate_slot_start;
+    tp.gate_slot_step = gate_slot_step;
+    tp.gates_per_token = gates_per_token;
+    return tp_gate_slot(&tp, seq);
+}
+#endif
 
 /* Reap completions: send CQEs free send-queue slots, recv CQEs advance the
  * arrival watermark (UC is in-order, so gate seq recv completions arrive

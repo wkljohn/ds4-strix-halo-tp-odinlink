@@ -76,6 +76,20 @@ static int check_connect_timeout(const char *name, const char *value,
     return 1;
 }
 
+static int check_gate_slot(const char *name, uint32_t features,
+                           uint32_t calls_per_token, uint64_t seq,
+                           uint32_t want) {
+    const uint32_t got = ds4_tp_test_gate_slot(
+            2u, features, 0u, 1u, calls_per_token, seq);
+    if (got != want) {
+        fprintf(stderr, "FAIL %s: seq=%llu got=%u want=%u\n", name,
+                (unsigned long long)seq, got, want);
+        return 0;
+    }
+    fprintf(stderr, "PASS %s\n", name);
+    return 1;
+}
+
 int main(void) {
     int ok = 1;
     ok &= check("hello equal-enabled",
@@ -108,6 +122,27 @@ int main(void) {
     ok &= check("hello mismatched-odinlink-batch-async",
                 DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00000004 peer=0x00000000)");
+    ok &= check("hello equal-q4k-row-shard",
+                DS4_TP_FEATURE_Q4K_ROW_SHARD,
+                DS4_TP_FEATURE_Q4K_ROW_SHARD, 1, NULL);
+    ok &= check("hello mismatched-q4k-row-shard",
+                DS4_TP_FEATURE_Q4K_ROW_SHARD, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00010000 peer=0x00000000)");
+    /* Two layers: ordinary slots are [attn0,ffn0,attn1,ffn1] =
+     * [0,1,3,4].  Row sharding inserts mid slots [2,5] before each FFN. */
+    const uint32_t ordinary_slots[] = {0u, 1u, 3u, 4u, 0u};
+    const uint32_t row_shard_slots[] = {0u, 2u, 1u, 3u, 5u, 4u, 0u};
+    for (uint32_t i = 0; i < sizeof(ordinary_slots) / sizeof(ordinary_slots[0]); i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "ordinary gate slot %u", i + 1u);
+        ok &= check_gate_slot(name, 0u, 4u, i + 1u, ordinary_slots[i]);
+    }
+    for (uint32_t i = 0; i < sizeof(row_shard_slots) / sizeof(row_shard_slots[0]); i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "row-shard gate slot %u", i + 1u);
+        ok &= check_gate_slot(name, DS4_TP_FEATURE_Q4K_ROW_SHARD,
+                              6u, i + 1u, row_shard_slots[i]);
+    }
     const uint32_t split_118 = ds4_tp_feature_expert_split(118u);
     const uint32_t split_128 = ds4_tp_feature_expert_split(128u);
     ok &= check("hello equal-asymmetric-expert-split",

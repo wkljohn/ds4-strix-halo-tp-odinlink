@@ -58869,7 +58869,11 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
     } else {
         *start = 0;
         *step = 1;
-        *per_token = DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
+        /* Ordinary DS4 fires ATTN+FFN.  The reserved MOE_MID slab slot is
+         * included only after the row-shard feature is negotiated. */
+        *per_token = DS4_N_LAYER *
+            ((ds4_engine_tp_runtime_features(e) &
+              DS4_TP_FEATURE_Q4K_ROW_SHARD) ? 3u : 2u);
     }
 }
 
