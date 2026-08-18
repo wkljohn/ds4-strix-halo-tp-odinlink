@@ -196,6 +196,77 @@ __global__ static void hc_expand4_kernel(
     }
 }
 
+__global__ static void hc_expand4_two_halves_kernel(
+        float *out_hc,
+        const float *block_low,
+        const float *block_high,
+        const float *residual_hc,
+        const float *split,
+        uint32_t n_embd,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (gid >= n) return;
+    const uint32_t d = gid % n_embd;
+    const uint32_t t = gid / n_embd;
+    const uint32_t half = n_embd / 2u;
+    const float bv = d < half
+        ? block_low[(uint64_t)t * half + d]
+        : block_high[(uint64_t)t * half + d - half];
+    const uint64_t hc_base = (uint64_t)t * 4u * n_embd + d;
+    const float r0 = residual_hc[hc_base + 0u * (uint64_t)n_embd];
+    const float r1 = residual_hc[hc_base + 1u * (uint64_t)n_embd];
+    const float r2 = residual_hc[hc_base + 2u * (uint64_t)n_embd];
+    const float r3 = residual_hc[hc_base + 3u * (uint64_t)n_embd];
+    const float *sp = split + (uint64_t)t * 24u;
+    const float *post = sp + 4u;
+    const float *comb = sp + 8u;
+#pragma unroll
+    for (uint32_t dst = 0; dst < 4u; dst++) {
+        float acc = bv * post[dst];
+        acc += comb[0u * 4u + dst] * r0;
+        acc += comb[1u * 4u + dst] * r1;
+        acc += comb[2u * 4u + dst] * r2;
+        acc += comb[3u * 4u + dst] * r3;
+        out_hc[hc_base + (uint64_t)dst * n_embd] = acc;
+    }
+}
+
+__global__ static void hc_expand_two_halves_kernel(
+        float *out_hc,
+        const float *block_low,
+        const float *block_high,
+        const float *residual_hc,
+        const float *post,
+        const float *comb,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_tokens,
+        uint32_t post_stride,
+        uint32_t comb_stride) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+    if (gid >= n_elem) return;
+    const uint32_t d = gid % n_embd;
+    const uint64_t tmp = gid / n_embd;
+    const uint32_t dst_hc = tmp % n_hc;
+    const uint32_t t = tmp / n_hc;
+    const uint32_t half = n_embd / 2u;
+    const float block_v = d < half
+        ? block_low[(uint64_t)t * half + d]
+        : block_high[(uint64_t)t * half + d - half];
+    float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
+    for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+        const float comb_v = comb[(uint64_t)t * comb_stride + dst_hc +
+                                  (uint64_t)src_hc * n_hc];
+        const float res_v = residual_hc[(uint64_t)t * n_hc * n_embd +
+                                         (uint64_t)src_hc * n_embd + d];
+        acc += comb_v * res_v;
+    }
+    out_hc[(uint64_t)t * n_hc * n_embd +
+           (uint64_t)dst_hc * n_embd + d] = acc;
+}
+
 __global__ static void hc_expand4_add_kernel(
         float *out_hc,
         const float *block_out,

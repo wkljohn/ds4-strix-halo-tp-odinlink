@@ -606,6 +606,22 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         uint64_t              k_cnt,
         const ds4_gpu_tensor *x,
         uint64_t              n_rows);
+/* Compact decode output-row form used by Q4_K TP row sharding. Weight rows
+ * keep their original full-K stride; out stores only the requested logical
+ * row span. The input remains a compact contiguous K slice. */
+int ds4_gpu_matmul_q8_0_kslice_output_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              full_in_dim,
+        uint64_t              k_off,
+        uint64_t              k_cnt,
+        uint64_t              full_out_dim,
+        uint64_t              row_base,
+        uint64_t              row_count,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_rows);
 int ds4_gpu_matmul_quant_kslice_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -3145,6 +3161,17 @@ int ds4_gpu_hc_expand_split_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+/* Same arithmetic as hc_expand_split_tensor, but the flat block vector is
+ * supplied as canonical low/high embedding halves. */
+int ds4_gpu_hc_expand_split_two_halves_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_low,
+        const ds4_gpu_tensor *block_high,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t              n_embd,
+        uint32_t              n_hc);
 
 int ds4_gpu_hc_expand_split_half_tensor(
         ds4_gpu_tensor       *out_hc,

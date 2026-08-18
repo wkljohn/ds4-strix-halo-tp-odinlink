@@ -1805,6 +1805,26 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
             full_in_dim, out_dim, k_off, k_cnt, &x_slice, 1u);
 }
 
+extern "C" int ds4_gpu_matmul_q8_0_kslice_output_rows_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim,
+        uint64_t k_off, uint64_t k_cnt, uint64_t full_out_dim,
+        uint64_t row_base, uint64_t row_count,
+        const ds4_gpu_tensor *x, uint64_t n_rows) {
+    if (!out || !x || !model_map || full_in_dim == 0u ||
+        full_out_dim == 0u || row_count == 0u ||
+        row_base > full_out_dim || row_count > full_out_dim - row_base ||
+        (full_in_dim % 32u) != 0u) return 0;
+    uint64_t row_bytes = 0, row_delta = 0, sliced_offset = 0;
+    if (!cuda_u64_mul_checked(full_in_dim / 32u, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(row_base, row_bytes, &row_delta) ||
+        weight_offset > UINT64_MAX - row_delta) return 0;
+    sliced_offset = weight_offset + row_delta;
+    return ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+        out, model_map, model_size, sliced_offset, full_in_dim,
+        row_count, k_off, k_cnt, x, n_rows);
+}
+
 /* ------------------------------------------------------------------------
  * DS4-TP-gfx1151 (patch 14): generic dense-quant K-slice.
  *
