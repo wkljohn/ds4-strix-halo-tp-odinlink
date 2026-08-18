@@ -2279,6 +2279,68 @@ __global__ static void moe_gate_up_mid_decode_q4K_row_shard_kernel(
     }
 }
 
+/* Production packed-row form.  The weight table and output are both compact:
+ * every expert stores only row_count rows, and every selected slot writes a
+ * row_count-wide activation.  logical row_base never enters address math; it
+ * is validated by the packed descriptor before launch. */
+template <uint32_t ROWS_PER_SUBGROUP, bool APPLY_EPILOGUE>
+__global__ static void moe_gate_or_up_decode_q4K_packed_rows_kernel(
+        float *proj_out,
+        const float *gate_in,
+        const char *weight_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t packed_expert_bytes,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t n_expert,
+        uint32_t row_count,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row_subgroups = blockDim.x >> 3u;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t slot = pair % n_expert;
+    const int32_t expert_i = selected[slot];
+    const float route_weight = weights[slot];
+    for (uint32_t rr = 0; rr < ROWS_PER_SUBGROUP; rr++) {
+        const uint32_t row = blockIdx.x *
+                                 (row_subgroups * ROWS_PER_SUBGROUP) +
+                             row_lane + rr * row_subgroups;
+        if (row >= row_count) continue;
+        const uint64_t off = (uint64_t)pair * row_count + row;
+        if (expert_i < 0 || route_weight == 0.0f) {
+            if (lane == 0u) proj_out[off] = 0.0f;
+            continue;
+        }
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+            weight_base + (uint64_t)(uint32_t)expert_i *
+                              packed_expert_bytes +
+            (uint64_t)row * row_bytes);
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0u) {
+            if constexpr (APPLY_EPILOGUE) {
+                float gate = gate_in[off];
+                float up = acc;
+                if (clamp > 1.0e-6f) {
+                    if (gate > clamp) gate = clamp;
+                    if (up > clamp) up = clamp;
+                    if (up < -clamp) up = -clamp;
+                }
+                proj_out[off] = (gate / (1.0f + expf(-gate))) * up *
+                                route_weight;
+            } else {
+                proj_out[off] = acc;
+            }
+        }
+    }
+}
+
 /* Experimental one-token Q4_K path with one weight projection per kernel.
  * The fused gate/up kernel keeps both Q4_K dot products live and is register
  * heavy on gfx1151.  Splitting the projections may admit another resident
@@ -2902,6 +2964,82 @@ __global__ static void moe_down_q4K_row_shard_one_group_kernel(
     if (lane == 0u) group_out[row] = total;
 }
 
+/* Packed output-row down projection consuming two independently quantized
+ * contiguous activation halves.  rank0_midq is always the logical low half
+ * and rank1_midq the high half, regardless of which process owns each pointer.
+ * The Q4 dot and quarter-wave reduction order are identical to sum6. */
+__global__ static void moe_down_q4K_packed_rows_one_group_kernel(
+        float *group_out,
+        const char *down_base,
+        const cuda_block_q8_K *rank0_midq,
+        const cuda_block_q8_K *rank1_midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t packed_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t half_blocks,
+        uint32_t row_count,
+        uint32_t n_expert,
+        uint32_t expert_lo,
+        uint32_t expert_hi) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= row_count) return;
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        if (weights[slot] == 0.0f) continue;
+        const int32_t expert_i = selected[slot];
+        if (expert_i < 0 || (uint32_t)expert_i < expert_lo ||
+            (uint32_t)expert_i >= expert_hi) continue;
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+            down_base + (uint64_t)(uint32_t)expert_i *
+                            packed_expert_bytes +
+            (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *x0 = rank0_midq +
+                                    (uint64_t)slot * half_blocks;
+        const cuda_block_q8_K *x1 = rank1_midq +
+                                    (uint64_t)slot * half_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < 2u * half_blocks; b += 8u) {
+            const cuda_block_q8_K *xb = b < half_blocks
+                ? x0 + b : x1 + b - half_blocks;
+            acc += dev_dot_q4_K_q8_K_block(wr + b, xb);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) group_out[row] = total;
+}
+
+__global__ static void moe_packed_row_groups_add_kernel(
+        float *out, const float *group0, const float *group1,
+        const float *shared0, const float *shared1, uint32_t count) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float rank0 = group0[i];
+    float rank1 = group1[i];
+    if (shared0) rank0 += shared0[i];
+    if (shared1) rank1 += shared1[i];
+    volatile float rounded0 = rank0;
+    volatile float rounded1 = rank1;
+    out[i] = rounded0 + rounded1;
+}
+
+__global__ static void q8_K_stitch_halves_kernel(
+        cuda_block_q8_K *out, const cuda_block_q8_K *rank0,
+        const cuda_block_q8_K *rank1, uint32_t half_blocks,
+        uint32_t n_rows) {
+    const uint32_t block = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= n_rows || block >= 2u * half_blocks) return;
+    const cuda_block_q8_K *src = block < half_blocks
+        ? rank0 + (uint64_t)row * half_blocks + block
+        : rank1 + (uint64_t)row * half_blocks + block - half_blocks;
+    out[(uint64_t)row * (2u * half_blocks) + block] = *src;
+}
+
 __global__ static void moe_row_shard_groups_combine_kernel(
         float *out,
         const float *rank0_routed,
@@ -2956,6 +3094,35 @@ __global__ static void moe_batch_row_shard_groups_reduce_kernel(
         else group1 += value;
     }
     const uint64_t out_off = (uint64_t)token * out_dim + row;
+    if (rank0_add) group0 += rank0_add[out_off];
+    if (rank1_add) group1 += rank1_add[out_off];
+    volatile float rounded0 = group0;
+    volatile float rounded1 = group1;
+    out[out_off] = rounded0 + rounded1;
+}
+
+__global__ static void moe_batch_row_shard_groups_reduce_compact_kernel(
+        float *out, const float *down, const float *rank0_add,
+        const float *rank1_add, const int32_t *selected,
+        uint32_t n_expert, uint32_t n_tokens,
+        uint32_t expert_split, uint32_t row_count) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * row_count;
+    if (gid >= n) return;
+    const uint32_t token = (uint32_t)(gid / row_count);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)token * row_count);
+    const uint64_t pair0 = (uint64_t)token * n_expert;
+    float group0 = 0.0f;
+    float group1 = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const uint64_t pair = pair0 + slot;
+        const int32_t expert = selected[pair];
+        if (expert < 0) continue;
+        const float value = down[pair * row_count + row];
+        if ((uint32_t)expert < expert_split) group0 += value;
+        else group1 += value;
+    }
+    const uint64_t out_off = (uint64_t)token * row_count + row;
     if (rank0_add) group0 += rank0_add[out_off];
     if (rank1_add) group1 += rank1_add[out_off];
     volatile float rounded0 = group0;

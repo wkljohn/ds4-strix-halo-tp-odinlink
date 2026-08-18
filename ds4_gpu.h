@@ -2686,6 +2686,28 @@ int ds4_gpu_rocm_q4k_row_shard_gate_up_tensor(
         float                 clamp,
         const ds4_gpu_tensor *x);
 
+/* Production compact forms backed only by the fail-closed packed-row
+ * registry.  The original GGUF offsets identify descriptors; legacy linear
+ * model resolution is never used. */
+int ds4_gpu_rocm_q4k_packed_row_gate_up_tensor(
+        ds4_gpu_tensor       *mid_compact,
+        ds4_gpu_tensor       *gate_compact,
+        ds4_gpu_tensor       *xq_scratch,
+        const void           *model_map,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              gate_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              row_base,
+        uint32_t              row_count,
+        float                 clamp,
+        const ds4_gpu_tensor *x);
+
 int ds4_gpu_rocm_q8k_quantize_rows_tensor(
         ds4_gpu_tensor       *q8,
         const ds4_gpu_tensor *x,
@@ -2721,6 +2743,34 @@ int ds4_gpu_rocm_q4k_row_shard_down_tensor(
         uint32_t              expert_split,
         uint32_t              row_base,
         uint32_t              row_count);
+
+int ds4_gpu_rocm_q4k_packed_row_down_tensor(
+        ds4_gpu_tensor       *out_compact,
+        ds4_gpu_tensor       *group0_compact,
+        ds4_gpu_tensor       *group1_compact,
+        const ds4_gpu_tensor *shared0_compact,
+        const ds4_gpu_tensor *shared1_compact,
+        const ds4_gpu_tensor *rank0_midq,
+        const ds4_gpu_tensor *rank1_midq,
+        const void           *model_map,
+        uint64_t              down_offset,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              expert_split,
+        uint32_t              row_base,
+        uint32_t              row_count);
+
+int ds4_gpu_rocm_q8k_stitch_halves_tensor(
+        ds4_gpu_tensor       *full,
+        const ds4_gpu_tensor *rank0_half,
+        const ds4_gpu_tensor *rank1_half,
+        uint32_t              half_width,
+        uint32_t              n_rows);
 
 /* Production-kernel batch oracle for the same Q4_K row-shard design.  These
  * launch the shipping sorted-pair WMMA/cold kernels with a compact output-row
@@ -2767,6 +2817,23 @@ int ds4_gpu_rocm_q4k_batch_row_shard_down_tensor(
         uint32_t              row_base,
         uint32_t              row_count);
 
+int ds4_gpu_rocm_q4k_batch_packed_row_down_split_midq_tensor(
+        ds4_gpu_tensor       *down,
+        ds4_gpu_tensor       *full_midq_scratch,
+        const ds4_gpu_tensor *rank0_midq,
+        const ds4_gpu_tensor *rank1_midq,
+        const void           *model_map,
+        uint64_t              down_offset,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              n_tokens,
+        uint32_t              row_base,
+        uint32_t              row_count);
+
 int ds4_gpu_rocm_q4k_batch_row_shard_reduce_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *down,
@@ -2778,6 +2845,17 @@ int ds4_gpu_rocm_q4k_batch_row_shard_reduce_tensor(
         uint32_t              n_tokens,
         uint32_t              expert_split,
         uint32_t              row_base,
+        uint32_t              row_count);
+
+int ds4_gpu_rocm_q4k_batch_row_shard_reduce_compact_add_tensor(
+        ds4_gpu_tensor       *out_compact,
+        const ds4_gpu_tensor *down_compact,
+        const ds4_gpu_tensor *rank0_add_compact,
+        const ds4_gpu_tensor *rank1_add_compact,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_expert,
+        uint32_t              n_tokens,
+        uint32_t              expert_split,
         uint32_t              row_count);
 
 int ds4_gpu_routed_moe_one_tensor(
