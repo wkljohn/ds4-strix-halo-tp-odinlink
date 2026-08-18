@@ -193,3 +193,47 @@ protocol risk. Research branch `research/q4k-hipgraph-20260818` preserves the
 experiment as commit `10f2463` followed by revert `6bd5db0`; model-free oracle
 commit `43e9d1a` remains available for a future architecture that can recover
 the balancing benefit without changing the wire protocol.
+
+## Production incident — incremental prefill after temporal decode
+
+The first 256K service deployment of the temporal schedule exposed a workload
+missing from the fixed benchmark: a tool continuation decoded 11 tokens and
+left two deferred compressor rows, then the next request appended an 89-token
+suffix through resumed layer-major prefill. The batch path advanced recurrent
+state to position 25,463 but left the decode-only pending marker at 25,372+2.
+The next decode failed closed with:
+
+```text
+ROCm temporal compressor position discontinuity at layer 2
+(25372 + 2 != 25463)
+```
+
+This was a session-state transition bug, not RDMA loss: neither node logged a
+kernel panic, GPU reset, mlx5 error, or reboot. The worker intentionally exits
+after a mirrored evaluation error, while the leader originally retained its
+HTTP listener.
+
+The fix materializes any deferred temporal rows before switching an extending
+session from token decode to resumed layer-major prefill. Mirrored sync/eval
+failures now also mark the leader TP transport failed immediately, and the
+deployment status command requires coordinator, worker, and API health before
+reporting readiness. The synthetic oracle includes the exact 11+89 boundary
+for ratio-4 and ratio-128 layers; both recurrent states and emitted rows match
+sequential updates bit for bit. The release gate additionally requires a real
+multi-request API continuation that crosses the same boundary while both TP
+ranks remain alive.
+
+Validation on the fixed branch used matching binaries on both nodes:
+
+| Gate | Prefill | Decode | Fingerprint/result |
+|---|---:|---:|---|
+| Q4_K RoCE v2, 2,048+300 | 219.02 t/s | 19.32 t/s | `5f8a983422299d76` |
+| Q2_K RoCE v2, 2,048+300 | 179.05 t/s | 19.11 t/s | `f9cb3a8a17e95c71` |
+
+The API reproduction decoded 11 tokens, appended a 245-token live suffix,
+decoded eight, appended another 395-token live suffix, and decoded eight more.
+The coordinator log retained the live ranges `343..588` and `596..991`; both
+ranks stayed ready and the two post-prefill decode samples measured 19.83 and
+19.60 t/s. Finally, terminating the test worker and issuing another request
+returned HTTP 500 for that request and HTTP 503 from `/health`; the deployment
+status reported `worker-stopped` and no longer reported the API ready.

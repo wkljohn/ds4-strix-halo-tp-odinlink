@@ -327,19 +327,30 @@ stop() {
 }
 
 status() {
+  local coord_ok=0 worker_ok=0 api_ok=0 worker_state
   if coord_is_active; then
     echo "coordinator: running pid $(coord_main_pid)"
+    coord_ok=1
   elif pid_matches "$LOCAL_PIDFILE" "ds4-server"; then
     echo "coordinator: running pid $(<"$LOCAL_PIDFILE")"
+    coord_ok=1
   else
     echo "coordinator: stopped"
   fi
-  "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then echo worker-running-pid-\$p; else echo worker-stopped; fi; else echo worker-stopped; fi"
+  worker_state=$("${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then echo worker-running-pid-\$p; else echo worker-stopped; fi; else echo worker-stopped; fi" 2>/dev/null) || worker_state=worker-unreachable
+  echo "$worker_state"
+  [[ $worker_state == worker-running-pid-* ]] && worker_ok=1
   if curl --silent --show-error --fail --max-time 3 "http://$API_HOST:$API_PORT/health" >/dev/null; then
-    echo "api: ready on $API_HOST:$API_PORT"
+    api_ok=1
+    if ((coord_ok && worker_ok)); then
+      echo "api: ready on $API_HOST:$API_PORT"
+    else
+      echo "api: listener healthy but TP pair incomplete"
+    fi
   else
     echo "api: loading or unavailable"
   fi
+  ((coord_ok && worker_ok && api_ok))
 }
 
 logs() {

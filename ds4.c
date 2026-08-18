@@ -60601,6 +60601,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
                               prompt->v, (uint32_t)prompt->len)) {
             snprintf(err, errlen, "tp: worker sync send failed");
+            ds4_tp_mark_failed(s->engine->tp.ctx);
             return 1;
         }
     }
@@ -60657,6 +60658,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
         }
         if (rc != 0 || !worker_ok || !logits_ok) {
+            /* The worker command loop exits after a mirrored sync failure.
+             * Withdraw leader readiness immediately instead of advertising a
+             * half-dead tensor-parallel pair. */
+            ds4_tp_mark_failed(s->engine->tp.ctx);
             ds4_session_invalidate(s);
             return rc != 0 ? rc : 1;
         }
@@ -61352,6 +61357,20 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
         if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+            /* Decode may have deferred the last non-emitting compressor rows.
+             * Resumed layer-major prefill advances recurrent state through
+             * the suffix but does not consume that decode-only pending ring.
+             * Materialize the old frontier before crossing this boundary. */
+            if (session_temporal_compressor_pending(
+                        &s->graph, 0u, DS4_N_LAYER - 1u) &&
+                !session_temporal_compressor_flush(
+                        s, 0u, DS4_N_LAYER - 1u)) {
+                snprintf(err, errlen,
+                         "%s temporal compressor flush failed before resumed prefill",
+                         backend_name);
+                s->checkpoint_valid = false;
+                return 1;
+            }
             bool cancelled = false;
             ds4_sync_progress progress = {
                 .session = s,
@@ -62713,11 +62732,15 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         if (!ds4_tp_send_eval(e->tp.ctx, s->tp_session_id,
                               ++e->tp.eval_seq, token)) {
             snprintf(err, errlen, "tp: worker eval send failed");
+            ds4_tp_mark_failed(e->tp.ctx);
             return 1;
         }
     }
     int rc = ds4_session_eval_internal(s, token, probe_mtp, err, errlen);
     if (rc != 0 && ds4_session_tp_leader(s)) {
+        /* The worker exits its command loop after an eval failure, so the
+         * mirrored connection cannot safely service another request. */
+        ds4_tp_mark_failed(s->engine->tp.ctx);
         ds4_session_invalidate(s);
         return rc;
     }

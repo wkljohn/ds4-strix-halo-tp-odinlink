@@ -218,5 +218,11 @@ int main() {
     ok &= case_run(4u, 1024u, 5u, 19u, {7u, 17u});
     ok &= case_run(4u, 256u, 6u, 21u, {5u, 14u});
     ok &= case_run(128u, 512u, 37u, 300u, {73u, 211u});
+    /* Production regression: an 11-token decode left a partial ratio window,
+     * then an 89-token incremental prompt switched to layer-major prefill.
+     * Flushing at that boundary must remain byte-identical to sequential
+     * recurrent updates for both compressor ratios. */
+    ok &= case_run(4u, 1024u, 25363u, 100u, {11u});
+    ok &= case_run(128u, 512u, 25363u, 217u, {11u});
     return ok ? 0 : 2;
 }
