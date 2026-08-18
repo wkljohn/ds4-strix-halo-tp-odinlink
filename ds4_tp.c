@@ -1082,7 +1082,6 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
 }
 
 static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq);
-static uint64_t tp_decode_gate_bytes(const ds4_tp *tp, uint32_t slot);
 
 static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
@@ -1205,16 +1204,13 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
         return 0;
     }
-    const uint64_t max_decode_gate =
-        (tp->runtime_features & DS4_TP_FEATURE_Q4K_SHARED_BALANCE) != 0u ?
-            2u * tp->vec_bytes : tp->vec_bytes;
     const uint64_t decode_chunks =
-        (max_decode_gate + r->decode_max_msg - 1u) / r->decode_max_msg;
+        (tp->vec_bytes + r->decode_max_msg - 1u) / r->decode_max_msg;
     if (decode_chunks > 2u) {
         tp_set_err(err, errlen,
                    "tp rdma: gate vector %llu bytes needs %llu messages at the "
                    "negotiated %u-byte limit (maximum 2)",
-                   (unsigned long long)max_decode_gate,
+                   (unsigned long long)tp->vec_bytes,
                    (unsigned long long)decode_chunks, r->decode_max_msg);
         return 0;
     }
@@ -1223,7 +1219,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
             "(%llu bytes, negotiated limit %u)\n",
             (unsigned long long)decode_chunks,
             decode_chunks == 1 ? "" : "s",
-            (unsigned long long)max_decode_gate, r->decode_max_msg);
+            (unsigned long long)tp->vec_bytes, r->decode_max_msg);
     /* Leave the receive queue empty for an initial bulk prefill.  The first
      * decode gate arms the normal lookahead window after prefill finishes. */
     if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_READY, NULL, 0)) {
@@ -1290,14 +1286,6 @@ static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
     }
     return tp->gate_slot_start +
            (uint32_t)((seq - 1) % tp->gates_per_token) * tp->gate_slot_step;
-}
-
-static uint64_t tp_decode_gate_bytes(const ds4_tp *tp, uint32_t slot) {
-    if ((tp->runtime_features & DS4_TP_FEATURE_Q4K_SHARED_BALANCE) != 0u &&
-        (slot % DS4_TP_GATES_PER_LAYER) == DS4_TP_GATE_FFN) {
-        return 2u * tp->vec_bytes;
-    }
-    return tp->vec_bytes;
 }
 
 #ifdef DS4_TP_TEST_HOOKS
@@ -1482,17 +1470,16 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
     const uint32_t slot = tp_gate_slot(tp, seq);
     const uintptr_t base =
         (uintptr_t)(tp->slab + tp->in_off + (uint64_t)slot * tp->vec_bytes);
-    const uint64_t gate_bytes = tp_decode_gate_bytes(tp, slot);
     /* Vectors above the negotiated provider message cap ride as two chunks
      * landing contiguously in the slot. UC delivery is in-order and both
      * sides post/send strictly in seq order, so the k'th send always
      * matches the k'th recv; only the FINAL chunk carries the seq as
      * wr_id, so the arrival watermark advances when the slot is whole. */
     uint64_t off = 0;
-    while (off < gate_bytes) {
-        const uint64_t len = gate_bytes - off > r->decode_max_msg ?
-            r->decode_max_msg : gate_bytes - off;
-        const int last = off + len == gate_bytes;
+    while (off < tp->vec_bytes) {
+        const uint64_t len = tp->vec_bytes - off > r->decode_max_msg ?
+            r->decode_max_msg : tp->vec_bytes - off;
+        const int last = off + len == tp->vec_bytes;
         struct ibv_sge sge;
         struct ibv_recv_wr wr, *bad = NULL;
         memset(&wr, 0, sizeof(wr));
@@ -1539,7 +1526,6 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
     }
     const uintptr_t send_base =
         (uintptr_t)(tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes);
-    const uint64_t gate_bytes = tp_decode_gate_bytes(tp, slot);
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const double lock_start = gate_profile ? tp_now_sec() : 0.0;
 #endif
@@ -1556,9 +1542,9 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const double post_send_start = gate_profile ? tp_now_sec() : 0.0;
 #endif
-    for (uint64_t off = 0; ok && off < gate_bytes; ) {
-        const uint64_t len = gate_bytes - off > r->decode_max_msg ?
-            r->decode_max_msg : gate_bytes - off;
+    for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
+        const uint64_t len = tp->vec_bytes - off > r->decode_max_msg ?
+            r->decode_max_msg : tp->vec_bytes - off;
         struct ibv_sge sge;
         struct ibv_send_wr wr, *bad = NULL;
         memset(&wr, 0, sizeof(wr));
@@ -1682,26 +1668,19 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     ds4_tp_rdma *r = &tp->rdma;
     if (!r->recv_window_active) return 1;
 
-    uint32_t nwr = 0u;
-    for (uint32_t i = 0; i < DS4_TP_RDMA_RECV_WINDOW; i++) {
-        const uint64_t seq = r->last_gate_seq + (uint64_t)i + 1u;
-        const uint32_t slot = tp_gate_slot(tp, seq);
-        const uint64_t bytes = tp_decode_gate_bytes(tp, slot);
-        nwr += (uint32_t)((bytes + r->decode_max_msg - 1u) /
-                          r->decode_max_msg);
-    }
+    const uint32_t chunks_per_gate =
+        (uint32_t)((tp->vec_bytes + r->decode_max_msg - 1u) /
+                   r->decode_max_msg);
+    const uint32_t nwr = DS4_TP_RDMA_RECV_WINDOW * chunks_per_gate;
     struct ibv_sge sge[DS4_TP_RDMA_RECV_WINDOW * 2u];
     struct ibv_send_wr wr[DS4_TP_RDMA_RECV_WINDOW * 2u];
     memset(wr, 0, sizeof(wr));
     uint8_t *scratch = tp->slab + tp->batch_out_off;
     uint32_t wi = 0;
     for (uint32_t gate = 0; gate < DS4_TP_RDMA_RECV_WINDOW; gate++) {
-        const uint64_t seq = r->last_gate_seq + (uint64_t)gate + 1u;
-        const uint32_t slot = tp_gate_slot(tp, seq);
-        const uint64_t bytes = tp_decode_gate_bytes(tp, slot);
-        for (uint64_t off = 0; off < bytes; ) {
-            const uint64_t len = bytes - off > r->decode_max_msg ?
-                r->decode_max_msg : bytes - off;
+        for (uint64_t off = 0; off < tp->vec_bytes; ) {
+            const uint64_t len = tp->vec_bytes - off > r->decode_max_msg ?
+                r->decode_max_msg : tp->vec_bytes - off;
             sge[wi] = (struct ibv_sge) {
                 .addr = (uintptr_t)(scratch + off),
                 .length = (uint32_t)len,
@@ -2262,13 +2241,11 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
      * write-then-read cannot deadlock.  Header and payload go out in one
      * writev so NODELAY does not split them into two segments. */
     ds4_tp_gate_header h = { DS4_TP_MAGIC, (uint16_t)layer, (uint16_t)gate, seq };
-    const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
-    const uint64_t gate_bytes = tp_decode_gate_bytes(tp, slot);
     struct iovec iov[2] = {
         { &h, sizeof(h) },
-        { tp->slab + ds4_tp_slab_out_offset(tp, layer, gate), gate_bytes },
+        { tp->slab + ds4_tp_slab_out_offset(tp, layer, gate), tp->vec_bytes },
     };
-    size_t want = sizeof(h) + gate_bytes;
+    size_t want = sizeof(h) + tp->vec_bytes;
     ssize_t w = writev(tp->data_fd, iov, 2);
     if (w < 0 || (size_t)w != want) {
         /* Short writev: finish with the plain path. */
@@ -2281,7 +2258,7 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
         uint64_t payload_done = done - sizeof(h);
         if (!tp_write_full(tp->data_fd,
                            tp->slab + ds4_tp_slab_out_offset(tp, layer, gate) + payload_done,
-                           gate_bytes - payload_done))
+                           tp->vec_bytes - payload_done))
             return 0;
     }
     ds4_tp_gate_header ph;
@@ -2293,7 +2270,7 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
         return 0;
     }
     if (!tp_read_full(tp->data_fd, tp->slab + ds4_tp_slab_in_offset(tp, layer, gate),
-                      gate_bytes))
+                      tp->vec_bytes))
         return 0;
     return 1;
 }

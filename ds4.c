@@ -24203,26 +24203,6 @@ static bool metal_graph_encode_decode_layer_phase(
     /* Real TP split slices the shared expert by intermediate lanes, which
      * needs the unfused gate/up/swiglu/down sequence. */
     const bool tp_split_shared = g->tp_world == 2;
-    const char *tp_shared_balance_env =
-        getenv("DS4_ROCM_TP_Q4K_SHARED_BALANCE");
-    const bool tp_q4_shared_balance =
-#if defined(DS4_ROCM_BUILD)
-        tp_split_shared && tp_shared_balance_env &&
-        tp_shared_balance_env[0] == '1' &&
-        tp_shared_balance_env[1] == '\0' &&
-        !keep_ffn_out &&
-        !metal_graph_directional_steering_ffn_enabled(g) &&
-        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
-        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
-        layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
-        layer->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
-        layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
-        DS4_N_EMBD == 4096u && shared_dim == 2048u;
-#else
-        false;
-    (void)tp_shared_balance_env;
-#endif
     const bool q4_selected_shared_overlap =
         metal_graph_use_q4_selected_shared_overlap() &&
         metal_graph_decode_q4_selected_slots_expected(g,
@@ -24612,7 +24592,6 @@ static bool metal_graph_encode_decode_layer_phase(
      * the sum6 kernel can fold the shared partial and write the slab slot
      * directly (no separate local add). */
     const bool tp_fold_ffn = tp_split_shared &&
-                             !tp_q4_shared_balance &&
                              !keep_ffn_out &&
                              !metal_graph_directional_steering_ffn_enabled(g);
     if (ok && !tp_fold_ffn && !cuda_tp_moe) ok = ds4_gpu_routed_moe_one_tensor(metal_graph_routed_out(g),
@@ -24659,32 +24638,7 @@ static bool metal_graph_encode_decode_layer_phase(
         phase == METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID) {
         return ok;
     }
-    if (ok && tp_q4_shared_balance) {
-        const uint32_t extra_slot =
-            il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_MOE_MID;
-        ok = ds4_gpu_tp_shared_balance_half_q8_0_tensor(
-                 metal_graph_shared_out(g), metal_graph_shared_mid(g),
-                 model->map, model->size,
-                 layer->ffn_gate_shexp->abs_offset,
-                 layer->ffn_up_shexp->abs_offset,
-                 layer->ffn_down_shexp->abs_offset,
-                 DS4_N_EMBD, shared_dim, DS4_N_EMBD,
-                 g->tp_rank,
-                 metal_graph_ffn_norm(g), metal_graph_router_selected(g),
-                 ds4_tp_expert_split_boundary(), DS4_N_EXPERT,
-                 g->tp_rank, DS4_SWIGLU_CLAMP_EXP) != 0 &&
-             ds4_gpu_tp_shared_balance_half_q8_0_tensor(
-                 g->tp_out[extra_slot], metal_graph_shared_gate(g),
-                 model->map, model->size,
-                 layer->ffn_gate_shexp->abs_offset,
-                 layer->ffn_up_shexp->abs_offset,
-                 layer->ffn_down_shexp->abs_offset,
-                 DS4_N_EMBD, shared_dim, DS4_N_EMBD,
-                 1u - g->tp_rank,
-                 metal_graph_ffn_norm(g), metal_graph_router_selected(g),
-                 ds4_tp_expert_split_boundary(), DS4_N_EXPERT,
-                 g->tp_rank, DS4_SWIGLU_CLAMP_EXP) != 0;
-    } else if (ok && tp_split_shared) {
+    if (ok && tp_split_shared) {
         /* Shared expert lane slice: the fused gate/up/swiglu kernel covers
          * this rank's half of the intermediate (row slicing is pure offset
          * math), compact at the buffer base; the down k-slice below turns
@@ -24779,10 +24733,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
         cuda_tp_moe_peer_tmp = ok;
     }
-    if (ok && tp_q4_shared_balance) {
-        /* Both guarded half calls above already include their Q8 down
-         * projection.  The ordinary split-down path must not run again. */
-    } else if (ok && cuda_tp_shared_fold) {
+    if (ok && cuda_tp_shared_fold) {
         bool switched_to_partner = false;
         ok = ds4_gpu_set_current_device(cuda_tp_partner_tier) == 0;
         switched_to_partner = ok;
@@ -24934,19 +24885,8 @@ static bool metal_graph_encode_decode_layer_phase(
          * routed_out. */
         const uint32_t tp_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
         if (!tp_fold_ffn) {
-            if (tp_q4_shared_balance) {
-                ok = ds4_gpu_tp_shared_balance_main_tensor(
-                         g->tp_out[tp_slot], metal_graph_routed_out(g),
-                         metal_graph_shared_out(g),
-                         metal_graph_router_selected(g),
-                         ds4_tp_expert_split_boundary(), DS4_N_EXPERT,
-                         g->tp_rank, DS4_N_EMBD) != 0;
-            } else {
-                ok = ds4_gpu_add_tensor(g->tp_out[tp_slot],
-                                        metal_graph_shared_out(g),
-                                        metal_graph_routed_out(g),
-                                        DS4_N_EMBD) != 0;
-            }
+            ok = ds4_gpu_add_tensor(g->tp_out[tp_slot], metal_graph_shared_out(g), metal_graph_routed_out(g),
+                                    DS4_N_EMBD) != 0;
         }
         if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
         if (ok) {
@@ -24954,18 +24894,6 @@ static bool metal_graph_encode_decode_layer_phase(
             ds4_gpu_tensor *second = g->tp_rank == 0 ? g->tp_in[tp_slot] : g->tp_out[tp_slot];
             if (keep_ffn_out || metal_graph_directional_steering_ffn_enabled(g)) {
                 ok = ds4_gpu_add_tensor(metal_graph_routed_out(g), first, second, DS4_N_EMBD) != 0;
-            } else if (tp_q4_shared_balance) {
-                const uint32_t extra_slot =
-                    il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_MOE_MID;
-                ok = ds4_gpu_tp_shared_balance_reconstruct_tensor(
-                         metal_graph_shared_out(g), metal_graph_routed_out(g),
-                         first, second,
-                         g->tp_out[extra_slot], g->tp_in[extra_slot],
-                         metal_graph_router_selected(g),
-                         ds4_tp_expert_split_boundary(), DS4_N_EXPERT,
-                         g->tp_rank, DS4_N_EMBD) != 0;
-                tp_ffn_a = metal_graph_shared_out(g);
-                tp_ffn_b = metal_graph_routed_out(g);
             } else {
                 tp_ffn_a = first;
                 tp_ffn_b = second;
@@ -51758,20 +51686,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
                 down->dim[1] * down_row_bytes, down_row_bytes,
                 (const uint8_t *)e->model.map + down->abs_offset);
     }
-    const char *shared_balance_env =
-        getenv("DS4_ROCM_TP_Q4K_SHARED_BALANCE");
-    const bool shared_balance_requested =
-        shared_balance_env && shared_balance_env[0] == '1' &&
-        shared_balance_env[1] == '\0';
-    const bool shared_balance_enabled =
-        shared_balance_requested && saw_q4k_layer &&
-        ds4_engine_routed_quant_bits(e) == 4 && !e->mtp_ready &&
-        !(e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
     return (saw_q4k_layer ? q4k_features : 0u) |
-           (saw_iq2_layer ? iq2_features : 0u) |
-           (shared_balance_enabled ?
-                DS4_TP_FEATURE_Q4K_SHARED_BALANCE : 0u) |
-           placement_features;
+           (saw_iq2_layer ? iq2_features : 0u) | placement_features;
 #endif
 }
 

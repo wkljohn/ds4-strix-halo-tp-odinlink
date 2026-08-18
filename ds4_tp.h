@@ -80,10 +80,6 @@ enum {
      * This changes both the arithmetic and the decode gate schedule, so it
      * must be an exact-matched hello capability. */
     DS4_TP_FEATURE_Q4K_ROW_SHARD = UINT32_C(1) << 16,
-    /* Decode-only Q4_K schedule: the lighter EP rank may compute both
-     * canonical shared halves.  FFN gates then exchange two adjacent vectors
-     * in one message; exact hello matching prevents asymmetric framing. */
-    DS4_TP_FEATURE_Q4K_SHARED_BALANCE = UINT32_C(1) << 17,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {
