@@ -2464,6 +2464,67 @@ int ds4_gpu_routed_moe_owned_packed_combine_tensor(
         uint32_t              out_dim,
         uint32_t              expert_split);
 
+/* Research oracle primitives for an exact Q4_K routed-expert row shard.
+ * These expose the production ROCm arithmetic in separable stages so the
+ * distributed layout can be proven bitwise before model residency or wire
+ * framing changes.  Non-ROCm callers must not use them. */
+int ds4_gpu_rocm_q4k_row_shard_gate_up_tensor(
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *gate_scratch,
+        ds4_gpu_tensor       *xq_scratch,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              gate_expert_bytes,
+        uint64_t              gate_row_bytes,
+        uint32_t              expert_in_dim,
+        uint32_t              expert_mid_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              row_base,
+        uint32_t              row_count,
+        float                 clamp,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_rocm_q8k_quantize_rows_tensor(
+        ds4_gpu_tensor       *q8,
+        const ds4_gpu_tensor *x,
+        uint32_t              row_width,
+        uint32_t              n_rows);
+
+int ds4_gpu_rocm_q8k_quantize_row_shard_tensor(
+        ds4_gpu_tensor       *q8,
+        const ds4_gpu_tensor *x,
+        uint32_t              row_width,
+        uint32_t              n_rows,
+        uint32_t              value_base,
+        uint32_t              value_count);
+
+int ds4_gpu_rocm_q4k_row_shard_down_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *rank0_routed,
+        ds4_gpu_tensor       *rank1_routed,
+        const ds4_gpu_tensor *rank0_add,
+        const ds4_gpu_tensor *rank1_add,
+        const ds4_gpu_tensor *midq,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              down_offset,
+        uint64_t              down_expert_bytes,
+        uint64_t              down_row_bytes,
+        uint32_t              expert_mid_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_total_expert,
+        uint32_t              n_expert,
+        uint32_t              expert_split,
+        uint32_t              row_base,
+        uint32_t              row_count);
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
