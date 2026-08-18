@@ -106,6 +106,112 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
 
+extern "C" int ds4_gpu_tp_shared_balance_half_q8_0_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t in_dim, uint64_t shared_dim, uint64_t out_dim,
+        uint32_t canonical_half, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *selected, uint32_t expert_split,
+        uint32_t n_expert, uint32_t rank, float clamp) {
+    if (!out || !mid || !model_map || !x || !selected ||
+        in_dim != 4096u || shared_dim != 2048u || out_dim != 4096u ||
+        canonical_half > 1u || rank > 1u || expert_split == 0u ||
+        expert_split >= n_expert || selected->bytes < 6u * sizeof(int32_t) ||
+        x->bytes < in_dim * sizeof(float) ||
+        mid->bytes < (shared_dim / 2u) * sizeof(float) ||
+        out->bytes < out_dim * sizeof(float)) return 0;
+    const uint64_t half = shared_dim / 2u;
+    const uint64_t gu_blocks = in_dim / 32u;
+    const uint64_t gu_row_bytes = gu_blocks * 34u;
+    const uint64_t half_weight_bytes = half * gu_row_bytes;
+    const uint64_t half_off = canonical_half * half_weight_bytes;
+    const uint64_t down_blocks = shared_dim / 32u;
+    const uint64_t down_row_bytes = down_blocks * 34u;
+    const uint64_t down_bytes = out_dim * down_row_bytes;
+    if (!cuda_model_range_fits(model_size, gate_offset + half_off,
+                               half_weight_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset + half_off,
+                               half_weight_bytes) ||
+        !cuda_model_range_fits(model_size, down_offset, down_bytes)) return 0;
+    const char *wg = cuda_model_range_ptr(
+        model_map, gate_offset + half_off, half_weight_bytes,
+        "tp shared balance gate");
+    const char *wu = cuda_model_range_ptr(
+        model_map, up_offset + half_off, half_weight_bytes,
+        "tp shared balance up");
+    const char *wd = cuda_model_range_ptr(
+        model_map, down_offset, down_bytes, "tp shared balance down");
+    if (!wg || !wu || !wd) return 0;
+    const unsigned gu_rows_per_block = 32u;
+    shared_gate_up_swiglu_q8_0_sharedx_balance_w32_kernel<<<
+        (unsigned)((half + gu_rows_per_block - 1u) / gu_rows_per_block),
+        gu_rows_per_block * 32u, (size_t)in_dim * sizeof(float)>>>(
+        (float *)mid->ptr,
+        reinterpret_cast<const unsigned char *>(wg),
+        reinterpret_cast<const unsigned char *>(wu),
+        (const float *)x->ptr, (uint32_t)gu_blocks, half,
+        gu_row_bytes, clamp, (const int32_t *)selected->ptr,
+        expert_split, n_expert, rank, canonical_half);
+    if (!cuda_ok(cudaGetLastError(),
+                 "tp shared balance gate/up launch")) return 0;
+    const unsigned threads = attention_output_expand_threads();
+    const unsigned rows_per_block = threads / 32u;
+    matmul_q8_0_f32_sharedx_balance_w32_kernel<<<
+        (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+        threads, (size_t)half * sizeof(float)>>>(
+        (float *)out->ptr,
+        reinterpret_cast<const unsigned char *>(wd) +
+            canonical_half * (half / 32u) * 34u,
+        (const float *)mid->ptr, (uint32_t)(half / 32u), out_dim,
+        down_row_bytes, (const int32_t *)selected->ptr,
+        expert_split, n_expert, rank, canonical_half);
+    return cuda_ok(cudaGetLastError(), "tp shared balance down launch");
+}
+
+extern "C" int ds4_gpu_tp_shared_balance_main_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *routed,
+        const ds4_gpu_tensor *shared, const ds4_gpu_tensor *selected,
+        uint32_t expert_split, uint32_t n_expert, uint32_t rank,
+        uint32_t n) {
+    if (!out || !routed || !shared || !selected || rank > 1u || n == 0u ||
+        expert_split == 0u || expert_split >= n_expert ||
+        out->bytes < (uint64_t)n * sizeof(float) ||
+        routed->bytes < (uint64_t)n * sizeof(float) ||
+        shared->bytes < (uint64_t)n * sizeof(float) ||
+        selected->bytes < 6u * sizeof(int32_t)) return 0;
+    tp_shared_balance_main_kernel<<<(n + 255u) / 256u, 256u>>>(
+        (float *)out->ptr, (const float *)routed->ptr,
+        (const float *)shared->ptr, (const int32_t *)selected->ptr,
+        expert_split, n_expert, rank, n);
+    return cuda_ok(cudaGetLastError(), "tp shared balance main launch");
+}
+
+extern "C" int ds4_gpu_tp_shared_balance_reconstruct_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *out1,
+        const ds4_gpu_tensor *main0, const ds4_gpu_tensor *main1,
+        const ds4_gpu_tensor *extra_local, const ds4_gpu_tensor *extra_peer,
+        const ds4_gpu_tensor *selected, uint32_t expert_split,
+        uint32_t n_expert, uint32_t rank, uint32_t n) {
+    if (!out0 || !out1 || !main0 || !main1 || !extra_local || !extra_peer ||
+        !selected || out0 == out1 || rank > 1u || n == 0u ||
+        expert_split == 0u || expert_split >= n_expert ||
+        out0->bytes < (uint64_t)n * sizeof(float) ||
+        out1->bytes < (uint64_t)n * sizeof(float) ||
+        main0->bytes < (uint64_t)n * sizeof(float) ||
+        main1->bytes < (uint64_t)n * sizeof(float) ||
+        extra_local->bytes < (uint64_t)n * sizeof(float) ||
+        extra_peer->bytes < (uint64_t)n * sizeof(float) ||
+        selected->bytes < 6u * sizeof(int32_t)) return 0;
+    tp_shared_balance_reconstruct_kernel<<<(n + 255u) / 256u, 256u>>>(
+        (float *)out0->ptr, (float *)out1->ptr,
+        (const float *)main0->ptr, (const float *)main1->ptr,
+        (const float *)extra_local->ptr, (const float *)extra_peer->ptr,
+        (const int32_t *)selected->ptr, expert_split, n_expert, rank, n);
+    return cuda_ok(cudaGetLastError(),
+                   "tp shared balance reconstruct launch");
+}
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

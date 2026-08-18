@@ -839,6 +839,49 @@ int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
         uint32_t                expert_split,
         bool                    home_rank);
 
+/* One canonical half of the TP shared expert, assigned dynamically from the
+ * replicated six-route selection.  Unassigned launches leave out/mid
+ * untouched and return success; the decision is made entirely on the GPU. */
+int ds4_gpu_tp_shared_balance_half_q8_0_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint64_t              in_dim,
+        uint64_t              shared_dim,
+        uint64_t              out_dim,
+        uint32_t              canonical_half,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *selected,
+        uint32_t              expert_split,
+        uint32_t              n_expert,
+        uint32_t              rank,
+        float                 clamp);
+int ds4_gpu_tp_shared_balance_main_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *routed,
+        const ds4_gpu_tensor *shared,
+        const ds4_gpu_tensor *selected,
+        uint32_t              expert_split,
+        uint32_t              n_expert,
+        uint32_t              rank,
+        uint32_t              n);
+int ds4_gpu_tp_shared_balance_reconstruct_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const ds4_gpu_tensor *main0,
+        const ds4_gpu_tensor *main1,
+        const ds4_gpu_tensor *extra_local,
+        const ds4_gpu_tensor *extra_peer,
+        const ds4_gpu_tensor *selected,
+        uint32_t              expert_split,
+        uint32_t              n_expert,
+        uint32_t              rank,
+        uint32_t              n);
+
 int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *mid,
         const void             *model_map,

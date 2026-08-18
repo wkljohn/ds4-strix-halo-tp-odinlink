@@ -55,7 +55,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-tp-hello test-tp-shared-balance test-roce-v2-mr test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-batch-row-shard test-rocm-q4k-row-shard-support dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-tp-hello test-tp-shared-balance test-roce-v2-mr test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-batch-row-shard test-rocm-q4k-row-shard-support test-rocm-tp-shared-balance dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
 
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
@@ -410,6 +410,15 @@ tests/test_rocm_shared_gu_swiglu_fused.o: tests/test_rocm_shared_gu_swiglu_fused
 
 tests/test_rocm_shared_gu_swiglu_fused: tests/test_rocm_shared_gu_swiglu_fused.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+tests/test_rocm_tp_shared_balance.o: tests/test_rocm_tp_shared_balance.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_tp_shared_balance.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_tp_shared_balance: tests/test_rocm_tp_shared_balance.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-tp-shared-balance: tests/test_rocm_tp_shared_balance
+	./tests/test_rocm_tp_shared_balance
 
 test-rocm-shared-gu-swiglu-fused: tests/test_rocm_shared_gu_swiglu_fused
 	./tests/test_rocm_shared_gu_swiglu_fused

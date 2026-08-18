@@ -554,6 +554,114 @@ __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+__device__ __forceinline__ static bool rocm_tp_shared_half_assigned(
+        const int32_t *selected, uint32_t expert_split,
+        uint32_t n_expert, uint32_t rank, uint32_t canonical_half) {
+    uint32_t count0 = 0u;
+    uint32_t count1 = 0u;
+#pragma unroll
+    for (uint32_t i = 0; i < 6u; i++) {
+        const int32_t expert = selected[i];
+        if (expert < 0 || (uint32_t)expert >= n_expert) return false;
+        if ((uint32_t)expert < expert_split) count0++;
+        else count1++;
+    }
+    const uint32_t heavy = count1 > count0 ? 1u : 0u;
+    const uint32_t light = 1u - heavy;
+    const uint32_t delta = heavy == 0u ? count0 - count1 : count1 - count0;
+    return rank == (delta >= 4u ? light : canonical_half);
+}
+
+__device__ __forceinline__ static uint32_t rocm_tp_shared_heavy_rank(
+        const int32_t *selected, uint32_t expert_split, uint32_t n_expert,
+        uint32_t *delta_out) {
+    uint32_t count0 = 0u;
+    uint32_t count1 = 0u;
+#pragma unroll
+    for (uint32_t i = 0; i < 6u; i++) {
+        const int32_t expert = selected[i];
+        if (expert >= 0 && (uint32_t)expert < n_expert) {
+            if ((uint32_t)expert < expert_split) count0++;
+            else count1++;
+        }
+    }
+    const uint32_t heavy = count1 > count0 ? 1u : 0u;
+    *delta_out = heavy == 0u ? count0 - count1 : count1 - count0;
+    return heavy;
+}
+
+__global__ static void tp_shared_balance_main_kernel(
+        float *out, const float *routed, const float *shared,
+        const int32_t *selected, uint32_t expert_split, uint32_t n_expert,
+        uint32_t rank, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (rocm_tp_shared_half_assigned(selected, expert_split, n_expert,
+                                     rank, rank)) {
+        out[i] = routed[i] + shared[i];
+    } else {
+        out[i] = routed[i];
+    }
+}
+
+__global__ static void tp_shared_balance_reconstruct_kernel(
+        float *out0, float *out1, const float *main0, const float *main1,
+        const float *extra_local, const float *extra_peer,
+        const int32_t *selected, uint32_t expert_split, uint32_t n_expert,
+        uint32_t rank, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint32_t delta = 0u;
+    const uint32_t heavy = rocm_tp_shared_heavy_rank(
+        selected, expert_split, n_expert, &delta);
+    if (delta < 4u) {
+        out0[i] = main0[i];
+        out1[i] = main1[i];
+        return;
+    }
+    const uint32_t light = 1u - heavy;
+    const float *extra = rank == light ? extra_local : extra_peer;
+    if (heavy == 0u) {
+        out0[i] = main0[i] + extra[i];
+        out1[i] = main1[i];
+    } else {
+        out0[i] = main0[i];
+        out1[i] = main1[i] + extra[i];
+    }
+}
+
+/* Bit-identical to the ordinary shared-x Q8_0 K-slice kernel when assigned.
+ * Every lane observes the same replicated route decision, so an unassigned
+ * block exits before touching LDS or the output. */
+__global__ static void matmul_q8_0_f32_sharedx_balance_w32_kernel(
+        float *out, const unsigned char *w, const float *x,
+        uint32_t n_blocks, uint64_t out_dim, uint64_t row_bytes,
+        const int32_t *selected, uint32_t expert_split, uint32_t n_expert,
+        uint32_t rank, uint32_t canonical_half) {
+    if (!rocm_tp_shared_half_assigned(selected, expert_split, n_expert,
+                                      rank, canonical_half)) return;
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * row_bytes;
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const unsigned char *blk = wr + (uint64_t)b * 34u;
+        const float d = q8_0_scale_broadcast_w32(blk);
+        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+        acc += d * (float)q * shx[(b << 5u) + lane];
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
 /* gfx1151 TP decode path for the attention-output expansion.
  * Four eight-lane groups consume four Q8_0 blocks per wave iteration while
  * retaining one output row per wave.  Explicit byte reads avoid relying on
@@ -1273,6 +1381,52 @@ __global__ static void shared_gate_up_swiglu_q8_0_sharedx_rows_w32_kernel(
         }
         const float s = sg / (1.0f + expf(-sg));
         mid[row] = s * su;
+    }
+}
+
+__global__ static void shared_gate_up_swiglu_q8_0_sharedx_balance_w32_kernel(
+        float *mid, const unsigned char *wg, const unsigned char *wu,
+        const float *x, uint32_t n_blocks, uint64_t out_dim,
+        uint64_t row_bytes, float clamp, const int32_t *selected,
+        uint32_t expert_split, uint32_t n_expert, uint32_t rank,
+        uint32_t canonical_half) {
+    if (!rocm_tp_shared_half_assigned(selected, expert_split, n_expert,
+                                      rank, canonical_half)) return;
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *row_g = wg + row * row_bytes;
+    const unsigned char *row_u = wu + row * row_bytes;
+    float acc_g = 0.0f;
+    float acc_u = 0.0f;
+    for (uint32_t b = 0; b < n_blocks; b++) {
+        const float xv = shx[(b << 5u) + lane];
+        const unsigned char *bg = row_g + (uint64_t)b * 34u;
+        const unsigned char *bu = row_u + (uint64_t)b * 34u;
+        const float dg = q8_0_scale_broadcast_w32(bg);
+        const float du = q8_0_scale_broadcast_w32(bu);
+        const int8_t qg = ((const int8_t *)(bg + 2u))[lane];
+        const int8_t qu = ((const int8_t *)(bu + 2u))[lane];
+        acc_g += dg * (float)qg * xv;
+        acc_u += du * (float)qu * xv;
+    }
+    const float g = warp_sum_f32(acc_g);
+    const float u = warp_sum_f32(acc_u);
+    if (lane == 0u) {
+        float sg = g;
+        float su = u;
+        if (clamp > 1.0e-6f) {
+            sg = fminf(sg, clamp);
+            su = fminf(fmaxf(su, -clamp), clamp);
+        }
+        mid[row] = (sg / (1.0f + expf(-sg))) * su;
     }
 }
 
