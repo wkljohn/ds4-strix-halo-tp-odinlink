@@ -3933,6 +3933,202 @@ static int ds4_tp_shard_prepare(const ds4_gpu_tensor *selected,
     v->active = 1;
     return 1;
 }
+
+extern "C" int ds4_gpu_rocm_q4k_row_shard_gate_up_tensor(
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *gate_scratch,
+        ds4_gpu_tensor *xq_scratch,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert,
+        uint32_t row_base, uint32_t row_count, float clamp,
+        const ds4_gpu_tensor *x) {
+    if (!mid || !gate_scratch || !xq_scratch || !model_map || !selected ||
+        !weights || !x ||
+        n_total_expert == 0u || n_expert == 0u ||
+        n_expert > DS4_ROCM_N_EXPERT_USED ||
+        expert_in_dim == 0u || expert_mid_dim == 0u ||
+        (expert_in_dim % CUDA_QK_K) != 0u ||
+        row_count == 0u || row_base > expert_mid_dim ||
+        row_count > expert_mid_dim - row_base ||
+        (row_base % CUDA_QK_K) != 0u ||
+        (row_count % CUDA_QK_K) != 0u) {
+        return 0;
+    }
+    uint64_t pair_values = 0, mid_bytes = 0, table_bytes = 0;
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint64_t xq_bytes = (uint64_t)xq_blocks * sizeof(cuda_block_q8_K);
+    if (!cuda_u64_mul_checked(n_expert, expert_mid_dim, &pair_values) ||
+        !cuda_u64_mul_checked(pair_values, sizeof(float), &mid_bytes) ||
+        !cuda_u64_mul_checked(n_total_expert, gate_expert_bytes, &table_bytes) ||
+        mid->bytes < mid_bytes || gate_scratch->bytes < mid_bytes ||
+        xq_scratch->bytes < xq_bytes ||
+        selected->bytes < (uint64_t)n_expert * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_expert * sizeof(float) ||
+        x->bytes < (uint64_t)expert_in_dim * sizeof(float)) {
+        return 0;
+    }
+    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset,
+                                               table_bytes,
+                                               "q4k row-shard gate oracle");
+    const char *up_w = cuda_model_range_ptr(model_map, up_offset,
+                                             table_bytes,
+                                             "q4k row-shard up oracle");
+    if (!gate_w || !up_w) return 0;
+    q8_K_quantize_kernel<<<dim3(xq_blocks, 1u, 1u), 256u>>>(
+        (cuda_block_q8_K *)xq_scratch->ptr,
+        (const float *)x->ptr, expert_in_dim, 1u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4k row-shard x quantize oracle launch")) return 0;
+    const dim3 grid((row_count + 127u) / 128u, n_expert, 1u);
+    if (routed_moe_q4k_decode_split_gate_up_enabled()) {
+        moe_gate_or_up_decode_q4K_row_shard_kernel<8u, false>
+            <<<grid, 128u>>>(
+                (float *)gate_scratch->ptr, NULL, gate_w,
+                (const cuda_block_q8_K *)xq_scratch->ptr,
+                (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                gate_expert_bytes, gate_row_bytes, xq_blocks,
+                expert_mid_dim, n_expert, row_base, row_count, clamp);
+        if (!cuda_ok(cudaGetLastError(),
+                     "q4k row-shard gate oracle launch")) return 0;
+        moe_gate_or_up_decode_q4K_row_shard_kernel<8u, true>
+            <<<grid, 128u>>>(
+                (float *)mid->ptr, (const float *)gate_scratch->ptr, up_w,
+                (const cuda_block_q8_K *)xq_scratch->ptr,
+                (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                gate_expert_bytes, gate_row_bytes, xq_blocks,
+                expert_mid_dim, n_expert, row_base, row_count, clamp);
+    } else {
+        moe_gate_up_mid_decode_q4K_row_shard_kernel<<<grid, 256u>>>(
+            (float *)mid->ptr, gate_w, up_w,
+            (const cuda_block_q8_K *)xq_scratch->ptr,
+            (const int32_t *)selected->ptr, (const float *)weights->ptr,
+            gate_expert_bytes, gate_row_bytes, xq_blocks, expert_mid_dim,
+            n_expert, row_base, row_count, clamp);
+    }
+    return cuda_ok(cudaGetLastError(),
+                   "q4k row-shard gate/up oracle launch");
+}
+
+extern "C" int ds4_gpu_rocm_q8k_quantize_rows_tensor(
+        ds4_gpu_tensor *q8, const ds4_gpu_tensor *x,
+        uint32_t row_width, uint32_t n_rows) {
+    if (!q8 || !x || row_width == 0u || n_rows == 0u ||
+        (row_width % CUDA_QK_K) != 0u) return 0;
+    const uint32_t blocks = row_width / CUDA_QK_K;
+    uint64_t values = 0, x_bytes = 0, q8_count = 0, q8_bytes = 0;
+    if (!cuda_u64_mul_checked(row_width, n_rows, &values) ||
+        !cuda_u64_mul_checked(values, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul_checked(blocks, n_rows, &q8_count) ||
+        !cuda_u64_mul_checked(q8_count, sizeof(cuda_block_q8_K), &q8_bytes) ||
+        x->bytes < x_bytes || q8->bytes < q8_bytes) return 0;
+    q8_K_quantize_kernel<<<dim3(blocks, n_rows, 1u), 256u>>>(
+        (cuda_block_q8_K *)q8->ptr, (const float *)x->ptr,
+        row_width, n_rows);
+    return cuda_ok(cudaGetLastError(), "q8_K row quantize oracle launch");
+}
+
+extern "C" int ds4_gpu_rocm_q8k_quantize_row_shard_tensor(
+        ds4_gpu_tensor *q8, const ds4_gpu_tensor *x,
+        uint32_t row_width, uint32_t n_rows,
+        uint32_t value_base, uint32_t value_count) {
+    if (!q8 || !x || row_width == 0u || n_rows == 0u ||
+        (row_width % CUDA_QK_K) != 0u ||
+        (value_base % CUDA_QK_K) != 0u ||
+        value_count == 0u || (value_count % CUDA_QK_K) != 0u ||
+        value_base > row_width || value_count > row_width - value_base) {
+        return 0;
+    }
+    const uint32_t full_blocks = row_width / CUDA_QK_K;
+    const uint32_t block_base = value_base / CUDA_QK_K;
+    const uint32_t block_count = value_count / CUDA_QK_K;
+    uint64_t values = 0, x_bytes = 0, q8_count = 0, q8_bytes = 0;
+    if (!cuda_u64_mul_checked(row_width, n_rows, &values) ||
+        !cuda_u64_mul_checked(values, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul_checked(full_blocks, n_rows, &q8_count) ||
+        !cuda_u64_mul_checked(q8_count, sizeof(cuda_block_q8_K), &q8_bytes) ||
+        x->bytes < x_bytes || q8->bytes < q8_bytes) return 0;
+    q8_K_quantize_row_shard_kernel<<<dim3(block_count, n_rows, 1u), 256u>>>(
+        (cuda_block_q8_K *)q8->ptr, (const float *)x->ptr,
+        row_width, n_rows, block_base, block_count);
+    return cuda_ok(cudaGetLastError(),
+                   "q8_K row-shard quantize oracle launch");
+}
+
+extern "C" int ds4_gpu_rocm_q4k_row_shard_down_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *rank0_routed,
+        ds4_gpu_tensor *rank1_routed, const ds4_gpu_tensor *rank0_add,
+        const ds4_gpu_tensor *rank1_add, const ds4_gpu_tensor *midq,
+        const void *model_map, uint64_t model_size,
+        uint64_t down_offset, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t expert_mid_dim,
+        uint32_t out_dim, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights, uint32_t n_total_expert,
+        uint32_t n_expert, uint32_t expert_split,
+        uint32_t row_base, uint32_t row_count) {
+    if (!out || !rank0_routed || !rank1_routed || !midq || !model_map ||
+        !selected || !weights ||
+        n_total_expert == 0u || n_expert == 0u ||
+        n_expert > DS4_ROCM_N_EXPERT_USED ||
+        expert_split == 0u || expert_split >= n_total_expert ||
+        expert_mid_dim == 0u || (expert_mid_dim % CUDA_QK_K) != 0u ||
+        row_count == 0u || row_base > out_dim ||
+        row_count > out_dim - row_base) {
+        return 0;
+    }
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    uint64_t table_bytes = 0, midq_count = 0, midq_bytes = 0;
+    if (!cuda_u64_mul_checked(n_total_expert, down_expert_bytes,
+                              &table_bytes) ||
+        !cuda_u64_mul_checked(n_expert, midq_blocks, &midq_count) ||
+        !cuda_u64_mul_checked(midq_count, sizeof(cuda_block_q8_K),
+                              &midq_bytes) ||
+        out->bytes < (uint64_t)out_dim * sizeof(float) ||
+        rank0_routed->bytes < (uint64_t)out_dim * sizeof(float) ||
+        rank1_routed->bytes < (uint64_t)out_dim * sizeof(float) ||
+        midq->bytes < midq_bytes ||
+        selected->bytes < (uint64_t)n_expert * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_expert * sizeof(float) ||
+        (rank0_add && rank0_add->bytes < (uint64_t)out_dim * sizeof(float)) ||
+        (rank1_add && rank1_add->bytes < (uint64_t)out_dim * sizeof(float))) {
+        return 0;
+    }
+    const char *down_w = cuda_model_range_ptr(model_map, down_offset,
+                                               table_bytes,
+                                               "q4k row-shard down oracle");
+    if (!down_w) return 0;
+    const dim3 grid((row_count + 31u) / 32u, 1u, 1u);
+    moe_down_q4K_row_shard_one_group_kernel<<<grid, 256u>>>(
+        (float *)rank0_routed->ptr,
+        down_w, (const cuda_block_q8_K *)midq->ptr,
+        (const int32_t *)selected->ptr, (const float *)weights->ptr,
+        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert,
+        0u, expert_split, row_base, row_count);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4k row-shard rank0 down oracle launch")) return 0;
+    moe_down_q4K_row_shard_one_group_kernel<<<grid, 256u>>>(
+        (float *)rank1_routed->ptr,
+        down_w, (const cuda_block_q8_K *)midq->ptr,
+        (const int32_t *)selected->ptr, (const float *)weights->ptr,
+        down_expert_bytes, down_row_bytes, midq_blocks, out_dim, n_expert,
+        expert_split, n_total_expert, row_base, row_count);
+    if (!cuda_ok(cudaGetLastError(),
+                 "q4k row-shard rank1 down oracle launch")) return 0;
+    moe_row_shard_groups_combine_kernel<<<(row_count + 255u) / 256u, 256u>>>(
+        (float *)out->ptr,
+        (const float *)rank0_routed->ptr,
+        (const float *)rank1_routed->ptr,
+        rank0_add ? (const float *)rank0_add->ptr : NULL,
+        rank1_add ? (const float *)rank1_add->ptr : NULL,
+        row_base, row_count);
+    return cuda_ok(cudaGetLastError(),
+                   "q4k row-shard group combine oracle launch");
+}
+
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in, uint32_t layer_index, bool force_resident) {
     /* DS4-TP-gfx1151 (patch 16): the addend must be folded AFTER the launch.
      *

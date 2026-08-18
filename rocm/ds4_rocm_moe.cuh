@@ -529,6 +529,68 @@ __global__ static void q8_K_quantize_kernel(cuda_block_q8_K *out, const float *x
     if (tid == 0) yb->d = 1.0f / iscale_s;
 }
 
+/* Quantize a contiguous 256-aligned slice inside every full-width row and
+ * write it directly to the matching block slots.  The block arithmetic is
+ * intentionally identical to q8_K_quantize_kernel so independently produced
+ * 1024-value halves stitch into the exact full Q8_K row. */
+__global__ static void q8_K_quantize_row_shard_kernel(
+        cuda_block_q8_K *out,
+        const float *x,
+        uint32_t row_width,
+        uint32_t n_rows,
+        uint32_t block_base,
+        uint32_t block_count) {
+    const uint32_t local_b = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (row >= n_rows || local_b >= block_count) return;
+    const uint32_t full_blocks = row_width / CUDA_QK_K;
+    const uint32_t b = block_base + local_b;
+    const float *xr = x + (uint64_t)row * row_width +
+                      (uint64_t)b * CUDA_QK_K;
+    cuda_block_q8_K *yb = out + (uint64_t)row * full_blocks + b;
+    __shared__ float abs_part[256];
+    __shared__ float val_part[256];
+    __shared__ float maxv_s;
+    __shared__ float iscale_s;
+    const uint32_t tid = threadIdx.x;
+    const float v = tid < CUDA_QK_K ? xr[tid] : 0.0f;
+    abs_part[tid] = tid < CUDA_QK_K ? fabsf(v) : 0.0f;
+    val_part[tid] = v;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+            abs_part[tid] = abs_part[tid + stride];
+            val_part[tid] = val_part[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float amax = abs_part[0];
+    if (amax == 0.0f) {
+        if (tid == 0) yb->d = 0.0f;
+        if (tid < CUDA_QK_K) yb->qs[tid] = 0;
+        if (tid < CUDA_QK_K / 16) yb->bsums[tid] = 0;
+        return;
+    }
+    if (tid == 0) {
+        maxv_s = val_part[0];
+        iscale_s = -127.0f / maxv_s;
+    }
+    __syncthreads();
+    if (tid < CUDA_QK_K) {
+        int qv = (int)lrintf(iscale_s * xr[tid]);
+        if (qv > 127) qv = 127;
+        if (qv < -128) qv = -128;
+        yb->qs[tid] = (int8_t)qv;
+    }
+    __syncthreads();
+    if (tid < CUDA_QK_K / 16) {
+        int sum = 0;
+        for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
+        yb->bsums[tid] = (int16_t)sum;
+    }
+    if (tid == 0) yb->d = 1.0f / iscale_s;
+}
+
 __global__ static DS4_ROCM_UNUSED void moe_gate_up_mid_kernel(
         float *gate_out,
         float *up_out,
@@ -2137,6 +2199,86 @@ __global__ static void moe_gate_up_mid_decode_q4K_staged_xq_kernel(
     }
 }
 
+/* Exact decode oracle for output-row sharded routed experts.  `row_base` is
+ * both the weight-row and full-mid destination offset: the two contiguous
+ * 1024-row halves can therefore be produced independently and stitched
+ * without a rearrangement kernel.  The dot, reduction, activation, routing
+ * multiply, and slot layout intentionally match the production staged-XQ
+ * kernel above. */
+__global__ static void moe_gate_up_mid_decode_q4K_row_shard_kernel(
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t row_base,
+        uint32_t row_count,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t slot = pair % n_expert;
+    const int32_t expert_i = selected[slot];
+    const float route_weight = weights[slot];
+    const uint32_t local_group_row = blockIdx.x * 128u + row_lane;
+
+    if (expert_i < 0 || route_weight == 0.0f) {
+        for (uint32_t rr = 0; rr < 4u; rr++) {
+            const uint32_t local_row = local_group_row + rr * 32u;
+            if (local_row >= row_count || lane != 0u) continue;
+            const uint32_t row = row_base + local_row;
+            mid_out[(uint64_t)pair * expert_mid_dim + row] = 0.0f;
+        }
+        return;
+    }
+
+    __shared__ cuda_block_q8_K staged_xq[16];
+    const cuda_block_q8_K *xqb = xq;
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) {
+            staged_xq[i] = xqb[i];
+        }
+        __syncthreads();
+        xqb = staged_xq;
+    }
+
+    const uint32_t expert = (uint32_t)expert_i;
+    for (uint32_t rr = 0; rr < 4u; rr++) {
+        const uint32_t local_row = local_group_row + rr * 32u;
+        if (local_row >= row_count) continue;
+        const uint32_t row = row_base + local_row;
+        const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(
+            gate_base + (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row * gate_row_bytes);
+        const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(
+            up_base + (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            gate += dev_dot_q4_K_q8_K_block(gr + b, xqb + b);
+            up += dev_dot_q4_K_q8_K_block(ur + b, xqb + b);
+        }
+        gate = quarter_warp_sum_f32(gate, lane);
+        up = quarter_warp_sum_f32(up, lane);
+        if (lane == 0u) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            mid_out[(uint64_t)pair * expert_mid_dim + row] =
+                (gate / (1.0f + expf(-gate))) * up * route_weight;
+        }
+    }
+}
+
 /* Experimental one-token Q4_K path with one weight projection per kernel.
  * The fused gate/up kernel keeps both Q4_K dot products live and is register
  * heavy on gfx1151.  Splitting the projections may admit another resident
@@ -2191,6 +2333,84 @@ __global__ static void moe_gate_or_up_decode_q4K_staged_xq_kernel(
                                  (row_subgroups * ROWS_PER_SUBGROUP) +
                              row_lane + rr * row_subgroups;
         if (row >= expert_mid_dim) continue;
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+            weight_base + (uint64_t)expert * expert_bytes +
+            (uint64_t)row * row_bytes);
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            acc += dev_dot_q4_K_q8_K_block(wr + b, xqb + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0u) {
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            if constexpr (APPLY_EPILOGUE) {
+                float gate = gate_in[off];
+                float up = acc;
+                if (clamp > 1.0e-6f) {
+                    if (gate > clamp) gate = clamp;
+                    if (up > clamp) up = clamp;
+                    if (up < -clamp) up = -clamp;
+                }
+                proj_out[off] = (gate / (1.0f + expf(-gate))) * up *
+                                route_weight;
+            } else {
+                proj_out[off] = acc;
+            }
+        }
+    }
+}
+
+template <uint32_t ROWS_PER_SUBGROUP, bool APPLY_EPILOGUE>
+__global__ static void moe_gate_or_up_decode_q4K_row_shard_kernel(
+        float *proj_out,
+        const float *gate_in,
+        const char *weight_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t expert_bytes,
+        uint64_t row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t row_base,
+        uint32_t row_count,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t row_subgroups = blockDim.x >> 3u;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t slot = pair % n_expert;
+    const int32_t expert_i = selected[slot];
+    const float route_weight = weights[slot];
+    if (expert_i < 0 || route_weight == 0.0f) {
+        for (uint32_t rr = 0; rr < ROWS_PER_SUBGROUP; rr++) {
+            const uint32_t local_row = blockIdx.x *
+                                           (row_subgroups * ROWS_PER_SUBGROUP) +
+                                       row_lane + rr * row_subgroups;
+            if (local_row < row_count && lane == 0u) {
+                const uint32_t row = row_base + local_row;
+                proj_out[(uint64_t)pair * expert_mid_dim + row] = 0.0f;
+            }
+        }
+        return;
+    }
+    __shared__ cuda_block_q8_K staged_xq[16];
+    const cuda_block_q8_K *xqb = xq;
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) {
+            staged_xq[i] = xqb[i];
+        }
+        __syncthreads();
+        xqb = staged_xq;
+    }
+    const uint32_t expert = (uint32_t)expert_i;
+    for (uint32_t rr = 0; rr < ROWS_PER_SUBGROUP; rr++) {
+        const uint32_t local_row = blockIdx.x *
+                                       (row_subgroups * ROWS_PER_SUBGROUP) +
+                                   row_lane + rr * row_subgroups;
+        if (local_row >= row_count) continue;
+        const uint32_t row = row_base + local_row;
         const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
             weight_base + (uint64_t)expert * expert_bytes +
             (uint64_t)row * row_bytes);
@@ -2634,6 +2854,72 @@ __global__ static void moe_down_q4K_sum6_staged_midq_kernel(
         if (lane == 0) total += acc;
     }
     if (lane == 0) out[row] = add_in ? total + add_in[row] : total;
+}
+
+/* Exact output-row sharded down projection for one original ownership group.
+ * This deliberately retains the production sum6 kernel's single accumulator.
+ * A prior one-launch/two-accumulator form changed low bits under -ffast-math
+ * even though its source-level grouping was equivalent. */
+__global__ static void moe_down_q4K_row_shard_one_group_kernel(
+        float *group_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t expert_lo,
+        uint32_t expert_hi,
+        uint32_t row_base,
+        uint32_t row_count) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t local_row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (local_row >= row_count) return;
+    const uint32_t row = row_base + local_row;
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        if (weights[slot] == 0.0f) continue;
+        const int32_t expert_i = selected[slot];
+        if (expert_i < 0) continue;
+        if ((uint32_t)expert_i < expert_lo ||
+            (uint32_t)expert_i >= expert_hi) continue;
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+            down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+            (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) group_out[row] = total;
+}
+
+__global__ static void moe_row_shard_groups_combine_kernel(
+        float *out,
+        const float *rank0_routed,
+        const float *rank1_routed,
+        const float *rank0_add,
+        const float *rank1_add,
+        uint32_t row_base,
+        uint32_t row_count) {
+    const uint32_t local_row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (local_row >= row_count) return;
+    const uint32_t row = row_base + local_row;
+    float group0 = rank0_routed[row];
+    float group1 = rank1_routed[row];
+    if (rank0_add) group0 += rank0_add[row];
+    if (rank1_add) group1 += rank1_add[row];
+    volatile float rounded0 = group0;
+    volatile float rounded1 = group1;
+    out[row] = rounded0 + rounded1;
 }
 
 __global__ static void moe_down_q4K_qwarp32_kernel(
