@@ -168,6 +168,7 @@ a stalled request even while decode is progressing.
 - [RoCE v2 bring-up and A/B results](research-results/roce-v2-2026-08-14/)
 - [OdinLink integration record](ODINLINK.md)
 - [Kernel and architecture reports](docs/)
+- [OpenAI-compatible server benchmark](docs/API-BENCHMARK.md)
 - [Safe upstream synchronization](docs/UPSTREAM-SYNC.md)
 
 To prepare—but not automatically commit—an upstream update:
