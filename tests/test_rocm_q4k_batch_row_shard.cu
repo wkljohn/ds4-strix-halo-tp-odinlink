@@ -63,6 +63,20 @@ static void pack_q4k_table(unsigned char *dst, uint32_t experts,
     }
 }
 
+static void pack_q4k_row_span(unsigned char *dst, const unsigned char *src,
+                              uint32_t experts, uint32_t full_rows,
+                              uint32_t row_base, uint32_t row_count,
+                              uint64_t row_bytes) {
+    const uint64_t full_expert_bytes = (uint64_t)full_rows * row_bytes;
+    const uint64_t packed_expert_bytes = (uint64_t)row_count * row_bytes;
+    for (uint32_t expert = 0; expert < experts; expert++) {
+        memcpy(dst + (uint64_t)expert * packed_expert_bytes,
+               src + (uint64_t)expert * full_expert_bytes +
+                   (uint64_t)row_base * row_bytes,
+               (size_t)packed_expert_bytes);
+    }
+}
+
 static int alloc_tensor(ds4_gpu_tensor *t, uint64_t bytes) {
     memset(t, 0, sizeof(*t));
     return ds4_gpu_tensor_alloc_on(t, 0, bytes) == 0;
@@ -142,6 +156,9 @@ static int compare_compact_half(const char *stage, uint32_t n_tokens,
 static int run_batch_case(
         uint32_t n_tokens, const void *model, uint64_t model_bytes,
         uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+        const uint64_t packed_gate_off[2],
+        const uint64_t packed_up_off[2],
+        const uint64_t packed_down_off[2],
         uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
         uint64_t down_expert_bytes, uint64_t down_row_bytes) {
     const uint32_t pairs = n_tokens * N_USED;
@@ -233,9 +250,10 @@ static int run_batch_case(
         const uint32_t row_base = half * mid_half;
         if (!ds4_gpu_rocm_q4k_batch_row_shard_gate_up_tensor(
                 &gate_half, &up_half, &mid_compact, &xq, model, model_bytes,
-                gate_off, up_off, gate_expert_bytes, gate_row_bytes,
+                packed_gate_off[half], packed_up_off[half],
+                (uint64_t)mid_half * gate_row_bytes, gate_row_bytes,
                 IN_DIM, MID_DIM, &selected, &weights, N_TOTAL_EXPERT, N_USED,
-                n_tokens, row_base, mid_half, 0.0f, &x) ||
+                n_tokens, 0u, mid_half, 0.0f, &x) ||
             !ds4_gpu_tensor_read(&mid_compact, 0, hhalf, mid_half_bytes) ||
             !compare_compact_half(half == 0u ? "gate-low" : "gate-high",
                                   n_tokens, href_mid, hhalf, pairs, MID_DIM,
@@ -254,9 +272,11 @@ static int run_batch_case(
     for (uint32_t half = 0; half < 2u; half++) {
         const uint32_t row_base = half * out_half;
         if (!ds4_gpu_rocm_q4k_batch_row_shard_down_tensor(
-                &down_compact, &midq, &mid_full, model, model_bytes, down_off,
-                down_expert_bytes, down_row_bytes, MID_DIM, OUT_DIM, &selected,
-                N_TOTAL_EXPERT, N_USED, n_tokens, row_base, out_half) ||
+                &down_compact, &midq, &mid_full, model, model_bytes,
+                packed_down_off[half],
+                (uint64_t)out_half * down_row_bytes, down_row_bytes,
+                MID_DIM, OUT_DIM, &selected, N_TOTAL_EXPERT, N_USED,
+                n_tokens, 0u, out_half) ||
             !ds4_gpu_tensor_read(&down_compact, 0, hhalf, down_half_bytes) ||
             !compare_compact_half(half == 0u ? "down-low" : "down-high",
                                   n_tokens, href_down, hhalf, pairs, OUT_DIM,
@@ -347,7 +367,22 @@ int main(void) {
     const uint64_t gate_off = 0;
     const uint64_t up_off = N_TOTAL_EXPERT * gate_expert_bytes;
     const uint64_t down_off = up_off + N_TOTAL_EXPERT * gate_expert_bytes;
-    const uint64_t model_bytes = down_off + N_TOTAL_EXPERT * down_expert_bytes;
+    const uint64_t full_model_bytes = down_off +
+                                      N_TOTAL_EXPERT * down_expert_bytes;
+    const uint64_t packed_gate_bytes =
+        (uint64_t)N_TOTAL_EXPERT * (MID_DIM / 2u) * gate_row_bytes;
+    const uint64_t packed_down_bytes =
+        (uint64_t)N_TOTAL_EXPERT * (OUT_DIM / 2u) * down_row_bytes;
+    uint64_t packed_gate_off[2], packed_up_off[2], packed_down_off[2];
+    uint64_t model_bytes = full_model_bytes;
+    for (uint32_t half = 0; half < 2u; half++) {
+        packed_gate_off[half] = model_bytes;
+        model_bytes += packed_gate_bytes;
+        packed_up_off[half] = model_bytes;
+        model_bytes += packed_gate_bytes;
+        packed_down_off[half] = model_bytes;
+        model_bytes += packed_down_bytes;
+    }
     unsigned char *model = (unsigned char *)malloc((size_t)model_bytes);
     CHECK(model, "allocate synthetic batch model");
     pack_q4k_table(model + gate_off, N_TOTAL_EXPERT, MID_DIM,
@@ -356,6 +391,20 @@ int main(void) {
                    (uint32_t)in_blocks, 37u);
     pack_q4k_table(model + down_off, N_TOTAL_EXPERT, OUT_DIM,
                    (uint32_t)mid_blocks, 73u);
+    for (uint32_t half = 0; half < 2u; half++) {
+        pack_q4k_row_span(model + packed_gate_off[half], model + gate_off,
+                          N_TOTAL_EXPERT, MID_DIM,
+                          half * (MID_DIM / 2u), MID_DIM / 2u,
+                          gate_row_bytes);
+        pack_q4k_row_span(model + packed_up_off[half], model + up_off,
+                          N_TOTAL_EXPERT, MID_DIM,
+                          half * (MID_DIM / 2u), MID_DIM / 2u,
+                          gate_row_bytes);
+        pack_q4k_row_span(model + packed_down_off[half], model + down_off,
+                          N_TOTAL_EXPERT, OUT_DIM,
+                          half * (OUT_DIM / 2u), OUT_DIM / 2u,
+                          down_row_bytes);
+    }
     CHECK(ds4_gpu_set_model_map(model, model_bytes), "install batch model map");
     CHECK(EXPERT_SPLIT * 2u == N_TOTAL_EXPERT,
           "ordinary TP split must be balanced");
@@ -364,6 +413,7 @@ int main(void) {
     for (uint32_t i = 0; i < sizeof(token_cases) / sizeof(token_cases[0]); i++) {
         CHECK(run_batch_case(token_cases[i], model, model_bytes,
                              gate_off, up_off, down_off,
+                             packed_gate_off, packed_up_off, packed_down_off,
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes),
               "exact production-kernel batch row-shard oracle");
