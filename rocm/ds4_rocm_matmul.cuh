@@ -24,16 +24,27 @@ static void cuda_launch_q8_batch_sharedx_bt(
     }
 }
 
-/* Experimental cache-free prefill tile.  M=128 lets eight waves reuse the
- * same 64-token activation tile across twice as many output rows.  Keep this
- * opt-in until the full TP fingerprint and both RDMA transports pass. */
+/* Cache-free gfx1151 prefill tile. M=128 lets eight waves reuse the same
+ * 64-token activation tile across twice as many output rows. */
 static int q8_batch_wmma_m128_enabled(void) {
     static int enabled = -1;
+    static int gfx1151;
     if (enabled < 0) {
         const char *value = getenv("DS4_ROCM_Q8_BATCH_WMMA_M128");
-        enabled = value != NULL && strcmp(value, "1") == 0;
+        const char *disable = getenv("DS4_ROCM_DISABLE_Q8_BATCH_WMMA_M128");
+        enabled = (value == NULL || strcmp(value, "0") != 0) &&
+                  !(disable != NULL && strcmp(disable, "1") == 0);
+        int device = 0;
+        cudaDeviceProp prop;
+        memset(&prop, 0, sizeof(prop));
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaGetDeviceProperties(&prop, device) == cudaSuccess) {
+            gfx1151 = strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        } else {
+            (void)cudaGetLastError();
+        }
     }
-    return enabled;
+    return enabled && gfx1151;
 }
 
 static unsigned attention_output_expand_threads(void) {

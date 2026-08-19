@@ -9,6 +9,14 @@ Q2_MODEL=${2:?usage: pre-main-tp-smoke.sh Q4_MODEL Q2_MODEL}
 Q4_FNV64=${DS4_PREMAIN_Q4_FNV64:-5f8a983422299d76}
 Q2_FNV64=${DS4_PREMAIN_Q2_FNV64:-f9cb3a8a17e95c71}
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+BENCH_CONFIG=${DS4_BENCH_CONFIG:-$REPO/bench.env.local}
+if [[ -r $BENCH_CONFIG ]]; then
+  # Resolve the same durable output directory as run-tp-ds4-bench.sh. The two
+  # scripts must not disagree when bench.env.local moves research artifacts.
+  # shellcheck disable=SC1090
+  source "$BENCH_CONFIG"
+fi
+PREMAIN_OUT=${DS4_BENCH_OUT:-$REPO/research-results/bench-runs}
 
 # The hello regression test proves independently launched ranks reject an
 # IQ2 integer-WMMA mismatch before entering a different MoE arithmetic path.
@@ -31,10 +39,10 @@ DS4_BENCH_CANDIDATE=1 DS4_BENCH_EXPECT_FNV64="$Q2_FNV64" \
   "$REPO/run-tp-ds4-bench.sh" "premain-q2-$STAMP" "$Q2_MODEL"
 
 grep -q 'negotiated=0x.* iq2_i8=1 ' \
-  "$REPO/research-results/quant-comparison-2026-08-10/coordinator-premain-q2-$STAMP.log"
+  "$PREMAIN_OUT/coordinator-premain-q2-$STAMP.log"
 grep -q 'negotiated=0x.* iq2_i8=1 ' \
-  "$REPO/research-results/quant-comparison-2026-08-10/worker-premain-q2-$STAMP.log"
+  "$PREMAIN_OUT/worker-premain-q2-$STAMP.log"
 grep -q 'IQ2_XXS fused integer WMMA active tokens=16 hot_experts=' \
-  "$REPO/research-results/quant-comparison-2026-08-10/coordinator-premain-q2-$STAMP.log"
+  "$PREMAIN_OUT/coordinator-premain-q2-$STAMP.log"
 
 echo "PRE_MAIN_TP_SMOKE_PASSED q4=$Q4_FNV64 q2=$Q2_FNV64"
