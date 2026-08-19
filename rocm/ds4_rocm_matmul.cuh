@@ -51,8 +51,15 @@ static int q8_batch_wmma_m128_enabled(void) {
  * barrier.  The 136-half LDS stride is essential on gfx1151; the natural
  * 128-half stride aliases token rows onto one bank phase. */
 static int q8_batch_wmma_k128_padded_enabled(void) {
-    const char *value = getenv("DS4_ROCM_Q8_BATCH_WMMA_K128_PADDED");
-    return value && value[0] == '1' && value[1] == '\0';
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_ROCM_Q8_BATCH_WMMA_K128_PADDED");
+        const char *disable = getenv(
+                "DS4_ROCM_DISABLE_Q8_BATCH_WMMA_K128_PADDED");
+        enabled = (value == NULL || strcmp(value, "0") != 0) &&
+                  !(disable != NULL && strcmp(disable, "1") == 0);
+    }
+    return enabled;
 }
 
 static unsigned attention_output_expand_threads(void) {
