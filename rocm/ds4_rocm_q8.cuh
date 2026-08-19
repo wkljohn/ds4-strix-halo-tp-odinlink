@@ -879,14 +879,15 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kerne
 typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
 
-/* Four-wave, 64x64 output-tile Q8_0 batched GEMM for large prefill chunks.
+/* Multi-wave, M_TILE x 64 output-tile Q8_0 batched GEMM for large prefill chunks.
  * This is the hipfire/llama.cpp-style MMQ shape adapted to DS4's existing
  * F32 activation buffers: each block stages a 64-token x 32-K activation tile
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
  * the token batch is large enough to amortize the bigger tile. */
-__launch_bounds__(128, 2)
-__global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
+template <uint32_t M_TILE>
+__launch_bounds__(2u * M_TILE, M_TILE == 64u ? 2u : 1u)
+__global__ static void matmul_q8_0_f32_batch_wmma_kernel(
         float *out,
         const unsigned char *w,
         const float *x,
@@ -894,10 +895,11 @@ __global__ static void matmul_q8_0_f32_batch_wmma_4w_kernel(
         uint32_t in_dim,
         uint32_t out_dim,
         uint64_t row_bytes) {
-    constexpr uint32_t M_TILE = 64u;
+    static_assert(M_TILE == 64u || M_TILE == 128u,
+                  "validated Q8 WMMA output-row tiles");
     constexpr uint32_t N_TILE = 64u;
     constexpr uint32_t K_TILE = 32u;
-    constexpr uint32_t WARPS = 4u;
+    constexpr uint32_t WARPS = M_TILE / 16u;
     constexpr uint32_t M_PER_WARP = M_TILE / WARPS;
     constexpr uint32_t N_TILES_PER_WARP = N_TILE / 16u;
 

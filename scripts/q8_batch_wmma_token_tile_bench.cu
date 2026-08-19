@@ -1,6 +1,7 @@
 // Small-step harness for increasing token reuse in the generic Q8_0 prefill
-// WMMA kernel. It compares the production 64-token tile with a 128-token
-// candidate before any production dispatch is changed.
+// WMMA kernel. It compares the production 64x64 output/token tile with both
+// a 64x128 token-reuse candidate and a 128x64 output-row-reuse candidate
+// before any production dispatch is changed.
 //
 // Build:
 //   /opt/rocm/bin/hipcc -O3 -ffast-math -fno-finite-math-only \
@@ -28,13 +29,14 @@ static void check(hipError_t rc, const char *where) {
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
-template <uint32_t N_TILE>
-__launch_bounds__(128, 1)
+template <uint32_t M_TILE, uint32_t N_TILE>
+__launch_bounds__(2u * M_TILE, 1)
 __global__ static void q8_wmma_kernel(float *out, const unsigned char *w,
         const float *x, uint32_t n_tokens, uint32_t in_dim,
         uint32_t out_dim, uint64_t row_bytes) {
+    static_assert(M_TILE == 64u || M_TILE == 128u, "tested output-row tiles");
     static_assert(N_TILE == 64u || N_TILE == 128u, "tested token tiles");
-    constexpr uint32_t M_TILE = 64u, K_TILE = 32u, WARPS = 4u;
+    constexpr uint32_t K_TILE = 32u, WARPS = M_TILE / 16u;
     constexpr uint32_t M_PER_WARP = M_TILE / WARPS;
     constexpr uint32_t NT = N_TILE / 16u;
     const uint32_t block_m = blockIdx.x * M_TILE;
@@ -102,7 +104,7 @@ struct Buffers {
     std::vector<unsigned char> w;
     std::vector<float> x;
     unsigned char *dw = nullptr;
-    float *dx = nullptr, *d64 = nullptr, *d128 = nullptr;
+    float *dx = nullptr, *d64 = nullptr, *dn128 = nullptr, *dm128 = nullptr;
     Buffers(uint32_t t, uint32_t k, uint32_t m)
         : tokens(t), in_dim(k), out_dim(m), row_bytes((uint64_t)(k / 32u) * 34u),
           w((uint64_t)m * row_bytes), x((uint64_t)t * k) {
@@ -123,31 +125,35 @@ struct Buffers {
         check(hipMalloc(&dw, w.size()), "weights allocation");
         check(hipMalloc(&dx, x.size() * sizeof(float)), "activation allocation");
         check(hipMalloc(&d64, out_bytes), "64 output allocation");
-        check(hipMalloc(&d128, out_bytes), "128 output allocation");
+        check(hipMalloc(&dn128, out_bytes), "N128 output allocation");
+        check(hipMalloc(&dm128, out_bytes), "M128 output allocation");
         check(hipMemcpy(dw, w.data(), w.size(), hipMemcpyHostToDevice), "weights copy");
         check(hipMemcpy(dx, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice), "activation copy");
     }
     ~Buffers() {
-        (void)hipFree(dw); (void)hipFree(dx); (void)hipFree(d64); (void)hipFree(d128);
+        (void)hipFree(dw); (void)hipFree(dx); (void)hipFree(d64);
+        (void)hipFree(dn128); (void)hipFree(dm128);
     }
 };
 
-template <uint32_t N_TILE>
+template <uint32_t M_TILE, uint32_t N_TILE>
 static void launch(Buffers &b, float *out) {
-    const dim3 grid((b.out_dim + 63u) / 64u, (b.tokens + N_TILE - 1u) / N_TILE);
-    q8_wmma_kernel<N_TILE><<<grid, 128u, N_TILE * 32u * sizeof(_Float16)>>>(
+    const dim3 grid((b.out_dim + M_TILE - 1u) / M_TILE,
+                    (b.tokens + N_TILE - 1u) / N_TILE);
+    q8_wmma_kernel<M_TILE, N_TILE>
+        <<<grid, 2u * M_TILE, N_TILE * 32u * sizeof(_Float16)>>>(
         out, b.dw, b.dx, b.tokens, b.in_dim, b.out_dim, b.row_bytes);
 }
 
-template <uint32_t N_TILE>
+template <uint32_t M_TILE, uint32_t N_TILE>
 static float elapsed(Buffers &b, float *out, int iterations) {
     hipEvent_t start, stop;
     check(hipEventCreate(&start), "start event");
     check(hipEventCreate(&stop), "stop event");
-    for (int i = 0; i < 2; ++i) launch<N_TILE>(b, out);
+    for (int i = 0; i < 2; ++i) launch<M_TILE, N_TILE>(b, out);
     check(hipDeviceSynchronize(), "warmup");
     check(hipEventRecord(start), "record start");
-    for (int i = 0; i < iterations; ++i) launch<N_TILE>(b, out);
+    for (int i = 0; i < iterations; ++i) launch<M_TILE, N_TILE>(b, out);
     check(hipEventRecord(stop), "record stop");
     check(hipEventSynchronize(stop), "sync stop");
     float ms = 0.0f;
@@ -160,21 +166,28 @@ static float elapsed(Buffers &b, float *out, int iterations) {
 int main() {
     {
         Buffers b(193u, 96u, 80u);
-        launch<64>(b, b.d64); launch<128>(b, b.d128);
+        launch<64, 64>(b, b.d64);
+        launch<64, 128>(b, b.dn128);
+        launch<128, 64>(b, b.dm128);
         check(hipDeviceSynchronize(), "correctness kernels");
         const size_t n = (size_t)b.tokens * b.out_dim;
-        std::vector<float> a(n), c(n);
+        std::vector<float> a(n), c(n), d(n);
         check(hipMemcpy(a.data(), b.d64, n * sizeof(float), hipMemcpyDeviceToHost), "copy 64");
-        check(hipMemcpy(c.data(), b.d128, n * sizeof(float), hipMemcpyDeviceToHost), "copy 128");
-        size_t bit_mismatch = 0;
-        double max_abs = 0.0;
+        check(hipMemcpy(c.data(), b.dn128, n * sizeof(float), hipMemcpyDeviceToHost), "copy N128");
+        check(hipMemcpy(d.data(), b.dm128, n * sizeof(float), hipMemcpyDeviceToHost), "copy M128");
+        size_t n128_mismatch = 0, m128_mismatch = 0;
+        double n128_max_abs = 0.0, m128_max_abs = 0.0;
         for (size_t i = 0; i < n; ++i) {
-            if (std::memcmp(&a[i], &c[i], sizeof(float))) ++bit_mismatch;
-            max_abs = std::max(max_abs, std::fabs((double)a[i] - c[i]));
+            if (std::memcmp(&a[i], &c[i], sizeof(float))) ++n128_mismatch;
+            if (std::memcmp(&a[i], &d[i], sizeof(float))) ++m128_mismatch;
+            n128_max_abs = std::max(n128_max_abs, std::fabs((double)a[i] - c[i]));
+            m128_max_abs = std::max(m128_max_abs, std::fabs((double)a[i] - d[i]));
         }
-        std::printf("correctness bit_mismatches=%zu/%zu max_abs=%.9g\n",
-                    bit_mismatch, n, max_abs);
-        if (bit_mismatch) return 2;
+        std::printf("correctness n128_bit_mismatches=%zu/%zu n128_max_abs=%.9g "
+                    "m128_bit_mismatches=%zu/%zu m128_max_abs=%.9g\n",
+                    n128_mismatch, n, n128_max_abs,
+                    m128_mismatch, n, m128_max_abs);
+        if (n128_mismatch || m128_mismatch) return 2;
     }
     struct Shape { const char *name; uint32_t in_dim, out_dim; };
     const Shape shapes[] = {
@@ -187,11 +200,15 @@ int main() {
     for (const Shape &s : shapes) {
         Buffers b(2048u, s.in_dim, s.out_dim);
         const int iterations = s.out_dim >= 8192u ? 3 : 6;
-        const float ms64 = elapsed<64>(b, b.d64, iterations);
-        const float ms128 = elapsed<128>(b, b.d128, iterations);
-        std::printf("shape=%s tokens=2048 in=%u out=%u tile64_ms=%.4f tile128_ms=%.4f change=%+.1f%%\n",
-                    s.name, s.in_dim, s.out_dim, ms64, ms128,
-                    100.0f * (ms128 / ms64 - 1.0f));
+        const float ms64 = elapsed<64, 64>(b, b.d64, iterations);
+        const float msn128 = elapsed<64, 128>(b, b.dn128, iterations);
+        const float msm128 = elapsed<128, 64>(b, b.dm128, iterations);
+        std::printf("shape=%s tokens=2048 in=%u out=%u tile64_ms=%.4f "
+                    "n128_ms=%.4f n128_change=%+.1f%% m128_ms=%.4f "
+                    "m128_change=%+.1f%%\n",
+                    s.name, s.in_dim, s.out_dim, ms64,
+                    msn128, 100.0f * (msn128 / ms64 - 1.0f),
+                    msm128, 100.0f * (msm128 / ms64 - 1.0f));
     }
     return 0;
 }

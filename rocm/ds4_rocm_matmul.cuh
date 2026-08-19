@@ -24,6 +24,18 @@ static void cuda_launch_q8_batch_sharedx_bt(
     }
 }
 
+/* Experimental cache-free prefill tile.  M=128 lets eight waves reuse the
+ * same 64-token activation tile across twice as many output rows.  Keep this
+ * opt-in until the full TP fingerprint and both RDMA transports pass. */
+static int q8_batch_wmma_m128_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_ROCM_Q8_BATCH_WMMA_M128");
+        enabled = value != NULL && strcmp(value, "1") == 0;
+    }
+    return enabled;
+}
+
 static unsigned attention_output_expand_threads(void) {
     static unsigned threads;
     if (threads == 0u) {
@@ -783,18 +795,32 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             out_dim >= 1024u &&
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
-            const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
-                            (uint32_t)((n_tok + 63u) / 64u),
-                            1u);
-            matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
-                    (float *)out->ptr,
-                    reinterpret_cast<const unsigned char *>(wptr),
-                    (const float *)x->ptr,
-                    (uint32_t)n_tok,
-                    (uint32_t)in_dim,
-                    (uint32_t)out_dim,
-                    blocks * 34u);
-            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+            if (q8_batch_wmma_m128_enabled()) {
+                const dim3 grid((uint32_t)((out_dim + 127u) / 128u),
+                                (uint32_t)((n_tok + 63u) / 64u),
+                                1u);
+                matmul_q8_0_f32_batch_wmma_kernel<128u><<<grid, 256u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+            } else {
+                const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
+                                (uint32_t)((n_tok + 63u) / 64u),
+                                1u);
+                matmul_q8_0_f32_batch_wmma_kernel<64u><<<grid, 128u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+            }
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma launch");
         }
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
