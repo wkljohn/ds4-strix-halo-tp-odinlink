@@ -47,6 +47,14 @@ static int q8_batch_wmma_m128_enabled(void) {
     return enabled && gfx1151;
 }
 
+/* Research candidate: group four Q8 blocks under one activation staging
+ * barrier.  The 136-half LDS stride is essential on gfx1151; the natural
+ * 128-half stride aliases token rows onto one bank phase. */
+static int q8_batch_wmma_k128_padded_enabled(void) {
+    const char *value = getenv("DS4_ROCM_Q8_BATCH_WMMA_K128_PADDED");
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
 static unsigned attention_output_expand_threads(void) {
     static unsigned threads;
     if (threads == 0u) {
@@ -810,14 +818,25 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 const dim3 grid((uint32_t)((out_dim + 127u) / 128u),
                                 (uint32_t)((n_tok + 63u) / 64u),
                                 1u);
-                matmul_q8_0_f32_batch_wmma_kernel<128u><<<grid, 256u>>>(
-                        (float *)out->ptr,
-                        reinterpret_cast<const unsigned char *>(wptr),
-                        (const float *)x->ptr,
-                        (uint32_t)n_tok,
-                        (uint32_t)in_dim,
-                        (uint32_t)out_dim,
-                        blocks * 34u);
+                if (out_dim >= 1024u && q8_batch_wmma_k128_padded_enabled()) {
+                    matmul_q8_0_f32_batch_wmma_kernel<128u, 128u><<<grid, 256u>>>(
+                            (float *)out->ptr,
+                            reinterpret_cast<const unsigned char *>(wptr),
+                            (const float *)x->ptr,
+                            (uint32_t)n_tok,
+                            (uint32_t)in_dim,
+                            (uint32_t)out_dim,
+                            blocks * 34u);
+                } else {
+                    matmul_q8_0_f32_batch_wmma_kernel<128u><<<grid, 256u>>>(
+                            (float *)out->ptr,
+                            reinterpret_cast<const unsigned char *>(wptr),
+                            (const float *)x->ptr,
+                            (uint32_t)n_tok,
+                            (uint32_t)in_dim,
+                            (uint32_t)out_dim,
+                            blocks * 34u);
+                }
             } else {
                 const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
                                 (uint32_t)((n_tok + 63u) / 64u),

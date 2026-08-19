@@ -885,7 +885,7 @@ typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;
  * into LDS as f16, while each wave owns 16 output rows and computes four
  * 16-token WMMA columns.  It is opt-in from host code because it only wins once
  * the token batch is large enough to amortize the bigger tile. */
-template <uint32_t M_TILE>
+template <uint32_t M_TILE, uint32_t K_STAGE = 32u>
 __launch_bounds__(2u * M_TILE, M_TILE == 64u ? 2u : 1u)
 __global__ static void matmul_q8_0_f32_batch_wmma_kernel(
         float *out,
@@ -897,8 +897,12 @@ __global__ static void matmul_q8_0_f32_batch_wmma_kernel(
         uint64_t row_bytes) {
     static_assert(M_TILE == 64u || M_TILE == 128u,
                   "validated Q8 WMMA output-row tiles");
+    static_assert(K_STAGE == 32u || K_STAGE == 128u,
+                  "validated Q8 WMMA K stages");
     constexpr uint32_t N_TILE = 64u;
     constexpr uint32_t K_TILE = 32u;
+    constexpr uint32_t BLOCKS_PER_STAGE = K_STAGE / K_TILE;
+    constexpr uint32_t LDS_STRIDE = K_STAGE == 128u ? 136u : K_STAGE;
     constexpr uint32_t WARPS = M_TILE / 16u;
     constexpr uint32_t M_PER_WARP = M_TILE / WARPS;
     constexpr uint32_t N_TILES_PER_WARP = N_TILE / 16u;
@@ -922,55 +926,63 @@ __global__ static void matmul_q8_0_f32_batch_wmma_kernel(
     ds4_q8_float8_t acc2 = acc0;
     ds4_q8_float8_t acc3 = acc0;
 
-    __shared__ _Float16 lds_x[N_TILE * K_TILE];
+    __shared__ _Float16 lds_x[N_TILE * LDS_STRIDE];
 
-    for (uint32_t bi = 0; bi < n_blocks; bi++) {
-        for (uint32_t j = tid; j < N_TILE * K_TILE; j += blockDim.x) {
-            const uint32_t nt = j >> 5u;
-            const uint32_t kk = j & 31u;
+    for (uint32_t stage_bi = 0; stage_bi < n_blocks;
+         stage_bi += BLOCKS_PER_STAGE) {
+        for (uint32_t j = tid; j < N_TILE * K_STAGE; j += blockDim.x) {
+            const uint32_t nt = j / K_STAGE;
+            const uint32_t kk = j % K_STAGE;
             const uint32_t tok = block_n + nt;
             float xv = 0.0f;
-            if (tok < n_tokens) xv = x[(uint64_t)tok * in_dim + bi * 32u + kk];
-            lds_x[j] = (_Float16)xv;
+            if (tok < n_tokens && stage_bi * K_TILE + kk < in_dim) {
+                xv = x[(uint64_t)tok * in_dim + stage_bi * K_TILE + kk];
+            }
+            lds_x[nt * LDS_STRIDE + kk] = (_Float16)xv;
         }
         __syncthreads();
 
-        const unsigned char *bp = row_base + (uint64_t)bi * 34u;
-        _Float16 sc;
-        {
-            uint16_t s_bits;
-            __builtin_memcpy(&s_bits, bp, 2);
-            __builtin_memcpy(&sc, &s_bits, 2);
-        }
+        for (uint32_t sb = 0;
+             sb < BLOCKS_PER_STAGE && stage_bi + sb < n_blocks; sb++) {
+            const unsigned char *bp = row_base +
+                (uint64_t)(stage_bi + sb) * 34u;
+            _Float16 sc;
+            {
+                uint16_t s_bits;
+                __builtin_memcpy(&s_bits, bp, 2);
+                __builtin_memcpy(&sc, &s_bits, 2);
+            }
 
-        const int8_t *w0 = (const int8_t *)(bp + 2u);
-        const int8_t *w1 = (const int8_t *)(bp + 18u);
-        ds4_q8_half16_t a0;
-        ds4_q8_half16_t a1;
+            const int8_t *w0 = (const int8_t *)(bp + 2u);
+            const int8_t *w1 = (const int8_t *)(bp + 18u);
+            ds4_q8_half16_t a0;
+            ds4_q8_half16_t a1;
 #pragma unroll
-        for (uint32_t i = 0; i < 16u; i++) {
-            a0[i] = sc * (_Float16)(float)(int)w0[i];
-            a1[i] = sc * (_Float16)(float)(int)w1[i];
-        }
+            for (uint32_t i = 0; i < 16u; i++) {
+                a0[i] = sc * (_Float16)(float)(int)w0[i];
+                a1[i] = sc * (_Float16)(float)(int)w1[i];
+            }
 
 #pragma unroll
-        for (uint32_t ntile = 0; ntile < N_TILES_PER_WARP; ntile++) {
-            const uint32_t nt = ntile * 16u + lane16;
-            const _Float16 *xb = lds_x + nt * K_TILE;
-            const ds4_q8_half16_t b0 = *(const ds4_q8_half16_t *)(xb);
-            const ds4_q8_half16_t b1 = *(const ds4_q8_half16_t *)(xb + 16u);
-            if (ntile == 0u) {
-                acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc0);
-                acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc0);
-            } else if (ntile == 1u) {
-                acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc1);
-                acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc1);
-            } else if (ntile == 2u) {
-                acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc2);
-                acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc2);
-            } else {
-                acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc3);
-                acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc3);
+            for (uint32_t ntile = 0; ntile < N_TILES_PER_WARP; ntile++) {
+                const uint32_t nt = ntile * 16u + lane16;
+                const _Float16 *xb = lds_x +
+                    nt * LDS_STRIDE + sb * K_TILE;
+                const ds4_q8_half16_t b0 = *(const ds4_q8_half16_t *)(xb);
+                const ds4_q8_half16_t b1 = *(const ds4_q8_half16_t *)(xb + 16u);
+                if (ntile == 0u) {
+                    acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc0);
+                    acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc0);
+                } else if (ntile == 1u) {
+                    acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc1);
+                    acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc1);
+                } else if (ntile == 2u) {
+                    acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc2);
+                    acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc2);
+                } else {
+                    acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a0, b0, acc3);
+                    acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a1, b1, acc3);
+                }
             }
         }
         __syncthreads();
