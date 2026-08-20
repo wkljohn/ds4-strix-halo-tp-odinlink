@@ -14,6 +14,10 @@ deploy/ds4-tp-caddy.sh start
 deploy/ds4-tp-caddy.sh status
 ```
 
+After the final build, set `DS4_SERVER_SHA256` in `config.env.local` from
+`sha256sum ./ds4-server`. Startup fails closed if that pin does not match, so a
+stale coordinator cannot use a different TP gate schedule from the worker.
+
 The launcher starts both independent model loads together, validates the
 selected RDMA provider plus matching binary and sampled model fingerprints,
 and refuses to replace unrelated processes. It uses a 262,144-token context
@@ -27,8 +31,11 @@ prefill defaults enforced by the pre-main benchmark gate. Set
 `DSPARK=1` only for experimental testing; the launcher warns because the
 current TP verifier does not match the target-only token fingerprint.
 Ordinary Q4_K/Q2_K launches also select the validated ordered ROCm TP callback
-and temporal-compressor schedule; no extra performance environment variables
-are required.
+and temporal-compressor schedule, the RoCE prefill wavefront, and the
+shape-gated M256/K128 Q8 projection. The wavefront provider-gates itself off
+for OdinLink. Set `PREFILL_FFN_WAVEFRONT=0` or `Q8_M256_K128=0` in the
+deployment config for a symmetric rollback; no extra shell environment is
+required.
 
 On the 96 GiB reference nodes the optional resident DSpark profile settles near
 97--98% reported VRAM use and leaves little safety margin. Ordinary production

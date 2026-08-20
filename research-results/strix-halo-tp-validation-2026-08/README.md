@@ -11,9 +11,9 @@ with mandatory RDMA and cache-free model weights.
 | DeepSeek V4 0731 configuration | Accepted runs, prefill/decode t/s | Reported result |
 |---|---|---|
 | Original Q4_K TP=2 baseline | archived 34.11/9.96 | 34.11/9.96 |
-| Current Q2_K over RoCE v2 | rebuilt final 179.24/19.11 | production validation 179.24/19.11 |
-| Current Q4_K over OdinLink | rebuilt final 199.91/19.01 | production validation 199.91/19.01 |
-| Current Q4_K over RoCE v2 | 219.56/19.37, 219.34/19.37, 219.62/19.35 | three-run median 219.56/19.37 |
+| Current Q2_K over RoCE v2 | 203.29/19.14, 203.00/19.11, 202.51/19.16 | three-run median 203.00/19.14 |
+| Current Q4_K over OdinLink | 218.24/19.02, 217.72/18.88, 220.39/18.83 | three-run median 218.24/18.88 |
+| Current Q4_K over RoCE v2 | 258.64/19.14, 256.90/19.22, 259.54/19.33 | three-run median 258.64/19.22 |
 
 The current Q4_K fingerprint is `5f8a983422299d76`; the current hybrid Q2_K
 fingerprint is `f9cb3a8a17e95c71`. Each fingerprint is specific to the
@@ -29,12 +29,10 @@ only the TP communication slab with a 77.4 MiB mapped allocation; it adds no
 expanded model-weight cache. The allocator and transport evidence is in
 [`../roce-v2-2026-08-14/`](../roce-v2-2026-08-14/).
 
-After merging the accepted schedule onto `main`, two clean rebuilt-binary
-release checks measured 219.22/19.22 and 220.00/19.36 t/s and both reproduced
-`5f8a983422299d76`. The second is back inside the accepted decode band; the
-first is retained as an observed low sample rather than omitted. The published
-219.56/19.37 row remains the earlier controlled three-run median.
-The same release binary also passed Q2_K over RoCE v2 at 180.19/19.17 with
+The preceding release had two clean rebuilt-binary checks at 219.22/19.22 and
+220.00/19.36 t/s, both reproducing `5f8a983422299d76`. Its earlier controlled
+three-run median was 219.56/19.37. The same preceding binary also passed Q2_K
+over RoCE v2 at 180.19/19.17 with
 `f9cb3a8a17e95c71`, and Q4_K over explicit OdinLink RDMA at 201.71/19.00 with
 `5f8a983422299d76`. Neither compatibility check used provider fallback.
 
@@ -67,8 +65,28 @@ Where documented HIP signal memory is unavailable, ROCm TP gates use ordered
 HIP host callbacks before explicit RDMA exchange. The validated temporal
 compressor batches the repeated F16 projection at its natural four-token
 boundary. Together these exact, cache-free changes produced the current
-19.37 t/s Q4_K RoCE median. The benchmark and deployment launchers enable them
+19.22 t/s Q4_K RoCE median. The benchmark and deployment launchers enable them
 for ordinary inference and negotiate the temporal feature between both ranks.
+
+The current launcher adds two cache-free, non-DSpark prefill improvements. A
+shape-gated M256/K128 Q8 projection applies on gfx1151. On mlx5, a four-wave
+FFN consumer schedule overlaps each 512-row wave with the next attention
+prefix; the same setting provider-gates itself off on OdinLink. A live two-node
+32 MiB big-gate test was exact on both ranks and hid 52.5--59.2% of measured
+wire time.
+
+A 6,657-token A/B exercised three full 2,048-token chunks plus a 513-token
+tail. Disabling both improvements measured 221.52/17.65; the launcher defaults
+measured 231.65/17.81. Both produced `0d9eda8d7a1ff814`, and candidate mode
+passed the semantic suite. This closes the full-chunk-to-tail transition that
+the 2,048-token headline workload does not cover.
+
+After launcher promotion, the combined pre-main gate passed again at
+258.33/19.31 for Q4_K and 202.21/18.97 for Q2_K with their established exact
+fingerprints. The ordinary deployment exposes symmetric rollback settings as
+`PREFILL_FFN_WAVEFRONT=0` and `Q8_M256_K128=0`; the kernel-global defaults were
+not changed. Deployment also pins the local `ds4-server` SHA-256 so a stale
+coordinator cannot enter a different gate schedule.
 
 Detailed reports:
 

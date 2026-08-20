@@ -41,6 +41,8 @@ fi
 TP_TIMEOUT_SEC=${TP_TIMEOUT_SEC:-60}
 DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0}
 DSPARK=${DSPARK:-0}
+PREFILL_FFN_WAVEFRONT=${PREFILL_FFN_WAVEFRONT:-1}
+Q8_M256_K128=${Q8_M256_K128:-1}
 if [[ -z ${EXPERT_SPLIT:-} ]]; then
   if [[ $DSPARK == 1 ]]; then EXPERT_SPLIT=118; else EXPERT_SPLIT=128; fi
 fi
@@ -70,6 +72,12 @@ is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$EXPERT_SPLIT" &&
   }
 (( EXPERT_SPLIT < 256 )) || { echo "error: expert split must be in 1..255" >&2; exit 2; }
 [[ $DSPARK == 0 || $DSPARK == 1 ]] || { echo "error: DSPARK must be 0 or 1" >&2; exit 2; }
+[[ $PREFILL_FFN_WAVEFRONT == 0 || $PREFILL_FFN_WAVEFRONT == 1 ]] || {
+  echo "error: PREFILL_FFN_WAVEFRONT must be 0 or 1" >&2; exit 2;
+}
+[[ $Q8_M256_K128 == 0 || $Q8_M256_K128 == 1 ]] || {
+  echo "error: Q8_M256_K128 must be 0 or 1" >&2; exit 2;
+}
 if [[ $DSPARK == 1 ]]; then : "${MTP:?MTP is required when DSPARK=1}"; fi
 (( CONTEXT == 262144 )) || echo "warning: deployment context is $CONTEXT, not 262144" >&2
 
@@ -127,6 +135,16 @@ coord_stop_service() {
 preflight() {
   [[ -x $REPO/ds4 && -x $REPO/ds4-server ]] || {
     echo "error: run 'make strix-halo' before deployment" >&2; exit 1;
+  }
+  [[ ${DS4_SERVER_SHA256:-} =~ ^[0-9a-fA-F]{64}$ ]] || {
+    echo "error: set DS4_SERVER_SHA256 to 'sha256sum ./ds4-server' after the final build" >&2
+    exit 1
+  }
+  local local_server_hash
+  local_server_hash=$(sha256sum "$REPO/ds4-server" | awk '{print $1}')
+  [[ $local_server_hash == "${DS4_SERVER_SHA256,,}" ]] || {
+    echo "error: local ds4-server does not match DS4_SERVER_SHA256; rebuild and update the pin" >&2
+    exit 1
   }
   [[ -r $MODEL ]] || { echo "error: local model is missing" >&2; exit 1; }
   if [[ $RDMA_PROFILE == odinlink ]]; then
@@ -246,8 +264,10 @@ start() {
     decode_env=(
       DS4_TP_GREEDY_TOP2=1
       DS4_TP_HOST_CALLBACK=1
+      DS4_TP_PREFILL_FFN_WAVEFRONT="$PREFILL_FFN_WAVEFRONT"
       DS4_ROCM_TEMPORAL_COMPRESSOR=1
       DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1
+      DS4_ROCM_Q8_BATCH_WMMA_M256_K128="$Q8_M256_K128"
       DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP=1
       DS4_ROCM_Q4K_WMMA_FUSE_MID=1
       DS4_ROCM_TP_SKIP_UNOWNED=1
