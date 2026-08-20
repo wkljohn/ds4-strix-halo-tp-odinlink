@@ -1851,6 +1851,10 @@ extern "C" int ds4_gpu_tp_expert_shard_active(void) {
     return (g_tp_split_world == 2 && !g_tp_expert_shard_suspended) ? 1 : 0;
 }
 
+extern "C" int ds4_gpu_tp_split_rank(void) {
+    return (int)g_tp_split_rank;
+}
+
 
 extern "C" void ds4_gpu_model_residency_skip(int skip) {
     (void)skip;

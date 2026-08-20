@@ -100,6 +100,10 @@ static int routed_moe_q4k_wmma_layer_log_enabled(void) {
     return enabled;
 }
 
+static const char *g_slot_balance_gate_w = NULL;
+static const char *g_slot_balance_up_w = NULL;
+static const char *g_slot_balance_down_w = NULL;
+
 static int routed_moe_q4k_decode_stage_xq_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -1246,6 +1250,16 @@ static int routed_moe_launch(
     const char *gate_w = NULL;
     const char *up_w = NULL;
     const char *down_w = NULL;
+    const int slot_balance_w =
+        g_slot_balance_gate_w && g_slot_balance_up_w && g_slot_balance_down_w;
+    if (slot_balance_w) {
+        gate_w = g_slot_balance_gate_w;
+        up_w = g_slot_balance_up_w;
+        down_w = g_slot_balance_down_w;
+        g_slot_balance_gate_w = NULL;
+        g_slot_balance_up_w = NULL;
+        g_slot_balance_down_w = NULL;
+    }
     const char **gate_slot_ptrs = NULL;
     const char **up_slot_ptrs = NULL;
     const char **down_slot_ptrs = NULL;
@@ -1260,6 +1274,7 @@ static int routed_moe_launch(
     uint32_t stream_batch_resident_count = 0;
     uint32_t stream_batch_missing_count = 0;
     const int stream_full_layer =
+        !slot_balance_w &&
         (n_tokens > 1u || force_resident) &&
         cuda_stream_layer_expert_cache_apply(model_map,
                                              layer_index,
@@ -1350,7 +1365,8 @@ static int routed_moe_launch(
                                          &stream_resident_mask,
                                          &stream_missing_mask);
     const int compact_selected =
-        split_selected ||
+        !slot_balance_w &&
+        (split_selected ||
         (!stream_full_layer &&
         n_tokens == 1u &&
         cuda_stream_selected_apply(model_map,
@@ -1362,8 +1378,8 @@ static int routed_moe_launch(
                                    &selected_exec,
                                    &gate_w,
                                    &up_w,
-                                   &down_w));
-    if (!compact_selected && !batch_stream_selected && !batch_stream_split_selected) {
+                                   &down_w)));
+    if (!slot_balance_w && !compact_selected && !batch_stream_selected && !batch_stream_split_selected) {
         if (g_ssd_streaming_mode &&
             n_total_expert > n_expert &&
             !stream_full_layer &&
@@ -3581,6 +3597,7 @@ static int routed_moe_launch(
 
 /* DS4-TP-gfx1151 (patch 9): defined in the TP runtime, which ds4_rocm.cu
  * includes AFTER this header. */
+extern "C" int ds4_gpu_tp_split_rank(void);
 extern "C" int ds4_gpu_tp_expert_shard_remap(
         const int32_t *selected, const float *weights, void *scratch,
         uint32_t n_pairs, uint32_t n_total_expert,
@@ -3598,7 +3615,179 @@ struct ds4_tp_shard_view {
     uint64_t down_off_delta;
     uint32_t n_total_expert;
     int      active;
+    const char *direct_gate;
+    const char *direct_up;
+    const char *direct_down;
 };
+
+static int routed_moe_slot_balance_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_TP_SLOT_BALANCE");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
+/* Decode-only: rank 0 computes slots 0-2, rank 1 slots 3-5. Assigned experts
+ * (including ones this shard does not map) are packed into a 3-expert device
+ * blob so the launcher never requests the 256-expert layer tensor. */
+static int routed_moe_slot_balance_prepare(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        ds4_tp_shard_view *v) {
+    v->active = 0;
+    if (!routed_moe_slot_balance_enabled() ||
+        !ds4_gpu_tp_expert_shard_active() ||
+        !model_map || !selected || !weights ||
+        n_total_expert == 0u) {
+        return 1;
+    }
+    static char *gate_blob = NULL;
+    static char *up_blob = NULL;
+    static char *down_blob = NULL;
+    static uint64_t gate_cap = 0;
+    static uint64_t down_cap = 0;
+    static int32_t *sel_dev = NULL;
+    static float *w_dev = NULL;
+    static int logged = 0;
+    const uint64_t need_g = 3u * gate_expert_bytes;
+    const uint64_t need_d = 3u * down_expert_bytes;
+    if (need_g > gate_cap) {
+        if (gate_blob) (void)cudaFree(gate_blob);
+        if (up_blob) (void)cudaFree(up_blob);
+        gate_blob = NULL;
+        up_blob = NULL;
+        gate_cap = 0;
+        if (cudaMalloc(&gate_blob, (size_t)need_g) != cudaSuccess ||
+            cudaMalloc(&up_blob, (size_t)need_g) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        gate_cap = need_g;
+    }
+    if (need_d > down_cap) {
+        if (down_blob) (void)cudaFree(down_blob);
+        down_blob = NULL;
+        down_cap = 0;
+        if (cudaMalloc(&down_blob, (size_t)need_d) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        down_cap = need_d;
+    }
+    if (!sel_dev && cudaMalloc(&sel_dev, 6u * sizeof(int32_t)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (!w_dev && cudaMalloc(&w_dev, 6u * sizeof(float)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    int32_t hsel[6];
+    float hw[6];
+    if (cudaMemcpy(hsel, selected->ptr, sizeof(hsel), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(hw, weights->ptr, sizeof(hw), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const int rank = ds4_gpu_tp_split_rank();
+    const uint32_t slot0 = rank == 1 ? 3u : 0u;
+    int32_t out_sel[6] = {0, 0, 0, 0, 0, 0};
+    float out_w[6] = {0, 0, 0, 0, 0, 0};
+    static int32_t last_e[3] = {-1, -1, -1};
+    int same = 1;
+    for (uint32_t k = 0; k < 3u; k++) {
+        const uint32_t slot = slot0 + k;
+        const int32_t e = (hsel[slot] >= 0 && hw[slot] != 0.0f) ? hsel[slot] : -1;
+        if (e != last_e[k]) same = 0;
+        last_e[k] = e;
+    }
+    for (uint32_t k = 0; k < 3u; k++) {
+        const uint32_t slot = slot0 + k;
+        const int32_t e = hsel[slot];
+        out_sel[slot] = (int32_t)k;
+        out_w[slot] = hw[slot];
+        if (e < 0 || (uint32_t)e >= n_total_expert || hw[slot] == 0.0f) {
+            out_sel[slot] = 0;
+            out_w[slot] = 0.0f;
+            if (!same) {
+                (void)cudaMemset(gate_blob + (uint64_t)k * gate_expert_bytes, 0,
+                                 (size_t)gate_expert_bytes);
+                (void)cudaMemset(up_blob + (uint64_t)k * gate_expert_bytes, 0,
+                                 (size_t)gate_expert_bytes);
+                (void)cudaMemset(down_blob + (uint64_t)k * down_expert_bytes, 0,
+                                 (size_t)down_expert_bytes);
+            }
+            continue;
+        }
+        if (same) continue;
+        const uint64_t g_off = gate_offset + (uint64_t)(uint32_t)e * gate_expert_bytes;
+        const uint64_t u_off = up_offset + (uint64_t)(uint32_t)e * gate_expert_bytes;
+        const uint64_t d_off = down_offset + (uint64_t)(uint32_t)e * down_expert_bytes;
+        if (g_off + gate_expert_bytes > model_size ||
+            u_off + gate_expert_bytes > model_size ||
+            d_off + down_expert_bytes > model_size) {
+            return 0;
+        }
+        const char *g_src = cuda_model_image_ptr(model_map, g_off);
+        const char *u_src = cuda_model_image_ptr(model_map, u_off);
+        const char *d_src = cuda_model_image_ptr(model_map, d_off);
+        const hipMemcpyKind gk = g_src ? hipMemcpyDeviceToDevice : hipMemcpyHostToDevice;
+        const hipMemcpyKind uk = u_src ? hipMemcpyDeviceToDevice : hipMemcpyHostToDevice;
+        const hipMemcpyKind dk = d_src ? hipMemcpyDeviceToDevice : hipMemcpyHostToDevice;
+        if (!g_src) g_src = (const char *)model_map + g_off;
+        if (!u_src) u_src = (const char *)model_map + u_off;
+        if (!d_src) d_src = (const char *)model_map + d_off;
+        static hipStream_t copy_stream = NULL;
+        if (!copy_stream && hipStreamCreateWithFlags(&copy_stream, hipStreamNonBlocking) != hipSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        if (hipMemcpyAsync(gate_blob + (uint64_t)k * gate_expert_bytes, g_src,
+                           (size_t)gate_expert_bytes, gk, copy_stream) != hipSuccess ||
+            hipMemcpyAsync(up_blob + (uint64_t)k * gate_expert_bytes, u_src,
+                           (size_t)gate_expert_bytes, uk, copy_stream) != hipSuccess ||
+            hipMemcpyAsync(down_blob + (uint64_t)k * down_expert_bytes, d_src,
+                           (size_t)down_expert_bytes, dk, copy_stream) != hipSuccess ||
+            hipStreamSynchronize(copy_stream) != hipSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    if (cudaMemcpy(sel_dev, out_sel, sizeof(out_sel), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(w_dev, out_w, sizeof(out_w), cudaMemcpyHostToDevice) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "experimental TP slot-balance decode enabled rank=%d\n", rank);
+    }
+    v->sel = *selected;
+    v->sel.ptr = sel_dev;
+    v->sel.owner = 0;
+    v->w = *weights;
+    v->w.ptr = w_dev;
+    v->w.owner = 0;
+    v->gate_off_delta = 0;
+    v->down_off_delta = 0;
+    v->n_total_expert = 3u;
+    v->direct_gate = gate_blob;
+    v->direct_up = up_blob;
+    v->direct_down = down_blob;
+    v->active = 2;
+    return 1;
+}
 
 static int ds4_tp_shard_prepare(const ds4_gpu_tensor *selected,
                                 const ds4_gpu_tensor *weights,
@@ -3608,6 +3797,9 @@ static int ds4_tp_shard_prepare(const ds4_gpu_tensor *selected,
                                 uint64_t down_expert_bytes,
                                 ds4_tp_shard_view *v) {
     v->active = 0;
+    v->direct_gate = NULL;
+    v->direct_up = NULL;
+    v->direct_down = NULL;
     if (!ds4_gpu_tp_expert_shard_active() || !selected || !weights || n_pairs == 0) return 1;
     /* DS4-TP-gfx1151 (patch 13): DEDICATED grow-only buffer, NOT cuda_tmp_alloc.
      *
@@ -3683,11 +3875,22 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
     ds4_tp_shard_view v;
     const ds4_gpu_tensor *use_selected = selected;
     const ds4_gpu_tensor *use_weights = weights;
-    if (!ds4_tp_shard_prepare(selected, weights, n_expert, n_total_expert,
+    if (n_expert == 6u &&
+        routed_moe_slot_balance_prepare(model_map, model_size,
+                                        gate_offset, up_offset, down_offset,
+                                        gate_expert_bytes, down_expert_bytes,
+                                        selected, weights, n_total_expert, &v) &&
+        v.active == 2) {
+        use_selected = &v.sel;
+        use_weights = &v.w;
+        n_total_expert = v.n_total_expert;
+        g_slot_balance_gate_w = v.direct_gate;
+        g_slot_balance_up_w = v.direct_up;
+        g_slot_balance_down_w = v.direct_down;
+    } else if (!ds4_tp_shard_prepare(selected, weights, n_expert, n_total_expert,
                               gate_expert_bytes, down_expert_bytes, &v)) {
         return 0;
-    }
-    if (v.active) {
+    } else if (v.active) {
         use_selected = &v.sel;
         use_weights = &v.w;
         gate_offset += v.gate_off_delta;
@@ -3705,6 +3908,9 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              use_selected, use_weights, n_total_expert, n_expert,
                              clamp, x, add_in, &add_fused, layer_index, 1,
                              force_resident);
+    g_slot_balance_gate_w = NULL;
+    g_slot_balance_up_w = NULL;
+    g_slot_balance_down_w = NULL;
     /* out_dim, not out->bytes/sizeof(float): the latter is the ALLOCATION size.
      * For the tp_out slab view they coincide, but it is a latent overrun for any
      * caller with a larger buffer. */
