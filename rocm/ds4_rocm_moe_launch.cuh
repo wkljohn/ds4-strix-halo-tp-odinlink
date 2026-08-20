@@ -118,6 +118,15 @@ static int routed_moe_q4k_decode_split_gate_up_enabled(void) {
     return enabled;
 }
 
+static int routed_moe_q4k_decode_stage_midq_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_DECODE_STAGE_MIDQ");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
 static int routed_moe_q4k_l2_pair_order_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -2562,19 +2571,47 @@ static int routed_moe_launch(
                         getenv("DS4_ROCM_Q4K_DECODE_FUSE_ADDEND");
                     const uint32_t fuse_add = add_in && fuse_add_env &&
                         fuse_add_env[0] == '1' && fuse_add_env[1] == '\0';
-                    moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
-                        (float *)out->ptr,
-                        fuse_add ? (const float *)add_in->ptr : NULL,
-                        down_w,
-                        midq,
-                        (const int32_t *)selected_exec->ptr,
-                        (const float *)weights->ptr,
-                        down_expert_bytes,
-                        down_row_bytes,
-                        midq_blocks,
-                        out_dim,
-                        n_expert,
-                        tp_skip_unowned && n_tokens == 1u);
+                    const uint32_t stage_midq =
+                        routed_moe_q4k_decode_stage_midq_enabled() &&
+                        n_tokens == 1u && n_expert == 6u &&
+                        midq_blocks == 8u && out_dim == 4096u;
+                    if (stage_midq) {
+                        static int logged_stage_midq = 0;
+                        if (!logged_stage_midq) {
+                            logged_stage_midq = 1;
+                            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                                    "Q4_K decode staged-MIDQ active n_expert=%u "
+                                    "midq_blocks=%u out_dim=%u\n",
+                                    n_expert, midq_blocks, out_dim);
+                        }
+                        moe_down_q4K_sum6_staged_midq_kernel<<<sgrid, 256>>>(
+                            (float *)out->ptr,
+                            fuse_add ? (const float *)add_in->ptr : NULL,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert,
+                            tp_skip_unowned && n_tokens == 1u);
+                    } else {
+                        moe_down_q4K_sum6_qwarp32_kernel<<<sgrid, 256>>>(
+                            (float *)out->ptr,
+                            fuse_add ? (const float *)add_in->ptr : NULL,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert,
+                            tp_skip_unowned && n_tokens == 1u);
+                    }
                     if (fuse_add && add_fused_out) *add_fused_out = 1;
                 } else {
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
