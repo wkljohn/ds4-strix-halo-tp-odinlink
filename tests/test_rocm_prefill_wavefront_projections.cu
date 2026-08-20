@@ -87,7 +87,8 @@ int main(void) {
     constexpr uint32_t kv_dim = 512u;
     constexpr uint32_t q_dim = 32768u;
     constexpr uint32_t rank_rows = tokens / 2u;
-    constexpr uint32_t rank_wave_rows = rank_rows / waves;
+    constexpr uint32_t rank_waves = 2u;
+    constexpr uint32_t rank_wave_rows = rank_rows / rank_waves;
     constexpr uint32_t comp_width = 1024u;
     constexpr uint32_t index_width = 256u;
     constexpr uint32_t index_q_dim = 8192u;
@@ -116,7 +117,7 @@ int main(void) {
     const uint64_t index_sc_offset = cursor;
     cursor = align64(cursor + (uint64_t)embd * index_width * sizeof(__half));
     const uint64_t index_q_offset = cursor;
-    cursor = align64(cursor + (uint64_t)q_rank * index_q_dim * sizeof(__half));
+    cursor = align64(cursor + q8_bytes(q_rank, index_q_dim));
     std::vector<unsigned char> model((size_t)cursor);
     pack_q8(model.data() + q_a_offset, embd, q_rank, 11u);
     pack_q8(model.data() + kv_offset, embd, kv_dim, 23u);
@@ -129,8 +130,7 @@ int main(void) {
              (uint64_t)embd * index_width, 47u);
     pack_f16(model.data() + index_sc_offset,
              (uint64_t)embd * index_width, 53u);
-    pack_f16(model.data() + index_q_offset,
-             (uint64_t)q_rank * index_q_dim, 59u);
+    pack_q8(model.data() + index_q_offset, q_rank, index_q_dim, 59u);
     CHECK(ds4_gpu_set_model_map(model.data(), model.size()),
           "install synthetic projection model");
 
@@ -201,7 +201,7 @@ int main(void) {
               &full_q, model.data(), model.size(), q_b_offset,
               q_rank, q_dim, rank_qr, rank_rows),
           "run full rank Q-B projection");
-    for (uint32_t wave = 0; wave < waves; wave++) {
+    for (uint32_t wave = 0; wave < rank_waves; wave++) {
         const uint32_t row0 = wave * rank_wave_rows;
         ds4_gpu_tensor *xv = ds4_gpu_tensor_view(
             rank_qr, (uint64_t)row0 * q_rank * sizeof(float),
@@ -218,7 +218,7 @@ int main(void) {
     }
     CHECK(tensors_bit_equal(&full_q, &wave_q,
                             (uint64_t)rank_rows * q_dim,
-                            "Q8 Q-B 1024/256"),
+                            "Q8 Q-B 1024/512"),
           "Q-B wave exactness");
 
     ds4_gpu_tensor full_comp_kv = {}, full_comp_sc = {};
@@ -313,7 +313,7 @@ int main(void) {
           ds4_gpu_tensor_alloc_on(&wave_index_q, 0,
                                   (uint64_t)tokens * index_q_dim * sizeof(float)) == 0,
           "allocate indexer Q outputs");
-    CHECK(ds4_gpu_matmul_f16_tensor(
+    CHECK(ds4_gpu_matmul_q8_0_tensor(
               &full_index_q, model.data(), model.size(), index_q_offset,
               q_rank, index_q_dim, &full_qr, tokens),
           "run full indexer Q projection");
@@ -325,7 +325,7 @@ int main(void) {
         ds4_gpu_tensor *ov = ds4_gpu_tensor_view(
             &wave_index_q, (uint64_t)row0 * index_q_dim * sizeof(float),
             (uint64_t)wave_rows * index_q_dim * sizeof(float));
-        CHECK(xv && ov && ds4_gpu_matmul_f16_tensor(
+        CHECK(xv && ov && ds4_gpu_matmul_q8_0_tensor(
                   ov, model.data(), model.size(), index_q_offset,
                   q_rank, index_q_dim, xv, wave_rows),
               "run wave indexer Q projection");
@@ -334,7 +334,7 @@ int main(void) {
     }
     CHECK(tensors_bit_equal(&full_index_q, &wave_index_q,
                             (uint64_t)tokens * index_q_dim,
-                            "F16 indexer Q 2048/512"),
+                            "Q8 indexer Q 2048/512"),
           "indexer Q wave exactness");
 
     ds4_gpu_tensor_free(rank_qr);
