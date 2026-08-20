@@ -70,6 +70,15 @@ static uint32_t routed_moe_q4k_wmma_min_count(void) {
     return value;
 }
 
+static int routed_moe_q4k_wmma_pair_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
 static int routed_moe_q4k_decode_stage_xq_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -1912,32 +1921,57 @@ static int routed_moe_launch(
                             (16u * 36u + 64u * 76u) * sizeof(int32_t);
                         dim3 wgrid((expert_mid_dim + 63u) / 64u,
                                    tile_capacity, 1);
-                        moe_q4K_routed_wmma_kernel<16><<<wgrid, 256, wmma_smem>>>(
-                            gate_w, q4k_q81,
-                            (float *)gate->ptr, sorted_pairs, sorted_offsets,
-                            sorted_counts, tile_total, tile_experts, tile_starts,
-                            n_tokens, xq_blocks, expert_mid_dim, n_expert,
-                            gate_expert_bytes, gate_row_bytes, wmma_min_count);
-                        ok = cuda_ok(cudaGetLastError(),
-                                     "routed_moe Q4_K gate WMMA launch");
-                        if (ok && q4k_decode_event_profile) {
-                            routed_moe_q4k_decode_event_record(
-                                    DS4_ROCM_Q4K_DECODE_EVENT_GATE_WMMA,
-                                    n_tokens);
-                        }
-                        if (ok) {
+                        if (routed_moe_q4k_wmma_pair_enabled()) {
+                            moe_q4K_routed_wmma_pair_kernel<16>
+                                <<<wgrid, 256, wmma_smem>>>(
+                                    gate_w, up_w, q4k_q81,
+                                    (float *)gate->ptr, (float *)up->ptr,
+                                    sorted_pairs, sorted_offsets, sorted_counts,
+                                    tile_total, tile_experts, tile_starts,
+                                    n_tokens, xq_blocks, expert_mid_dim, n_expert,
+                                    gate_expert_bytes, gate_row_bytes,
+                                    wmma_min_count);
+                            ok = cuda_ok(cudaGetLastError(),
+                                         "routed_moe Q4_K paired WMMA launch");
+                            if (ok && q4k_decode_event_profile) {
+                                routed_moe_q4k_decode_event_record(
+                                        DS4_ROCM_Q4K_DECODE_EVENT_GATE_WMMA,
+                                        n_tokens);
+                                routed_moe_q4k_decode_event_record(
+                                        DS4_ROCM_Q4K_DECODE_EVENT_UP_WMMA,
+                                        n_tokens);
+                            }
+                        } else {
                             moe_q4K_routed_wmma_kernel<16><<<wgrid, 256, wmma_smem>>>(
-                                up_w, q4k_q81,
-                                (float *)up->ptr, sorted_pairs, sorted_offsets,
+                                gate_w, q4k_q81,
+                                (float *)gate->ptr, sorted_pairs, sorted_offsets,
                                 sorted_counts, tile_total, tile_experts, tile_starts,
                                 n_tokens, xq_blocks, expert_mid_dim, n_expert,
                                 gate_expert_bytes, gate_row_bytes, wmma_min_count);
                             ok = cuda_ok(cudaGetLastError(),
-                                         "routed_moe Q4_K up WMMA launch");
+                                         "routed_moe Q4_K gate WMMA launch");
                             if (ok && q4k_decode_event_profile) {
                                 routed_moe_q4k_decode_event_record(
-                                        DS4_ROCM_Q4K_DECODE_EVENT_UP_WMMA,
+                                        DS4_ROCM_Q4K_DECODE_EVENT_GATE_WMMA,
                                         n_tokens);
+                            }
+                            if (ok) {
+                                moe_q4K_routed_wmma_kernel<16>
+                                    <<<wgrid, 256, wmma_smem>>>(
+                                        up_w, q4k_q81,
+                                        (float *)up->ptr, sorted_pairs,
+                                        sorted_offsets, sorted_counts, tile_total,
+                                        tile_experts, tile_starts, n_tokens,
+                                        xq_blocks, expert_mid_dim, n_expert,
+                                        gate_expert_bytes, gate_row_bytes,
+                                        wmma_min_count);
+                                ok = cuda_ok(cudaGetLastError(),
+                                             "routed_moe Q4_K up WMMA launch");
+                                if (ok && q4k_decode_event_profile) {
+                                    routed_moe_q4k_decode_event_record(
+                                            DS4_ROCM_Q4K_DECODE_EVENT_UP_WMMA,
+                                            n_tokens);
+                                }
                             }
                         }
                         if (ok) {

@@ -4783,6 +4783,308 @@ __global__ static void moe_q4K_routed_wmma_kernel(
 }
 
 /*
+ * Paired hot-tile Q4_K projection for prefill.  The existing gate and up
+ * kernels consume identical Q8_1 activation tiles.  Keep both halves in a
+ * distributed register staging array, reuse the original one-half LDS tile,
+ * and run gate then up without changing either projection's K accumulation
+ * order.  This preserves the 21,760-byte LDS allocation and the three-block
+ * gfx1151 occupancy of the single-projection kernel.
+ */
+__device__ __forceinline__ static void ds4_q4k_stage_wmma_weight_tile(
+        const char *expert_weight_base,
+        uint64_t weight_row_bytes,
+        uint32_t kb,
+        uint32_t row0,
+        uint32_t nrows,
+        int32_t *sx) {
+    constexpr int XS = 76;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+
+    if (wave < 8) {
+        const int r = wave * 8 + lane / 4;
+        const int txi = (lane % 4) * 8;
+        const uint32_t row = row0 + (uint32_t)r;
+        if (row < nrows) {
+            const cuda_block_q4_K &w =
+                reinterpret_cast<const cuda_block_q4_K *>(
+                    expert_weight_base +
+                    (uint64_t)row * weight_row_bytes)[kb];
+#pragma unroll
+            for (int q = 0; q < 8; q++) {
+                const int32_t v = *reinterpret_cast<const int32_t *>(
+                    w.qs + 4 * (txi + q));
+                const int32_t dst =
+                    r * XS + 16 * ((txi + q) / 8) + (txi + q) % 8;
+                sx[dst] = v & 0x0f0f0f0f;
+                sx[dst + 8] = (v >> 4) & 0x0f0f0f0f;
+            }
+        }
+    }
+
+    if (wave < 4) {
+        const int r = wave * 16 + lane / 2;
+        const uint32_t row = row0 + (uint32_t)r;
+        if (row < nrows) {
+            const cuda_block_q4_K &w =
+                reinterpret_cast<const cuda_block_q4_K *>(
+                    expert_weight_base +
+                    (uint64_t)row * weight_row_bytes)[kb];
+            const int32_t ksc = lane & 1;
+            const int32_t sc32 = ds4_q4k_unpack_scales(
+                reinterpret_cast<const int32_t *>(w.scales), ksc);
+            const int32_t min32 = ds4_q4k_unpack_scales(
+                reinterpret_cast<const int32_t *>(w.scales), ksc + 2);
+            const uint8_t *sc = reinterpret_cast<const uint8_t *>(&sc32);
+            const uint8_t *mn = reinterpret_cast<const uint8_t *>(&min32);
+            const float wd = __half2float(
+                *reinterpret_cast<const half *>(&w.d));
+            const float wm = __half2float(
+                *reinterpret_cast<const half *>(&w.dmin));
+#pragma unroll
+            for (int l = 0; l < 4; l++) {
+                reinterpret_cast<half2 *>(sx + r * XS + 64)
+                    [4 * ksc + l] = __floats2half2_rn(
+                        wd * (float)sc[l], -wm * (float)mn[l]);
+            }
+        }
+    }
+}
+
+template <int J>
+__launch_bounds__(256)
+__global__ static void moe_q4K_routed_wmma_pair_kernel(
+        const char *gate_weight_base,
+        const char *up_weight_base,
+        const ds4_q8_1_mmq_block *acts,
+        float *gate_out,
+        float *up_out,
+        const uint32_t *sorted_pairs,
+        const uint32_t *offsets,
+        const uint32_t *counts,
+        const uint32_t *tile_total,
+        const uint32_t *tile_experts,
+        const uint32_t *tile_starts,
+        uint32_t ntokens,
+        uint32_t xq_blocks,
+        uint32_t nrows,
+        uint32_t n_expert,
+        uint64_t weight_expert_bytes,
+        uint64_t weight_row_bytes,
+        uint32_t min_count) {
+    static_assert(J == 16,
+                  "moe_q4K_routed_wmma_pair_kernel requires J=16");
+    constexpr int I = 64;
+    constexpr int XS = 76;
+    constexpr int YS = 36;
+
+    extern __shared__ int32_t smem[];
+    int32_t *sy = smem;
+    int32_t *sx = sy + J * YS;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const uint32_t tile = (uint32_t)blockIdx.y;
+    if (tile >= *tile_total) return;
+
+    const uint32_t expert = tile_experts[tile];
+    const uint32_t start = tile_starts[tile];
+    const uint32_t count = counts[expert];
+    if (count < min_count) return;
+
+    const uint32_t row0 = (uint32_t)blockIdx.x * (uint32_t)I;
+    float gate_acc[J / 16][8] = {};
+    float up_acc[J / 16][8] = {};
+    const char *gate_expert_base =
+        gate_weight_base + (uint64_t)expert * weight_expert_bytes;
+    const char *up_expert_base =
+        up_weight_base + (uint64_t)expert * weight_expert_bytes;
+
+    for (uint32_t kb = 0; kb < xq_blocks; kb++) {
+        int32_t act_regs[5] = {};
+#pragma unroll
+        for (int q = 0; q < 5; q++) {
+            const int l = tid + q * 256;
+            if (l < 2 * J * YS) {
+                const int half = l / (J * YS);
+                const int he = l - half * J * YS;
+                const int j = he / YS;
+                const int e = he - j * YS;
+                const uint32_t local_pair = start + (uint32_t)j;
+                if (local_pair < count) {
+                    const uint32_t pair =
+                        sorted_pairs[offsets[expert] + local_pair];
+                    const uint32_t token = pair / n_expert;
+                    const int32_t *src =
+                        reinterpret_cast<const int32_t *>(
+                            &acts[((uint64_t)kb * 2u +
+                                   (uint32_t)half) * ntokens + token]);
+                    act_regs[q] = src[e];
+                }
+            }
+        }
+
+#pragma unroll
+        for (int q = 0; q < 5; q++) {
+            const int l = tid + q * 256;
+            if (l < J * YS) sy[l] = act_regs[q];
+        }
+        ds4_q4k_stage_wmma_weight_tile(
+            gate_expert_base, weight_row_bytes, kb, row0, nrows, sx);
+        __syncthreads();
+        if (wave < 4) {
+#pragma unroll
+            for (int kk = 0; kk < 4; kk++) {
+                const ds4_q4k_wmma_ab_frag a =
+                    ds4_q4k_load_rdna3_mirrored_16x8(
+                        sx + wave * 16 * XS + kk * 8, XS);
+                const ds4_q4k_wmma_ab_frag b =
+                    ds4_q4k_load_rdna3_mirrored_16x8(
+                        sy + 4 + kk * 8, YS);
+                ds4_q4k_i32x8 c = {};
+                c = ds4_q4k_wmma_i8_16x16x16(a, b, c);
+#pragma unroll
+                for (int l = 0; l < 8; l++) {
+                    const int i = 2 * l + lane / 16;
+                    const int j = lane % 16;
+                    const float2 bd = __half22float2(
+                        reinterpret_cast<const half2 *>(sy + j * YS)[kk]);
+                    const float2 ad = __half22float2(
+                        reinterpret_cast<const half2 *>(
+                            sx + (wave * 16 + i) * XS + 64)[kk]);
+                    gate_acc[0][l] +=
+                        ad.x * bd.x * (float)c[l] + ad.y * bd.y;
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int q = 0; q < 5; q++) {
+            const int l = tid + q * 256;
+            if (l >= J * YS && l < 2 * J * YS) {
+                sy[l - J * YS] = act_regs[q];
+            }
+        }
+        __syncthreads();
+        if (wave < 4) {
+#pragma unroll
+            for (int kk = 0; kk < 4; kk++) {
+                const ds4_q4k_wmma_ab_frag a =
+                    ds4_q4k_load_rdna3_mirrored_16x8(
+                        sx + wave * 16 * XS + 32 + kk * 8, XS);
+                const ds4_q4k_wmma_ab_frag b =
+                    ds4_q4k_load_rdna3_mirrored_16x8(
+                        sy + 4 + kk * 8, YS);
+                ds4_q4k_i32x8 c = {};
+                c = ds4_q4k_wmma_i8_16x16x16(a, b, c);
+#pragma unroll
+                for (int l = 0; l < 8; l++) {
+                    const int i = 2 * l + lane / 16;
+                    const int j = lane % 16;
+                    const float2 bd = __half22float2(
+                        reinterpret_cast<const half2 *>(sy + j * YS)[kk]);
+                    const float2 ad = __half22float2(
+                        reinterpret_cast<const half2 *>(
+                            sx + (wave * 16 + i) * XS + 64)[4 + kk]);
+                    gate_acc[0][l] +=
+                        ad.x * bd.x * (float)c[l] + ad.y * bd.y;
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int q = 0; q < 5; q++) {
+            const int l = tid + q * 256;
+            if (l < J * YS) sy[l] = act_regs[q];
+        }
+        ds4_q4k_stage_wmma_weight_tile(
+            up_expert_base, weight_row_bytes, kb, row0, nrows, sx);
+        __syncthreads();
+        if (wave < 4) {
+#pragma unroll
+            for (int kk = 0; kk < 4; kk++) {
+                const ds4_q4k_wmma_ab_frag a =
+                    ds4_q4k_load_rdna3_mirrored_16x8(
+                        sx + wave * 16 * XS + kk * 8, XS);
+                const ds4_q4k_wmma_ab_frag b =
+                    ds4_q4k_load_rdna3_mirrored_16x8(
+                        sy + 4 + kk * 8, YS);
+                ds4_q4k_i32x8 c = {};
+                c = ds4_q4k_wmma_i8_16x16x16(a, b, c);
+#pragma unroll
+                for (int l = 0; l < 8; l++) {
+                    const int i = 2 * l + lane / 16;
+                    const int j = lane % 16;
+                    const float2 bd = __half22float2(
+                        reinterpret_cast<const half2 *>(sy + j * YS)[kk]);
+                    const float2 ad = __half22float2(
+                        reinterpret_cast<const half2 *>(
+                            sx + (wave * 16 + i) * XS + 64)[kk]);
+                    up_acc[0][l] +=
+                        ad.x * bd.x * (float)c[l] + ad.y * bd.y;
+                }
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int q = 0; q < 5; q++) {
+            const int l = tid + q * 256;
+            if (l >= J * YS && l < 2 * J * YS) {
+                sy[l - J * YS] = act_regs[q];
+            }
+        }
+        __syncthreads();
+        if (wave < 4) {
+#pragma unroll
+            for (int kk = 0; kk < 4; kk++) {
+                const ds4_q4k_wmma_ab_frag a =
+                    ds4_q4k_load_rdna3_mirrored_16x8(
+                        sx + wave * 16 * XS + 32 + kk * 8, XS);
+                const ds4_q4k_wmma_ab_frag b =
+                    ds4_q4k_load_rdna3_mirrored_16x8(
+                        sy + 4 + kk * 8, YS);
+                ds4_q4k_i32x8 c = {};
+                c = ds4_q4k_wmma_i8_16x16x16(a, b, c);
+#pragma unroll
+                for (int l = 0; l < 8; l++) {
+                    const int i = 2 * l + lane / 16;
+                    const int j = lane % 16;
+                    const float2 bd = __half22float2(
+                        reinterpret_cast<const half2 *>(sy + j * YS)[kk]);
+                    const float2 ad = __half22float2(
+                        reinterpret_cast<const half2 *>(
+                            sx + (wave * 16 + i) * XS + 64)[4 + kk]);
+                    up_acc[0][l] +=
+                        ad.x * bd.x * (float)c[l] + ad.y * bd.y;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (wave < 4) {
+#pragma unroll
+        for (int l = 0; l < 8; l++) {
+            const uint32_t row =
+                row0 + (uint32_t)(wave * 16 + 2 * l + lane / 16);
+            const uint32_t local_pair =
+                start + (uint32_t)(lane % 16);
+            if (row < nrows && local_pair < count) {
+                const uint32_t pair =
+                    sorted_pairs[offsets[expert] + local_pair];
+                const uint64_t out = (uint64_t)pair * nrows + row;
+                gate_out[out] = gate_acc[0][l];
+                up_out[out] = up_acc[0][l];
+            }
+        }
+    }
+}
+
+/*
  * IQ2_XXS gate/up integer-MMQ experiment for gfx1151.
  *
  * The load-tile arithmetic follows llama.cpp's IQ2_XXS Q8_0 SRAM layout:
