@@ -253,27 +253,30 @@ int main() {
         {"compressor", 4096u, 1024u},
         {"kv", 4096u, 512u},
     };
-    for (const Shape &s : shapes) {
-        Buffers b(2048u, s.in_dim, s.out_dim);
-        const int iterations = s.out_dim >= 8192u ? 3 : 6;
-        const float ms64 = elapsed<64, 64>(b, b.d64, iterations);
-        const float msn128 = elapsed<64, 128>(b, b.dn128, iterations);
-        const float msm128 = elapsed<128, 64>(b, b.dm128, iterations);
-        const float msk128 = elapsed_k128<128, 64>(b, b.dk128, iterations);
-        const float msm256k128 = s.out_dim >= 8192u
-            ? elapsed_k128<256, 64>(b, b.dm256k128, iterations)
-            : 0.0f;
-        std::printf("shape=%s tokens=2048 in=%u out=%u tile64_ms=%.4f "
-                    "n128_ms=%.4f n128_change=%+.1f%% m128_ms=%.4f "
-                    "m128_change=%+.1f%% k128_ms=%.4f k128_vs_m128=%+.1f%% "
-                    "m256k128_ms=%.4f m256k128_vs_m128k128=%+.1f%%\n",
-                    s.name, s.in_dim, s.out_dim, ms64,
-                    msn128, 100.0f * (msn128 / ms64 - 1.0f),
-                    msm128, 100.0f * (msm128 / ms64 - 1.0f),
-                    msk128, 100.0f * (msk128 / msm128 - 1.0f),
-                    msm256k128,
-                    s.out_dim >= 8192u
-                        ? 100.0f * (msm256k128 / msk128 - 1.0f) : 0.0f);
+    const uint32_t token_shapes[] = {512u, 2048u};
+    for (uint32_t tokens : token_shapes) {
+        for (const Shape &s : shapes) {
+            Buffers b(tokens, s.in_dim, s.out_dim);
+            const int iterations = s.out_dim >= 8192u ? 3 : 6;
+            const float ms64 = elapsed<64, 64>(b, b.d64, iterations);
+            const float msn128 = elapsed<64, 128>(b, b.dn128, iterations);
+            const float msm128 = elapsed<128, 64>(b, b.dm128, iterations);
+            const float msk128 = elapsed_k128<128, 64>(b, b.dk128, iterations);
+            const float msm256k128 = s.out_dim >= 8192u
+                ? elapsed_k128<256, 64>(b, b.dm256k128, iterations)
+                : 0.0f;
+            std::printf("shape=%s tokens=%u in=%u out=%u tile64_ms=%.4f "
+                        "n128_ms=%.4f n128_change=%+.1f%% m128_ms=%.4f "
+                        "m128_change=%+.1f%% k128_ms=%.4f k128_vs_m128=%+.1f%% "
+                        "m256k128_ms=%.4f m256k128_vs_m128k128=%+.1f%%\n",
+                        s.name, tokens, s.in_dim, s.out_dim, ms64,
+                        msn128, 100.0f * (msn128 / ms64 - 1.0f),
+                        msm128, 100.0f * (msm128 / ms64 - 1.0f),
+                        msk128, 100.0f * (msk128 / msm128 - 1.0f),
+                        msm256k128,
+                        s.out_dim >= 8192u
+                            ? 100.0f * (msm256k128 / msk128 - 1.0f) : 0.0f);
+        }
     }
     return 0;
 }
