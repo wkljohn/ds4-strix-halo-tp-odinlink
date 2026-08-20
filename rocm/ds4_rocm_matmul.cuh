@@ -62,6 +62,18 @@ static int q8_batch_wmma_k128_padded_enabled(void) {
     return enabled;
 }
 
+/* Opt-in research tile: sixteen waves reuse the padded K=128 activation
+ * stage across 256 output rows. Keep it separate from the production M=128
+ * default until full-model Q4/Q2 and both-provider gates pass. */
+static int q8_batch_wmma_m256_k128_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_ROCM_Q8_BATCH_WMMA_M256_K128");
+        enabled = value != NULL && strcmp(value, "1") == 0;
+    }
+    return enabled;
+}
+
 static unsigned attention_output_expand_threads(void) {
     static unsigned threads;
     if (threads == 0u) {
@@ -822,19 +834,39 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             if (q8_batch_wmma_m128_enabled()) {
-                const dim3 grid((uint32_t)((out_dim + 127u) / 128u),
-                                (uint32_t)((n_tok + 63u) / 64u),
-                                1u);
                 if (out_dim >= 1024u && q8_batch_wmma_k128_padded_enabled()) {
-                    matmul_q8_0_f32_batch_wmma_kernel<128u, 128u><<<grid, 256u>>>(
-                            (float *)out->ptr,
-                            reinterpret_cast<const unsigned char *>(wptr),
-                            (const float *)x->ptr,
-                            (uint32_t)n_tok,
-                            (uint32_t)in_dim,
-                            (uint32_t)out_dim,
-                            blocks * 34u);
+                    if (out_dim >= 8192u &&
+                        q8_batch_wmma_m256_k128_enabled()) {
+                        const dim3 grid(
+                                (uint32_t)((out_dim + 255u) / 256u),
+                                (uint32_t)((n_tok + 63u) / 64u), 1u);
+                        matmul_q8_0_f32_batch_wmma_kernel<256u, 128u>
+                                <<<grid, 512u>>>(
+                                (float *)out->ptr,
+                                reinterpret_cast<const unsigned char *>(wptr),
+                                (const float *)x->ptr,
+                                (uint32_t)n_tok,
+                                (uint32_t)in_dim,
+                                (uint32_t)out_dim,
+                                blocks * 34u);
+                    } else {
+                        const dim3 grid(
+                                (uint32_t)((out_dim + 127u) / 128u),
+                                (uint32_t)((n_tok + 63u) / 64u), 1u);
+                        matmul_q8_0_f32_batch_wmma_kernel<128u, 128u>
+                                <<<grid, 256u>>>(
+                                (float *)out->ptr,
+                                reinterpret_cast<const unsigned char *>(wptr),
+                                (const float *)x->ptr,
+                                (uint32_t)n_tok,
+                                (uint32_t)in_dim,
+                                (uint32_t)out_dim,
+                                blocks * 34u);
+                    }
                 } else {
+                    const dim3 grid(
+                            (uint32_t)((out_dim + 127u) / 128u),
+                            (uint32_t)((n_tok + 63u) / 64u), 1u);
                     matmul_q8_0_f32_batch_wmma_kernel<128u><<<grid, 256u>>>(
                             (float *)out->ptr,
                             reinterpret_cast<const unsigned char *>(wptr),

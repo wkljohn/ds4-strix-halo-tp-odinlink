@@ -378,8 +378,9 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--step-incr N", "Linear step when --step-mul is 1. Default: 2048");
     opt(fp, c, "--gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
     opt(fp, c, "--semantic-smoke", "Before timing, require isolated arithmetic and long-context retrieval replies to close reasoning, answer correctly, and stop.");
-    opt(fp, c, "--decode-self-check", "Compare incremental decode logits with fresh batched-prefix logits at fixed checkpoints.");
+    opt(fp, c, "--decode-self-check", "Require incremental and fresh batched-prefix argmax to match at every fixed checkpoint.");
     opt(fp, c, "--teacher-force-control", "Measure top-token margins while teacher-forcing the known-good llama.cpp control reply.");
+    opt(fp, c, "--teacher-force-expect-fnv64 HEX", "Require the exact recorded teacher mismatch signature (16 hex digits).");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
     fputc('\n', fp);

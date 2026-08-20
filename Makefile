@@ -55,7 +55,19 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-tp-hello test-roce-v2-mr test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-tp-hello test-roce-v2-mr test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+
+test-quality-gates:
+	python3 tests/test_frontier_logits_gate.py
+
+test-moe-wave-plan:
+	python3 tests/test_moe_wave_plan.py
+
+tests/test_rocm_moe_wave_plan: tests/test_rocm_moe_wave_plan.cu
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $<
+
+test-rocm-moe-wave-plan: tests/test_rocm_moe_wave_plan
+	./tests/test_rocm_moe_wave_plan
 
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
@@ -72,6 +84,42 @@ tests/roce_v2_mr_probe: tests/roce_v2_mr_probe.cpp
 test-roce-v2-mr: tests/roce_v2_mr_probe
 	@test -n "$(RDMA_DEVICE)" || { echo "error: set RDMA_DEVICE=mlx5_N" >&2; exit 2; }
 	./tests/roce_v2_mr_probe "$(RDMA_DEVICE)"
+
+tests/ds4_tp_big_gate_overlap.o: ds4_tp.c ds4_tp.h ds4.h
+	$(CC) $(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1 \
+		-ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
+
+tests/test_tp_big_gate_overlap.o: tests/test_tp_big_gate_overlap.cu ds4_tp.h ds4.h
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_tp_big_gate_overlap: tests/test_tp_big_gate_overlap.o tests/ds4_tp_big_gate_overlap.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS) -ldl
+
+test-tp-big-gate-overlap: tests/test_tp_big_gate_overlap
+	@test -n "$(TP_ROLE)" -a -n "$(TP_LEADER)" -a -n "$(TP_PORT)" -a -n "$(RDMA_DEVICE)" -a -n "$(RDMA_GID_INDEX)" || { \
+		echo "error: set TP_ROLE TP_LEADER TP_PORT RDMA_DEVICE RDMA_GID_INDEX" >&2; exit 2; }
+	./tests/test_tp_big_gate_overlap "$(TP_ROLE)" "$(TP_LEADER)" "$(TP_PORT)" \
+		"$(RDMA_DEVICE)" "$(RDMA_GID_INDEX)" \
+		"$(if $(TP_CHUNKS),$(TP_CHUNKS),8)" \
+		"$(if $(TP_WORK_ITERS),$(TP_WORK_ITERS),4096)"
+
+tests/test_rocm_tp_split_gate.o: tests/test_rocm_tp_split_gate.cu ds4_gpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_tp_split_gate: tests/test_rocm_tp_split_gate.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-tp-split-gate: tests/test_rocm_tp_split_gate
+	./tests/test_rocm_tp_split_gate
+
+tests/test_rocm_prefill_wavefront_projections.o: tests/test_rocm_prefill_wavefront_projections.cu ds4_gpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_prefill_wavefront_projections: tests/test_rocm_prefill_wavefront_projections.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-prefill-wavefront-projections: tests/test_rocm_prefill_wavefront_projections
+	./tests/test_rocm_prefill_wavefront_projections
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent

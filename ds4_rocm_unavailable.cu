@@ -43,6 +43,3 @@ ROCM_UNAVAILABLE_INT(ds4_gpu_routed_moe_owned_slots_combine_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_shared_down_hc_expand_add_q8_0_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor)
 ROCM_UNAVAILABLE_INT(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor)
-
-extern "C" uint64_t ds4_gpu_tp_big_gate_kick(...) { return 0; }
-ROCM_UNAVAILABLE_INT(ds4_gpu_tp_big_gate_wait)

@@ -67,6 +67,8 @@ typedef struct {
     bool semantic_smoke;
     bool decode_self_check;
     bool teacher_force_control;
+    bool teacher_force_expect_fnv64_set;
+    uint64_t teacher_force_expect_fnv64;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -165,6 +167,27 @@ static int parse_nonnegative_int(const char *s, const char *opt) {
         exit(2);
     }
     return (int)v;
+}
+
+static uint64_t parse_fnv64_arg(const char *s, const char *opt) {
+    if (!s || strlen(s) != 16u) {
+        fprintf(stderr, "ds4-bench: %s requires exactly 16 hexadecimal digits\n",
+                opt);
+        exit(2);
+    }
+    uint64_t value = 0u;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        uint32_t digit;
+        if (*p >= '0' && *p <= '9') digit = (uint32_t)(*p - '0');
+        else if (*p >= 'a' && *p <= 'f') digit = (uint32_t)(*p - 'a' + 10u);
+        else if (*p >= 'A' && *p <= 'F') digit = (uint32_t)(*p - 'A' + 10u);
+        else {
+            fprintf(stderr, "ds4-bench: invalid value for %s: %s\n", opt, s);
+            exit(2);
+        }
+        value = (value << 4u) | digit;
+    }
+    return value;
 }
 
 static double parse_double_arg(const char *s, const char *opt) {
@@ -413,6 +436,10 @@ static bench_config parse_options(int argc, char **argv) {
             c.decode_self_check = true;
         } else if (!strcmp(arg, "--teacher-force-control")) {
             c.teacher_force_control = true;
+        } else if (!strcmp(arg, "--teacher-force-expect-fnv64")) {
+            c.teacher_force_expect_fnv64 = parse_fnv64_arg(
+                need_arg(&i, argc, argv, arg), arg);
+            c.teacher_force_expect_fnv64_set = true;
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -443,6 +470,12 @@ static bench_config parse_options(int argc, char **argv) {
     if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
     if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
+        exit(2);
+    }
+    if (c.teacher_force_expect_fnv64_set && !c.teacher_force_control) {
+        fprintf(stderr,
+                "ds4-bench: --teacher-force-expect-fnv64 requires "
+                "--teacher-force-control\n");
         exit(2);
     }
     char tp_err[256];
@@ -796,10 +829,11 @@ static int run_decode_self_check(ds4_engine *engine, ds4_session *incremental,
     free(incremental_logits);
     free(batched_logits);
     ds4_tokens_free(&prompt);
-    return 0;
+    return argmax_mismatches == 0 ? 0 : 1;
 }
 
-static int run_teacher_force_control(ds4_engine *engine, ds4_session *session) {
+static int run_teacher_force_control(ds4_engine *engine, ds4_session *session,
+                                     bool expect_set, uint64_t expected_fnv64) {
     static const char question[] = "What is 2+2? Answer clearly and briefly.";
     static const char reference_text[] =
         "1.  **Analyze the User's Request**:\n"
@@ -842,6 +876,7 @@ static int run_teacher_force_control(ds4_engine *engine, ds4_session *session) {
     int first_mismatch = 0;
     int near_tie_mismatches = 0;
     float worst_teacher_gap = 0.0f;
+    uint64_t mismatch_fnv64 = UINT64_C(14695981039346656037);
     for (int step = 0; step < reference.len; step++) {
         ds4_token_score top[2];
         ds4_token_score teacher;
@@ -861,6 +896,11 @@ static int run_teacher_force_control(ds4_engine *engine, ds4_session *session) {
             if (!first_mismatch) first_mismatch = step + 1;
             if (margin <= 0.25f || teacher_gap <= 0.25f) near_tie_mismatches++;
             if (teacher_gap > worst_teacher_gap) worst_teacher_gap = teacher_gap;
+            mismatch_fnv64 = bench_token_hash_update(mismatch_fnv64, step + 1);
+            mismatch_fnv64 = bench_token_hash_update(
+                mismatch_fnv64, reference.v[step]);
+            mismatch_fnv64 = bench_token_hash_update(mismatch_fnv64, top[0].id);
+            mismatch_fnv64 = bench_token_hash_update(mismatch_fnv64, top[1].id);
             fprintf(stderr,
                     "ds4-bench: teacher-force mismatch step=%d teacher=%d top1=%d "
                     "top2=%d top1_margin=%g teacher_gap=%g\n",
@@ -879,11 +919,22 @@ static int run_teacher_force_control(ds4_engine *engine, ds4_session *session) {
     }
     fprintf(stderr,
             "ds4-bench: teacher-force control complete tokens=%d mismatches=%d "
-            "first_mismatch=%d near_tie_mismatches=%d worst_teacher_gap=%g\n",
+            "first_mismatch=%d near_tie_mismatches=%d worst_teacher_gap=%g "
+            "mismatch_fnv64=%016llx expected_fnv64=%016llx enforced=%d\n",
             reference.len, mismatches, first_mismatch, near_tie_mismatches,
-            worst_teacher_gap);
+            worst_teacher_gap, (unsigned long long)mismatch_fnv64,
+            (unsigned long long)(expect_set ? expected_fnv64 : 0u),
+            expect_set ? 1 : 0);
     ds4_tokens_free(&prompt);
     ds4_tokens_free(&reference);
+    if (expect_set && mismatch_fnv64 != expected_fnv64) {
+        fprintf(stderr,
+                "ds4-bench: teacher-force mismatch signature changed: "
+                "expected=%016llx actual=%016llx\n",
+                (unsigned long long)expected_fnv64,
+                (unsigned long long)mismatch_fnv64);
+        return 1;
+    }
     return 0;
 }
 
@@ -1219,7 +1270,9 @@ int main(int argc, char **argv) {
         return self_check_rc;
     }
     if (cfg.teacher_force_control) {
-        const int teacher_rc = run_teacher_force_control(engine, session);
+        const int teacher_rc = run_teacher_force_control(
+            engine, session, cfg.teacher_force_expect_fnv64_set,
+            cfg.teacher_force_expect_fnv64);
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
         if (tp_leader) ds4_tp_send_stop(tp_leader);

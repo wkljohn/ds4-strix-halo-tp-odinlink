@@ -1664,9 +1664,18 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
 static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                      const void *out,
                                      void *in,
-                                     uint64_t bytes) {
+                                     uint64_t bytes,
+                                     uint64_t wave_bytes,
+                                     uint32_t waves,
+                                     ds4_tp_big_wave_ready_fn ready,
+                                     void *ready_ud) {
     ds4_tp_rdma *r = &tp->rdma;
     if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
+    if ((ready == NULL) != (waves == 0u) ||
+        (ready && (wave_bytes == 0u || bytes % wave_bytes != 0u ||
+                   bytes / wave_bytes != waves))) {
+        return 0;
+    }
 
     /* Payloads already inside the registered slab (verify batches) can ride
      * directly. Ordinary prefill tensors use the idle verify regions as
@@ -1704,6 +1713,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     uint8_t *stage_send = tp->slab + tp->batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->batch_in_off;
     uint64_t off = 0;
+    uint32_t ready_waves = 0u;
     while (off < bytes) {
         const uint64_t remaining = bytes - off;
         uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_BULK_MAX_MSG - 1u) /
@@ -1873,7 +1883,12 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             if (g_bg_trace) bg_copy += tp_now_sec() - c1;
         }
         off += round_bytes;
+        while (ready && ready_waves < waves &&
+               off >= (uint64_t)(ready_waves + 1u) * wave_bytes) {
+            ready(ready_ud, ready_waves++);
+        }
     }
+    if (ready && ready_waves != waves) return 0;
     if (g_bg_trace) {
         const double total = tp_now_sec() - bg_t0;
         g_bg_copy_s += bg_copy;
@@ -2109,6 +2124,14 @@ void ds4_tp_free(ds4_tp *tp) {
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
+bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *tp) {
+#ifdef DS4_TP_HAVE_VERBS
+    return tp && tp->rdma_active && tp_rdma_big_gate_capable(tp);
+#else
+    (void)tp;
+    return false;
+#endif
+}
 bool ds4_tp_requires_host_slab(const ds4_tp *tp) {
 #ifdef DS4_TP_HAVE_VERBS
     return tp && tp->rdma_active && tp->rdma.is_mlx5;
@@ -2212,7 +2235,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 tp,
                 tp->slab + ds4_tp_slab_batch_out_offset(tp, layer),
                 tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
-                bytes);
+                bytes, 0u, 0u, NULL, NULL);
     }
 #endif
     struct iovec iov[2] = {
@@ -2276,7 +2299,8 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
         if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(tp, out, in, bytes);
+        return tp_rdma_big_gate_exchange(tp, out, in, bytes,
+                                         0u, 0u, NULL, NULL);
     }
 #endif
     uint64_t off = 0;
@@ -2297,6 +2321,47 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                 o[0], o[1], o[2], o[3], i[0], i[1], i[2], i[3]);
     }
     return 1;
+}
+
+int ds4_tp_big_gate_exchange_waves(ds4_tp *tp, uint32_t layer, uint64_t seq,
+                                   const void *out, void *in, uint64_t bytes,
+                                   uint64_t wave_bytes, uint32_t waves,
+                                   ds4_tp_big_wave_ready_fn ready,
+                                   void *ready_ud) {
+    if (!tp || tp->data_fd < 0 || !out || !in || !bytes || !wave_bytes ||
+        waves < 2u || bytes % wave_bytes != 0u ||
+        bytes / wave_bytes != waves || !ready) {
+        return 0;
+    }
+#ifdef DS4_TP_HAVE_VERBS
+    /* The staged wave consumer is currently proved only for mlx5's mapped
+     * three-MR slab. OdinLink retains the established single-gate path. */
+    if (!tp->rdma_active || !tp->rdma.is_mlx5 ||
+        !tp_rdma_big_gate_capable(tp)) {
+        return 0;
+    }
+    ds4_tp_gate_header h = {
+        DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB17u, seq
+    };
+    if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+    ds4_tp_gate_header ph;
+    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
+        ph.gate != 0xB17u || ph.seq != seq) {
+        fprintf(stderr,
+                "ds4-tp: wave big gate desync: got l=%u tag=%x seq=%llu, "
+                "want l=%u seq=%llu\n",
+                ph.layer, ph.gate, (unsigned long long)ph.seq,
+                layer, (unsigned long long)seq);
+        return 0;
+    }
+    if (!tp_rdma_drain_decode_window(tp)) return 0;
+    return tp_rdma_big_gate_exchange(tp, out, in, bytes,
+                                     wave_bytes, waves, ready, ready_ud);
+#else
+    (void)layer; (void)seq; (void)ready_ud;
+    return 0;
+#endif
 }
 
 /* ------------------------------------------------------------------------

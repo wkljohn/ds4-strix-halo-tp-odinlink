@@ -66,6 +66,8 @@ TP_TIMEOUT_SEC=${DS4_BENCH_TP_TIMEOUT_SEC:-60}
 TP_TIMEOUT_EXPLICIT=${DS4_BENCH_TP_TIMEOUT_SEC+x}
 DECODE_SELF_CHECK=${DS4_BENCH_DECODE_SELF_CHECK:-0}
 TEACHER_FORCE_CONTROL=${DS4_BENCH_TEACHER_FORCE_CONTROL:-0}
+EXPECTED_TEACHER_FNV64=${DS4_BENCH_EXPECT_TEACHER_FNV64:-}
+RECORD_TEACHER_BASELINE=${DS4_BENCH_RECORD_TEACHER_BASELINE:-0}
 QUALITY=${DS4_BENCH_QUALITY:-0}
 ALLOW_NONSTANDARD_SPLIT=${DS4_BENCH_ALLOW_NONSTANDARD_SPLIT:-0}
 VALIDATE_CONFIG_ONLY=${DS4_BENCH_VALIDATE_CONFIG_ONLY:-0}
@@ -164,7 +166,28 @@ elif [[ $DECODE_SELF_CHECK != 0 ]]; then
   exit 2
 fi
 if [[ $TEACHER_FORCE_CONTROL == 1 ]]; then
-  CANDIDATE_ARGS+=(--teacher-force-control)
+  [[ $RECORD_TEACHER_BASELINE == 0 || $RECORD_TEACHER_BASELINE == 1 ]] || {
+    echo "error: DS4_BENCH_RECORD_TEACHER_BASELINE must be 0 or 1" >&2
+    exit 2
+  }
+  if [[ $RECORD_TEACHER_BASELINE == 1 ]]; then
+    [[ $CANDIDATE == 0 ]] || {
+      echo "error: a teacher baseline recording is diagnostic, not a candidate gate" >&2
+      exit 2
+    }
+    [[ -z $EXPECTED_TEACHER_FNV64 ]] || {
+      echo "error: do not supply an expected teacher signature while recording" >&2
+      exit 2
+    }
+    CANDIDATE_ARGS+=(--teacher-force-control)
+  else
+    [[ $EXPECTED_TEACHER_FNV64 =~ ^[0-9a-fA-F]{16}$ ]] || {
+      echo "error: teacher-force gate requires DS4_BENCH_EXPECT_TEACHER_FNV64" >&2
+      exit 2
+    }
+    CANDIDATE_ARGS+=(--teacher-force-control
+                     --teacher-force-expect-fnv64 "$EXPECTED_TEACHER_FNV64")
+  fi
 elif [[ $TEACHER_FORCE_CONTROL != 0 ]]; then
   echo "error: DS4_BENCH_TEACHER_FORCE_CONTROL must be 0 or 1" >&2
   exit 2
@@ -211,8 +234,10 @@ else
   CURRENT_OPT_ENV+=(
     DS4_TP_GREEDY_TOP2=1
     DS4_TP_HOST_CALLBACK=1
+    DS4_TP_PREFILL_FFN_WAVEFRONT=1
     DS4_ROCM_TEMPORAL_COMPRESSOR=1
     DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
+    DS4_ROCM_Q8_BATCH_WMMA_M256_K128=1
     DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1
     DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP=1
     DS4_ROCM_Q4K_WMMA_FUSE_MID=1
@@ -221,6 +246,15 @@ else
     DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1
   )
   EXPECT_GREEDY_TOP2=1
+fi
+
+# Distributional quality diagnostics require complete vocabulary logits.
+# Production greedy-top2 deliberately exposes only two global candidates and
+# therefore cannot serve as a full-logit oracle. This override is symmetric
+# across ranks and applies only to the pre-timing diagnostic modes.
+if [[ $DECODE_SELF_CHECK == 1 || $TEACHER_FORCE_CONTROL == 1 ]]; then
+  CURRENT_OPT_ENV+=(DS4_TP_GREEDY_TOP2=0)
+  EXPECT_GREEDY_TOP2=0
 fi
 
 if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
@@ -576,8 +610,35 @@ wait_worker 180 || {
 WORKER_STARTED=0
 trap - EXIT
 "${PEER_SCP[@]}" "$PEER_MGMT:$WORKER_LOG" "$WORKER_LOG"
-if [[ $DECODE_SELF_CHECK == 1 || $TEACHER_FORCE_CONTROL == 1 ]]; then
-  echo "TP_DECODE_DIAGNOSTIC_DONE"
+if [[ $DECODE_SELF_CHECK == 1 ]]; then
+  grep -q 'ds4-bench: decode self-check complete .*argmax_mismatches=0 ' \
+    "$COORD_LOG" || {
+      echo "error: decode self-check did not prove zero argmax mismatches" >&2
+      exit 1
+    }
+  "$REPO/scripts/check-tp-rdma-logs.sh" \
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE"
+  echo "TP_DECODE_SELF_CHECK_PASSED"
+  exit 0
+fi
+if [[ $TEACHER_FORCE_CONTROL == 1 ]]; then
+  "$REPO/scripts/check-tp-rdma-logs.sh" \
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE"
+  if [[ $RECORD_TEACHER_BASELINE == 1 ]]; then
+    grep -E 'ds4-bench: teacher-force control complete .*mismatch_fnv64=[0-9a-f]{16} .*enforced=0' \
+      "$COORD_LOG" || {
+        echo "error: teacher-force baseline signature was not recorded" >&2
+        exit 1
+      }
+    echo "TP_TEACHER_FORCE_BASELINE_RECORDED_NOT_VALIDATED"
+    exit 0
+  fi
+  grep -qi "ds4-bench: teacher-force control complete .*mismatch_fnv64=${EXPECTED_TEACHER_FNV64} .*expected_fnv64=${EXPECTED_TEACHER_FNV64} enforced=1" \
+    "$COORD_LOG" || {
+      echo "error: teacher-force control did not match its enforced signature" >&2
+      exit 1
+    }
+  echo "TP_TEACHER_FORCE_CONTROL_PASSED"
   exit 0
 fi
 "$REPO/scripts/check-ds4-bench-result.sh" \

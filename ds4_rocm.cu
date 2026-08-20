@@ -233,6 +233,7 @@ static ds4_gpu_tp_exchange_fn   g_tp_fn        = NULL;
 static void                    *g_tp_ud        = NULL;
 static ds4_gpu_tp_batch_exchange_fn g_tp_batch_fn = NULL;
 static ds4_gpu_tp_big_exchange_fn   g_tp_big_fn   = NULL;
+static ds4_gpu_tp_big_wave_exchange_fn g_tp_big_wave_fn = NULL;
 static pthread_t                g_tp_thread;
 static volatile int             g_tp_thread_live = 0;
 static volatile int             g_tp_run         = 0;
@@ -395,6 +396,30 @@ static hipEvent_t               g_tp_host_sync_event = NULL;
 static int                      g_tp_host_callback = 0;
 static int                      g_tp_thread_started = 0;
 static uint64_t                 g_tp_host_sync_timeout_ns = 300000000000ull;
+
+/* ROCm production gates use a host-synchronous producer event when HIP signal
+ * memory is unavailable.  That reliable default is deliberately blocking.
+ * Prefill wavefront experiments need a narrower primitive: record a producer
+ * event now, exchange the completed row chunk on a dedicated worker, and let
+ * the main thread wait for each release only when it consumes that chunk.
+ *
+ * The queue is lazy and single-producer/single-consumer.  Normal inference
+ * creates no thread or event.  An entry remains counted until its release word
+ * is published, preventing event reuse and preventing an ordinary batch gate
+ * from overtaking a split request. */
+#define DS4_TP_SPLIT_QUEUE 16u
+struct ds4_tp_split_item {
+    struct ds4_tp_req req;
+    hipEvent_t producer_event;
+};
+static struct ds4_tp_split_item g_tp_split_queue[DS4_TP_SPLIT_QUEUE];
+static uint32_t                 g_tp_split_head = 0;
+static uint32_t                 g_tp_split_count = 0;
+static pthread_mutex_t          g_tp_split_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t           g_tp_split_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t                g_tp_split_thread;
+static int                      g_tp_split_thread_started = 0;
+static int                      g_tp_split_run = 0;
 /* ds4_tp.c is plain C; declare the hook setter with C linkage rather than
  * including ds4_tp.h into this .cu. Must match ds4_tp.h exactly. */
 extern "C" {
@@ -448,6 +473,7 @@ static void ds4_tp_fail_release_gpu_waits(void) {
     g_tp_fn = NULL;
     g_tp_batch_fn = NULL;
     g_tp_big_fn = NULL;
+    g_tp_big_wave_fn = NULL;
     g_tp_run = 0;
 }
 
@@ -1101,6 +1127,14 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
 
 extern "C" void ds4_gpu_tp_shutdown(void) {
     if (!g_tp_thread_live) return;
+    pthread_mutex_lock(&g_tp_split_mutex);
+    g_tp_split_run = 0;
+    pthread_cond_broadcast(&g_tp_split_cond);
+    pthread_mutex_unlock(&g_tp_split_mutex);
+    if (g_tp_split_thread_started) {
+        pthread_join(g_tp_split_thread, NULL); /* drains queued chunks */
+        g_tp_split_thread_started = 0;
+    }
     g_tp_run = 0;
     if (g_tp_thread_started) pthread_join(g_tp_thread, NULL); /* drains */
     hipDeviceSynchronize();                 /* no pending WaitValue on the word */
@@ -1119,6 +1153,14 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
         (void)hipEventDestroy(g_tp_host_sync_event);
         g_tp_host_sync_event = NULL;
     }
+    for (uint32_t i = 0; i < DS4_TP_SPLIT_QUEUE; i++) {
+        if (g_tp_split_queue[i].producer_event) {
+            (void)hipEventDestroy(g_tp_split_queue[i].producer_event);
+            g_tp_split_queue[i].producer_event = NULL;
+        }
+    }
+    g_tp_split_head = 0u;
+    g_tp_split_count = 0u;
     if (g_tp_sig_alloc) {
         if (g_tp_sig_is_host) hipHostFree(g_tp_sig_alloc); else hipFree(g_tp_sig_alloc);
         g_tp_sig_alloc = NULL;
@@ -1193,10 +1235,146 @@ static void ds4_tp_host_callback_run(void *opaque) {
     __atomic_store_n(c->cpu_flag, req->seq, __ATOMIC_RELEASE);
 }
 
+static void *ds4_tp_split_service_thread(void *opaque) {
+    (void)opaque;
+    for (;;) {
+        pthread_mutex_lock(&g_tp_split_mutex);
+        while (g_tp_split_count == 0u && g_tp_split_run) {
+            pthread_cond_wait(&g_tp_split_cond, &g_tp_split_mutex);
+        }
+        if (g_tp_split_count == 0u && !g_tp_split_run) {
+            pthread_mutex_unlock(&g_tp_split_mutex);
+            break;
+        }
+        struct ds4_tp_split_item *item =
+            &g_tp_split_queue[g_tp_split_head];
+        pthread_mutex_unlock(&g_tp_split_mutex);
+
+        hipError_t err = hipErrorNotReady;
+        const uint64_t started_ns = ds4_tp_monotonic_ns();
+        uint32_t polls = 0;
+        while (err == hipErrorNotReady) {
+            err = hipEventQuery(item->producer_event);
+            if (err != hipErrorNotReady) break;
+            for (int i = 0; i < 64; i++) __builtin_ia32_pause();
+            if ((++polls & 255u) == 0u) {
+                if (ds4_tp_monotonic_ns() - started_ns >=
+                    g_tp_host_sync_timeout_ns) {
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX
+                            "TP split gate: producer timeout rank=%u "
+                            "layer=%u seq=%llu\n",
+                            g_tp_split_rank, item->req.layer,
+                            (unsigned long long)item->req.seq);
+                    err = hipErrorUnknown;
+                    break;
+                }
+                sched_yield();
+            }
+        }
+
+        struct ds4_tp_split_wave_release {
+            volatile uint64_t *flag;
+            uint64_t first_seq;
+        } wave_release = {
+            g_tp_chan[1].cpu_flag,
+            item->req.seq - (item->req.gate ? item->req.gate : 1u) + 1u,
+        };
+        int ok = 0;
+        if (err == hipSuccess && !ds4_tp_fail_get()) {
+            const struct ds4_tp_req *req = &item->req;
+            if (req->gate > 1u) {
+                ok = (g_tp_big_wave_fn && req->out_ptr && req->in_ptr) ?
+                    g_tp_big_wave_fn(
+                        g_tp_ud, req->layer, req->seq,
+                        req->out_ptr, req->in_ptr, req->bytes,
+                        req->bytes / req->gate, req->gate,
+                        [](void *ud, uint32_t wave) {
+                            ds4_tp_split_wave_release *release =
+                                (ds4_tp_split_wave_release *)ud;
+                            __atomic_store_n(release->flag,
+                                             release->first_seq + wave,
+                                             __ATOMIC_RELEASE);
+                        },
+                        &wave_release) : 0;
+            } else {
+                ok = (g_tp_big_fn && req->out_ptr && req->in_ptr) ?
+                    g_tp_big_fn(g_tp_ud, req->layer, req->seq,
+                                req->out_ptr, req->in_ptr, req->bytes) : 0;
+            }
+        }
+
+        const uint64_t completed_seq = item->req.seq;
+        pthread_mutex_lock(&g_tp_split_mutex);
+        if (ok) {
+            /* Publish release while holding the same mutex that makes this
+             * event slot reusable. A following kick therefore cannot observe
+             * count==0 with a stale release word. */
+            __atomic_store_n(g_tp_chan[1].cpu_flag, completed_seq,
+                             __ATOMIC_RELEASE);
+        }
+        g_tp_split_head = (g_tp_split_head + 1u) % DS4_TP_SPLIT_QUEUE;
+        g_tp_split_count--;
+        if (!ok) {
+            g_tp_split_count = 0u;
+            g_tp_split_run = 0;
+        }
+        pthread_cond_broadcast(&g_tp_split_cond);
+        pthread_mutex_unlock(&g_tp_split_mutex);
+
+        if (!ok) {
+            if (err != hipSuccess && err != hipErrorUnknown) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "TP split gate: producer event failed: %s\n",
+                        hipGetErrorString(err));
+            } else if (err == hipSuccess) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "TP split gate exchange failed (seq %llu)\n",
+                        (unsigned long long)completed_seq);
+            }
+            ds4_tp_fail_release_gpu_waits();
+            break;
+        }
+    }
+    return NULL;
+}
+
+static int ds4_tp_split_start(void) {
+    pthread_mutex_lock(&g_tp_split_mutex);
+    if (!g_tp_split_thread_started) {
+        g_tp_split_head = 0u;
+        g_tp_split_count = 0u;
+        g_tp_split_run = 1;
+        if (pthread_create(&g_tp_split_thread, NULL,
+                           ds4_tp_split_service_thread, NULL) != 0) {
+            g_tp_split_run = 0;
+            pthread_mutex_unlock(&g_tp_split_mutex);
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "TP split gate: service thread create failed\n");
+            return 0;
+        }
+        g_tp_split_thread_started = 1;
+    }
+    pthread_mutex_unlock(&g_tp_split_mutex);
+    return 1;
+}
+
+static int ds4_tp_split_pending(void) {
+    pthread_mutex_lock(&g_tp_split_mutex);
+    const int pending = g_tp_split_count != 0u;
+    pthread_mutex_unlock(&g_tp_split_mutex);
+    return pending;
+}
+
 /* Publish arrival on `ch`, then block the null stream until release. */
 static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
     if (!g_tp_thread_live) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "TP gate encoded before tp_init\n");
+        return 0;
+    }
+    if (ch == 1 && ds4_tp_split_pending()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "TP gate submitted before pending split big gate was waited\n");
+        ds4_tp_fail_release_gpu_waits();
         return 0;
     }
     struct ds4_tp_chan *c = &g_tp_chan[ch];
@@ -1401,8 +1579,142 @@ extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
     return ds4_tp_encode(1, &r);
 }
 
+static uint64_t ds4_gpu_tp_big_gate_kick_impl(
+        uint32_t layer, uint32_t rows, const ds4_gpu_tensor *out_t,
+        ds4_gpu_tensor *in_t, uint64_t bytes, uint32_t waves) {
+    if (!g_tp_thread_live || !g_tp_host_sync ||
+        (waves > 1u ? !g_tp_big_wave_fn : !g_tp_big_fn) ||
+        !out_t || !in_t || !out_t->ptr || !in_t->ptr || !rows || !bytes) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "TP split big gate unavailable or has invalid buffers\n");
+        return 0;
+    }
+    if (!ds4_tp_split_start()) return 0;
+
+    struct ds4_tp_chan *c = &g_tp_chan[1];
+    pthread_mutex_lock(&g_tp_split_mutex);
+    if (!g_tp_split_run || g_tp_split_count >= DS4_TP_SPLIT_QUEUE) {
+        pthread_mutex_unlock(&g_tp_split_mutex);
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "TP split big gate queue overflow or stopped\n");
+        ds4_tp_fail_release_gpu_waits();
+        return 0;
+    }
+    const uint64_t released =
+        __atomic_load_n(c->cpu_flag, __ATOMIC_ACQUIRE);
+    if (g_tp_split_count == 0u && released != c->seq) {
+        pthread_mutex_unlock(&g_tp_split_mutex);
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "TP split big gate started with an unreleased batch gate "
+                "(submitted=%llu released=%llu)\n",
+                (unsigned long long)c->seq,
+                (unsigned long long)released);
+        ds4_tp_fail_release_gpu_waits();
+        return 0;
+    }
+
+    if (waves == 0u || bytes % waves != 0u || waves >= DS4_TP_RING) {
+        pthread_mutex_unlock(&g_tp_split_mutex);
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "TP split big gate has invalid wave layout\n");
+        ds4_tp_fail_release_gpu_waits();
+        return 0;
+    }
+    const uint64_t first_seq = c->seq + 1u;
+    const uint64_t seq = c->seq + waves;
+    c->seq = seq;
+    if (seq - released >= DS4_TP_RING) {
+        pthread_mutex_unlock(&g_tp_split_mutex);
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "TP split big gate exceeded sequence ring (seq %llu)\n",
+                (unsigned long long)seq);
+        ds4_tp_fail_release_gpu_waits();
+        return 0;
+    }
+    const uint32_t tail =
+        (g_tp_split_head + g_tp_split_count) % DS4_TP_SPLIT_QUEUE;
+    struct ds4_tp_split_item *item = &g_tp_split_queue[tail];
+    if (!item->producer_event) {
+        const hipError_t create_err = hipEventCreateWithFlags(
+            &item->producer_event, hipEventDisableTiming);
+        if (create_err != hipSuccess) {
+            pthread_mutex_unlock(&g_tp_split_mutex);
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "TP split big gate producer event create failed: %s\n",
+                    hipGetErrorString(create_err));
+            ds4_tp_fail_release_gpu_waits();
+            return 0;
+        }
+    }
+    item->req = {};
+    item->req.kind = DS4_TP_BIG;
+    item->req.layer = layer;
+    item->req.rows = rows;
+    item->req.gate = waves;
+    item->req.ch = 1;
+    item->req.out_ptr = out_t->ptr;
+    item->req.in_ptr = in_t->ptr;
+    item->req.bytes = bytes;
+    item->req.seq = seq;
+    const hipError_t record_err = hipEventRecord(item->producer_event, NULL);
+    if (record_err != hipSuccess) {
+        pthread_mutex_unlock(&g_tp_split_mutex);
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "TP split big gate producer event record failed: %s\n",
+                hipGetErrorString(record_err));
+        ds4_tp_fail_release_gpu_waits();
+        return 0;
+    }
+    g_tp_split_count++;
+    pthread_cond_signal(&g_tp_split_cond);
+    pthread_mutex_unlock(&g_tp_split_mutex);
+    return first_seq;
+}
+
+extern "C" uint64_t ds4_gpu_tp_big_gate_kick(
+        uint32_t layer, uint32_t rows, const ds4_gpu_tensor *out_t,
+        ds4_gpu_tensor *in_t, uint64_t bytes) {
+    return ds4_gpu_tp_big_gate_kick_impl(layer, rows, out_t, in_t, bytes, 1u);
+}
+
+extern "C" uint64_t ds4_gpu_tp_big_gate_waves_kick(
+        uint32_t layer, uint32_t rows, const ds4_gpu_tensor *out_t,
+        ds4_gpu_tensor *in_t, uint64_t bytes, uint32_t waves) {
+    return ds4_gpu_tp_big_gate_kick_impl(layer, rows, out_t, in_t, bytes, waves);
+}
+
+extern "C" int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
+    if (!seq || !g_tp_thread_live || seq > g_tp_chan[1].seq) return 0;
+    const uint64_t started_ns = ds4_tp_monotonic_ns();
+    uint32_t polls = 0;
+    for (;;) {
+        const uint64_t released =
+            __atomic_load_n(g_tp_chan[1].cpu_flag, __ATOMIC_ACQUIRE);
+        if (released == UINT64_MAX || ds4_tp_fail_get()) return 0;
+        if (released >= seq) return 1;
+        for (int i = 0; i < 64; i++) __builtin_ia32_pause();
+        if ((++polls & 255u) == 0u) {
+            if (ds4_tp_monotonic_ns() - started_ns >=
+                g_tp_host_sync_timeout_ns) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "TP split big gate release timeout rank=%u seq=%llu\n",
+                        g_tp_split_rank, (unsigned long long)seq);
+                ds4_tp_fail_release_gpu_waits();
+                return 0;
+            }
+            sched_yield();
+        }
+    }
+}
+
 extern "C" void ds4_gpu_tp_set_batch_exchange(ds4_gpu_tp_batch_exchange_fn fn) { g_tp_batch_fn = fn; }
 extern "C" void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn)     { g_tp_big_fn = fn; }
+extern "C" void ds4_gpu_tp_set_big_wave_exchange(ds4_gpu_tp_big_wave_exchange_fn fn) {
+    g_tp_big_wave_fn = fn;
+}
+extern "C" int ds4_gpu_tp_big_gate_waves_available(void) {
+    return g_tp_thread_live && g_tp_host_sync && g_tp_big_wave_fn != NULL;
+}
 extern "C" void ds4_gpu_tp_set_session_batch_mode(int enabled)                 { g_tp_session_batch = enabled; }
 extern "C" void ds4_gpu_tp_set_expert_split(uint32_t first_rank1)              { g_tp_expert_split = first_rank1; }
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend)                { g_tp_expert_shard_suspended = suspend; }
