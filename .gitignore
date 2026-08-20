@@ -35,6 +35,7 @@
 /tests/test_rocm_attention_q_b_fused
 /tests/test_rocm_moe_wave_plan
 /tests/test_rocm_q4k_decode_bench
+/tests/test_rocm_q4k_one_token_oracle
 /tests/test_rocm_prefill_wavefront_projections
 /tests/test_rocm_q4k_skip_unowned
 /tests/test_rocm_q8_pair_pack4
