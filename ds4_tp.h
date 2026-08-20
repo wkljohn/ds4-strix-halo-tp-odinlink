@@ -72,6 +72,9 @@ enum {
     DS4_TP_FEATURE_EXPERT_SPLIT_SHIFT = 8,
     DS4_TP_FEATURE_EXPERT_SPLIT_MASK = UINT32_C(0xff) <<
                                            DS4_TP_FEATURE_EXPERT_SPLIT_SHIFT,
+    /* Fusing the Q4_K hot-tile SwiGLU epilogue changes which buffers are
+     * materialized.  Independently launched ranks must select it together. */
+    DS4_TP_FEATURE_Q4K_FUSED_MID = UINT32_C(1) << 16,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {

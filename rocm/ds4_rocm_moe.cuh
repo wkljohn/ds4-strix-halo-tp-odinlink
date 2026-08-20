@@ -4852,7 +4852,7 @@ __device__ __forceinline__ static void ds4_q4k_stage_wmma_weight_tile(
     }
 }
 
-template <int J>
+template <int J, bool FUSE_MID = false>
 __launch_bounds__(256)
 __global__ static void moe_q4K_routed_wmma_pair_kernel(
         const char *gate_weight_base,
@@ -4872,7 +4872,10 @@ __global__ static void moe_q4K_routed_wmma_pair_kernel(
         uint32_t n_expert,
         uint64_t weight_expert_bytes,
         uint64_t weight_row_bytes,
-        uint32_t min_count) {
+        uint32_t min_count,
+        float *mid_out,
+        const float *route_weights,
+        float clamp) {
     static_assert(J == 16,
                   "moe_q4K_routed_wmma_pair_kernel requires J=16");
     constexpr int I = 64;
@@ -5077,8 +5080,20 @@ __global__ static void moe_q4K_routed_wmma_pair_kernel(
                 const uint32_t pair =
                     sorted_pairs[offsets[expert] + local_pair];
                 const uint64_t out = (uint64_t)pair * nrows + row;
-                gate_out[out] = gate_acc[0][l];
-                up_out[out] = up_acc[0][l];
+                if constexpr (FUSE_MID) {
+                    float gate = gate_acc[0][l];
+                    float up = up_acc[0][l];
+                    if (clamp > 1.0e-6f) {
+                        if (gate > clamp) gate = clamp;
+                        if (up > clamp) up = clamp;
+                        if (up < -clamp) up = -clamp;
+                    }
+                    mid_out[out] =
+                        moe_silu_oldhip(gate) * up * route_weights[pair];
+                } else {
+                    gate_out[out] = gate_acc[0][l];
+                    up_out[out] = up_acc[0][l];
+                }
             }
         }
     }
@@ -5592,6 +5607,7 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
     }
 }
 
+template <bool COLD_ONLY = false>
 __global__ static void moe_gate_up_mid_q4K_routed_epilogue_kernel(
         float *gate_in,
         float *up_in,
@@ -5605,11 +5621,15 @@ __global__ static void moe_gate_up_mid_q4K_routed_epilogue_kernel(
         const float *weights,
         uint32_t nrows,
         uint32_t n_expert,
+        uint32_t min_count,
         uint32_t write_gate_up,
         float clamp) {
     const uint32_t tile = (uint32_t)blockIdx.y;
     if (tile >= *tile_total) return;
     const uint32_t expert = tile_experts[tile];
+    if constexpr (COLD_ONLY) {
+        if (counts[expert] >= min_count) return;
+    }
     const uint32_t local_pair = tile_starts[tile] +
                                 (uint32_t)threadIdx.x;
     if (local_pair >= counts[expert]) return;
@@ -5634,6 +5654,7 @@ __global__ static void moe_gate_up_mid_q4K_routed_epilogue_kernel(
 /* Row-parallel form of the routed gate/up epilogue.  Threads in a wave touch
  * adjacent rows of one routed pair, instead of assigning one pair per thread
  * and issuing strided wave accesses while each thread walks all rows. */
+template <bool COLD_ONLY = false>
 __global__ static void moe_gate_up_mid_q4K_routed_epilogue_coalesced_kernel(
         float *gate_in,
         float *up_in,
@@ -5647,6 +5668,7 @@ __global__ static void moe_gate_up_mid_q4K_routed_epilogue_coalesced_kernel(
         const float *weights,
         uint32_t nrows,
         uint32_t n_expert,
+        uint32_t min_count,
         uint32_t write_gate_up,
         float clamp) {
     (void)n_expert;
@@ -5656,6 +5678,9 @@ __global__ static void moe_gate_up_mid_q4K_routed_epilogue_coalesced_kernel(
     const uint32_t expert = tile_experts[tile];
     const uint32_t start = tile_starts[tile];
     const uint32_t count = counts[expert];
+    if constexpr (COLD_ONLY) {
+        if (count >= min_count) return;
+    }
     const uint32_t np = start < count ? min(16u, count - start) : 0u;
     for (uint32_t p = 0; p < np; p++) {
         const uint32_t pair = sorted_pairs[offsets[expert] + start + p];

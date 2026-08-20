@@ -55,7 +55,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-tp-hello test-roce-v2-mr test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-tp-hello test-roce-v2-mr test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
 
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
@@ -368,6 +368,21 @@ test-rocm-q4k-skip-unowned: tests/test_rocm_q4k_skip_unowned
 	DS4_ROCM_Q4K_DECODE_STAGE_XQ=1 ./tests/test_rocm_q4k_skip_unowned
 	DS4_ROCM_Q4K_DECODE_STAGE_XQ=0 ./tests/test_rocm_q4k_skip_unowned
 
+tests/test_rocm_q4k_fused_mid.o: tests/test_rocm_q4k_fused_mid.cu ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_q4k_fused_mid: tests/test_rocm_q4k_fused_mid.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-q4k-fused-mid: tests/test_rocm_q4k_fused_mid
+	@set -e; control=$$(mktemp); candidate=$$(mktemp); candidate_log=$$(mktemp); \
+	 trap 'rm -f "$$control" "$$candidate" "$$candidate_log"' EXIT; \
+	 DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP=1 DS4_ROCM_Q4K_WMMA_FUSE_MID=0 ./tests/test_rocm_q4k_fused_mid "$$control"; \
+	 DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP=1 DS4_ROCM_Q4K_WMMA_FUSE_MID=1 ./tests/test_rocm_q4k_fused_mid "$$candidate" >"$$candidate_log" 2>&1; \
+	 cat "$$candidate_log"; \
+	 grep -q 'Q4_K WMMA fused-mid active' "$$candidate_log"; \
+	 cmp "$$control" "$$candidate"
+
 tests/test_rocm_q4k_decode_bench.o: tests/test_rocm_q4k_decode_bench.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
@@ -523,4 +538,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_tp_hello tests/test_metal_session_batch tests/test_gpu_xdev tests/test_rocm_attention_output_tp tests/test_rocm_attention_decode_mixed tests/test_rocm_attention_prefill_static_flash tests/test_rocm_q4k_decode_bench tests/test_rocm_shared_gu_swiglu_fused tests/test_rocm_q8_pair_pack4 tests/test_rocm_attention_q_b_fused tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_tp_hello tests/test_metal_session_batch tests/test_gpu_xdev tests/test_rocm_attention_output_tp tests/test_rocm_attention_decode_mixed tests/test_rocm_attention_prefill_static_flash tests/test_rocm_q4k_decode_bench tests/test_rocm_q4k_fused_mid tests/test_rocm_shared_gu_swiglu_fused tests/test_rocm_q8_pair_pack4 tests/test_rocm_attention_q_b_fused tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

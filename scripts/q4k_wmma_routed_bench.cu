@@ -103,7 +103,7 @@ __global__ __launch_bounds__(256) static void q4k_wmma_routed_kernel(
 // activation LDS tile is repopulated for gate/up.  This keeps the shipping
 // 21,760-byte LDS footprint and its occupancy instead of paying the 3->2
 // blocks/CU cliff measured for a two-half LDS tile.
-template<int J>
+template<int J,bool FUSE_MID=false>
 __global__ __launch_bounds__(256) static void q4k_wmma_routed_pair_kernel(
  const cuda_block_q4_K *gate_weights,const cuda_block_q4_K *up_weights,
  const q8_1_mmq_block *acts,float *gate_out,float *up_out,
@@ -111,7 +111,9 @@ __global__ __launch_bounds__(256) static void q4k_wmma_routed_pair_kernel(
  const uint32_t *tile_total,const uint32_t *tile_experts,const uint32_t *tile_starts,
  uint32_t ntokens,uint32_t xq_blocks,uint32_t nrows,uint32_t n_expert,
  uint32_t wmma_min_count,uint32_t *dispatch_counters,
- uint32_t *gate_markers,uint32_t *up_markers) {
+ uint32_t *gate_markers,uint32_t *up_markers,
+ float *mid_out=nullptr,const float *route_weights=nullptr,float clamp=0.0f,
+ uint32_t *mid_markers=nullptr) {
     static_assert(J==16,"paired harness is validated only for J=16");
     constexpr int I=64,XS=76,YS=36;
     extern __shared__ int32_t smem[];
@@ -147,7 +149,7 @@ __global__ __launch_bounds__(256) static void q4k_wmma_routed_pair_kernel(
       __syncthreads();
       for(int half=0;half<2;++half){if(half){for(int q=0;q<5;++q){int l=tid+q*256;if(l>=J*YS&&l<2*J*YS)sy[l-J*YS]=act_regs[q];}__syncthreads();}if(wave<4){for(int kk=0;kk<4;++kk){auto A=load_rdna3_mirrored_16x8(sx+wave*16*XS+half*32+kk*8,XS);for(int j0=0;j0<J;j0+=16){auto B=load_rdna3_mirrored_16x8(sy+j0*YS+4+kk*8,YS);i32x8 c={};c=wmma_i8_16x16x16(A,B,c);for(int l=0;l<8;++l){int i=2*l+lane/16,j=j0+lane%16;float2 bd=__half22float2(reinterpret_cast<const half2*>(sy+j*YS)[kk]);float2 ad=__half22float2(reinterpret_cast<const half2*>(sx+(wave*16+i)*XS+64)[half*4+kk]);up_acc[j0/16][l]+=ad.x*bd.x*(float)c[l]+ad.y*bd.y;}}}}__syncthreads();}
     }
-    if(wave<4)for(int j0=0;j0<J;j0+=16)for(int l=0;l<8;++l){uint32_t row=row0+wave*16+2*l+lane/16,lp=start+j0+lane%16;if(row<nrows&&lp<count){uint32_t pair=sorted_pairs[offsets[expert]+lp];uint64_t off=(uint64_t)pair*nrows+row;gate_out[off]=gate_acc[j0/16][l];up_out[off]=up_acc[j0/16][l];if(gate_markers)atomicAdd(gate_markers+off,1u);if(up_markers)atomicAdd(up_markers+off,1u);}}
+    if(wave<4)for(int j0=0;j0<J;j0+=16)for(int l=0;l<8;++l){uint32_t row=row0+wave*16+2*l+lane/16,lp=start+j0+lane%16;if(row<nrows&&lp<count){uint32_t pair=sorted_pairs[offsets[expert]+lp];uint64_t off=(uint64_t)pair*nrows+row;if constexpr(FUSE_MID){float g=gate_acc[j0/16][l],u=up_acc[j0/16][l];if(clamp>1.0e-6f){if(g>clamp)g=clamp;if(u>clamp)u=clamp;if(u<-clamp)u=-clamp;}mid_out[off]=(g/(1.0f+expf(-g)))*u*route_weights[pair];if(mid_markers)atomicAdd(mid_markers+off,1u);}else{gate_out[off]=gate_acc[j0/16][l];up_out[off]=up_acc[j0/16][l];if(gate_markers)atomicAdd(gate_markers+off,1u);if(up_markers)atomicAdd(up_markers+off,1u);}}}
 }
 
 // Harness-only DP4A fallback.  This is intentionally separate from the
@@ -183,6 +185,16 @@ __global__ static void q4k_dp4a_cold_tile16_kernel(
 __global__ static void routed_epilogue(const float *gate,const float *up,float *mid,const uint32_t *sorted_pairs,const uint32_t *offsets,const uint32_t *counts,const uint32_t *tile_total,const uint32_t *tile_experts,const uint32_t *tile_starts,const float *weights,uint32_t nrows,uint32_t n_expert,float clamp){
  uint32_t tile=blockIdx.y;if(tile>=*tile_total)return;uint32_t e=tile_experts[tile],lp=tile_starts[tile]+blockIdx.x*blockDim.x+threadIdx.x;if(lp>=counts[e])return;uint32_t pair=sorted_pairs[offsets[e]+lp],tok=pair/n_expert,slot=pair-tok*n_expert;
  for(uint32_t row=0;row<nrows;++row){uint64_t off=(uint64_t)pair*nrows+row;float g=gate[off],u=up[off];if(clamp>1e-6f){if(g>clamp)g=clamp;if(u>clamp)u=clamp;if(u<-clamp)u=-clamp;}mid[off]=(g/(1.0f+expf(-g)))*u*weights[(uint64_t)tok*n_expert+slot];}
+}
+
+__global__ static void routed_epilogue_cold_legacy(const float *gate,const float *up,float *mid,const uint32_t *sorted_pairs,const uint32_t *offsets,const uint32_t *counts,const uint32_t *tile_total,const uint32_t *tile_experts,const uint32_t *tile_starts,const float *weights,uint32_t nrows,uint32_t n_expert,float clamp,uint32_t min_count,uint32_t *mid_markers){
+ uint32_t tile=blockIdx.y;if(tile>=*tile_total)return;uint32_t e=tile_experts[tile];if(counts[e]>=min_count)return;uint32_t lp=tile_starts[tile]+blockIdx.x*blockDim.x+threadIdx.x;if(lp>=counts[e])return;uint32_t pair=sorted_pairs[offsets[e]+lp],tok=pair/n_expert,slot=pair-tok*n_expert;
+ for(uint32_t row=0;row<nrows;++row){uint64_t off=(uint64_t)pair*nrows+row;float g=gate[off],u=up[off];if(clamp>1e-6f){if(g>clamp)g=clamp;if(u>clamp)u=clamp;if(u<-clamp)u=-clamp;}mid[off]=(g/(1.0f+expf(-g)))*u*weights[(uint64_t)tok*n_expert+slot];if(mid_markers)atomicAdd(mid_markers+off,1u);}
+}
+
+__global__ static void routed_epilogue_cold_coalesced(const float *gate,const float *up,float *mid,const uint32_t *sorted_pairs,const uint32_t *offsets,const uint32_t *counts,const uint32_t *tile_total,const uint32_t *tile_experts,const uint32_t *tile_starts,const float *weights,uint32_t nrows,float clamp,uint32_t min_count,uint32_t *mid_markers){
+ uint32_t tile=blockIdx.y,row=blockIdx.x*blockDim.x+threadIdx.x;if(tile>=*tile_total||row>=nrows)return;uint32_t e=tile_experts[tile],count=counts[e];if(count>=min_count)return;uint32_t start=tile_starts[tile],np=start<count?min(16u,count-start):0u;
+ for(uint32_t p=0;p<np;++p){uint32_t pair=sorted_pairs[offsets[e]+start+p];uint64_t off=(uint64_t)pair*nrows+row;float g=gate[off],u=up[off];if(clamp>1e-6f){if(g>clamp)g=clamp;if(u>clamp)u=clamp;if(u<-clamp)u=-clamp;}mid[off]=(g/(1.0f+expf(-g)))*u*weights[pair];if(mid_markers)atomicAdd(mid_markers+off,1u);}
 }
 
 static bool close_vec(const char *tag,const std::vector<float>&a,const std::vector<float>&b,double at,double rt){uint64_t bad=0;double ma=0;for(size_t i=0;i<a.size();++i){double d=fabs((double)a[i]-b[i]);ma=std::max(ma,d);if(!std::isfinite(a[i])||d>at+rt*fabs((double)b[i]))++bad;}printf("  %-5s bad=%llu/%zu max_abs=%.6g\n",tag,(unsigned long long)bad,a.size(),ma);return bad==0;}
@@ -249,17 +261,23 @@ struct pipeline_timing { uint32_t bucket; double crossover_us,dp4a_us; };
 static std::vector<pipeline_timing> pipeline_timings;
 struct paired_timing { uint32_t bucket,xq_blocks; double separate_us,paired_us; };
 static std::vector<paired_timing> paired_timings;
+struct fused_mid_timing { uint32_t bucket,xq_blocks; double staged_us,fused_us; bool exact; };
+static std::vector<fused_mid_timing> fused_mid_timings;
+static bool fused_seen_gate_pos_clamp=false;
+static bool fused_seen_up_pos_clamp=false;
+static bool fused_seen_up_neg_clamp=false;
+static bool fused_seen_zero_weight_write=false;
 static constexpr uint32_t kWmmaMinCount=6;
 
-static bool run_case(const char *name,uint32_t nt,uint32_t ne,const std::vector<int32_t>&sel,uint32_t timing_bucket=0,uint32_t xb=2,uint32_t pair_bucket=0){
- const uint32_t used=6,nr=64,pc=nt*used,wmma_min_count=kWmmaMinCount;bool mixed=!strcmp(name,"mixed");std::mt19937 rng(0x2200u+nt+ne+xb);
+static bool run_case(const char *name,uint32_t nt,uint32_t ne,const std::vector<int32_t>&sel,uint32_t timing_bucket=0,uint32_t xb=2,uint32_t pair_bucket=0,uint32_t min_count=kWmmaMinCount){
+ const uint32_t used=6,nr=64,pc=nt*used,wmma_min_count=min_count;bool mixed=!strcmp(name,"mixed");std::mt19937 rng(0x2200u+nt+ne+xb);
  if(sel.size()!=pc){fprintf(stderr,"CASE %s invalid selection size %zu (expected %u)\n",name,sel.size(),pc);return false;}
  std::vector<cuda_block_q8_K> hx((size_t)nt*xb);for(auto&b:hx)fill_q8_K_block(&b,rng);
  std::vector<cuda_block_q4_K> hg((size_t)ne*nr*xb),hu(hg.size());for(auto&b:hg)fill_q4_K_block(&b,rng);for(auto&b:hu)fill_q4_K_block(&b,rng);
- std::vector<float> hw(pc);std::uniform_real_distribution<float>wd(.5f,1.5f);for(auto&w:hw)w=wd(rng);
- int32_t *ds;uint32_t *dc,*doo,*dcur,*dsp,*dto,*dtt,*dte,*dts,*rto,*rtt,*rte,*rts,*dispatch_counts,*gate_marks,*up_marks;cuda_block_q8_K*dx;q8_1_mmq_block*dq;cuda_block_q4_K*dg,*du;float *dwgt,*rg,*ru,*rm,*wg,*wu,*wm,*pg,*pu,*cg,*cu,*cm;size_t os=(size_t)pc*nr*sizeof(float),ms=(size_t)pc*nr*sizeof(uint32_t);
+ std::vector<float> hw(pc);std::uniform_real_distribution<float>wd(.5f,1.5f);for(auto&w:hw)w=wd(rng);if(!hw.empty())hw[0]=0.0f;
+ int32_t *ds;uint32_t *dc,*doo,*dcur,*dsp,*dto,*dtt,*dte,*dts,*rto,*rtt,*rte,*rts,*dispatch_counts,*gate_marks,*up_marks;cuda_block_q8_K*dx;q8_1_mmq_block*dq;cuda_block_q4_K*dg,*du;float *dwgt,*rg,*ru,*rm,*wg,*wu,*wm,*pg,*pu,*fm,*fm2,*cg,*cu,*cm;size_t os=(size_t)pc*nr*sizeof(float),ms=(size_t)pc*nr*sizeof(uint32_t);
  #define HM(p,n,msg) hip_check(hipMalloc(&(p),(n)),msg)
- HM(ds,pc*sizeof(*ds),"selected");HM(dc,ne*sizeof(*dc),"counts");HM(doo,(ne+1)*sizeof(*doo),"offsets");HM(dcur,ne*sizeof(*dcur),"cursors");HM(dsp,pc*sizeof(*dsp),"pairs");HM(dto,(ne+1)*sizeof(*dto),"tile16 offsets");HM(dtt,sizeof(*dtt),"tile16 total");HM(dte,pc*sizeof(*dte),"tile16 experts");HM(dts,pc*sizeof(*dts),"tile16 starts");HM(rto,(ne+1)*sizeof(*rto),"tile8 offsets");HM(rtt,sizeof(*rtt),"tile8 total");HM(rte,pc*sizeof(*rte),"tile8 experts");HM(rts,pc*sizeof(*rts),"tile8 starts");HM(dx,hx.size()*sizeof(*dx),"xq");HM(dq,(size_t)nt*xb*2*sizeof(*dq),"q81");HM(dg,hg.size()*sizeof(*dg),"gate weights");HM(du,hu.size()*sizeof(*du),"up weights");HM(dwgt,pc*sizeof(*dwgt),"route weights");HM(rg,os,"ref gate");HM(ru,os,"ref up");HM(rm,os,"ref mid");HM(wg,os+sizeof(float),"wmma gate guard");HM(wu,os+sizeof(float),"wmma up guard");HM(wm,os+sizeof(float),"wmma mid guard");HM(pg,os+sizeof(float),"paired gate guard");HM(pu,os+sizeof(float),"paired up guard");HM(cg,os+sizeof(float),"crossover gate guard");HM(cu,os+sizeof(float),"crossover up guard");HM(cm,os+sizeof(float),"crossover mid guard");HM(dispatch_counts,4*sizeof(*dispatch_counts),"dispatch counters");HM(gate_marks,ms+sizeof(uint32_t),"gate marker guard");HM(up_marks,ms+sizeof(uint32_t),"up marker guard");
+ HM(ds,pc*sizeof(*ds),"selected");HM(dc,ne*sizeof(*dc),"counts");HM(doo,(ne+1)*sizeof(*doo),"offsets");HM(dcur,ne*sizeof(*dcur),"cursors");HM(dsp,pc*sizeof(*dsp),"pairs");HM(dto,(ne+1)*sizeof(*dto),"tile16 offsets");HM(dtt,sizeof(*dtt),"tile16 total");HM(dte,pc*sizeof(*dte),"tile16 experts");HM(dts,pc*sizeof(*dts),"tile16 starts");HM(rto,(ne+1)*sizeof(*rto),"tile8 offsets");HM(rtt,sizeof(*rtt),"tile8 total");HM(rte,pc*sizeof(*rte),"tile8 experts");HM(rts,pc*sizeof(*rts),"tile8 starts");HM(dx,hx.size()*sizeof(*dx),"xq");HM(dq,(size_t)nt*xb*2*sizeof(*dq),"q81");HM(dg,hg.size()*sizeof(*dg),"gate weights");HM(du,hu.size()*sizeof(*du),"up weights");HM(dwgt,pc*sizeof(*dwgt),"route weights");HM(rg,os,"ref gate");HM(ru,os,"ref up");HM(rm,os,"ref mid");HM(wg,os+sizeof(float),"wmma gate guard");HM(wu,os+sizeof(float),"wmma up guard");HM(wm,os+sizeof(float),"wmma mid guard");HM(pg,os+sizeof(float),"paired gate guard");HM(pu,os+sizeof(float),"paired up guard");HM(fm,os+sizeof(float),"fused legacy mid guard");HM(fm2,os+sizeof(float),"fused coalesced mid guard");HM(cg,os+sizeof(float),"crossover gate guard");HM(cu,os+sizeof(float),"crossover up guard");HM(cm,os+sizeof(float),"crossover mid guard");HM(dispatch_counts,4*sizeof(*dispatch_counts),"dispatch counters");HM(gate_marks,ms+sizeof(uint32_t),"gate marker guard");HM(up_marks,ms+sizeof(uint32_t),"up marker guard");
  hip_check(hipMemcpy(ds,sel.data(),pc*sizeof(*ds),hipMemcpyHostToDevice),"copy selected");hip_check(hipMemcpy(dx,hx.data(),hx.size()*sizeof(*dx),hipMemcpyHostToDevice),"copy xq");hip_check(hipMemcpy(dg,hg.data(),hg.size()*sizeof(*dg),hipMemcpyHostToDevice),"copy gate");hip_check(hipMemcpy(du,hu.data(),hu.size()*sizeof(*du),hipMemcpyHostToDevice),"copy up");hip_check(hipMemcpy(dwgt,hw.data(),pc*sizeof(*dwgt),hipMemcpyHostToDevice),"copy weights");hip_check(hipMemset(dc,0,ne*sizeof(*dc)),"clear counts");
  moe_count_sorted_pairs_kernel<<<(pc+255)/256,256>>>(dc,ds,pc,ne);moe_prefix_sorted_pairs_kernel<<<1,1>>>(doo,dcur,dc,ne);moe_scatter_sorted_pairs_deterministic_kernel<<<ne,1>>>(dsp,doo,ds,pc,ne);moe_build_expert_tile_offsets_kernel<<<1,1>>>(dto,dtt,dc,16,ne);moe_build_expert_tiles_kernel<<<(ne+255)/256,256>>>(dte,dts,dto,dc,16,ne);moe_build_expert_tile_offsets_kernel<<<1,1>>>(rto,rtt,dc,8,ne);moe_build_expert_tiles_kernel<<<(ne+255)/256,256>>>(rte,rts,rto,dc,8,ne);hip_check(hipDeviceSynchronize(),"routing builders");
  std::vector<uint32_t> hc(ne),ho(ne+1),hp(pc),hte(pc),hts(pc);uint32_t tiles;hip_check(hipMemcpy(hc.data(),dc,ne*4,hipMemcpyDeviceToHost),"counts back");hip_check(hipMemcpy(ho.data(),doo,(ne+1)*4,hipMemcpyDeviceToHost),"offsets back");hip_check(hipMemcpy(hp.data(),dsp,pc*4,hipMemcpyDeviceToHost),"pairs back");hip_check(hipMemcpy(&tiles,dtt,4,hipMemcpyDeviceToHost),"tiles back");hip_check(hipMemcpy(hte.data(),dte,tiles*4,hipMemcpyDeviceToHost),"experts back");hip_check(hipMemcpy(hts.data(),dts,tiles*4,hipMemcpyDeviceToHost),"starts back");
@@ -282,6 +300,25 @@ static bool run_case(const char *name,uint32_t nt,uint32_t ne,const std::vector<
  uint32_t hot_tiles=0,cold_tiles=0;for(uint32_t t=0;t<tiles;++t)(hc[hte[t]]>=wmma_min_count?hot_tiles:cold_tiles)++;bool markers=cg_guard==0xffffffffu&&cu_guard==0xffffffffu&&cm_guard==0xffffffffu&&gm_guard==0u&&um_guard==0u;for(uint32_t p=0;p<pc;++p){uint32_t expected=hc[(uint32_t)std::max(sel[p],0)]>=wmma_min_count?1u:2u;for(uint32_t row=0;row<nr;++row){size_t i=(size_t)p*nr+row;markers&=hgm[i]==expected&&hum[i]==expected;}}
  bool counters=hdispatch[0]==hot_tiles&&hdispatch[1]==cold_tiles&&hdispatch[2]==cold_tiles&&hdispatch[3]==hot_tiles;std::vector<float> cpu_gc=cpu_g,cpu_uc=cpu_u;for(auto&v:cpu_gc)v=std::min(v,3.0f);for(auto&v:cpu_uc)v=std::max(-3.0f,std::min(v,3.0f));bool cross_gate=close_vec("xgate",hcg,cpu_g,.05,.01),cross_up=close_vec("xup",hcu,cpu_u,.05,.01),cross_mid=close_mid(hcm,cpu_m,hcg,cpu_gc,cpu_uc,hw,nr,.05,.01,3.0f);bool crossover=markers&&counters&&cross_gate&&cross_up&&cross_mid;printf("  crossover threshold=%u hot/cold=%u/%u counters=%u,%u,%u,%u markers=%s result=%s\n",wmma_min_count,hot_tiles,cold_tiles,hdispatch[0],hdispatch[1],hdispatch[2],hdispatch[3],markers?"PASS":"FAIL",crossover?"PASS":"FAIL");
 
+ // Fused hot tiles write mid directly; cold tiles retain the DP4A gate/up
+ // staging and are consumed by a cold-only epilogue.  Run both production
+ // epilogue layouts against the exact full-stream baseline.  One additive
+ // owner marker per output proves that the >=6 and <6 predicates neither
+ // overlap nor leave holes, including the explicit 5/6/7 boundary cases.
+ hip_check(hipMemset(pg,0xff,os+4),"poison fused-mixed gate");hip_check(hipMemset(pu,0xff,os+4),"poison fused-mixed up");hip_check(hipMemset(fm,0xff,os+4),"poison fused legacy mid");hip_check(hipMemset(fm2,0xff,os+4),"poison fused coalesced mid");hip_check(hipMemset(gate_marks,0,ms+4),"clear fused legacy markers");hip_check(hipMemset(up_marks,0,ms+4),"clear fused coalesced markers");
+ q4k_wmma_routed_pair_kernel<16,true><<<wgrid,256,pair_sh>>>(dg,du,dq,NULL,NULL,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,wmma_min_count,NULL,NULL,NULL,fm,dwgt,3.0f,gate_marks);
+ q4k_wmma_routed_pair_kernel<16,true><<<wgrid,256,pair_sh>>>(dg,du,dq,NULL,NULL,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,wmma_min_count,NULL,NULL,NULL,fm2,dwgt,3.0f,up_marks);
+ q4k_dp4a_cold_tile16_kernel<<<dim3((nr+31)/32,tiles),256>>>(pg,pu,(const char*)dg,(const char*)du,dx,dsp,doo,dc,dtt,dte,dts,(uint64_t)nr*xb*sizeof(cuda_block_q4_K),(uint64_t)xb*sizeof(cuda_block_q4_K),xb,nr,used,wmma_min_count,NULL,NULL,NULL);
+ routed_epilogue_cold_legacy<<<dim3(1,tiles),16>>>(pg,pu,fm,dsp,doo,dc,dtt,dte,dts,dwgt,nr,used,3.0f,wmma_min_count,gate_marks);
+ routed_epilogue_cold_coalesced<<<dim3((nr+255)/256,tiles),256>>>(pg,pu,fm2,dsp,doo,dc,dtt,dte,dts,dwgt,nr,3.0f,wmma_min_count,up_marks);
+ hip_check(hipDeviceSynchronize(),"fused mixed hot/cold phase");
+ std::vector<float> hfm(pc*nr),hfm2(pc*nr);std::vector<uint32_t> hfmm(pc*nr),hfm2m(pc*nr);hip_check(hipMemcpy(hfm.data(),fm,os,hipMemcpyDeviceToHost),"fused legacy mid back");hip_check(hipMemcpy(hfm2.data(),fm2,os,hipMemcpyDeviceToHost),"fused coalesced mid back");hip_check(hipMemcpy(hfmm.data(),gate_marks,ms,hipMemcpyDeviceToHost),"fused legacy markers back");hip_check(hipMemcpy(hfm2m.data(),up_marks,ms,hipMemcpyDeviceToHost),"fused coalesced markers back");
+ uint32_t fm_guard=0,fm2_guard=0,fmm_guard=1,fm2m_guard=1;hip_check(hipMemcpy(&fm_guard,(const char*)fm+os,4,hipMemcpyDeviceToHost),"fused legacy guard back");hip_check(hipMemcpy(&fm2_guard,(const char*)fm2+os,4,hipMemcpyDeviceToHost),"fused coalesced guard back");hip_check(hipMemcpy(&fmm_guard,(const char*)gate_marks+ms,4,hipMemcpyDeviceToHost),"fused legacy marker guard back");hip_check(hipMemcpy(&fm2m_guard,(const char*)up_marks+ms,4,hipMemcpyDeviceToHost),"fused coalesced marker guard back");
+ bool fused_owners=fm_guard==0xffffffffu&&fm2_guard==0xffffffffu&&fmm_guard==0u&&fm2m_guard==0u;for(size_t i=0;i<hfmm.size();++i)fused_owners&=hfmm[i]==1u&&hfm2m[i]==1u;bool fused_legacy_exact=!memcmp(hfm.data(),hcm.data(),os),fused_coalesced_exact=!memcmp(hfm2.data(),hcm.data(),os);bool fused_mixed=fused_owners&&fused_legacy_exact&&fused_coalesced_exact;
+ if(!hw.empty()&&hw[0]==0.0f){bool pair0_written=true;for(uint32_t row=0;row<nr;++row)pair0_written&=hfmm[row]==1u&&hfm2m[row]==1u;fused_seen_zero_weight_write|=pair0_written;}
+ for(uint32_t p=0;p<pc;++p)if(hc[(uint32_t)std::max(sel[p],0)]>=wmma_min_count)for(uint32_t row=0;row<nr;++row){size_t i=(size_t)p*nr+row;fused_seen_gate_pos_clamp|=hcg[i]>3.0f;fused_seen_up_pos_clamp|=hcu[i]>3.0f;fused_seen_up_neg_clamp|=hcu[i]<-3.0f;}
+ printf("  fused-mixed legacy=%s coalesced=%s owners=%s zero-weight-write=%s result=%s\n",fused_legacy_exact?"PASS":"FAIL",fused_coalesced_exact?"PASS":"FAIL",fused_owners?"PASS":"FAIL",fused_seen_zero_weight_write?"PASS":"FAIL",fused_mixed?"PASS":"FAIL");
+
  // Full Stage-2 pipeline metric.  Routing is already built, just as it is at
  // dispatch time.  The crossover timed unit converts each unique token once,
  // runs both routed WMMA GEMMs, the complementary DP4A fallback, and the
@@ -292,6 +329,16 @@ static bool run_case(const char *name,uint32_t nt,uint32_t ne,const std::vector<
   BenchResult paired_wmma=time_launch([&](){q4k_wmma_routed_pair_kernel<16><<<wgrid,256,pair_sh>>>(dg,du,dq,pg,pu,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,0,NULL,NULL,NULL);});
   paired_timings.push_back({pair_bucket?pair_bucket:timing_bucket,xb,separate_wmma.median_us,paired_wmma.median_us});
   printf("  paired-WMMA bucket=%u K=%u separate_us=%.3f paired_us=%.3f speedup=%.4fx\n",pair_bucket?pair_bucket:timing_bucket,xb*256u,separate_wmma.median_us,paired_wmma.median_us,separate_wmma.median_us/paired_wmma.median_us);
+ }
+ if(pair_bucket){
+  hip_check(hipMemset(pg,0xff,os+4),"poison staged gate");hip_check(hipMemset(pu,0xff,os+4),"poison staged up");hip_check(hipMemset(wm,0xff,os+4),"poison staged mid");hip_check(hipMemset(fm,0xff,os+4),"poison fused mid");
+  q4k_wmma_routed_pair_kernel<16><<<wgrid,256,pair_sh>>>(dg,du,dq,pg,pu,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,0,NULL,NULL,NULL);
+  routed_epilogue<<<dim3(1,tiles),16>>>(pg,pu,wm,dsp,doo,dc,dtt,dte,dts,dwgt,nr,used,3.0f);
+  q4k_wmma_routed_pair_kernel<16,true><<<wgrid,256,pair_sh>>>(dg,du,dq,NULL,NULL,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,0,NULL,NULL,NULL,fm,dwgt,3.0f,NULL);
+  hip_check(hipDeviceSynchronize(),"fused mid exactness");std::vector<float> staged_mid(pc*nr),fused_mid(pc*nr);hip_check(hipMemcpy(staged_mid.data(),wm,os,hipMemcpyDeviceToHost),"staged mid back");hip_check(hipMemcpy(fused_mid.data(),fm,os,hipMemcpyDeviceToHost),"fused mid back");uint32_t smg=0,fmg=0;hip_check(hipMemcpy(&smg,(const char*)wm+os,4,hipMemcpyDeviceToHost),"staged mid guard");hip_check(hipMemcpy(&fmg,(const char*)fm+os,4,hipMemcpyDeviceToHost),"fused mid guard");bool fused_exact=!memcmp(staged_mid.data(),fused_mid.data(),os)&&smg==0xffffffffu&&fmg==0xffffffffu;
+  BenchResult staged_time=time_launch([&](){q4k_wmma_routed_pair_kernel<16><<<wgrid,256,pair_sh>>>(dg,du,dq,pg,pu,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,0,NULL,NULL,NULL);routed_epilogue<<<dim3(1,tiles),16>>>(pg,pu,wm,dsp,doo,dc,dtt,dte,dts,dwgt,nr,used,3.0f);});
+  BenchResult fused_time=time_launch([&](){q4k_wmma_routed_pair_kernel<16,true><<<wgrid,256,pair_sh>>>(dg,du,dq,NULL,NULL,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,0,NULL,NULL,NULL,fm,dwgt,3.0f,NULL);});
+  fused_mid_timings.push_back({pair_bucket,xb,staged_time.median_us,fused_time.median_us,fused_exact});printf("  fused-mid bucket=%u K=%u staged_us=%.3f fused_us=%.3f speedup=%.4fx exact=%s\n",pair_bucket,xb*256u,staged_time.median_us,fused_time.median_us,staged_time.median_us/fused_time.median_us,fused_exact?"PASS":"FAIL");
  }
  if(timing_bucket){
   BenchResult cross_time=time_launch([&](){q8_K_to_q8_1_mmq_kernel<<<dim3(nt,xb),32>>>(dx,dq,nt,xb);q4k_wmma_routed_kernel<16><<<wgrid,256,sh>>>(dg,dq,cg,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,wmma_min_count,NULL,NULL);q4k_wmma_routed_kernel<16><<<wgrid,256,sh>>>(du,dq,cu,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,wmma_min_count,NULL,NULL);q4k_dp4a_cold_tile16_kernel<<<dim3((nr+31)/32,tiles),256>>>(cg,cu,(const char*)dg,(const char*)du,dx,dsp,doo,dc,dtt,dte,dts,(uint64_t)nr*xb*sizeof(cuda_block_q4_K),(uint64_t)xb*sizeof(cuda_block_q4_K),xb,nr,used,wmma_min_count,NULL,NULL,NULL);routed_epilogue<<<dim3(1,tiles),16>>>(cg,cu,cm,dsp,doo,dc,dtt,dte,dts,dwgt,nr,used,3.0f);});
@@ -306,7 +353,7 @@ static bool run_case(const char *name,uint32_t nt,uint32_t ne,const std::vector<
  // it is outside the timed region and is not part of the crossover mechanism.
  if(mixed){for(uint32_t threshold:std::vector<uint32_t>{2,kWmmaMinCount,8,16}){std::vector<uint32_t> he,hs,ce,cs;for(uint32_t t=0;t<tiles;++t){if(hc[hte[t]]>=threshold){he.push_back(hte[t]);hs.push_back(hts[t]);}else{ce.push_back(hte[t]);cs.push_back(hts[t]);}}uint32_t *dhe,*dhs,*dce,*dcs,*dhn,*dcn;HM(dhe,he.size()*4,"hot experts");HM(dhs,hs.size()*4,"hot starts");HM(dce,ce.size()*4,"cold experts");HM(dcs,cs.size()*4,"cold starts");HM(dhn,4,"hot total");HM(dcn,4,"cold total");uint32_t hn=(uint32_t)he.size(),cn=(uint32_t)ce.size();hip_check(hipMemcpy(dhe,he.data(),hn*4,hipMemcpyHostToDevice),"hot experts copy");hip_check(hipMemcpy(dhs,hs.data(),hn*4,hipMemcpyHostToDevice),"hot starts copy");hip_check(hipMemcpy(dce,ce.data(),cn*4,hipMemcpyHostToDevice),"cold experts copy");hip_check(hipMemcpy(dcs,cs.data(),cn*4,hipMemcpyHostToDevice),"cold starts copy");hip_check(hipMemcpy(dhn,&hn,4,hipMemcpyHostToDevice),"hot total copy");hip_check(hipMemcpy(dcn,&cn,4,hipMemcpyHostToDevice),"cold total copy");BenchResult actual=time_launch([&](){q4k_wmma_routed_kernel<16><<<wgrid,256,sh>>>(dg,dq,cg,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,threshold,NULL,NULL);q4k_wmma_routed_kernel<16><<<wgrid,256,sh>>>(du,dq,cu,dsp,doo,dc,dtt,dte,dts,nt,xb,nr,used,threshold,NULL,NULL);q4k_dp4a_cold_tile16_kernel<<<dim3((nr+31)/32,tiles),256>>>(cg,cu,(const char*)dg,(const char*)du,dx,dsp,doo,dc,dtt,dte,dts,(uint64_t)nr*xb*sizeof(cuda_block_q4_K),(uint64_t)xb*sizeof(cuda_block_q4_K),xb,nr,used,threshold,NULL,NULL,NULL);});dim3 hwgrid((nr+63)/64,hn),hcgrid((nr+31)/32,cn);BenchResult ideal=time_launch([&](){q4k_wmma_routed_kernel<16><<<hwgrid,256,sh>>>(dg,dq,cg,dsp,doo,dc,dhn,dhe,dhs,nt,xb,nr,used,0,NULL,NULL);q4k_wmma_routed_kernel<16><<<hwgrid,256,sh>>>(du,dq,cu,dsp,doo,dc,dhn,dhe,dhs,nt,xb,nr,used,0,NULL,NULL);q4k_dp4a_cold_tile16_kernel<<<hcgrid,256>>>(cg,cu,(const char*)dg,(const char*)du,dx,dsp,doo,dc,dcn,dce,dcs,(uint64_t)nr*xb*sizeof(cuda_block_q4_K),(uint64_t)xb*sizeof(cuda_block_q4_K),xb,nr,used,UINT32_MAX,NULL,NULL,NULL);});printf("  crossover-overhead threshold=%u hot/cold=%u/%u dual_us=%.3f ideal_compact_us=%.3f overhead_us=%+.3f overhead_pct=%+.2f%%\n",threshold,hn,cn,actual.median_us,ideal.median_us,actual.median_us-ideal.median_us,100.0*(actual.median_us/ideal.median_us-1.0));(void)hipFree(dhe);(void)hipFree(dhs);(void)hipFree(dce);(void)hipFree(dcs);(void)hipFree(dhn);(void)hipFree(dcn);}}
  #define HF(p) (void)hipFree(p)
- HF(ds);HF(dc);HF(doo);HF(dcur);HF(dsp);HF(dto);HF(dtt);HF(dte);HF(dts);HF(rto);HF(rtt);HF(rte);HF(rts);HF(dx);HF(dq);HF(dg);HF(du);HF(dwgt);HF(rg);HF(ru);HF(rm);HF(wg);HF(wu);HF(wm);HF(pg);HF(pu);HF(cg);HF(cu);HF(cm);HF(dispatch_counts);HF(gate_marks);HF(up_marks);return route&&gemm&&epi&&crossover;
+ HF(ds);HF(dc);HF(doo);HF(dcur);HF(dsp);HF(dto);HF(dtt);HF(dte);HF(dts);HF(rto);HF(rtt);HF(rte);HF(rts);HF(dx);HF(dq);HF(dg);HF(du);HF(dwgt);HF(rg);HF(ru);HF(rm);HF(wg);HF(wu);HF(wm);HF(pg);HF(pu);HF(fm);HF(fm2);HF(cg);HF(cu);HF(cm);HF(dispatch_counts);HF(gate_marks);HF(up_marks);return route&&gemm&&epi&&crossover&&fused_mixed;
 }
 
 static std::vector<int32_t> selections_from_counts(const std::vector<uint32_t>&counts){
@@ -343,7 +390,15 @@ static bool report_paired_gate(){
  double geomean=std::exp(log_sum/retained);bool pass=geomean>=1.08;printf("  selected_geomean=%.4fx required>=1.08x gate=%s\n",geomean,pass?"PASS":"FAIL");return pass;
 }
 
-int main(){bool ok=true;int base_blocks=0,pair_blocks=0;const size_t kernel_lds=(16*36+64*76)*sizeof(int32_t);hip_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&base_blocks,q4k_wmma_routed_kernel<16>,256,kernel_lds),"baseline occupancy");hip_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&pair_blocks,q4k_wmma_routed_pair_kernel<16>,256,kernel_lds),"paired occupancy");printf("COMPILED OCCUPANCY baseline_blocks_per_CU=%d paired_blocks_per_CU=%d baseline_lds=%zu paired_lds=%zu\n",base_blocks,pair_blocks,kernel_lds,kernel_lds);
+static bool report_fused_mid_gate(){
+ double log_sum=0.0;uint32_t retained=0;bool data_ok=true,exact=true;
+ printf("\nFUSED HOT-MID GATE\n");
+ for(const auto&r:fused_mid_timings){bool selected=r.xq_blocks==16u&&(r.bucket==22u||r.bucket==48u);bool valid=std::isfinite(r.staged_us)&&std::isfinite(r.fused_us)&&r.staged_us>0.0&&r.fused_us>0.0;double speedup=valid?r.staged_us/r.fused_us:NAN;printf("  bucket=%3u K=%4u selected=%s staged_us=%9.3f fused_us=%9.3f speedup=%7.4fx exact=%s\n",r.bucket,r.xq_blocks*256u,selected?"yes":"no",r.staged_us,r.fused_us,speedup,r.exact?"PASS":"FAIL");if(selected){data_ok&=valid;exact&=r.exact;if(valid){log_sum+=std::log(speedup);++retained;}}}
+ if(!data_ok||retained!=2u){printf("  gate=UNDECIDED (requires valid production-K buckets 22 and 48)\n");return false;}
+ double geomean=std::exp(log_sum/retained);bool pass=exact&&geomean>=1.05;printf("  selected_geomean=%.4fx required>=1.05x exact=%s gate=%s\n",geomean,exact?"PASS":"FAIL",pass?"PASS":"FAIL");return pass;
+}
+
+int main(){bool ok=true;int base_blocks=0,pair_blocks=0,fused_blocks=0;const size_t kernel_lds=(16*36+64*76)*sizeof(int32_t);hip_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&base_blocks,q4k_wmma_routed_kernel<16>,256,kernel_lds),"baseline occupancy");hip_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&pair_blocks,q4k_wmma_routed_pair_kernel<16>,256,kernel_lds),"paired occupancy");hip_check(hipOccupancyMaxActiveBlocksPerMultiprocessor(&fused_blocks,q4k_wmma_routed_pair_kernel<16,true>,256,kernel_lds),"fused occupancy");printf("COMPILED OCCUPANCY baseline_blocks_per_CU=%d paired_blocks_per_CU=%d fused_blocks_per_CU=%d lds=%zu\n",base_blocks,pair_blocks,fused_blocks,kernel_lds);ok&=base_blocks==3&&pair_blocks==3&&fused_blocks==3;
  // Preserve the five already-validated cases, now expressed through the same
  // explicit selection-vector entry point used by the extended sweep.
  ok&=run_case("balanced",17,256,formula_selections(17,256,false,false));ok&=run_case("skewed",23,256,formula_selections(23,256,true,false));ok&=run_case("tiny-tail",3,256,formula_selections(3,256,false,false));ok&=run_case("single",16,1,formula_selections(16,1,true,false));ok&=run_case("mixed",12,256,formula_selections(12,256,false,true));
@@ -361,6 +416,10 @@ int main(){bool ok=true;int base_blocks=0,pair_blocks=0;const size_t kernel_lds=
  // Each pair/slot remains a distinct CPU-reference output, so the reference
  // neither coalesces duplicates nor itself double-counts an accumulated value.
  std::vector<int32_t> repeated(24,1);for(uint32_t p=0;p<17;++p)repeated[p]=0;ok&=run_case("repeated-boundary",4,8,repeated);
+ // Exercise both endpoints of the production's user-tunable threshold through
+ // the complete fused hot/cold ownership and exactness gate.
+ ok&=run_case("fused-min-1",6,6,selections_from_counts({0,1,5,6,7,17}),0,2,0,1);
+ ok&=run_case("fused-min-16",12,6,selections_from_counts({5,6,7,16,17,21}),0,2,0,16);
  // Uniform six-expert histograms provide one independently timed point per
  // bucket.  They also run the complete correctness suite before timing.
  for(uint32_t m:std::vector<uint32_t>{1,4,5,6,7,8,9,15,16,17,22,32,48,64}){char name[48];snprintf(name,sizeof(name),"timing-bucket-%u",m);ok&=run_case(name,m,16,selections_from_counts(std::vector<uint32_t>(6,m)),m);}
@@ -368,4 +427,5 @@ int main(){bool ok=true;int base_blocks=0,pair_blocks=0;const size_t kernel_lds=
  // Stage-2 full-pipeline gate, whose DP4A comparison intentionally uses K=512.
  ok&=run_case("paired-prod-k22",22,16,selections_from_counts(std::vector<uint32_t>(6,22)),0,16,22);
  ok&=run_case("paired-prod-k48",48,16,selections_from_counts(std::vector<uint32_t>(6,48)),0,16,48);
- bool timing_gate=report_pipeline_gate(),paired_gate=report_paired_gate();printf("routed Stage-2 validation: %s; timing gate: %s; paired gate: %s\n",ok?"PASS":"FAIL",timing_gate?"PASS":"FAIL",paired_gate?"PASS":"FAIL");return ok&&timing_gate&&paired_gate?0:1;}
+ bool fused_coverage=fused_seen_gate_pos_clamp&&fused_seen_up_pos_clamp&&fused_seen_up_neg_clamp&&fused_seen_zero_weight_write;printf("FUSED COVERAGE gate>clamp=%s up>clamp=%s up<-clamp=%s zero-weight-write=%s coverage=%s\n",fused_seen_gate_pos_clamp?"PASS":"FAIL",fused_seen_up_pos_clamp?"PASS":"FAIL",fused_seen_up_neg_clamp?"PASS":"FAIL",fused_seen_zero_weight_write?"PASS":"FAIL",fused_coverage?"PASS":"FAIL");
+ bool timing_gate=report_pipeline_gate(),paired_gate=report_paired_gate(),fused_mid_gate=report_fused_mid_gate();printf("routed Stage-2 validation: %s; timing gate: %s; paired gate: %s; fused-mid gate: %s; fused coverage: %s\n",ok?"PASS":"FAIL",timing_gate?"PASS":"FAIL",paired_gate?"PASS":"FAIL",fused_mid_gate?"PASS":"FAIL",fused_coverage?"PASS":"FAIL");return ok&&timing_gate&&paired_gate&&fused_mid_gate&&fused_coverage?0:1;}

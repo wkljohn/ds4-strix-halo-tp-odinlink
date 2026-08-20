@@ -51636,7 +51636,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     return placement_features;
 #else
     if (!e || !e->metal_ready) return placement_features;
-    uint32_t q4k_features = DS4_TP_FEATURE_Q4K_WMMA;
+    uint32_t q4k_features = DS4_TP_FEATURE_Q4K_WMMA |
+                            DS4_TP_FEATURE_Q4K_FUSED_MID;
     uint32_t iq2_features = DS4_TP_FEATURE_IQ2_I8_WMMA;
     bool saw_q4k_layer = false;
     bool saw_iq2_layer = false;

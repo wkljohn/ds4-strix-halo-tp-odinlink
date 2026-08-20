@@ -10,6 +10,9 @@ static int routed_moe_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
 #ifndef DS4_TP_FEATURE_IQ2_I8_WMMA
 #define DS4_TP_FEATURE_IQ2_I8_WMMA (UINT32_C(1) << 6)
 #endif
+#ifndef DS4_TP_FEATURE_Q4K_FUSED_MID
+#define DS4_TP_FEATURE_Q4K_FUSED_MID (UINT32_C(1) << 16)
+#endif
 
 static int routed_moe_align256_checked(uint64_t v, uint64_t *out) {
     if (!out || v > UINT64_MAX - 255ull) return 0;
@@ -74,6 +77,24 @@ static int routed_moe_q4k_wmma_pair_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *env = getenv("DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
+static int routed_moe_q4k_wmma_fuse_mid_requested(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_WMMA_FUSE_MID");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
+static int routed_moe_q4k_wmma_layer_log_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_WMMA_LAYER_LOG");
         enabled = env && env[0] == '1' && env[1] == '\0';
     }
     return enabled;
@@ -171,8 +192,15 @@ extern "C" uint32_t ds4_gpu_q4k_wmma_runtime_features(
         down_row_bytes == 8u * sizeof(cuda_block_q4_K) &&
         down_expert_bytes == (uint64_t)down_out_dim * down_row_bytes &&
         (((uintptr_t)gate_w | (uintptr_t)up_w | (uintptr_t)down_w) & 15u) == 0u;
-    return cfg->gfx1151 && shape_ok && cfg->opt_in &&
-           !cfg->disabled && !g_quality_mode ? DS4_TP_FEATURE_Q4K_WMMA : 0u;
+    if (!(cfg->gfx1151 && shape_ok && cfg->opt_in &&
+          !cfg->disabled && !g_quality_mode)) return 0u;
+    uint32_t features = DS4_TP_FEATURE_Q4K_WMMA;
+    if (routed_moe_q4k_wmma_pair_enabled() &&
+        routed_moe_q4k_wmma_fuse_mid_requested() &&
+        !routed_moe_q4k_wmma_layer_log_enabled()) {
+        features |= DS4_TP_FEATURE_Q4K_FUSED_MID;
+    }
+    return features;
 }
 
 extern "C" uint32_t ds4_gpu_iq2_i8_wmma_runtime_features(
@@ -201,15 +229,17 @@ extern "C" void ds4_gpu_set_tp_runtime_features(uint32_t rank,
     g_q4k_wmma_tp_runtime_features = features;
     g_q4k_wmma_tp_runtime_features_valid = 1;
     const int q4k = (features & DS4_TP_FEATURE_Q4K_WMMA) != 0;
+    const int q4k_fused_mid =
+        (features & DS4_TP_FEATURE_Q4K_FUSED_MID) != 0;
     const int iq2_i8 = (features & DS4_TP_FEATURE_IQ2_I8_WMMA) != 0;
     fprintf(stderr, DS4_GPU_LOG_PREFIX
             "Q4_K WMMA startup rank=%u negotiated=0x%08x gate=%d up=%d "
             "down=%d sorted_min_tokens=%u gate_up_threshold=%u "
-            "down_threshold=1 iq2_i8=%d quality=%d "
+            "down_threshold=1 fused_active=%d iq2_i8=%d quality=%d "
             "kill_switch=%d\n",
             rank, features, q4k, q4k, q4k,
             routed_moe_q4k_sorted_min_tokens(),
-            routed_moe_q4k_wmma_min_count(),
+            routed_moe_q4k_wmma_min_count(), q4k_fused_mid,
             iq2_i8, g_quality_mode, cfg->disabled);
 }
 
@@ -1423,10 +1453,9 @@ static int routed_moe_launch(
                 gate_row_bytes, gate_w, up_w);
         const uint32_t need_x_q81 =
             use_q4k_wmma || request_iq2_i8_wmma;
-        const char *q4k_layer_log_env =
-            getenv("DS4_ROCM_Q4K_WMMA_LAYER_LOG");
-        if (use_q4k_wmma && q4k_layer_log_env &&
-            q4k_layer_log_env[0] == '1' && q4k_layer_log_env[1] == '\0') {
+        const uint32_t q4k_layer_log =
+            routed_moe_q4k_wmma_layer_log_enabled();
+        if (use_q4k_wmma && q4k_layer_log) {
             static uint64_t logged_q4k_layers;
             if (layer_index < 64u &&
                 (logged_q4k_layers & (UINT64_C(1) << layer_index)) == 0u) {
@@ -1440,6 +1469,17 @@ static int routed_moe_launch(
         }
         const uint32_t routing_tile_m = use_q4k_wmma ? 16u : expert_tile_m;
         const uint32_t write_gate_up = 0u;
+        const uint32_t q4k_wmma_pair_active =
+            use_q4k_wmma && routed_moe_q4k_wmma_pair_enabled();
+        const uint32_t q4k_fused_feature_active =
+            !ds4_gpu_tp_expert_shard_active() ||
+            (g_q4k_wmma_tp_runtime_features_valid &&
+             (g_q4k_wmma_tp_runtime_features &
+              DS4_TP_FEATURE_Q4K_FUSED_MID));
+        const uint32_t q4k_fused_active =
+            q4k_wmma_pair_active &&
+            routed_moe_q4k_wmma_fuse_mid_requested() &&
+            q4k_fused_feature_active && !q4k_layer_log && !write_gate_up;
         const uint32_t use_p2_sorted = 0u;
         const char *tp_prefill_skip_env =
             getenv("DS4_ROCM_TP_PREFILL_SKIP_UNOWNED");
@@ -1921,16 +1961,38 @@ static int routed_moe_launch(
                             (16u * 36u + 64u * 76u) * sizeof(int32_t);
                         dim3 wgrid((expert_mid_dim + 63u) / 64u,
                                    tile_capacity, 1);
-                        if (routed_moe_q4k_wmma_pair_enabled()) {
-                            moe_q4K_routed_wmma_pair_kernel<16>
-                                <<<wgrid, 256, wmma_smem>>>(
-                                    gate_w, up_w, q4k_q81,
-                                    (float *)gate->ptr, (float *)up->ptr,
-                                    sorted_pairs, sorted_offsets, sorted_counts,
-                                    tile_total, tile_experts, tile_starts,
-                                    n_tokens, xq_blocks, expert_mid_dim, n_expert,
-                                    gate_expert_bytes, gate_row_bytes,
-                                    wmma_min_count);
+                        if (q4k_wmma_pair_active) {
+                            if (q4k_fused_active) {
+                                static int fused_logged;
+                                if (!fused_logged) {
+                                    fused_logged = 1;
+                                    fprintf(stderr, DS4_GPU_LOG_PREFIX
+                                            "Q4_K WMMA fused-mid active "
+                                            "min_count=%u\n",
+                                            wmma_min_count);
+                                }
+                                moe_q4K_routed_wmma_pair_kernel<16, true>
+                                    <<<wgrid, 256, wmma_smem>>>(
+                                        gate_w, up_w, q4k_q81, NULL, NULL,
+                                        sorted_pairs, sorted_offsets,
+                                        sorted_counts, tile_total, tile_experts,
+                                        tile_starts, n_tokens, xq_blocks,
+                                        expert_mid_dim, n_expert,
+                                        gate_expert_bytes, gate_row_bytes,
+                                        wmma_min_count, (float *)mid->ptr,
+                                        (const float *)weights->ptr, clamp);
+                            } else {
+                                moe_q4K_routed_wmma_pair_kernel<16, false>
+                                    <<<wgrid, 256, wmma_smem>>>(
+                                        gate_w, up_w, q4k_q81,
+                                        (float *)gate->ptr, (float *)up->ptr,
+                                        sorted_pairs, sorted_offsets,
+                                        sorted_counts, tile_total, tile_experts,
+                                        tile_starts, n_tokens, xq_blocks,
+                                        expert_mid_dim, n_expert,
+                                        gate_expert_bytes, gate_row_bytes,
+                                        wmma_min_count, NULL, NULL, 0.0f);
+                            }
                             ok = cuda_ok(cudaGetLastError(),
                                          "routed_moe Q4_K paired WMMA launch");
                             if (ok && q4k_decode_event_profile) {
@@ -1996,21 +2058,50 @@ static int routed_moe_launch(
                                 n_tokens >= 8u) {
                                 dim3 egrid((expert_mid_dim + 255u) / 256u,
                                            tile_capacity, 1u);
-                                moe_gate_up_mid_q4K_routed_epilogue_coalesced_kernel
-                                    <<<egrid, 256>>>(
-                                        (float *)gate->ptr, (float *)up->ptr,
-                                        (float *)mid->ptr, sorted_pairs, sorted_offsets,
-                                        sorted_counts, tile_total, tile_experts, tile_starts,
-                                        (const float *)weights->ptr, expert_mid_dim,
-                                        n_expert, write_gate_up, clamp);
+                                if (q4k_fused_active) {
+                                    moe_gate_up_mid_q4K_routed_epilogue_coalesced_kernel<true>
+                                        <<<egrid, 256>>>(
+                                            (float *)gate->ptr, (float *)up->ptr,
+                                            (float *)mid->ptr, sorted_pairs,
+                                            sorted_offsets, sorted_counts,
+                                            tile_total, tile_experts, tile_starts,
+                                            (const float *)weights->ptr,
+                                            expert_mid_dim, n_expert,
+                                            wmma_min_count, write_gate_up, clamp);
+                                } else {
+                                    moe_gate_up_mid_q4K_routed_epilogue_coalesced_kernel<false>
+                                        <<<egrid, 256>>>(
+                                            (float *)gate->ptr, (float *)up->ptr,
+                                            (float *)mid->ptr, sorted_pairs,
+                                            sorted_offsets, sorted_counts,
+                                            tile_total, tile_experts, tile_starts,
+                                            (const float *)weights->ptr,
+                                            expert_mid_dim, n_expert,
+                                            wmma_min_count, write_gate_up, clamp);
+                                }
                             } else {
                                 dim3 egrid(1u, tile_capacity, 1u);
-                                moe_gate_up_mid_q4K_routed_epilogue_kernel<<<egrid, 16>>>(
-                                    (float *)gate->ptr, (float *)up->ptr,
-                                    (float *)mid->ptr, sorted_pairs, sorted_offsets,
-                                    sorted_counts, tile_total, tile_experts, tile_starts,
-                                    (const float *)weights->ptr, expert_mid_dim,
-                                    n_expert, write_gate_up, clamp);
+                                if (q4k_fused_active) {
+                                    moe_gate_up_mid_q4K_routed_epilogue_kernel<true>
+                                        <<<egrid, 16>>>(
+                                            (float *)gate->ptr, (float *)up->ptr,
+                                            (float *)mid->ptr, sorted_pairs,
+                                            sorted_offsets, sorted_counts,
+                                            tile_total, tile_experts, tile_starts,
+                                            (const float *)weights->ptr,
+                                            expert_mid_dim, n_expert,
+                                            wmma_min_count, write_gate_up, clamp);
+                                } else {
+                                    moe_gate_up_mid_q4K_routed_epilogue_kernel<false>
+                                        <<<egrid, 16>>>(
+                                            (float *)gate->ptr, (float *)up->ptr,
+                                            (float *)mid->ptr, sorted_pairs,
+                                            sorted_offsets, sorted_counts,
+                                            tile_total, tile_experts, tile_starts,
+                                            (const float *)weights->ptr,
+                                            expert_mid_dim, n_expert,
+                                            wmma_min_count, write_gate_up, clamp);
+                                }
                             }
                             ok = cuda_ok(cudaGetLastError(),
                                          "routed_moe Q4_K WMMA epilogue launch");

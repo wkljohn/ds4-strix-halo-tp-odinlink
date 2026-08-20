@@ -96,6 +96,12 @@ int main(void) {
     ok &= check("hello mismatched-temporal-compressor",
                 DS4_TP_FEATURE_TEMPORAL_COMPRESSOR, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00000080 peer=0x00000000)");
+    ok &= check("hello equal-q4k-fused-mid",
+                DS4_TP_FEATURE_Q4K_FUSED_MID,
+                DS4_TP_FEATURE_Q4K_FUSED_MID, 1, NULL);
+    ok &= check("hello mismatched-q4k-fused-mid",
+                DS4_TP_FEATURE_Q4K_FUSED_MID, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00010000 peer=0x00000000)");
     ok &= check("hello equal-batch-attn-head-split",
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);
