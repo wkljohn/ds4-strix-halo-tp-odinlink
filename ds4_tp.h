@@ -174,6 +174,8 @@ void ds4_tp_free(ds4_tp *tp);
 
 int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
+/* True only when large batch gates use verbs instead of TCP fallback. */
+bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *tp);
 /* True only when the selected provider requires a host-pinned GPU-visible
  * slab for NIC registration. OdinLink keeps its existing device allocation. */
 bool ds4_tp_requires_host_slab(const ds4_tp *tp);
@@ -243,6 +245,12 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
  * RDMA, with interleaved 2MB TCP rounds as fallback (see ds4_tp.c). */
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes);
+typedef void (*ds4_tp_big_wave_ready_fn)(void *ud, uint32_t wave);
+int ds4_tp_big_gate_exchange_waves(ds4_tp *tp, uint32_t layer, uint64_t seq,
+                                   const void *out, void *in, uint64_t bytes,
+                                   uint64_t wave_bytes, uint32_t waves,
+                                   ds4_tp_big_wave_ready_fn ready,
+                                   void *ready_ud);
 
 /* Lockstep mirroring (leader side) and worker loop primitives. */
 typedef struct {

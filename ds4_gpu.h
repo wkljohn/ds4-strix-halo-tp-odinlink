@@ -223,6 +223,8 @@ uint32_t ds4_gpu_iq2_i8_wmma_runtime_features(
         const void *gate_w,
         const void *up_w);
 void ds4_gpu_set_tp_runtime_features(uint32_t rank, uint32_t features);
+/* Exact-matched TP hello feature word supplied at bind time. */
+uint32_t ds4_gpu_get_tp_runtime_features(void);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
@@ -342,6 +344,17 @@ typedef int (*ds4_gpu_tp_big_exchange_fn)(void *ud, uint32_t layer,
                                           uint64_t seq, const void *out,
                                           void *in, uint64_t bytes);
 void ds4_gpu_tp_set_big_exchange(ds4_gpu_tp_big_exchange_fn fn);
+/* One-rendezvous wave exchange. The transport calls ready(wave) after the
+ * zero-based wave is fully received; later waves continue on the same bulk
+ * exchange. This is intentionally separate from repeated split big gates. */
+typedef void (*ds4_gpu_tp_big_wave_ready_fn)(void *ud, uint32_t wave);
+typedef int (*ds4_gpu_tp_big_wave_exchange_fn)(
+        void *ud, uint32_t layer, uint64_t seq,
+        const void *out, void *in, uint64_t bytes,
+        uint64_t wave_bytes, uint32_t waves,
+        ds4_gpu_tp_big_wave_ready_fn ready, void *ready_ud);
+void ds4_gpu_tp_set_big_wave_exchange(ds4_gpu_tp_big_wave_exchange_fn fn);
+int ds4_gpu_tp_big_gate_waves_available(void);
 int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                                const ds4_gpu_tensor *out_t,
                                ds4_gpu_tensor *in_t,
@@ -356,6 +369,13 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                   const ds4_gpu_tensor *out_t,
                                   ds4_gpu_tensor *in_t,
                                   uint64_t bytes);
+/* Queue one transport collective covering `waves` equal contiguous regions.
+ * Returns the first reserved release sequence; wait(first + wave) consumes
+ * each completed region. */
+uint64_t ds4_gpu_tp_big_gate_waves_kick(uint32_t layer, uint32_t rows,
+                                        const ds4_gpu_tensor *out_t,
+                                        ds4_gpu_tensor *in_t,
+                                        uint64_t bytes, uint32_t waves);
 int ds4_gpu_tp_big_gate_wait(uint64_t seq);
 /* Pause/resume the DVFS keep-alive around work that keeps the GPU busy.
  * No-op when TP is not bound. */

@@ -243,6 +243,11 @@ extern "C" void ds4_gpu_set_tp_runtime_features(uint32_t rank,
             iq2_i8, g_quality_mode, cfg->disabled);
 }
 
+extern "C" uint32_t ds4_gpu_get_tp_runtime_features(void) {
+    return g_q4k_wmma_tp_runtime_features_valid ?
+        g_q4k_wmma_tp_runtime_features : 0u;
+}
+
 static int routed_moe_iq2_i8_wmma_enabled(
         uint32_t expert_in_dim,
         uint32_t expert_mid_dim,
