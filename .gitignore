@@ -30,7 +30,15 @@
 /tests/test_tp_hello
 /tests/test_rocm_q4k_fused_mid
 /tests/test_rocm_attention_prefill_static_flash
+/tests/test_rocm_attention_decode_mixed
+/tests/test_rocm_attention_output_tp
+/tests/test_rocm_attention_q_b_fused
+/tests/test_rocm_moe_wave_plan
+/tests/test_rocm_q4k_decode_bench
 /tests/test_rocm_prefill_wavefront_projections
+/tests/test_rocm_q4k_skip_unowned
+/tests/test_rocm_q8_pair_pack4
+/tests/test_rocm_shared_gu_swiglu_fused
 /tests/test_rocm_tp_split_gate
 /tests/test_tp_big_gate_overlap
 /tests/roce_v2_mr_probe
