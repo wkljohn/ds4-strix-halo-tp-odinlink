@@ -895,7 +895,7 @@ __global__ static void matmul_q8_0_f32_batch_wmma_kernel(
         uint32_t in_dim,
         uint32_t out_dim,
         uint64_t row_bytes) {
-    static_assert(M_TILE == 64u || M_TILE == 128u,
+    static_assert(M_TILE == 64u || M_TILE == 128u || M_TILE == 256u,
                   "validated Q8 WMMA output-row tiles");
     static_assert(K_STAGE == 32u || K_STAGE == 128u,
                   "validated Q8 WMMA K stages");
