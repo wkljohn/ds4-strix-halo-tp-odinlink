@@ -64,13 +64,19 @@ Run the current research branch with all new experimental flags default-off:
 | Run | Acceptance |
 |---|---|
 | Q4_K RoCE v2 2048+300 | **done 2026-08-21 at `efd7c33`**: `255.27/19.35`, `257.87/19.20`, `258.25/19.32`; fingerprint `5f8a983422299d76`; median `257.87/19.32` |
-| Q4_K OdinLink 2048+300 | fingerprint `5f8a983422299d76`, no regression vs 18.88 t/s |
+| Q4_K OdinLink 2048+300 | **done 2026-08-21 at `5eb27c5`**: `218.89/18.89`; fingerprint `5f8a983422299d76`; no regression vs frozen `18.88` |
 | Q2_K RoCE v2 2048+300 | **done 2026-08-21 at `efd7c33`**: `202.88/19.04`, `202.26/19.22`, `202.86/19.13`; fingerprint `f9cb3a8a17e95c71`; median `202.86/19.13` |
-| Q2_K OdinLink 2048+300 | fingerprint `f9cb3a8a17e95c71`, establish baseline |
+| Q2_K OdinLink 2048+300 | **done 2026-08-21 at `5eb27c5`**: `178.06/18.69`; fingerprint `f9cb3a8a17e95c71`; baseline established |
 | Optional Q4_K 32K RoCE/OdinLink | preserve long-context visibility |
 
 A fingerprint mismatch, short generation, transport fallback, or throughput
 regression should trigger a bisect of `3fd5aa6..657fe1e` before any new work.
+
+Note: `bench.env.local` currently defaults to RoCE v2. OdinLink validation used
+`DS4_BENCH_CONFIG=/dev/null` plus explicit `DS4_BENCH_RDMA_PROFILE=odinlink`,
+`DS4_COORDINATOR_ADDR=10.4.0.1`, `DS4_LOCAL_RDMA_DEVICE=odl_tb5_0`,
+`DS4_PEER_RDMA_DEVICE=odl_tb5_0`, and `DS4_ODINLINK_ROOT=/home/wkljohn/Desktop/cc/OdinLink-Five`
+to avoid accidentally relabeling a RoCE run as OdinLink.
 
 ## Reopen conditions
 
