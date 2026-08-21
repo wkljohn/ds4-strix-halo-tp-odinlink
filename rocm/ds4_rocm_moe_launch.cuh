@@ -16,6 +16,9 @@ static int routed_moe_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
 #ifndef DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER
 #define DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER (UINT32_C(1) << 21)
 #endif
+#ifndef DS4_TP_FEATURE_Q4K_VERIFY_DOWN_FIRST_OWNER
+#define DS4_TP_FEATURE_Q4K_VERIFY_DOWN_FIRST_OWNER (UINT32_C(1) << 25)
+#endif
 
 static int routed_moe_align256_checked(uint64_t v, uint64_t *out) {
     if (!out || v > UINT64_MAX - 255ull) return 0;
@@ -151,6 +154,15 @@ static int routed_moe_q4k_verify_first_owner_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *env = getenv("DS4_ROCM_Q4K_VERIFY_FIRST_OWNER");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
+static int routed_moe_q4k_verify_down_first_owner_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_VERIFY_DOWN_FIRST_OWNER");
         enabled = env && env[0] == '1' && env[1] == '\0';
     }
     return enabled;
@@ -2608,22 +2620,82 @@ static int routed_moe_launch(
         }
         int direct_q4_down_done = 0;
         if (ok && use_q4k_verify_direct_sum6) {
-            const dim3 sgrid((out_dim + 31u) / 32u, n_tokens, 1u);
-            moe_down_q4K_sum6_qwarp32_batch_kernel<<<sgrid, 256>>>(
-                    (float *)out->ptr,
-                    down_w,
-                    midq,
-                    (const int32_t *)selected_exec->ptr,
-                    (const float *)weights->ptr,
-                    down_expert_bytes,
-                    down_row_bytes,
-                    midq_blocks,
-                    out_dim,
-                    n_expert,
-                    n_tokens,
-                    tp_skip_unowned);
-            ok = cuda_ok(cudaGetLastError(),
-                         "routed_moe Q4_K verifier direct-sum6 launch");
+            const uint32_t use_down_first_owner =
+                use_q4k_verify_first_owner && out_dim == 2u * expert_mid_dim &&
+                (!ds4_gpu_tp_expert_shard_active() ||
+                 (g_q4k_wmma_tp_runtime_features_valid &&
+                  (g_q4k_wmma_tp_runtime_features &
+                   DS4_TP_FEATURE_Q4K_VERIFY_DOWN_FIRST_OWNER))) &&
+                routed_moe_q4k_verify_down_first_owner_enabled();
+            if (use_down_first_owner) {
+                uint64_t midq_aligned = 0;
+                uint64_t right_hi_bytes = 0;
+                uint64_t scratch_end = 0;
+                ok = routed_moe_align256_checked(midq_bytes, &midq_aligned) &&
+                     cuda_u64_mul_checked(pair_count64,
+                         (uint64_t)expert_mid_dim * sizeof(float),
+                         &right_hi_bytes) &&
+                     routed_moe_u64_add_checked(midq_aligned, right_hi_bytes,
+                                                &scratch_end) &&
+                     scratch_end <= down->bytes;
+                float *right_hi = ok ? (float *)((char *)down->ptr +
+                                                  midq_aligned) : NULL;
+                const dim3 partial_grid((out_dim + 127u) / 128u,
+                                        pair_count, 1u);
+#define DS4_Q4K_DOWN_FIRST_OWNER_CASE(NT) \
+                case NT: \
+                    moe_down_q4K_first_owner_partial_kernel<NT> \
+                        <<<partial_grid, 256>>>( \
+                        (float *)gate->ptr, (float *)up->ptr, \
+                        (float *)mid->ptr, right_hi, down_w, midq, \
+                        (const int32_t *)selected_exec->ptr, \
+                        (const float *)weights->ptr, down_expert_bytes, \
+                        down_row_bytes, midq_blocks, out_dim, expert_mid_dim, \
+                        n_expert, n_tokens, tp_skip_unowned); \
+                    break
+                switch (n_tokens) {
+                    DS4_Q4K_DOWN_FIRST_OWNER_CASE(2);
+                    DS4_Q4K_DOWN_FIRST_OWNER_CASE(3);
+                    DS4_Q4K_DOWN_FIRST_OWNER_CASE(4);
+                    DS4_Q4K_DOWN_FIRST_OWNER_CASE(5);
+                    default: ok = 0; break;
+                }
+#undef DS4_Q4K_DOWN_FIRST_OWNER_CASE
+                if (ok) {
+                    ok = cuda_ok(cudaGetLastError(),
+                        "routed_moe Q4_K verifier down first-owner partial");
+                }
+                if (ok) {
+                    const dim3 fold_grid((out_dim + 31u) / 32u,
+                                         n_tokens, 1u);
+                    moe_down_q4K_first_owner_fold_kernel<<<fold_grid, 256>>>(
+                        (float *)out->ptr, (const float *)gate->ptr,
+                        (const float *)up->ptr, (const float *)mid->ptr,
+                        right_hi,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr, out_dim, expert_mid_dim,
+                        n_expert, n_tokens, tp_skip_unowned);
+                    ok = cuda_ok(cudaGetLastError(),
+                        "routed_moe Q4_K verifier down first-owner fold");
+                }
+            } else {
+                const dim3 sgrid((out_dim + 31u) / 32u, n_tokens, 1u);
+                moe_down_q4K_sum6_qwarp32_batch_kernel<<<sgrid, 256>>>(
+                        (float *)out->ptr,
+                        down_w,
+                        midq,
+                        (const int32_t *)selected_exec->ptr,
+                        (const float *)weights->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert,
+                        n_tokens,
+                        tp_skip_unowned);
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe Q4_K verifier direct-sum6 launch");
+            }
             direct_q4_down_done = ok;
         }
         int direct_iq2_down_done = 0;

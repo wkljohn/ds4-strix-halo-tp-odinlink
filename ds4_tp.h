@@ -109,6 +109,9 @@ enum {
      * one exact parallel reduction per verifier row.  Negotiate it so both
      * independently launched ranks retain one fail-closed execution profile. */
     DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX = UINT32_C(1) << 24,
+    /* DSpark Q4_K verifier down projection groups repeated expert rows while
+     * retaining the shipped two-half wave reduction and slot fold. */
+    DS4_TP_FEATURE_Q4K_VERIFY_DOWN_FIRST_OWNER = UINT32_C(1) << 25,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {

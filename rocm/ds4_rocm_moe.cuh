@@ -311,6 +311,27 @@ __device__ __noinline__ static float2 dev_q4_K_gate_up_column_exact(
     return make_float2(gate, up);
 }
 
+/* Preserve the two halves that feed the final offset-1 quarter-wave add.
+ * gfx1151 fast-math folds the prior route-slot total between that add's left
+ * and right operands, so a final rounded per-route scalar is insufficient for
+ * bit-exact decomposition across kernels. */
+__device__ __noinline__ static float2 dev_q4_K_down_column_halves_exact(
+        const cuda_block_q4_K *wr,
+        const cuda_block_q8_K *xq,
+        uint32_t midq_blocks,
+        uint32_t lane) {
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+        acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+    }
+    const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+    acc += __shfl_down_sync(static_cast<MASK_T>(mask), acc, 4, 8);
+    acc += __shfl_down_sync(static_cast<MASK_T>(mask), acc, 2, 8);
+    const float right = __shfl_down_sync(
+        static_cast<MASK_T>(mask), acc, 1, 8);
+    return make_float2(acc, right);
+}
+
 __device__ __noinline__ static float dev_weighted_swiglu_column_exact(
         float gate, float up, float weight, float clamp) {
     if (clamp > 1.0e-6f) {
@@ -2685,6 +2706,148 @@ __global__ static void moe_down_q4K_sum6_qwarp32_batch_kernel(
         }
         acc = quarter_warp_sum_f32(acc, lane);
         if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
+}
+
+/* Exact DSpark verifier down projection with content-driven first ownership.
+ * One owner CTA reads an expert row for every matching verifier route.  Each
+ * route's dot/reduction remains an independent noinline column operation; only
+ * the memory working set is shared.  The already-dead gate/up/mid auxiliaries
+ * and unused tail of the down workspace hold the four transient reduction
+ * halves. */
+template <uint32_t MAX_TOKENS>
+__global__ static void moe_down_q4K_first_owner_partial_kernel(
+        float *left_lo,
+        float *left_hi,
+        float *right_lo,
+        float *right_hi,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t split_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        uint32_t skip_zero_weight) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t owner_pair = blockIdx.y;
+    const uint32_t pair_count = n_tokens * n_expert;
+    if (owner_pair >= pair_count) return;
+
+    const int32_t expert_i = selected[owner_pair];
+    const float owner_weight = weights[owner_pair];
+    /* TP maps peer-owned routes to zero weight.  The exact fold skips those
+     * slots, so producing zero scratch for them is dead work.  Keep the
+     * legacy zero-fill behavior for unsharded callers and malformed routes. */
+    if (skip_zero_weight && owner_weight == 0.0f) return;
+    if (expert_i < 0 || owner_weight == 0.0f) {
+        for (uint32_t rr = 0; rr < 4u; ++rr) {
+            const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+            if (row >= out_dim || lane != 0u) continue;
+            const uint64_t off = (uint64_t)owner_pair * split_dim +
+                                 (row < split_dim ? row : row - split_dim);
+            if (row < split_dim) {
+                left_lo[off] = 0.0f;
+                right_lo[off] = 0.0f;
+            } else {
+                left_hi[off] = 0.0f;
+                right_hi[off] = 0.0f;
+            }
+        }
+        return;
+    }
+    for (uint32_t pair = 0; pair < owner_pair; ++pair) {
+        if (weights[pair] != 0.0f && selected[pair] == expert_i) return;
+    }
+
+    uint32_t matches[MAX_TOKENS] = {};
+    uint32_t nm = 0u;
+    for (uint32_t pair = owner_pair; pair < pair_count; ++pair) {
+        if (weights[pair] != 0.0f && selected[pair] == expert_i &&
+            nm < MAX_TOKENS) {
+            matches[nm++] = pair;
+        }
+    }
+
+    __shared__ cuda_block_q8_K staged_midq[MAX_TOKENS][8];
+    for (uint32_t i = threadIdx.x; i < nm * midq_blocks; i += blockDim.x) {
+        const uint32_t m = i / midq_blocks;
+        const uint32_t b = i - m * midq_blocks;
+        staged_midq[m][b] = midq[(uint64_t)matches[m] * midq_blocks + b];
+    }
+    __syncthreads();
+
+    const uint32_t expert = (uint32_t)expert_i;
+    for (uint32_t rr = 0; rr < 4u; ++rr) {
+        const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= out_dim) continue;
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+            down_base + (uint64_t)expert * down_expert_bytes +
+            (uint64_t)row * down_row_bytes);
+        for (uint32_t m = 0; m < MAX_TOKENS; ++m) {
+            if (m >= nm) continue;
+            const float2 halves = dev_q4_K_down_column_halves_exact(
+                wr, staged_midq[m], midq_blocks, lane);
+            if (lane == 0u) {
+                const uint32_t pair = matches[m];
+                const uint64_t off = (uint64_t)pair * split_dim +
+                                     (row < split_dim ? row : row - split_dim);
+                if (row < split_dim) {
+                    left_lo[off] = halves.x;
+                    right_lo[off] = halves.y;
+                } else {
+                    left_hi[off] = halves.x;
+                    right_hi[off] = halves.y;
+                }
+            }
+        }
+    }
+}
+
+/* Recreate the shipped direct-sum6 cross-slot association after first-owner
+ * partial production.  The empty inline barriers keep each slot addition
+ * ordered under -ffast-math. */
+__global__ static void moe_down_q4K_first_owner_fold_kernel(
+        float *out,
+        const float *left_lo,
+        const float *left_hi,
+        const float *right_lo,
+        const float *right_hi,
+        const int32_t *selected,
+        const float *weights,
+        uint32_t out_dim,
+        uint32_t split_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        uint32_t skip_zero_weight) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+    const uint64_t pair0 = (uint64_t)tok * n_expert;
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; ++slot) {
+        if (slot >= n_expert) continue;
+        const uint64_t pair = pair0 + slot;
+        if (skip_zero_weight && weights[pair] == 0.0f) continue;
+        if (selected[pair] < 0) continue;
+        const uint64_t off = pair * split_dim +
+                             (row < split_dim ? row : row - split_dim);
+        if (lane == 0u) {
+            const float left = row < split_dim ? left_lo[off] : left_hi[off];
+            const float right = row < split_dim ? right_lo[off] : right_hi[off];
+            float next = left + total;
+            __asm__ volatile("" : "+v"(next));
+            total = next + right;
+            __asm__ volatile("" : "+v"(total));
+        }
     }
     if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
 }

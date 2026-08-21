@@ -595,3 +595,25 @@ cycle-normalized verifier budget, or about 51.9 ms per full verifier invocation
 at the observed 83/143 invocation rate.  Current verifier wall is about
 181.9 ms before this 12.3 ms removal, so reaching 30 t/s still requires roughly
 a further 3.3x verifier reduction, higher accepted yield, or both.
+
+## Exact Q4_K down first-owner reuse
+
+The next candidate reuses selected Q4_K down rows across verifier tokens while
+recreating the shipped `(left + prior_total) + right` direct-sum6 association.
+Its first live form was rejected at 14.46 t/s because it performed dead scratch
+work for peer-owned zero-weight routes.  A shard-aware early return removed
+that work and passed synchronized live GPU-event attribution: W5 down improved
+15.1% on rank 0 and 12.2% on rank 1, while complete routed MoE improved about
+3% per layer.
+
+Three instrumentation-free RoCE v2 runs measured 15.04/15.04/15.07 decode t/s
+for a **15.04 t/s median**, with 189.60 t/s median prefill.  All retained FNV64
+`7174e214e05fd83e` and the exact acceptance histogram.  OdinLink measured
+181.67/15.19 t/s with 37,908 streaming calls and zero fallback on both ranks.
+The ordinary no-DSpark control measured 257.21/19.68 t/s with fingerprint
+`b7694f9d11a3760e` and did not select the DSpark-only feature.
+
+The implementation adds no persistent allocation or expanded-weight cache and
+is negotiated with TP feature bit 25.  Detailed arithmetic, rejected-path,
+oracle, profiler, and reproduction evidence is in
+[Q4-DOWN-FIRST-OWNER-20260822.md](Q4-DOWN-FIRST-OWNER-20260822.md).

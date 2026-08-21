@@ -40,6 +40,7 @@
 /tests/test_rocm_q4k_decode_bench
 /tests/test_rocm_q4k_one_token_oracle
 /tests/test_rocm_q4k_staged_midq_oracle
+/tests/test_rocm_q4k_verify_batch_oracle
 /tests/test_rocm_q4k_ffn_row_balance_oracle
 /tests/test_rocm_q4k_slot_balance_oracle
 /tests/test_rocm_compressor_row_shard_oracle

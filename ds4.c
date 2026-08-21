@@ -52404,11 +52404,16 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     const bool dspark_batch_argmax_requested =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
         metal_graph_tp_env_flag("DS4_ROCM_DSPARK_BATCH_ARGMAX", false);
+    const bool q4k_verify_down_first_owner_requested =
+        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        metal_graph_tp_env_flag(
+            "DS4_ROCM_Q4K_VERIFY_DOWN_FIRST_OWNER", false);
 #else
     const bool q4k_verify_first_owner_requested = false;
     const bool q8_attn_out_weight_outer_requested = false;
     const bool dspark_exact_attn_head2_requested = false;
     const bool dspark_batch_argmax_requested = false;
+    const bool q4k_verify_down_first_owner_requested = false;
 #endif
     const char *rdma_logits = getenv("DS4_TP_RDMA_LOGITS");
     const bool rdma_logits_requested =
@@ -52447,6 +52452,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
              DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2 : 0u) |
         (dspark_batch_argmax_requested ?
              DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX : 0u) |
+        (q4k_verify_down_first_owner_requested ?
+             DS4_TP_FEATURE_Q4K_VERIFY_DOWN_FIRST_OWNER : 0u) |
         (rdma_logits_requested && !greedy_top2_enabled ?
              DS4_TP_FEATURE_RDMA_LOGITS : 0u) |
         (rank0_full_logits_requested && !greedy_top2_enabled ?

@@ -146,6 +146,10 @@ int main(int argc, char **argv) {
     const uint32_t n_tok = argc > 1 ? (uint32_t)atoi(argv[1]) : 2u;
     const char *tile = argc > 2 ? argv[2] : "8";
     const bool first_owner = argc <= 3 || strcmp(argv[3], "first-owner") == 0;
+    const bool down_first_owner =
+        getenv("DS4_ROCM_Q4K_VERIFY_DOWN_FIRST_OWNER") != NULL;
+    const bool tp_skip_unowned =
+        getenv("DS4_TEST_TP_SKIP_UNOWNED") != NULL;
     CHECK(n_tok >= 2u && n_tok <= N_TOK_MAX,
           "usage: test_rocm_q4k_verify_batch_oracle [2-5] [4|8] [serial|first-owner]");
     CHECK(strcmp(tile, "4") == 0 || strcmp(tile, "8") == 0,
@@ -164,7 +168,13 @@ int main(int argc, char **argv) {
     CHECK(setenv("DS4_ROCM_Q4K_VERIFY_WRITE_AUX", "1", 1) == 0,
           "gate/up localization");
     CHECK(setenv("DS4_ROCM_EXPERT_TILE_M", tile, 1) == 0, "tile width");
-    CHECK(unsetenv("DS4_ROCM_TP_SKIP_UNOWNED") == 0, "full local routes");
+    if (tp_skip_unowned) {
+        CHECK(setenv("DS4_ROCM_TP_SKIP_UNOWNED", "1", 1) == 0,
+              "TP zero-weight skip");
+    } else {
+        CHECK(unsetenv("DS4_ROCM_TP_SKIP_UNOWNED") == 0,
+              "full local routes");
+    }
 
     int devices = 0;
     CHECK(hipGetDeviceCount(&devices) == hipSuccess && devices > 0,
@@ -218,6 +228,21 @@ int main(int argc, char **argv) {
         {4, 5, 8, 9, 10, 11},
         {0, 2, 4, 6, 8, 10},
     };
+    const char *route_pattern = getenv("DS4_TEST_ROUTE_PATTERN");
+    if (route_pattern && strcmp(route_pattern, "all-shared") == 0) {
+        for (uint32_t t = 0; t < N_TOK_MAX; ++t) {
+            for (uint32_t s = 0; s < N_USED; ++s) routes[t][s] = (int32_t)s;
+        }
+    } else if (route_pattern && strcmp(route_pattern, "disjoint") == 0) {
+        CHECK(n_tok == 2u, "disjoint route pattern is defined for width 2");
+        for (uint32_t s = 0; s < N_USED; ++s) {
+            routes[0][s] = (int32_t)s;
+            routes[1][s] = (int32_t)(s + N_USED);
+        }
+    } else {
+        CHECK(!route_pattern || strcmp(route_pattern, "mixed") == 0,
+              "DS4_TEST_ROUTE_PATTERN must be mixed, disjoint, or all-shared");
+    }
     float hw[N_TOK_MAX][N_USED];
     float *hx = (float *)malloc((size_t)N_TOK_MAX * IN_DIM * sizeof(float));
     CHECK(hx, "activation allocation");
@@ -346,6 +371,20 @@ int main(int argc, char **argv) {
     float batch_ms = 0.0f;
     CHECK(hipEventElapsedTime(&batch_ms, start, stop) == hipSuccess,
           "batch elapsed");
+
+    /* Populate the compiler-gated stage-event ledger with synchronized
+     * samples.  This is outside the timed loop so instrumentation cannot
+     * become a performance candidate. */
+    if (getenv("DS4_ROCM_Q4K_DECODE_EVENT_PROFILE") != NULL) {
+        for (uint32_t i = 0; i < 64u; ++i) {
+            CHECK(run_batch(&b, model, model_bytes, test_gate_off, test_up_off,
+                            down_off, gate_expert_bytes, gate_row_bytes,
+                            down_expert_bytes, down_row_bytes, n_tok),
+                  "profile batch");
+            CHECK(hipDeviceSynchronize() == hipSuccess,
+                  "profile batch sync");
+        }
+    }
     printf("mode=%s width=%u tile=%s serial_ms=%.3f batch_ms=%.3f speedup=%.3fx\n",
            first_owner ? "first-owner" : "serial", n_tok, tile,
            serial_ms / ITERS, batch_ms / ITERS,
@@ -366,9 +405,15 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor_free_in_place(&b.out);
     ds4_gpu_cleanup();
 
-    CHECK(up_mismatch == 0, "batch up must be bit-exact to serial rows");
-    CHECK(zero_mismatch == 0, "zero-weight routes must be canonical +0");
-    CHECK(mid_mismatch == 0, "batch mid must be bit-exact to serial rows");
+    /* Down first-owner deliberately reuses the dead gate/up/mid auxiliaries
+     * for transient pair partials after the validated SwiGLU and quantize. */
+    if (!down_first_owner) {
+        CHECK(up_mismatch == 0, "batch up must be bit-exact to serial rows");
+    }
+    if (!down_first_owner) {
+        CHECK(zero_mismatch == 0, "zero-weight routes must be canonical +0");
+        CHECK(mid_mismatch == 0, "batch mid must be bit-exact to serial rows");
+    }
     CHECK(out_mismatch == 0, "batch out must be bit-exact to serial rows");
     printf("test_rocm_q4k_verify_batch_oracle: PASS\n");
     return 0;
