@@ -47,14 +47,17 @@ Gold-standard Q4_K RoCE v2 candidate:
 
 | Tag | Prefill | Decode | Fingerprint | Semantic suite |
 | --- | ---: | ---: | --- | --- |
-| `q4-hc-exact-coop-r1` | 258.06 t/s | 19.54 t/s | `5f8a983422299d76` | pass |
+| Q4_K RoCE v2, 3-run median | 258.06 t/s | 19.55 t/s | `5f8a983422299d76` | pass |
+| Q2_K RoCE v2, first full candidate | 202.86 t/s | 19.49 t/s | `f9cb3a8a17e95c71` | pass |
+| Q4_K OdinLink, first full candidate | 220.98 t/s | 19.19 t/s | `5f8a983422299d76` | pass |
 
 Workload: 2,048-token fixed frontier plus 300 generated tokens, balanced
 128/128 experts, mandatory RoCE v2, cache-free. The exact fingerprint matches
 the established Q4_K production baseline. The arithmetic and 1,532-token
 retrieval semantic cases both passed.
 
-The prior three-run Q4_K RoCE v2 median was 257.87 prefill / 19.32 decode t/s.
-One candidate run is sufficient to admit the implementation as a tested stage,
-but repeat medians and Q2_K/OdinLink provider checks remain required before it
-can become a default.
+The three Q4_K RoCE v2 candidate runs measured 258.06/19.54,
+257.28/19.60, and 260.10/19.55 prefill/decode t/s. The prior three-run median
+was 257.87/19.32, so the whole-model median gain is +1.2% decode and essentially
+flat prefill. Q2_K and OdinLink retain their exact established fingerprints;
+their rows above are first full candidate runs rather than new medians.

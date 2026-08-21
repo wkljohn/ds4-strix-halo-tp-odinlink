@@ -20,6 +20,7 @@ PREMAIN_OUT=${DS4_BENCH_OUT:-$REPO/research-results/bench-runs}
 
 # The hello regression test proves independently launched ranks reject an
 # IQ2 integer-WMMA mismatch before entering a different MoE arithmetic path.
+"$REPO/tests/test_bench_env_precedence.sh"
 make -C "$REPO" test-tp-hello
 
 # Keep the production metadata classifier in the gate: both paths must select
