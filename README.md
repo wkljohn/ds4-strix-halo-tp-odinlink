@@ -22,15 +22,15 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
 | **Current Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **202.83 t/s** | **19.49 t/s** | three-run median, exact fingerprint |
-| **Current Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **217.01 t/s** | **19.19 t/s** | three-run median, exact fingerprint |
-| **Current Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **258.06 t/s** | **19.55 t/s** | three-run median, exact fingerprint |
+| **Current Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **231.46 t/s** | **19.13 t/s** | three-run median, exact fingerprint |
+| **Current Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **272.51 t/s** | **19.54 t/s** | three-run median, exact fingerprint |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
-generated tokens over mandatory RDMA. The Q4_K target is
-`DeepSeek-V4-Flash-Q4_K-0731.gguf` (164,633,502,592 bytes). It does not fit one
-node's current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node.
-Q2_K and Q4_K run without a persistent expanded-weight cache.
+generated tokens over mandatory RDMA. The current Q4_K rows use the Antirez
+reference model listed below. It does not fit one node's current 96 GiB ROCm
+aperture; TP=2 keeps one expert shard on each node. Q2_K and Q4_K run without a
+persistent expanded-weight cache.
 
 The ordinary benchmark and deployment launchers enable the validated ordered
 ROCm TP callback, temporal-compressor schedule, shape-gated M256/K128 Q8
@@ -43,6 +43,17 @@ The table reports reproducible inference results, not a single-node scaling
 claim. Raw runs, fingerprints, kernel decisions, rejected candidates, memory
 policy, and maintainer gates are preserved in the
 [August 2026 validation record](research-results/strix-halo-tp-validation-2026-08/).
+
+## Supported and tested models
+
+| Model source | Tested target files | Support |
+|---|---|---|
+| [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the current Q4_K OdinLink and RoCE v2 rows. |
+| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. The Q2_K file is used for the current Q2_K row. |
+| Unsloth DeepSeek V4 Flash 0731 `UD-*` target weights | — | **Not supported:** their mixed-precision tensor layouts do not match the currently validated DS4 target paths. |
+
+The Unsloth warning applies to `UD-*` target-model weights, not to a separately
+documented optional DSpark drafter.
 
 ## Quick start
 
