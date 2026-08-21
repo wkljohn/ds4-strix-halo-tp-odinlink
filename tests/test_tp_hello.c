@@ -108,6 +108,12 @@ int main(void) {
     ok &= check("hello mismatched-hc-stage-exact-coop",
                 DS4_TP_FEATURE_HC_STAGE_EXACT_COOP, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00020000 peer=0x00000000)");
+    ok &= check("hello equal-indexer-topk-radix-tree",
+                DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE,
+                DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE, 1, NULL);
+    ok &= check("hello mismatched-indexer-topk-radix-tree",
+                DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00040000 peer=0x00000000)");
     ok &= check("hello equal-batch-attn-head-split",
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);

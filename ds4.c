@@ -51957,6 +51957,17 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         }
         if (exact_layout) hc_features = DS4_TP_FEATURE_HC_STAGE_EXACT_COOP;
     }
+    uint32_t indexer_features = 0u;
+    const char *indexer_radix_tree =
+        getenv("DS4_ROCM_INDEXER_TOPK_RADIX_TREE");
+    const bool indexer_radix_tree_requested =
+        indexer_radix_tree && indexer_radix_tree[0] == '1' &&
+        indexer_radix_tree[1] == '\0';
+    if (indexer_radix_tree_requested && !e->mtp_ready &&
+        !(e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) &&
+        ds4_gpu_indexer_topk_radix_tree_supported() != 0) {
+        indexer_features = DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE;
+    }
     uint32_t q4k_features = DS4_TP_FEATURE_Q4K_WMMA |
                             DS4_TP_FEATURE_Q4K_FUSED_MID;
     uint32_t iq2_features = DS4_TP_FEATURE_IQ2_I8_WMMA;
@@ -52010,7 +52021,7 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     }
     return (saw_q4k_layer ? q4k_features : 0u) |
            (saw_iq2_layer ? iq2_features : 0u) |
-           hc_features | placement_features;
+           hc_features | indexer_features | placement_features;
 #endif
 }
 

@@ -1,9 +1,18 @@
 #include "ds4_gpu.h"
+#include "ds4_tp.h"
 
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+
+#ifdef DS4_ROCM_BUILD
+/* The GPU object installs this optional transport-copy hook during TP init.
+ * This model-free test never initializes TP, so keep it independent of the
+ * full engine and transport objects. */
+typedef int (*ds4_test_devcopy_fn)(void *, const void *, uint64_t);
+void ds4_tp_set_devcopy(ds4_test_devcopy_fn fn) { (void)fn; }
+#endif
 
 static double monotonic_seconds(void) {
     struct timespec ts;
@@ -86,6 +95,64 @@ cleanup:
     return rc;
 }
 
+#ifdef DS4_ROCM_BUILD
+static int check_radix_tree_topk(void) {
+    const uint32_t n_comp = 8448;
+    const uint32_t n_tokens = 32;
+    const uint32_t top_k = 512;
+    const uint64_t score_count = (uint64_t)n_comp * n_tokens;
+    float *scores_host = (float *)malloc((size_t)score_count * sizeof(float));
+    uint32_t *selected_host =
+        (uint32_t *)malloc((size_t)n_tokens * top_k * sizeof(uint32_t));
+    if (!scores_host || !selected_host) return 1;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t i = 0; i < n_comp; i++) {
+            /* Repeated scores prove the lower-index tie rule as well as the
+             * selected set; the final 512 rows remain strictly highest. */
+            scores_host[(uint64_t)t * n_comp + i] =
+                i + top_k < n_comp ? (float)(i % 31u) : (float)i;
+        }
+    }
+
+    ds4_gpu_tensor *scores =
+        ds4_gpu_tensor_alloc(score_count * sizeof(float));
+    ds4_gpu_tensor *selected =
+        ds4_gpu_tensor_alloc((uint64_t)n_tokens * top_k * sizeof(uint32_t));
+    int rc = 1;
+    ds4_gpu_set_tp_runtime_features(
+        0u, DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE);
+    if (scores && selected &&
+        ds4_gpu_tensor_write(scores, 0, scores_host,
+                             score_count * sizeof(float)) &&
+        ds4_gpu_indexer_topk_tensor(selected, scores, n_comp, n_tokens,
+                                    top_k) &&
+        ds4_gpu_synchronize() &&
+        ds4_gpu_tensor_read(selected, 0, selected_host,
+                            (uint64_t)n_tokens * top_k * sizeof(uint32_t))) {
+        rc = 0;
+        for (uint32_t t = 0; t < n_tokens && rc == 0; t++) {
+            for (uint32_t i = 0; i < top_k; i++) {
+                const uint32_t expected = n_comp - 1u - i;
+                const uint32_t got = selected_host[(uint64_t)t * top_k + i];
+                if (got != expected) {
+                    fprintf(stderr,
+                            "radix top-k mismatch token=%u rank=%u "
+                            "got=%u expected=%u\n",
+                            t, i, got, expected);
+                    rc = 1;
+                    break;
+                }
+            }
+        }
+    }
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(scores);
+    free(selected_host);
+    free(scores_host);
+    return rc;
+}
+#endif
+
 static int check_decode_attention_overflow_path(void) {
     const uint32_t n_head = 8;
     const uint32_t head_dim = 512;
@@ -158,7 +225,11 @@ static int check_decode_attention_overflow_path(void) {
 
 int main(void) {
     if (!ds4_gpu_init()) return 1;
-    int rc = check_large_topk();
+    int rc = 0;
+#ifdef DS4_ROCM_BUILD
+    rc = check_radix_tree_topk();
+#endif
+    if (check_large_topk() != 0) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");

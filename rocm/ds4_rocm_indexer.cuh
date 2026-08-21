@@ -358,6 +358,112 @@ __global__ static void indexer_topk_8192_cub_kernel(
     }
 }
 
+#ifndef DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE
+#define DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE (UINT32_C(1) << 18)
+#endif
+
+/* Exact long-context radix tree for gfx1151.  A single 12288-item CUB block
+ * needs 98304 bytes of TempStorage and cannot launch on the 64 KiB LDS limit.
+ * Sort independent 4096-row chunks instead, retain their exact top 512, then
+ * radix-sort at most 2048 candidates.  Packed keys preserve the established
+ * descending score / ascending original-index tie order. */
+template <uint32_t ITEMS_PER_THREAD>
+__global__ static void indexer_topk_chunk_cub_kernel(
+        uint32_t *candidates,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t candidate_stride) {
+    constexpr uint32_t BLOCK_THREADS = 512u;
+    constexpr uint32_t CHUNK_N = BLOCK_THREADS * ITEMS_PER_THREAD;
+    using BlockSort =
+        cub::BlockRadixSort<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    __shared__ typename BlockSort::TempStorage sort_storage;
+    const uint32_t t = blockIdx.x;
+    const uint32_t chunk = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t chunk_start = chunk * CHUNK_N;
+    if (t >= n_tokens || chunk_start >= n_comp) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    uint64_t keys[ITEMS_PER_THREAD];
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t idx = chunk_start + tid * ITEMS_PER_THREAD + item;
+        keys[item] = idx < n_comp ? topk_pack_key(row[idx], idx)
+                                  : topk_pack_key(-INFINITY, UINT32_MAX);
+    }
+    BlockSort(sort_storage).SortDescending(keys);
+    uint32_t *out = candidates +
+        (uint64_t)t * candidate_stride + chunk * 512u;
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t rank = tid * ITEMS_PER_THREAD + item;
+        if (rank < 512u) {
+            out[rank] = UINT32_MAX - (uint32_t)keys[item];
+        }
+    }
+}
+
+template <uint32_t ITEMS_PER_THREAD>
+__global__ static void indexer_topk_merge_cub_kernel(
+        uint32_t *selected,
+        const uint32_t *candidates,
+        const float *scores,
+        uint32_t n_comp,
+        uint32_t n_tokens,
+        uint32_t candidate_count,
+        uint32_t candidate_stride) {
+    constexpr uint32_t BLOCK_THREADS = 512u;
+    using BlockSort =
+        cub::BlockRadixSort<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
+    __shared__ typename BlockSort::TempStorage sort_storage;
+    const uint32_t t = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (t >= n_tokens) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride;
+    uint64_t keys[ITEMS_PER_THREAD];
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t slot = tid * ITEMS_PER_THREAD + item;
+        const uint32_t idx = slot < candidate_count
+            ? cand[slot] : UINT32_MAX;
+        keys[item] = idx < n_comp ? topk_pack_key(row[idx], idx)
+                                  : topk_pack_key(-INFINITY, UINT32_MAX);
+    }
+    BlockSort(sort_storage).SortDescending(keys);
+#pragma unroll
+    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
+        const uint32_t rank = tid * ITEMS_PER_THREAD + item;
+        if (rank < 512u) {
+            selected[(uint64_t)t * 512u + rank] =
+                UINT32_MAX - (uint32_t)keys[item];
+        }
+    }
+}
+
+extern "C" int ds4_gpu_indexer_topk_radix_tree_supported(void) {
+#if !defined(__HIP_PLATFORM_AMD__)
+    return 0;
+#else
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    cached = 0;
+    int device = 0;
+    hipDeviceProp_t prop{};
+    if (hipGetDevice(&device) == hipSuccess &&
+        hipGetDeviceProperties(&prop, device) == hipSuccess &&
+        strncmp(prop.gcnArchName, "gfx1151", 7) == 0) {
+        cached = 1;
+    } else {
+        (void)hipGetLastError();
+    }
+    return cached;
+#endif
+}
+
 __global__ static void indexer_topk_1024_kernel(
         uint32_t *selected,
         const float *scores,
@@ -864,6 +970,31 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
+    }
+    if (top_k == 512u && n_comp > 8192u && n_comp <= 16384u &&
+        ds4_gpu_indexer_topk_radix_tree_supported() &&
+        (ds4_gpu_get_tp_runtime_features() &
+         DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE) != 0u) {
+        constexpr uint32_t chunk_n = 4096u;
+        const uint32_t n_chunks = (n_comp + chunk_n - 1u) / chunk_n;
+        const uint32_t candidate_stride = n_chunks * top_k;
+        const uint64_t tmp_bytes =
+            (uint64_t)n_tokens * candidate_stride * sizeof(uint32_t);
+        uint32_t *scratch =
+            (uint32_t *)cuda_tmp_alloc(tmp_bytes, "indexer topk radix tree");
+        if (!scratch) return 0;
+        const dim3 grid_chunks(n_tokens, n_chunks, 1u);
+        indexer_topk_chunk_cub_kernel<8><<<grid_chunks, 512>>>(
+            scratch, (const float *)scores->ptr, n_comp, n_tokens,
+            candidate_stride);
+        if (!cuda_ok(cudaGetLastError(),
+                     "indexer topk radix chunk launch")) return 0;
+        indexer_topk_merge_cub_kernel<4><<<n_tokens, 512>>>(
+            (uint32_t *)selected->ptr, scratch,
+            (const float *)scores->ptr, n_comp, n_tokens,
+            candidate_stride, candidate_stride);
+        return cuda_ok(cudaGetLastError(),
+                       "indexer topk radix merge launch");
     }
     if (top_k == 512u && n_comp <= 1024u) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,

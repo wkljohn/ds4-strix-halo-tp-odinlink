@@ -80,6 +80,10 @@ enum {
      * scratch buffers.  Require both independently launched ranks to select
      * the same path so asymmetric environment or device support fails closed. */
     DS4_TP_FEATURE_HC_STAGE_EXACT_COOP = UINT32_C(1) << 17,
+    /* Above 8192 compressed index rows, gfx1151 can replace the exact
+     * bitonic chunk tree with an exact packed-key radix tree.  Negotiate it
+     * because independently launched ranks must select identical index rows. */
+    DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE = UINT32_C(1) << 18,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {

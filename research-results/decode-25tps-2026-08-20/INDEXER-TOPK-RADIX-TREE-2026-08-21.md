@@ -1,0 +1,84 @@
+# Exact long-context indexer top-k radix tree
+
+Date: 2026-08-21
+
+## Root cause and boundary measurement
+
+The fast indexer top-k path ended at 8,192 compressed rows.  With the model's
+4:1 index compression ratio, decode immediately after a 32,768-token prefill
+crossed into the generic chunked bitonic tree.  A matched Q4_K RoCE v2 test
+using the same `promessi_sposi.txt` prefix, 300 generated tokens, 2,048-token
+prefill chunks, exact cooperative HC stage, and cache-free defaults measured:
+
+| Frontier | Prefill | Decode | Steady decode | First token | Fingerprint |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 30,720 (below boundary) | 211.09 t/s | 16.83 t/s | 16.87 t/s | 83.496 ms | `784e3e95cd17a6d0` |
+| 33,792 (above boundary) | 208.67 t/s | 16.49 t/s | 16.55 t/s | 115.807 ms | `59a7cf4d6737efbf` |
+
+The boundary therefore cost about 1.15 ms per steady token and 32.3 ms on the
+first token in this matched test.  It explains a useful part, but not most, of
+the total long-context slowdown.
+
+## Model-free candidate
+
+`scripts/indexer_topk_long_bench.cu` compares the shipped two-stage bitonic
+tree with an exact packed-key radix tree.  A single 12,288-item CUB block was
+rejected at compile time because its 98,304-byte TempStorage exceeds gfx1151's
+65,536-byte per-block limit.  The accepted layout radix-sorts independent
+4,096-row chunks, keeps their exact top 512, then radix-sorts at most 2,048
+candidates.
+
+The lower 32 bits of each key encode the inverse original index, retaining the
+established descending-score and ascending-index tie order.  Random finite
+scores with deliberate ties matched the bitonic output exactly at every tested
+shape.
+
+| `n_comp` | Tokens | Existing | Radix tree | Speedup | Index differences |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8,193 | 1 | 74.320 us | 44.049 us | 1.687x | 0 |
+| 8,448 | 1 | 74.564 us | 44.688 us | 1.669x | 0 |
+| 12,288 | 1 | 74.700 us | 45.553 us | 1.640x | 0 |
+| 8,448 | 16 | 123.627 us | 70.164 us | 1.762x | 0 |
+| 8,448 | 256 | 1,325.054 us | 789.555 us | 1.678x | 0 |
+
+At the real 8,448-row decode shape, the isolated saving is 29.876 us per
+layer, or about 1.28 ms over 43 layers.
+
+## Production-disabled validation
+
+Enable on both TP ranks with:
+
+```sh
+export DS4_ROCM_INDEXER_TOPK_RADIX_TREE=1
+```
+
+The path is restricted to gfx1151, `top_k=512`, and
+`8192 < n_comp <= 16384`.  All other shapes and architectures retain their
+previous dispatch.  TP hello bit `DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE`
+prevents independently launched ranks from selecting different index rows.
+The candidate reuses the existing temporary arena and adds no persistent
+memory.
+
+The full 33,792+300 Q4_K RoCE v2 candidate measured:
+
+| Path | Prefill | Decode | Steady decode | First token | Fingerprint |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Existing bitonic tree | 208.67 t/s | 16.49 t/s | 16.55 t/s | 115.807 ms | `59a7cf4d6737efbf` |
+| Exact radix tree | 207.54 t/s | 16.73 t/s | 16.74 t/s | 61.520 ms | `59a7cf4d6737efbf` |
+
+The candidate gained 1.2% steady decode and removed nearly all of the observed
+one-time boundary penalty.  The single prefill measurement was 0.5% lower and
+needs a repeated median before the switch can become a default.
+
+Short-context candidate gates proved the feature is inert below the boundary:
+
+| Model/provider | Prefill | Decode | Fingerprint | Result |
+| --- | ---: | ---: | --- | --- |
+| Q4_K RoCE v2 | 257.70 t/s | 19.59 t/s | `5f8a983422299d76` | pass |
+| Q2_K RoCE v2 | 202.83 t/s | 19.45 t/s | `f9cb3a8a17e95c71` | pass |
+| Q4_K OdinLink | 217.01 t/s | 19.27 t/s | `5f8a983422299d76` | pass |
+
+Each candidate passed the mandatory RDMA proof, exact 300-token fingerprint,
+semantic smoke, retrieval case, and fail-closed feature negotiation.  The
+ROCm model-free integration test is `make test-rocm-long-context`; TP hello is
+covered by `make test-tp-hello`.

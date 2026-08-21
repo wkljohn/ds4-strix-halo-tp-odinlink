@@ -227,6 +227,8 @@ void ds4_gpu_set_tp_runtime_features(uint32_t rank, uint32_t features);
 uint32_t ds4_gpu_get_tp_runtime_features(void);
 /* gfx1151-only exact cooperative one-token HC pre-chain. */
 int ds4_gpu_hc_stage_exact_coop_supported(void);
+/* gfx1151 exact long-context indexer top-k radix tree capability. */
+int ds4_gpu_indexer_topk_radix_tree_supported(void);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
