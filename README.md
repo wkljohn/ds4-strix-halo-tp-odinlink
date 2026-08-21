@@ -30,6 +30,9 @@ Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
 generated tokens over mandatory RDMA. The Q4_K target is
 `DeepSeek-V4-Flash-Q4_K-0731.gguf` (164,633,502,592 bytes). It does not fit one
 node's current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node.
+The benchmarked Q2_K target is
+[`DeepSeek-V4-Flash-Q2_K-0731.gguf`](https://huggingface.co/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF)
+(97,591,747,456 bytes). It is distinct from Unsloth's `UD-Q2_K_XL` release.
 Q2_K and Q4_K run without a persistent expanded-weight cache.
 
 The ordinary benchmark and deployment launchers enable the validated ordered
