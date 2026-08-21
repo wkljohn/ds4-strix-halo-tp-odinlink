@@ -59887,14 +59887,51 @@ static void ds4_format_len_hist(
     }
 }
 
+static void ds4_format_accept_positions(
+        char           *buf,
+        size_t          buflen,
+        const uint64_t *draft_hist,
+        const uint64_t *accept_hist) {
+    if (!buf || buflen == 0 || !draft_hist || !accept_hist) return;
+    size_t off = 0;
+    buf[0] = '\0';
+    for (uint32_t pos = 1; pos <= DS4_DSPARK_MAX_BLOCK_SIZE; pos++) {
+        uint64_t eligible = 0;
+        uint64_t accepted = 0;
+        for (uint32_t len = pos; len <= DS4_DSPARK_MAX_BLOCK_SIZE; len++) {
+            eligible += draft_hist[len];
+            accepted += accept_hist[len];
+        }
+        if (eligible == 0) continue;
+        const int n = snprintf(buf + off,
+                               off < buflen ? buflen - off : 0,
+                               "%s%u:%llu/%llu(%.1f%%)",
+                               off ? "," : "",
+                               pos,
+                               (unsigned long long)accepted,
+                               (unsigned long long)eligible,
+                               100.0 * (double)accepted / (double)eligible);
+        if (n < 0) break;
+        if ((size_t)n >= (off < buflen ? buflen - off : 0)) {
+            off = buflen - 1u;
+            break;
+        }
+        off += (size_t)n;
+    }
+    if (off == 0) snprintf(buf, buflen, "none");
+}
+
 static void ds4_session_print_dspark_stats(const ds4_session *s) {
     if (!s || !ds4_dspark_stats_enabled()) return;
     const ds4_dspark_spec_stats *st = &s->dspark_stats;
     if (st->cycles == 0 && st->propose_ms == 0.0) return;
     char draft_hist[192];
     char accept_hist[192];
+    char accept_positions[384];
     ds4_format_len_hist(draft_hist, sizeof(draft_hist), st->draft_len_hist);
     ds4_format_len_hist(accept_hist, sizeof(accept_hist), st->accepted_len_hist);
+    ds4_format_accept_positions(accept_positions, sizeof(accept_positions),
+                                st->draft_len_hist, st->accepted_len_hist);
     const double accept_rate =
         st->proposed_tokens ?
             (100.0 * (double)st->accepted_draft_tokens /
@@ -59902,11 +59939,16 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
     const double avg_accept =
         st->cycles ?
             (double)st->accepted_draft_tokens / (double)st->cycles : 0.0;
+    const uint64_t final_tokens =
+        st->first_tokens + st->accepted_draft_tokens;
+    const double tokens_per_cycle =
+        st->cycles ? (double)final_tokens / (double)st->cycles : 0.0;
     const double extra_ms = st->propose_ms + st->total_ms;
     const double net_saved_ms = st->saved_ms - extra_ms;
     fprintf(stderr,
             "ds4: DSpark stats cycles=%llu first_tokens=%llu proposed=%llu "
             "accepted_draft=%llu accept_rate=%.2f%% avg_accept=%.3f "
+            "final_tokens=%llu tokens_per_cycle=%.3f "
             "full=%llu partial=%llu miss_first=%llu no_draft=%llu "
             "no_room=%llu invalid=%llu scheduler_skips=%llu "
             "tail_skips=%llu verifier_unavailable=%llu errors=%llu time_ms propose=%.3f "
@@ -59917,13 +59959,15 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             "verify_layer=%.3f verify_head=%.3f verify_read=%.3f "
             "verify_fused_head=%llu replay=%.3f spec_total=%.3f "
             "target=%.3f saved=%.3f net_saved=%.3f "
-            "draft_len_hist=%s accepted_len_hist=%s\n",
+            "draft_len_hist=%s accepted_len_hist=%s accept_pos=%s\n",
             (unsigned long long)st->cycles,
             (unsigned long long)st->first_tokens,
             (unsigned long long)st->proposed_tokens,
             (unsigned long long)st->accepted_draft_tokens,
             accept_rate,
             avg_accept,
+            (unsigned long long)final_tokens,
+            tokens_per_cycle,
             (unsigned long long)st->full_accepts,
             (unsigned long long)st->partial_accepts,
             (unsigned long long)st->first_misses,
@@ -59957,7 +60001,8 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
             st->saved_ms,
             net_saved_ms,
             draft_hist,
-            accept_hist);
+            accept_hist,
+            accept_positions);
 #if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     /* Keep the cumulative event breakdown adjacent to the cumulative DSpark
      * stats line.  This function never waits for an event. */
@@ -64501,7 +64546,10 @@ static int ds4_session_eval_dspark_speculative_argmax(
      s->dspark_last_propose_ms + (now_sec() - stats_t0) * 1000.0 : 0.0)
     if (stats_enabled) {
         s->dspark_stats.cycles++;
-        if (n_accept > 0) s->dspark_stats.first_tokens++;
+        /* Only the first verifier call in a public sampling cycle enters with
+         * the one ordinary target token. Chained verifier calls enter with a
+         * larger cumulative n_accept and must not count that prefix again. */
+        if (n_accept == 1) s->dspark_stats.first_tokens++;
     }
     if (spec_log) {
         fprintf(stderr,

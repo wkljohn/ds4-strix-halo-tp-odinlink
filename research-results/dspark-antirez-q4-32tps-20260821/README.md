@@ -388,6 +388,14 @@ accepted across 143 cycles, producing about 2.10 final tokens/cycle. The
 milestone blocker is now acceptance/token yield rather than Q8 verifier
 latency; 32 t/s is not credible without roughly 4.2--5 final tokens/cycle.
 
+The stats logger previously counted the already-emitted top-level token again
+for every chained verifier call, reporting `first_tokens=143`. The corrected
+definition counts only calls entering with exactly one top-level token: this
+workload has 65 such tokens plus 235 accepted drafts, or exactly 300 final
+tokens / 143 verifier cycles = 2.098 tokens/cycle. The logger now prints that
+value directly and reports cumulative accepted/eligible counts for each draft
+position; these counters are diagnostics only and do not enter scheduling.
+
 Enable the opt-in candidate symmetrically on both ranks with:
 
 ```sh
