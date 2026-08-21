@@ -34,6 +34,7 @@
 /tests/test_rocm_attention_decode_mixed
 /tests/test_rocm_attention_output_tp
 /tests/test_rocm_attention_exact_head2
+/tests/test_rocm_argmax_rows
 /tests/test_rocm_attention_q_b_fused
 /tests/test_rocm_moe_wave_plan
 /tests/test_rocm_q4k_decode_bench

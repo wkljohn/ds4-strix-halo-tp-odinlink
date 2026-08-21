@@ -640,6 +640,15 @@ int ds4_gpu_argmax_tensor(
         const ds4_gpu_tensor *logits,
         uint32_t                n_vocab);
 
+/* ROCm DSpark verifier helper: independent top-1 over contiguous F32 rows.
+ * Writes one int32 index per row with the same lower-index tie break as
+ * ds4_gpu_argmax_tensor(). */
+int ds4_gpu_argmax_rows_tensor(
+        ds4_gpu_tensor       *out_idx,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_vocab,
+        uint32_t                n_rows);
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,

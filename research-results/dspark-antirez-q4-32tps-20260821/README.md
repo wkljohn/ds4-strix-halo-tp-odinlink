@@ -516,3 +516,74 @@ The remaining economic gap is still large: at 2.098 final tokens per cycle,
 approach 30 ms.  The next measurement therefore separates verifier wall time,
 summed GPU work, and launch count by compute island before another kernel is
 attempted; acceptance changes remain deferred until verifier hits are cheaper.
+
+## Verifier launch ledger and exact batched vocabulary argmax
+
+A compiler-gated ROCTx range around the complete target verifier made it
+possible to join verifier wall intervals to the coordinator's rocprofv3 kernel
+and HIP API records.  The range and dynamic ROCTx dependency exist only in
+`PROFILE=1` builds; the production binary compiles them out.  The diagnostic
+2,048+300 run retained fingerprint `7174e214e05fd83e` and measured 83 complete
+target-verifier invocations:
+
+| Per full verifier invocation | Mean |
+|---|---:|
+| Wall interval | 181.92 ms |
+| GPU kernel-active union | 142.02 ms |
+| Wall minus kernel-active | 39.90 ms |
+| Kernel dispatches | 4,375.5 |
+| Explicit `hipLaunchKernel` calls | 3,539.5 |
+| CPU time inside launch APIs | 44.88 ms |
+
+The wall/kernel gap clears the predeclared 25 ms launch-ledger gate, but the
+family breakdown exposed a more bounded defect first.  The final vocabulary
+top-1 for a multi-row verifier called the generic single-thread
+`indexer_topk_kernel`, scanning 129,280 logits serially.  It appeared once per
+full verifier and cost 12.34 ms.  This operation is independent across rows and
+does not require a general top-k implementation.
+
+The replacement launches one 1,024-thread workgroup per row and performs the
+same strict-greater reduction with the same lower-index tie break as the
+existing parallel one-row argmax.  A production-shape oracle covers ties,
+all-negative-infinity input, and widths 1--4:
+
+| Rows | Generic top-1 | Parallel row argmax | Isolated speedup | Exact |
+|---:|---:|---:|---:|:---:|
+| 1 | 12.116 ms | 0.0155 ms | 782.0x | yes |
+| 2 | 12.122 ms | 0.0158 ms | 769.3x | yes |
+| 3 | 12.135 ms | 0.0157 ms | 774.5x | yes |
+| 4 | 12.143 ms | 0.0159 ms | 764.0x | yes |
+
+TP hello feature bit 24 rejects asymmetric enablement.  The candidate adds no
+persistent allocation or expanded-weight cache and is selected only for an
+active ROCm DSpark session with:
+
+```sh
+export DS4_ROCM_DSPARK_BATCH_ARGMAX=1
+```
+
+Three instrumentation-free RoCE v2 candidate runs and both required controls
+produced:
+
+| Run | Provider / mode | Prefill | Decode | FNV64 |
+|---|---|---:|---:|---|
+| r1 | RoCE v2 + DSpark | 190.75 t/s | 14.88 t/s | `7174e214e05fd83e` |
+| r2 | RoCE v2 + DSpark | 190.73 t/s | 14.71 t/s | `7174e214e05fd83e` |
+| r3 | RoCE v2 + DSpark | 188.00 t/s | 14.85 t/s | `7174e214e05fd83e` |
+| Cross-provider | OdinLink + DSpark | 181.34 t/s | 15.05 t/s | `7174e214e05fd83e` |
+| Ordinary control | RoCE v2, no DSpark | 258.84 t/s | 19.52 t/s | `b7694f9d11a3760e` |
+
+The production RoCE median is **190.73 prefill / 14.85 decode t/s**, 4.4%
+above the exact two-head median and 14.0% above the 13.03 t/s exact baseline.
+All DSpark runs retained the exact acceptance histogram
+`21,5,11,5,3,5,1,3,2,2,2,1,0,0,0,0,4`.  OdinLink reported 37,908 streaming
+copies, 3.49 GB, and zero fallback calls on both ranks.  The ordinary path did
+not negotiate the DSpark feature and remained within 0.3% of its 19.57 t/s
+reference while preserving its exact fingerprint.
+
+At unchanged 2.098-token/cycle yield, 30 t/s allows 69.9 ms per cycle.  The
+measured non-verifier term consumes about 39.8 ms, leaving 30.1 ms of
+cycle-normalized verifier budget, or about 51.9 ms per full verifier invocation
+at the observed 83/143 invocation rate.  Current verifier wall is about
+181.9 ms before this 12.3 ms removal, so reaching 30 t/s still requires roughly
+a further 3.3x verifier reduction, higher accepted yield, or both.

@@ -40,6 +40,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+#include <dlfcn.h>
+#endif
+
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_tp.h"
@@ -63,6 +67,35 @@ extern void ds4_gpu_rocm_mark_speculative_decode(void);
 #else
 #define DS4_PROFILE_ENV(name) NULL
 #define DS4_PROFILE_ENV_PRESENT(a, b) false
+#endif
+
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+/* Diagnostic-only ROCTx range used to correlate target-verifier wall time
+ * with kernel dispatches in rocprofv3.  Resolve dynamically so production
+ * builds and non-ROCm backends acquire no profiler dependency. */
+static bool ds4_profile_roctx_verifier_range(bool push) {
+    typedef int (*push_fn)(const char *);
+    typedef int (*pop_fn)(void);
+    static int initialized;
+    static push_fn range_push;
+    static pop_fn range_pop;
+    static void *handle;
+    if (getenv("DS4_DSPARK_VERIFY_ROCTX") == NULL) return false;
+    if (!initialized) {
+        initialized = 1;
+        handle = dlopen("librocprofiler-sdk-roctx.so", RTLD_NOW | RTLD_GLOBAL);
+        void *scope = handle ? handle : RTLD_DEFAULT;
+        range_push = (push_fn)dlsym(scope, "roctxRangePushA");
+        range_pop = (pop_fn)dlsym(scope, "roctxRangePop");
+    }
+    if (!range_push || !range_pop) return false;
+    return (push ? range_push("ds4_dspark_target_verifier") : range_pop()) >= 0;
+}
+#else
+static inline bool ds4_profile_roctx_verifier_range(bool push) {
+    (void)push;
+    return false;
+}
 #endif
 
 #define DS4_CUDA_TP_PEER_TMP_BYTES \
@@ -36735,6 +36768,15 @@ static bool metal_graph_dspark_verify_selected_profile_enabled(void) {
 #endif
 }
 
+static bool metal_graph_rocm_dspark_batch_argmax_requested(void) {
+#if defined(DS4_ROCM_BUILD)
+    return (ds4_gpu_get_tp_runtime_features() &
+            DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX) != 0u;
+#else
+    return false;
+#endif
+}
+
 /* Layer-major speculative target verifier for tiny MTP suffixes.
  *
  * This is the first production-shaped verifier attempt: unlike repeated decode
@@ -36874,11 +36916,21 @@ static bool metal_graph_verify_suffix_tops_impl(
                                        g->spec_logits,
                                        DS4_N_VOCAB) != 0;
         } else if (top_rows) {
-            ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
-                                             g->spec_logits,
-                                             DS4_N_VOCAB,
-                                             top_rows,
-                                             1) != 0;
+#if defined(DS4_ROCM_BUILD)
+            if (metal_graph_rocm_dspark_batch_argmax_requested()) {
+                ok = ds4_gpu_argmax_rows_tensor(metal_graph_comp_selected(g),
+                                                g->spec_logits,
+                                                DS4_N_VOCAB,
+                                                top_rows) != 0;
+            } else
+#endif
+            {
+                ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
+                                                 g->spec_logits,
+                                                 DS4_N_VOCAB,
+                                                 top_rows,
+                                                 1) != 0;
+            }
         }
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -36915,11 +36967,23 @@ static bool metal_graph_verify_suffix_tops_impl(
                 /* top-1 of each of the top_rows rows: n_tokens=top_rows, top_k=1.
                  * The order is transposed vs the indexer-score callers; a swap
                  * silently scores row 0's runner-ups instead of each row. */
-                ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
-                                                   g->spec_logits,
-                                                   DS4_N_VOCAB,
-                                                   top_rows,
-                                                   1) != 0;
+#if defined(DS4_ROCM_BUILD)
+                if (metal_graph_rocm_dspark_batch_argmax_requested()) {
+                    ok = ds4_gpu_argmax_rows_tensor(
+                            metal_graph_comp_selected(g),
+                            g->spec_logits,
+                            DS4_N_VOCAB,
+                            top_rows) != 0;
+                } else
+#endif
+                {
+                    ok = ds4_gpu_indexer_topk_tensor(
+                            metal_graph_comp_selected(g),
+                            g->spec_logits,
+                            DS4_N_VOCAB,
+                            top_rows,
+                            1) != 0;
+                }
             }
         }
         if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -52337,10 +52401,14 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         batch_attn_head_split_requested &&
         metal_graph_tp_env_flag(
             "DS4_ROCM_DSPARK_EXACT_ATTN_HEAD2", false);
+    const bool dspark_batch_argmax_requested =
+        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        metal_graph_tp_env_flag("DS4_ROCM_DSPARK_BATCH_ARGMAX", false);
 #else
     const bool q4k_verify_first_owner_requested = false;
     const bool q8_attn_out_weight_outer_requested = false;
     const bool dspark_exact_attn_head2_requested = false;
+    const bool dspark_batch_argmax_requested = false;
 #endif
     const char *rdma_logits = getenv("DS4_TP_RDMA_LOGITS");
     const bool rdma_logits_requested =
@@ -52377,6 +52445,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
              DS4_TP_FEATURE_Q8_ATTN_OUT_WEIGHT_OUTER : 0u) |
         (dspark_exact_attn_head2_requested ?
              DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2 : 0u) |
+        (dspark_batch_argmax_requested ?
+             DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX : 0u) |
         (rdma_logits_requested && !greedy_top2_enabled ?
              DS4_TP_FEATURE_RDMA_LOGITS : 0u) |
         (rank0_full_logits_requested && !greedy_top2_enabled ?
@@ -64768,6 +64838,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
         verifier_may_have_mutated = true;
         ds4_verify_suffix_timing verify_timing;
         const double verify_t0 = stats_enabled ? now_sec() : 0.0;
+        const bool verifier_roctx = ds4_profile_roctx_verifier_range(true);
         ok = metal_graph_verify_suffix_tops(&s->graph,
                                             &e->model,
                                             &e->weights,
@@ -64779,6 +64850,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
                                             row_tops,
                                             NULL,
                                             stats_enabled ? &verify_timing : NULL);
+        if (verifier_roctx) (void)ds4_profile_roctx_verifier_range(false);
         if (stats_enabled) {
             s->dspark_stats.verify_ms += (now_sec() - verify_t0) * 1000.0;
             s->dspark_stats.verify_upload_ms += verify_timing.upload_ms;

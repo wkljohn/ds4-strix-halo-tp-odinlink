@@ -132,6 +132,12 @@ int main(void) {
     ok &= check("hello mismatched-dspark-exact-attn-head2",
                 DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00800000 peer=0x00000000)");
+    ok &= check("hello equal-dspark-batch-argmax",
+                DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX,
+                DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX, 1, NULL);
+    ok &= check("hello mismatched-dspark-batch-argmax",
+                DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x01000000 peer=0x00000000)");
     ok &= check("hello equal-batch-attn-head-split",
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);

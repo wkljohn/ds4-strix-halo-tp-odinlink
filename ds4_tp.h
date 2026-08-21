@@ -105,6 +105,10 @@ enum {
      * 256-thread head reductions into one gfx1151 workgroup and batches the
      * verifier rows.  Both ranks must select the same launch schedule. */
     DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2 = UINT32_C(1) << 23,
+    /* The DSpark target head replaces a serial vocabulary top-1 scan with
+     * one exact parallel reduction per verifier row.  Negotiate it so both
+     * independently launched ranks retain one fail-closed execution profile. */
+    DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX = UINT32_C(1) << 24,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {
