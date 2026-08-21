@@ -407,3 +407,52 @@ The launcher command is the Q4 first-owner reproduction in
 The next implementation lane is exact QKV-to-core/head-group/indexer
 multi-row reuse; its isolated stop gate remains at least 1.25x with the known
 fingerprint unchanged.
+
+## QKV-to-core kernel trace and indexer stop gate
+
+A coordinator-only `rocprofv3 --runtime-trace --selected-regions` run used the
+same 2,048+300 Antirez workload, RoCE v2, exact fingerprint
+`7174e214e05fd83e`, and the opt-in exact Q8 attention-output candidate. Both
+ranks used binary SHA-256
+`78f5eba10931047c826ac4744134bd26fd18b6efff58c325498d68b1451d14df`.
+The profiler perturbs timing, so its 13.23 t/s result is diagnostic only.
+
+| Serial QKV/core family | Calls | GPU time over 83 full verifiers | Per full verifier |
+|---|---:|---:|---:|
+| Indexed + non-indexed attention scans | 20,210 | 1,472.09 ms | 17.74 ms |
+| Indexer score + top-k + mask | 25,389 | 458.18 ms | 5.52 ms |
+| Raw-KV store | 20,837 | 27.66 ms | 0.33 ms |
+
+The attention scan is 3.2x the complete score/top-k/mask indexer term. The raw
+trace is under
+`runs/rocprof-antirez-q4-dspark-qkv-kerneltrace-r1/`; it is intentionally
+git-excluded because ROCm emitted a 1.4 GB SQLite database.
+
+The bounded exact indexer experiment stages one 128-float compressed K row per
+CTA and evaluates verifier tokens sequentially with the shipped
+`float4`/`warp_sum`/`partial[4]`/`h0` arithmetic. It receives the authoritative
+per-token host `index_counts`; it never reconstructs visibility from position.
+Full-mantissa inputs, near-ReLU-boundary rows, mixed visibility, cap-flat
+counts, the top-k boundary, W1, scores, selected IDs, and masks all passed
+bitwise.
+
+| Width | Serial score | K-reuse token loop | Speedup | Exact |
+|---:|---:|---:|---:|---:|
+| 1 | 0.01326 ms | 0.01332 ms | 0.995x | yes |
+| 2 | 0.02644 ms | 0.02422 ms | 1.092x | yes |
+| 3 | 0.03976 ms | 0.03500 ms | 1.136x | yes |
+| 4 | 0.05314 ms | 0.04732 ms | 1.123x | yes |
+| 5 | 0.06682 ms | 0.05898 ms | 1.133x | yes |
+
+Every W2--W5 result misses the preset 1.25x stop gate. A mistakenly concurrent
+three-process timing produced larger W3--W5 figures; those measurements are
+invalid and explicitly discarded. Fable's failure review also rejected a
+grid-Y retry: one token already exposes 576 CTAs, so extra token concurrency is
+unlikely to recover W2's missing 15 percentage points, while per-token top-k
+and mask launch costs would remain. The experiment is not integrated. The
+next target is exact attention head-group/multi-row reuse.
+
+The DSpark stats anchor counter now increments at the public sampling-cycle
+entry, outside the chained verifier and before the final one-token tail return.
+This fixes the diagnostic total from 299 to the benchmark's 300 generated
+tokens without changing scheduling, acceptance, or model arithmetic.

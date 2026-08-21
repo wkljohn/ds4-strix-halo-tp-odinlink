@@ -554,6 +554,22 @@ int ds4_gpu_indexer_score_one_tensor(
         uint32_t                head_dim,
         float                   scale);
 
+#ifdef DS4_ROCM_BUILD
+/* Bit-exact small-width verifier scoring. index_counts is host memory copied
+ * into scalar launch arguments; no persistent device allocation is added. */
+int ds4_gpu_indexer_scores_exact_token_loop_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                score_stride,
+        uint32_t                n_tokens,
+        const uint32_t         *index_counts,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   scale);
+#endif
+
 int ds4_gpu_indexer_scores_prefill_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

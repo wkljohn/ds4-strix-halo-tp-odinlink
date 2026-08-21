@@ -125,6 +125,69 @@ __global__ static void indexer_score_one_direct_kernel(
     if (tid == 0) scores[c] = total;
 }
 
+/* Exact small-width verifier form of indexer_score_one_direct_kernel.
+ *
+ * One CTA still owns one compressed row and the h0/warp/lane reduction tree
+ * is intentionally identical to the shipped one-row kernel above. Only the
+ * immutable K row is reused: verifier tokens are evaluated sequentially so
+ * their accumulators cannot be combined. Counts are the authoritative host
+ * cache frontiers; deriving them from pos/ratio is incorrect after restore. */
+template <uint32_t W>
+__global__ static void indexer_scores_exact_token_loop_kernel(
+        float *scores,
+        const float *q,
+        const float *weights,
+        const float *index_comp,
+        uint32_t score_stride,
+        uint32_t count0,
+        uint32_t count1,
+        uint32_t count2,
+        uint32_t count3,
+        uint32_t count4,
+        float scale) {
+    static_assert(W >= 1u && W <= 5u, "verifier width must be 1..5");
+    const uint32_t c = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (c >= score_stride || tid >= 128u) return;
+
+    __shared__ float krow[128];
+    __shared__ float partial[4];
+    krow[tid] = index_comp[(uint64_t)c * 128u + tid];
+    __syncthreads();
+
+    const uint32_t counts[5] = {count0, count1, count2, count3, count4};
+#pragma unroll
+    for (uint32_t t = 0; t < W; t++) {
+        if (c >= counts[t]) {
+            if (tid == 0) scores[(uint64_t)t * score_stride + c] = -INFINITY;
+            continue;
+        }
+        float total = 0.0f;
+        const float *qt = q + (uint64_t)t * 64u * 128u;
+        const float *wt = weights + (uint64_t)t * 64u;
+        for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
+            const uint32_t h = h0 + warp;
+            const float4 qv =
+                ((const float4 *)(qt + (uint64_t)h * 128u))[lane];
+            const float4 kv = ((const float4 *)krow)[lane];
+            float dot = qv.x * kv.x + qv.y * kv.y +
+                        qv.z * kv.z + qv.w * kv.w;
+            dot = warp_sum_f32(dot);
+            if (lane == 0) {
+                partial[warp] = fmaxf(dot, 0.0f) * wt[h] * scale;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                total += partial[0] + partial[1] + partial[2] + partial[3];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) scores[(uint64_t)t * score_stride + c] = total;
+    }
+}
+
 __global__ static void indexer_scores_wmma128_kernel(
         float *scores,
         const float *q,
@@ -926,6 +989,49 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
                                  n_head, head_dim, 1, scale, 0);
+}
+
+extern "C" int ds4_gpu_indexer_scores_exact_token_loop_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                score_stride,
+        uint32_t                n_tokens,
+        const uint32_t         *index_counts,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        float                   scale) {
+    if (!scores || !q || !weights || !index_comp || !index_counts ||
+        score_stride == 0u || n_tokens == 0u || n_tokens > 5u ||
+        n_head != 64u || head_dim != 128u ||
+        q->bytes < (uint64_t)n_tokens * 64u * 128u * sizeof(float) ||
+        weights->bytes < (uint64_t)n_tokens * 64u * sizeof(float) ||
+        index_comp->bytes < (uint64_t)score_stride * 128u * sizeof(float) ||
+        scores->bytes < (uint64_t)n_tokens * score_stride * sizeof(float)) {
+        return 0;
+    }
+    uint32_t counts[5] = {0u, 0u, 0u, 0u, 0u};
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        if (index_counts[t] == 0u || index_counts[t] > score_stride) return 0;
+        counts[t] = index_counts[t];
+    }
+#define DS4_LAUNCH_INDEXER_EXACT_TOKEN_LOOP(width_)                         \
+    indexer_scores_exact_token_loop_kernel<width_><<<score_stride, 128>>>(  \
+        (float *)scores->ptr, (const float *)q->ptr,                        \
+        (const float *)weights->ptr, (const float *)index_comp->ptr,        \
+        score_stride, counts[0], counts[1], counts[2], counts[3],           \
+        counts[4], scale)
+    switch (n_tokens) {
+        case 1u: DS4_LAUNCH_INDEXER_EXACT_TOKEN_LOOP(1u); break;
+        case 2u: DS4_LAUNCH_INDEXER_EXACT_TOKEN_LOOP(2u); break;
+        case 3u: DS4_LAUNCH_INDEXER_EXACT_TOKEN_LOOP(3u); break;
+        case 4u: DS4_LAUNCH_INDEXER_EXACT_TOKEN_LOOP(4u); break;
+        case 5u: DS4_LAUNCH_INDEXER_EXACT_TOKEN_LOOP(5u); break;
+        default: return 0;
+    }
+#undef DS4_LAUNCH_INDEXER_EXACT_TOKEN_LOOP
+    return cuda_ok(cudaGetLastError(), "indexer exact token-loop launch");
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(

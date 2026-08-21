@@ -64544,13 +64544,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
 #define DS4_DSPARK_SCHED_EXTRA_MS()                                         \
     ((scheduler_enabled && stats_t0 != 0.0) ?                                \
      s->dspark_last_propose_ms + (now_sec() - stats_t0) * 1000.0 : 0.0)
-    if (stats_enabled) {
-        s->dspark_stats.cycles++;
-        /* Only the first verifier call in a public sampling cycle enters with
-         * the one ordinary target token. Chained verifier calls enter with a
-         * larger cumulative n_accept and must not count that prefix again. */
-        if (n_accept == 1) s->dspark_stats.first_tokens++;
-    }
+    if (stats_enabled) s->dspark_stats.cycles++;
     if (spec_log) {
         fprintf(stderr,
                 "ds4: DSpark spec enter accepted=%d max=%d valid=%d len=%u pos=%d\n",
@@ -68286,6 +68280,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                   errlen) != 0) return -1;
     int n_accept = 0;
     accepted[n_accept++] = first_token;
+    /* Count public sampling-cycle anchors here, before the tail/strict early
+     * returns and outside the internal chained-verifier loop. Counting inside
+     * ds4_session_eval_dspark_speculative_argmax missed the final one-token
+     * tail cycle and previously counted chained calls as new anchors. */
+    if (e->support_kind == DS4_SUPPORT_DSPARK &&
+        ds4_dspark_stats_enabled()) {
+        s->dspark_stats.first_tokens++;
+    }
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
     if (strict_dspark) return n_accept;
     if (dspark_tail_skip) return n_accept;
