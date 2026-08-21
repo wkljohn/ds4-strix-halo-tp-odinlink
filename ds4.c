@@ -29998,8 +29998,9 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
                 if (ok) {
                     ok = ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
-                            metal_graph_batch_heads(g), model->map, model->size,
-                            tp_batch_sinks_offset, metal_graph_batch_q(g),
+                            metal_graph_batch_heads(g), model->map,
+                            model->size, tp_batch_sinks_offset,
+                            metal_graph_batch_q(g),
                             g->layer_raw_cache[il],
                             g->layer_attn_comp_cache[il],
                             metal_graph_attn_comp_cache_is_f16(),

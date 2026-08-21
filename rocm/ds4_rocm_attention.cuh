@@ -700,9 +700,11 @@ __global__ static void attention_decode_indexed_exact_head2_batch_kernel(
     extern __shared__ int32_t smem[];
     uint32_t *comp_rows = (uint32_t *)smem;
     float *scores = (float *)(comp_rows + top_k);
-    float *reduce = scores + 2u * score_stride;
+    float *reduce_max = scores + 2u * score_stride;
+    float *reduce_sum = reduce_max + 16u;
     float *head_scores = scores + subgroup * score_stride;
-    float *head_reduce = reduce + subgroup * 8u;
+    float *head_reduce_max = reduce_max + subgroup * 8u;
+    float *head_reduce_sum = reduce_sum + subgroup * 8u;
 
     const uint4 state = attention_exact_state_for_token(
         t, state0, state1, state2, state3, state4);
@@ -748,7 +750,7 @@ __global__ static void attention_decode_indexed_exact_head2_batch_kernel(
         local_max = fmaxf(local_max, s);
     }
     const float max_score = attention_subgroup_max_oldhip_w32(
-        local_max, head_reduce, sub_tid);
+        local_max, head_reduce_max, sub_tid);
 
     float local_sum = 0.0f;
     for (uint32_t r = sub_tid; r < n_rows; r += 256u) {
@@ -758,7 +760,7 @@ __global__ static void attention_decode_indexed_exact_head2_batch_kernel(
     }
     if (sub_tid == 0u) local_sum += expf(sinks[h] - max_score);
     const float denom = attention_subgroup_sum_oldhip_w32(
-        local_sum, head_reduce, sub_tid);
+        local_sum, head_reduce_sum, sub_tid);
     const float inv_denom = 1.0f / denom;
 
     for (uint32_t d = sub_tid; d < head_dim; d += 256u) {

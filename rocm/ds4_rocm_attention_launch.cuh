@@ -787,7 +787,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
      * for this boundary and for any future shape that exceeds the LDS budget. */
     const size_t shmem = (size_t)top_k * sizeof(uint32_t) +
                          (size_t)2u * score_stride * sizeof(float) +
-                         (size_t)16u * sizeof(float);
+                         (size_t)32u * sizeof(float);
     const bool serial_fallback = raw_cap - n_raw_by_token[0] < n_tokens ||
                                  shmem > 32768u;
     if (serial_fallback) {
