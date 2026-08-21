@@ -22320,6 +22320,14 @@ static bool metal_graph_encode_decode_layer_phase(
         DS4_N_HC == 4 &&
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
+#ifdef DS4_ROCM_BUILD
+    const bool hc_stage_exact_coop =
+        fuse_hc_norm && !tp_ablate_hcpre && g->tp_world == 2 &&
+        (ds4_gpu_get_tp_runtime_features() &
+         DS4_TP_FEATURE_HC_STAGE_EXACT_COOP) != 0u;
+#else
+    const bool hc_stage_exact_coop = false;
+#endif
     const bool stop_before_attn =
         phase == METAL_DECODE_LAYER_FROM_ATTN_PRE_TO_ATTN ||
         phase == METAL_DECODE_LAYER_FROM_QKV_TO_ATTN ||
@@ -22341,12 +22349,25 @@ static bool metal_graph_encode_decode_layer_phase(
         phase != METAL_DECODE_LAYER_FROM_QA_KV_RAW_TO_SHARED_MID &&
         phase != METAL_DECODE_LAYER_FROM_KV_STORE_TO_ATTN &&
         !resume_after_attn) {
-    if (ok && !tp_ablate_hcpre) {
+    if (ok && hc_stage_exact_coop) {
+#ifdef DS4_ROCM_BUILD
+        ok = ds4_gpu_hc_stage_exact_coop_tensor(
+                metal_graph_attn_cur(g), metal_graph_attn_norm(g),
+                metal_graph_flat_hc(g), metal_graph_hc_mix(g),
+                metal_graph_hc_split(g), metal_graph_cur_hc(g),
+                model->map, model->size, layer->hc_attn_fn->abs_offset,
+                layer->hc_attn_scale->abs_offset,
+                layer->hc_attn_base->abs_offset,
+                layer->attn_norm->abs_offset,
+                DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
+                DS4_HC_EPS, DS4_RMS_EPS) != 0;
+#endif
+    } else if (ok && !tp_ablate_hcpre) {
         ok = ds4_gpu_rms_norm_plain_tensor(metal_graph_flat_hc(g), metal_graph_cur_hc(g), (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
         if (ok) ok = metal_graph_matmul_plain_tensor(metal_graph_hc_mix(g), model, layer->hc_attn_fn,
                                                      hc_dim, mix_hc, metal_graph_flat_hc(g), 1);
     }
-    if (ok && fuse_hc_norm) {
+    if (ok && fuse_hc_norm && !hc_stage_exact_coop) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(metal_graph_attn_cur(g),
                                                          metal_graph_attn_norm(g),
                                                          metal_graph_hc_split(g),
@@ -22375,7 +22396,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                   il,
                                                   pos);
         }
-    } else if (ok) {
+    } else if (ok && !hc_stage_exact_coop) {
         ok = metal_graph_decode_hc_pre(metal_graph_attn_cur(g),
                                        metal_graph_hc_split(g),
                                        metal_graph_hc_mix(g),
@@ -23653,12 +23674,25 @@ static bool metal_graph_encode_decode_layer_phase(
                 g->dspark_validate_decode_stages,
                 metal_graph_after_attn_hc(g), 4, 0);
     }
-    if (ok && !tp_ablate_hcpre) {
+    if (ok && hc_stage_exact_coop) {
+#ifdef DS4_ROCM_BUILD
+        ok = ds4_gpu_hc_stage_exact_coop_tensor(
+                metal_graph_ffn_cur(g), metal_graph_ffn_norm(g),
+                metal_graph_flat_hc(g), metal_graph_hc_mix(g),
+                metal_graph_hc_split(g), metal_graph_after_attn_hc(g),
+                model->map, model->size, layer->hc_ffn_fn->abs_offset,
+                layer->hc_ffn_scale->abs_offset,
+                layer->hc_ffn_base->abs_offset,
+                layer->ffn_norm->abs_offset,
+                DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER,
+                DS4_HC_EPS, DS4_RMS_EPS) != 0;
+#endif
+    } else if (ok && !tp_ablate_hcpre) {
         ok = ds4_gpu_rms_norm_plain_tensor(metal_graph_flat_hc(g), metal_graph_after_attn_hc(g), (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
         if (ok) ok = metal_graph_matmul_plain_tensor(metal_graph_hc_mix(g), model, layer->hc_ffn_fn,
                                                      hc_dim, mix_hc, metal_graph_flat_hc(g), 1);
     }
-    if (ok && fuse_hc_norm) {
+    if (ok && fuse_hc_norm && !hc_stage_exact_coop) {
         ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(metal_graph_ffn_cur(g),
                                                          metal_graph_ffn_norm(g),
                                                          metal_graph_hc_split(g),
@@ -23687,7 +23721,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                   il,
                                                   pos);
         }
-    } else if (ok) {
+    } else if (ok && !hc_stage_exact_coop) {
         ok = metal_graph_decode_hc_pre(metal_graph_ffn_cur(g),
                                        metal_graph_hc_split(g),
                                        metal_graph_hc_mix(g),
@@ -23706,7 +23740,7 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre", metal_graph_ffn_cur(g), DS4_N_EMBD, il, pos);
     }
-    if (ok && !fuse_hc_norm) ok = ds4_gpu_rms_norm_weight_tensor(metal_graph_ffn_norm(g), metal_graph_ffn_cur(g),
+    if (ok && !fuse_hc_norm && !hc_stage_exact_coop) ok = ds4_gpu_rms_norm_weight_tensor(metal_graph_ffn_norm(g), metal_graph_ffn_cur(g),
                                                                    model->map, model->size,
                                                                    layer->ffn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
@@ -51901,6 +51935,28 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     return placement_features;
 #else
     if (!e || !e->metal_ready) return placement_features;
+    uint32_t hc_features = 0u;
+    const char *hc_exact_coop = getenv("DS4_ROCM_HC_STAGE_EXACT_COOP");
+    const bool hc_exact_coop_requested =
+        hc_exact_coop && hc_exact_coop[0] == '1' && hc_exact_coop[1] == '\0';
+    if (hc_exact_coop_requested && !e->mtp_ready &&
+        !(e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) &&
+        DS4_N_EMBD == 4096u && DS4_N_HC == 4u &&
+        ds4_gpu_hc_stage_exact_coop_supported() != 0) {
+        const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+        const uint64_t mix_hc = 2u * DS4_N_HC +
+                                (uint64_t)DS4_N_HC * DS4_N_HC;
+        bool exact_layout = true;
+        for (uint32_t il = 0; exact_layout && il < DS4_N_LAYER; ++il) {
+            const ds4_tensor *attn = e->weights.layer[il].hc_attn_fn;
+            const ds4_tensor *ffn = e->weights.layer[il].hc_ffn_fn;
+            exact_layout = attn && ffn &&
+                attn->type == DS4_TENSOR_F16 && ffn->type == DS4_TENSOR_F16 &&
+                attn->dim[0] == hc_dim && attn->dim[1] == mix_hc &&
+                ffn->dim[0] == hc_dim && ffn->dim[1] == mix_hc;
+        }
+        if (exact_layout) hc_features = DS4_TP_FEATURE_HC_STAGE_EXACT_COOP;
+    }
     uint32_t q4k_features = DS4_TP_FEATURE_Q4K_WMMA |
                             DS4_TP_FEATURE_Q4K_FUSED_MID;
     uint32_t iq2_features = DS4_TP_FEATURE_IQ2_I8_WMMA;
@@ -51953,7 +52009,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
                 (const uint8_t *)e->model.map + down->abs_offset);
     }
     return (saw_q4k_layer ? q4k_features : 0u) |
-           (saw_iq2_layer ? iq2_features : 0u) | placement_features;
+           (saw_iq2_layer ? iq2_features : 0u) |
+           hc_features | placement_features;
 #endif
 }
 

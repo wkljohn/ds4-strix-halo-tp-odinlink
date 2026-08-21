@@ -166,7 +166,7 @@ __global__ static void hc_tail_kernel(
 template <bool STORE_FLAT>
 __global__ static void exact_hc_stage_cooperative(
         float *out, float *norm_out, float *flat, float *mix, float *split,
-        float *rms_scale, const __half *w, const float *residual,
+        const __half *w, const float *residual,
         const float *scale, const float *base, const float *norm_w) {
     cg::grid_group grid = cg::this_grid();
     const uint32_t tid = threadIdx.x;
@@ -183,11 +183,11 @@ __global__ static void exact_hc_stage_cooperative(
             if (tid < stride) rms_partial[tid] += rms_partial[tid + stride];
             __syncthreads();
         }
-        if (tid == 0) rms_scale[0] = rsqrtf(rms_partial[0] / (float)kInput + kRmsEps);
+        if (tid == 0) split[0] = rsqrtf(rms_partial[0] / (float)kInput + kRmsEps);
         __syncthreads();
         if (STORE_FLAT) {
             for (uint32_t i = tid; i < kInput; i += blockDim.x) {
-                flat[i] = residual[i] * rms_scale[0];
+                flat[i] = residual[i] * split[0];
             }
         }
     }
@@ -206,7 +206,7 @@ __global__ static void exact_hc_stage_cooperative(
             if (STORE_FLAT) {
                 xv = flat[i];
             } else {
-                xv = residual[i] * rms_scale[0];
+                xv = residual[i] * split[0];
                 asm volatile("" : "+v"(xv));
             }
             sum += __half2float(wr[i]) * xv;
@@ -227,8 +227,8 @@ struct buffers {
     __half *w{};
     float *residual{}, *scale{}, *base{}, *norm_w{};
     float *b_flat{}, *b_mix{}, *b_split{}, *b_out{}, *b_norm{};
-    float *c_flat{}, *c_mix{}, *c_split{}, *c_out{}, *c_norm{}, *c_rms{};
-    float *i_flat{}, *i_mix{}, *i_split{}, *i_out{}, *i_norm{}, *i_rms{};
+    float *c_flat{}, *c_mix{}, *c_split{}, *c_out{}, *c_norm{};
+    float *i_flat{}, *i_mix{}, *i_split{}, *i_out{}, *i_norm{};
 };
 
 static void launch_base(const buffers &b, uint32_t layer) {
@@ -247,8 +247,7 @@ static void launch_coop(const buffers &b, uint32_t layer) {
     float *flat = STORE_FLAT ? b.c_flat : b.i_flat;
     float *mix = STORE_FLAT ? b.c_mix : b.i_mix;
     float *split = STORE_FLAT ? b.c_split : b.i_split;
-    float *rms = STORE_FLAT ? b.c_rms : b.i_rms;
-    void *args[] = {&out, &norm, &flat, &mix, &split, &rms,
+    void *args[] = {&out, &norm, &flat, &mix, &split,
                     &w, const_cast<float **>(&b.residual),
                     const_cast<float **>(&b.scale), const_cast<float **>(&b.base),
                     const_cast<float **>(&b.norm_w)};
@@ -299,10 +298,10 @@ int main() {
     check(hipMemcpy(b.base, hb.data(), hb.size() * sizeof(float), hipMemcpyHostToDevice), "base copy");
     check(hipMemcpy(b.norm_w, hn.data(), hn.size() * sizeof(float), hipMemcpyHostToDevice), "norm copy");
     float **all[] = {&b.b_flat,&b.b_mix,&b.b_split,&b.b_out,&b.b_norm,
-                    &b.c_flat,&b.c_mix,&b.c_split,&b.c_out,&b.c_norm,&b.c_rms,
-                    &b.i_flat,&b.i_mix,&b.i_split,&b.i_out,&b.i_norm,&b.i_rms};
-    const size_t sizes[] = {kInput,kMix,kMix,kEmbd,kEmbd,kInput,kMix,kMix,kEmbd,kEmbd,1,
-                            kInput,kMix,kMix,kEmbd,kEmbd,1};
+                    &b.c_flat,&b.c_mix,&b.c_split,&b.c_out,&b.c_norm,
+                    &b.i_flat,&b.i_mix,&b.i_split,&b.i_out,&b.i_norm};
+    const size_t sizes[] = {kInput,kMix,kMix,kEmbd,kEmbd,kInput,kMix,kMix,kEmbd,kEmbd,
+                            kInput,kMix,kMix,kEmbd,kEmbd};
     for (uint32_t i = 0; i < sizeof(all)/sizeof(all[0]); ++i) alloc(all[i], sizes[i], "scratch alloc");
 
     launch_base(b, 0); launch_coop<true>(b, 0); launch_coop<false>(b, 0);

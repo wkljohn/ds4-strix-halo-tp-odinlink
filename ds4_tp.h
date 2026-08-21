@@ -75,6 +75,11 @@ enum {
     /* Fusing the Q4_K hot-tile SwiGLU epilogue changes which buffers are
      * materialized.  Independently launched ranks must select it together. */
     DS4_TP_FEATURE_Q4K_FUSED_MID = UINT32_C(1) << 16,
+    /* The one-token HC pre-chain changes from three launches to one
+     * cooperative launch while preserving the established arithmetic and
+     * scratch buffers.  Require both independently launched ranks to select
+     * the same path so asymmetric environment or device support fails closed. */
+    DS4_TP_FEATURE_HC_STAGE_EXACT_COOP = UINT32_C(1) << 17,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {

@@ -4,6 +4,7 @@
 
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm.h"
+#include <hip/hip_cooperative_groups.h>
 #include <hipblaslt/hipblaslt.h>
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
