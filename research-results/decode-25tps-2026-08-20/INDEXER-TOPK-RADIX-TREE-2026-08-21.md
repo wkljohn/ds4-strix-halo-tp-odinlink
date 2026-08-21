@@ -52,9 +52,12 @@ Enable on both TP ranks with:
 export DS4_ROCM_INDEXER_TOPK_RADIX_TREE=1
 ```
 
-The path is restricted to gfx1151, `top_k=512`, and
-`8192 < n_comp <= 16384`.  All other shapes and architectures retain their
-previous dispatch.  TP hello bit `DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE`
+The path is restricted to gfx1151, one-token decode, `top_k=512`, and
+`8192 < n_comp <= 16384`. Batched prefill retains the established path: an
+alternating three-run Q4_K A/B found a positive decode median but a small
+prefill regression when the radix tree was used for both. All other shapes and
+architectures retain their previous dispatch. TP hello bit
+`DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE`
 prevents independently launched ranks from selecting different index rows.
 The candidate reuses the existing temporary arena and adds no persistent
 memory.
@@ -66,9 +69,23 @@ The full 33,792+300 Q4_K RoCE v2 candidate measured:
 | Existing bitonic tree | 208.67 t/s | 16.49 t/s | 16.55 t/s | 115.807 ms | `59a7cf4d6737efbf` |
 | Exact radix tree | 207.54 t/s | 16.73 t/s | 16.74 t/s | 61.520 ms | `59a7cf4d6737efbf` |
 
-The candidate gained 1.2% steady decode and removed nearly all of the observed
-one-time boundary penalty.  The single prefill measurement was 0.5% lower and
-needs a repeated median before the switch can become a default.
+The original all-token candidate gained 1.2% steady decode in its first run.
+The completed alternating three-run medians were:
+
+| Path | Median prefill | Median decode | Median steady decode |
+| --- | ---: | ---: | ---: |
+| Existing bitonic tree | 208.67 t/s | 16.49 t/s | 16.55 t/s |
+| Radix tree for decode and prefill | 207.92 t/s | 16.73 t/s | 16.74 t/s |
+
+That is +1.46% decode and +1.15% steady decode, but -0.36% prefill. The
+production-disabled dispatch was therefore narrowed to one-token decode before
+provider/model validation; batched prefill no longer selects it.
+
+The first full decode-only rerun measured 207.60 prefill, 16.72 decode, and
+16.74 steady decode t/s with the same `59a7cf4d6737efbf` fingerprint. Its
+prefill result remained inside the observed 207.54--208.85 t/s run spread even
+though the radix kernel was unreachable during prefill. Treat the earlier
+0.36% prefill midpoint difference as run noise, not a candidate regression.
 
 Short-context candidate gates proved the feature is inert below the boundary:
 

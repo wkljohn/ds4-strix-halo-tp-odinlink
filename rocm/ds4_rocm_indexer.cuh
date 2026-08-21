@@ -971,7 +971,8 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
     }
-    if (top_k == 512u && n_comp > 8192u && n_comp <= 16384u &&
+    if (top_k == 512u && n_tokens == 1u &&
+        n_comp > 8192u && n_comp <= 16384u &&
         ds4_gpu_indexer_topk_radix_tree_supported() &&
         (ds4_gpu_get_tp_runtime_features() &
          DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE) != 0u) {

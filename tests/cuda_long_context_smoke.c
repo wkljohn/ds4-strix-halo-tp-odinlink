@@ -98,7 +98,7 @@ cleanup:
 #ifdef DS4_ROCM_BUILD
 static int check_radix_tree_topk(void) {
     const uint32_t n_comp = 8448;
-    const uint32_t n_tokens = 32;
+    const uint32_t n_tokens = 1;
     const uint32_t top_k = 512;
     const uint64_t score_count = (uint64_t)n_comp * n_tokens;
     float *scores_host = (float *)malloc((size_t)score_count * sizeof(float));
