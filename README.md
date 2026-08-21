@@ -21,9 +21,9 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Current Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **203.00 t/s** | **19.14 t/s** | three-run median, same fingerprint |
-| **Current Q4_K over OdinLink** | balanced 50/50, 4,096-token chunk | **218.24 t/s** | **18.88 t/s** | three-run median, same fingerprint |
-| **Current Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **258.64 t/s** | **19.22 t/s** | three-run median, same fingerprint |
+| **Current Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **202.83 t/s** | **19.49 t/s** | three-run median, exact fingerprint |
+| **Current Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **217.01 t/s** | **19.19 t/s** | three-run median, exact fingerprint |
+| **Current Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **258.06 t/s** | **19.55 t/s** | three-run median, exact fingerprint |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
@@ -34,9 +34,10 @@ Q2_K and Q4_K run without a persistent expanded-weight cache.
 
 The ordinary benchmark and deployment launchers enable the validated ordered
 ROCm TP callback, temporal-compressor schedule, shape-gated M256/K128 Q8
-projection, and RoCE prefill wavefront automatically. The wavefront
-provider-gates itself off on OdinLink. DSpark stays opt-in and does not inherit
-that target-only schedule.
+projection, cooperative HC decode stage, exact long-context indexer top-k, and
+RoCE prefill wavefront automatically. The wavefront provider-gates itself off
+on OdinLink. DSpark stays opt-in and does not inherit that target-only
+schedule.
 
 The table reports reproducible inference results, not a single-node scaling
 claim. Raw runs, fingerprints, kernel decisions, rejected candidates, memory
