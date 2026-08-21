@@ -32,10 +32,12 @@ prefill defaults enforced by the pre-main benchmark gate. Set
 current TP verifier does not match the target-only token fingerprint.
 Ordinary Q4_K/Q2_K launches also select the validated ordered ROCm TP callback
 and temporal-compressor schedule, the RoCE prefill wavefront, and the
-shape-gated M256/K128 Q8 projection. The wavefront provider-gates itself off
-for OdinLink. Set `PREFILL_FFN_WAVEFRONT=0` or `Q8_M256_K128=0` in the
-deployment config for a symmetric rollback; no extra shell environment is
-required.
+shape-gated M256/K128 Q8 projection, exact cooperative HC decode stage, and
+the exact long-context indexer radix tree. The wavefront provider-gates itself
+off for OdinLink, and the radix tree engages only after 8,192 compressed rows.
+Set `PREFILL_FFN_WAVEFRONT=0`, `Q8_M256_K128=0`,
+`HC_STAGE_EXACT_COOP=0`, or `INDEXER_TOPK_RADIX_TREE=0` in the deployment
+config for a symmetric rollback; no extra shell environment is required.
 
 On the 96 GiB reference nodes the optional resident DSpark profile settles near
 97--98% reported VRAM use and leaves little safety margin. Ordinary production

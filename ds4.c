@@ -51938,7 +51938,7 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     uint32_t hc_features = 0u;
     const char *hc_exact_coop = getenv("DS4_ROCM_HC_STAGE_EXACT_COOP");
     const bool hc_exact_coop_requested =
-        hc_exact_coop && hc_exact_coop[0] == '1' && hc_exact_coop[1] == '\0';
+        !hc_exact_coop || !hc_exact_coop[0] || strcmp(hc_exact_coop, "0") != 0;
     if (hc_exact_coop_requested && !e->mtp_ready &&
         !(e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) &&
         DS4_N_EMBD == 4096u && DS4_N_HC == 4u &&
@@ -51961,8 +51961,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     const char *indexer_radix_tree =
         getenv("DS4_ROCM_INDEXER_TOPK_RADIX_TREE");
     const bool indexer_radix_tree_requested =
-        indexer_radix_tree && indexer_radix_tree[0] == '1' &&
-        indexer_radix_tree[1] == '\0';
+        !indexer_radix_tree || !indexer_radix_tree[0] ||
+        strcmp(indexer_radix_tree, "0") != 0;
     if (indexer_radix_tree_requested && !e->mtp_ready &&
         !(e->support_kind == DS4_SUPPORT_DSPARK && e->dspark) &&
         ds4_gpu_indexer_topk_radix_tree_supported() != 0) {

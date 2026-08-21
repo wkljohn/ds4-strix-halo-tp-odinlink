@@ -44,12 +44,13 @@ shape.
 At the real 8,448-row decode shape, the isolated saving is 29.876 us per
 layer, or about 1.28 ms over 43 layers.
 
-## Production-disabled validation
+## Production validation
 
-Enable on both TP ranks with:
+The exact one-token path is enabled by default after cross-model and
+cross-provider validation. Disable it on both TP ranks with:
 
 ```sh
-export DS4_ROCM_INDEXER_TOPK_RADIX_TREE=1
+export DS4_ROCM_INDEXER_TOPK_RADIX_TREE=0
 ```
 
 The path is restricted to gfx1151, one-token decode, `top_k=512`, and
@@ -99,3 +100,11 @@ Each candidate passed the mandatory RDMA proof, exact 300-token fingerprint,
 semantic smoke, retrieval case, and fail-closed feature negotiation.  The
 ROCm model-free integration test is `make test-rocm-long-context`; TP hello is
 covered by `make test-tp-hello`.
+
+A matched 33,792+300 OdinLink check used the same 2,048-token chunks and long
+prompt as the RoCE test. Control measured 179.60/15.94 prefill/decode t/s and
+radix measured 180.47/15.94 t/s; both produced fingerprint
+`59a7cf4d6737efbf`. The path is therefore exact and performance-neutral when
+OdinLink communication masks its isolated saving. An earlier apparent
+fingerprint mismatch was invalid evidence: that run accidentally used a
+4,096-token prefill chunk, which changes the deterministic trajectory.

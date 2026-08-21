@@ -36,7 +36,8 @@ There are 86 applicable chains per generated token, projecting approximately
 
 ## Production candidate
 
-The production path is opt-in with `DS4_ROCM_HC_STAGE_EXACT_COOP=1`. It is
+The production path is enabled by default after validation. Set
+`DS4_ROCM_HC_STAGE_EXACT_COOP=0` on both ranks to disable it. It is
 restricted to gfx1151, the exact 4096x4 HC layout, F16 16384x24 projection
 weights, ordinary non-DSpark TP=2 decode, and hardware with enough cooperative
 grid residency. A TP hello feature bit makes asymmetric rank selection fail
