@@ -456,3 +456,63 @@ The DSpark stats anchor counter now increments at the public sampling-cycle
 entry, outside the chained verifier and before the final one-token tail return.
 This fixes the diagnostic total from 299 to the benchmark's 300 generated
 tokens without changing scheduling, acceptance, or model arithmetic.
+
+## Exact two-head indexed-attention batching
+
+The next bounded experiment targeted the indexed-attention scan rather than
+the smaller indexer term.  It pairs two independent 256-thread head groups in
+one 512-thread CTA for verifier widths 2--5.  Each head retains the shipped
+serial `float4` dot order, eight-wave reduction, unsorted top-k order, sink
+placement, and raw-then-compressed accumulation.  The production gate is
+ROCm + TP head split + DSpark + ratio-4 indexed attention + compact F32 cache;
+TP hello feature bit 23 rejects asymmetric enablement.  No weight expansion,
+model cache, or persistent allocation is added.
+
+| Width | Repeated isolated speedup | Bitwise exact |
+|---:|---:|:---:|
+| 2 | 1.94--2.04x | yes |
+| 3 | 1.41--1.52x | yes |
+| 4 | 1.55--1.59x | yes |
+| 5 | 1.59--1.74x | yes |
+
+The first full candidate changed the token fingerprint even though the
+isolated oracle passed.  A temporary serial diagnostic preserved the same
+top-k/raw-row schedule and restored `7174e214e05fd83e`, isolating the failure
+to the paired kernel.  A live paired-versus-serial comparator then found
+intermittent whole-head losses: exactly 512 or 1,024 mismatched values.  The
+two reductions had reused the same eight shared-memory slots; a leading wave
+could begin the sum reduction before a trailing wave consumed the max.  The
+fix assigns distinct max and sum storage.  Twenty repeated isolated W2--W5
+tests passed bitwise afterward, followed by a complete 2,048+300 live
+comparison with zero mismatch events and the exact fingerprint.
+
+The clean final binary produced:
+
+| Run | Provider | Prefill | Decode | FNV64 |
+|---|---|---:|---:|---|
+| r1 | RoCE v2 | 188.58 t/s | 14.23 t/s | `7174e214e05fd83e` |
+| r2 | RoCE v2 | 190.18 t/s | 14.21 t/s | `7174e214e05fd83e` |
+| r3 | RoCE v2 | 190.05 t/s | 14.24 t/s | `7174e214e05fd83e` |
+| Cross-provider | OdinLink | 181.36 t/s | 14.27 t/s | `7174e214e05fd83e` |
+| Ordinary control | RoCE v2 | 258.60 t/s | 19.32 t/s | `b7694f9d11a3760e` |
+
+The RoCE v2 median is **190.05 prefill / 14.23 decode t/s**.  That is 9.2%
+above the 13.03 t/s exact first-owner baseline and 3.8% above the preceding
+13.71 t/s Q8 weight-outer median.  The acceptance histogram remains exactly
+`21,5,11,5,3,5,1,3,2,2,2,1,0,0,0,0,4`; the speedup is verifier execution only.
+OdinLink reported 37,908 streaming copies, 3.49 GB, and zero fallback calls.
+The ordinary control did not advertise or select the DSpark-only feature and
+retained its known fingerprint.
+
+Enable the accepted candidate symmetrically with:
+
+```sh
+export DS4_ROCM_DSPARK_EXACT_ATTN_HEAD2=1
+```
+
+The remaining economic gap is still large: at 2.098 final tokens per cycle,
+30 t/s permits only 69.9 ms for the complete cycle.  With approximately
+39.8 ms outside the measured 107.6 ms verifier, the verifier would need to
+approach 30 ms.  The next measurement therefore separates verifier wall time,
+summed GPU work, and launch count by compute island before another kernel is
+attempted; acceptance changes remain deferred until verifier hits are cheaper.
