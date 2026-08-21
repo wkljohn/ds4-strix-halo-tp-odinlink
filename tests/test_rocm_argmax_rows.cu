@@ -138,6 +138,29 @@ int main(void) {
               "width gate");
     }
 
+    /* The legacy generic top-1 initializes its winner to column zero.  A NaN
+     * there must therefore remain index zero; later NaNs are ignored by its
+     * strict-greater comparison. */
+    host[0] = NAN;
+    host[1] = 100.0f;
+    host[(uint64_t)1 * N_VOCAB + 5] = NAN;
+    CHECK(ds4_gpu_tensor_write(&logits, 0, host, count * sizeof(float)),
+          "upload NaN contract logits");
+    uint32_t nan_ref[2] = {}, nan_got[2] = {};
+    CHECK(ds4_gpu_indexer_topk_tensor(&reference, &logits,
+                                      N_VOCAB, 2u, 1u),
+          "NaN reference top-1");
+    CHECK(ds4_gpu_argmax_rows_tensor(&candidate, &logits, N_VOCAB, 2u),
+          "NaN batched argmax");
+    CHECK(ds4_gpu_tensor_read(&reference, 0, nan_ref, sizeof(nan_ref)),
+          "read NaN reference");
+    CHECK(ds4_gpu_tensor_read(&candidate, 0, nan_got, sizeof(nan_got)),
+          "read NaN candidate");
+    CHECK(memcmp(nan_ref, nan_got, sizeof(nan_ref)) == 0,
+          "NaN selection contract must match generic top-1");
+    CHECK(nan_got[0] == 0u && nan_got[1] != 5u,
+          "column-zero NaN wins and later NaN loses");
+
     ds4_gpu_tensor_free_in_place(&candidate);
     ds4_gpu_tensor_free_in_place(&reference);
     ds4_gpu_tensor_free_in_place(&logits);

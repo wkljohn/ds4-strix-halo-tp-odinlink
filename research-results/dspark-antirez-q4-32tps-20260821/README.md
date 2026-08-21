@@ -554,6 +554,14 @@ all-negative-infinity input, and widths 1--4:
 | 3 | 12.135 ms | 0.0157 ms | 774.5x | yes |
 | 4 | 12.143 ms | 0.0159 ms | 764.0x | yes |
 
+The rows=1 timing is an oracle coverage point, not a production saving: the
+existing verifier already used its parallel one-row argmax when only one top
+row was present.  Production savings accrue on the multi-row calls.  The ROCm
+flags explicitly place `-fno-finite-math-only` after `-ffast-math`, so the
+negative-infinity sentinel remains in contract.  A follow-up oracle also
+covers the legacy generic path's unusual NaN rule: NaN at column zero remains
+selected, while a NaN in any later column loses the strict-greater comparison.
+
 TP hello feature bit 24 rejects asymmetric enablement.  The candidate adds no
 persistent allocation or expanded-weight cache and is selected only for an
 active ROCm DSpark session with:

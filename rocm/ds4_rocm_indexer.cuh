@@ -361,6 +361,14 @@ __global__ static void argmax_rows_kernel(
     const uint32_t tid = threadIdx.x;
     if (row_idx >= n_rows) return;
     const float *row = logits + (uint64_t)row_idx * n_vocab;
+    /* The generic top_k=1 path seeds selection with column zero.  Preserve
+     * its fail-closed NaN behavior exactly: a NaN in column zero remains the
+     * selected value, while NaNs in later columns lose the strict-greater
+     * comparison and are ignored. */
+    if (isnan(row[0])) {
+        if (tid == 0u) out_idx[row_idx] = 0;
+        return;
+    }
     float local_v = -INFINITY;
     int32_t local_i = 0;
     for (uint32_t i = tid; i < n_vocab; i += THREADS) {
