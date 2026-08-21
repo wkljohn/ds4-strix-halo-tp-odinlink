@@ -558,6 +558,34 @@ __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_kernel(
  * Four eight-lane groups consume four Q8_0 blocks per wave iteration while
  * retaining one output row per wave.  Explicit byte reads avoid relying on
  * unaligned vector loads or sub-wave shuffle behavior. */
+__device__ __forceinline__ static float q8_pack4_block_fma_serial_dag(
+        float acc, float d, const int8_t *q, const float4 &xv) {
+#pragma clang fp reassociate(off)
+    /* Match the emitted gfx1151 DAG of the first accumulator in the shipped
+     * two-output-row low pack4 kernel: form q0,q1,q2,q3 first, then apply the
+     * block scale once.  The paired candidate uses this for even low rows. */
+    float dot = (float)q[0] * xv.x;
+    dot = __builtin_fmaf((float)q[1], xv.y, dot);
+    dot = __builtin_fmaf((float)q[2], xv.z, dot);
+    dot = __builtin_fmaf((float)q[3], xv.w, dot);
+    return __builtin_fmaf(dot, d, acc);
+}
+
+__device__ __forceinline__ static float q8_pack4_block_fma_serial_odd_dag(
+        float acc, float d, const int8_t *q, const float4 &xv) {
+#pragma clang fp reassociate(off)
+    /* Match q3,q1,q2,q0 as emitted for the shipped low kernel's second
+     * accumulator and for the shipped one-row expansion kernel.  Therefore
+     * paired low uses this for odd rows, while expansion uses it for every
+     * row.  The same-binary W2-W5 oracle is the guard against toolchain DAG
+     * drift; algebraic source equivalence is not sufficient under fast-math. */
+    float dot = (float)q[3] * xv.w;
+    dot = __builtin_fmaf((float)q[1], xv.y, dot);
+    dot = __builtin_fmaf((float)q[2], xv.z, dot);
+    dot = __builtin_fmaf((float)q[0], xv.x, dot);
+    return __builtin_fmaf(dot, d, acc);
+}
+
 __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_kernel(
         float *out,
         const unsigned char *w,
@@ -594,6 +622,123 @@ __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
+}
+
+/* Exact two-row verifier form of the TP attention-output expansion.  Each
+ * wave retains the established pack4 block order and reduction tree for both
+ * rows, but loads each Q8 weight word once.  Only the independent activation
+ * values and accumulators are duplicated. */
+__global__ static void
+matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_tok2_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t subgroup = lane >> 3u;
+    const uint32_t lane8 = lane & 7u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < 2u * in_dim; i += blockDim.x) {
+        shx[i] = x[i];
+    }
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * row_bytes;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (uint32_t b4 = 0; b4 < n_blocks; b4 += 4u) {
+        const uint32_t b = b4 + subgroup;
+        const uint32_t elem = (b << 5u) + (lane8 << 2u);
+        const float4 x0 = *reinterpret_cast<const float4 *>(shx + elem);
+        const float4 x1 = *reinterpret_cast<const float4 *>(
+                shx + in_dim + elem);
+        const unsigned char *blk = wr + (uint64_t)b * 34u;
+        const float d = q8_0_scale_scalar(blk);
+        const int8_t *q = (const int8_t *)(blk + 2u + (lane8 << 2u));
+        acc0 = q8_pack4_block_fma_serial_odd_dag(acc0, d, q, x0);
+        acc1 = q8_pack4_block_fma_serial_odd_dag(acc1, d, q, x1);
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0u) {
+        out[row] = acc0;
+        out[out_dim + row] = acc1;
+    }
+}
+
+template <uint32_t TOK_TILE>
+__global__ static void
+matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out_dim,
+        uint32_t n_tokens,
+        uint64_t row_bytes) {
+    constexpr uint32_t BLOCK_TILE = 32u;
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t subgroup = lane >> 3u;
+    const uint32_t lane8 = lane & 7u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * row_bytes;
+    float acc[TOK_TILE];
+#pragma unroll
+    for (uint32_t t = 0; t < TOK_TILE; t++) acc[t] = 0.0f;
+
+    for (uint32_t block0 = 0; block0 < n_blocks; block0 += BLOCK_TILE) {
+        const uint32_t block_count =
+            n_blocks - block0 < BLOCK_TILE ? n_blocks - block0 : BLOCK_TILE;
+        const uint32_t tile_elems = block_count << 5u;
+        for (uint32_t i = tid; i < n_tokens * tile_elems; i += blockDim.x) {
+            const uint32_t tok = i / tile_elems;
+            const uint32_t k = i - tok * tile_elems;
+            shx[i] = x[(uint64_t)tok * in_dim +
+                       ((uint64_t)block0 << 5u) + k];
+        }
+        __syncthreads();
+        for (uint32_t bb4 = 0; bb4 < block_count; bb4 += 4u) {
+            const uint32_t bb = bb4 + subgroup;
+            if (bb >= block_count) continue;
+            const uint32_t b = block0 + bb;
+            const uint32_t elem = (bb << 5u) + (lane8 << 2u);
+            const unsigned char *blk = wr + (uint64_t)b * 34u;
+            const float d = q8_0_scale_scalar(blk);
+            const int8_t *q =
+                (const int8_t *)(blk + 2u + (lane8 << 2u));
+#pragma unroll
+            for (uint32_t t = 0; t < TOK_TILE; t++) {
+                if (t >= n_tokens) continue;
+                const float4 xv = *reinterpret_cast<const float4 *>(
+                    shx + t * tile_elems + elem);
+                acc[t] = q8_pack4_block_fma_serial_odd_dag(
+                    acc[t], d, q, xv);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < TOK_TILE; t++) acc[t] = warp_sum_f32(acc[t]);
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOK_TILE; t++) {
+            if (t < n_tokens) out[(uint64_t)t * out_dim + row] = acc[t];
+        }
+    }
 }
 
 /* TP=2 Q-B projection owned by one head per workgroup. The 32 waves compute
@@ -1837,6 +1982,189 @@ __global__ static void grouped_q8_0_a_f32_sharedx_rows_w32_2row_pack4_kernel(
     if (lane == 0u) {
         low[idx0] = acc0;
         if (have_row1) low[idx1] = acc1;
+    }
+}
+
+/* Exact two-verifier-row counterpart of the one-row grouped pack4 kernel.
+ * Weight addressing and per-row FP accumulation order stay unchanged.  The
+ * two compact owned-head rows are staged side by side so every Q8 weight word
+ * feeds both rows before it is discarded. */
+__global__ static void
+grouped_q8_0_a_f32_sharedx_rows_w32_2row_pack4_tok2_kernel(
+        float *low,
+        const unsigned char *w,
+        const float *heads,
+        uint32_t n_groups,
+        uint32_t n_blocks,
+        uint64_t rank,
+        uint64_t heads_row_stride,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t subgroup = lane >> 3u;
+    const uint32_t lane8 = lane & 7u;
+    const uint32_t rows_per_block = (blockDim.x >> 5u) << 1u;
+    const uint32_t group_dim = n_blocks << 5u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t base_idx = (uint64_t)blockIdx.x * rows_per_block;
+    if (base_idx >= low_dim) return;
+    const uint32_t g = (uint32_t)((base_idx / rank) % n_groups);
+    for (uint32_t i = tid; i < 2u * group_dim; i += blockDim.x) {
+        const uint32_t tok = i / group_dim;
+        const uint32_t k = i - tok * group_dim;
+        shx[i] = heads[(uint64_t)tok * heads_row_stride +
+                       (uint64_t)g * group_dim + k];
+    }
+    __syncthreads();
+
+    const uint64_t idx0 = base_idx + ((uint64_t)wave << 1u);
+    if (idx0 >= low_dim) return;
+    const uint64_t row0 = idx0 % rank;
+    const uint64_t idx1 = idx0 + 1u;
+    const uint64_t tensor_row0 = (uint64_t)g * rank + row0;
+    const unsigned char *wr0 = w + tensor_row0 * row_bytes;
+    const unsigned char *wr1 = wr0 + row_bytes;
+    const int have_row1 = row0 + 1u < rank && idx1 < low_dim;
+    float acc00 = 0.0f;
+    float acc01 = 0.0f;
+    float acc10 = 0.0f;
+    float acc11 = 0.0f;
+
+    for (uint32_t b4 = 0; b4 < n_blocks; b4 += 4u) {
+        const uint32_t b = b4 + subgroup;
+        const uint32_t elem = (b << 5u) + (lane8 << 2u);
+        const float4 x0 = *reinterpret_cast<const float4 *>(shx + elem);
+        const float4 x1 = *reinterpret_cast<const float4 *>(
+                shx + group_dim + elem);
+        const unsigned char *blk0 = wr0 + (uint64_t)b * 34u;
+        const float d0 = q8_0_scale_scalar(blk0);
+        const int8_t *q0 =
+            (const int8_t *)(blk0 + 2u + (lane8 << 2u));
+        acc00 = q8_pack4_block_fma_serial_dag(acc00, d0, q0, x0);
+        acc01 = q8_pack4_block_fma_serial_dag(acc01, d0, q0, x1);
+        if (have_row1) {
+            const unsigned char *blk1 = wr1 + (uint64_t)b * 34u;
+            const float d1 = q8_0_scale_scalar(blk1);
+            const int8_t *q1 =
+                (const int8_t *)(blk1 + 2u + (lane8 << 2u));
+            acc10 = q8_pack4_block_fma_serial_odd_dag(
+                acc10, d1, q1, x0);
+            acc11 = q8_pack4_block_fma_serial_odd_dag(
+                acc11, d1, q1, x1);
+        }
+    }
+    acc00 = warp_sum_f32(acc00);
+    acc01 = warp_sum_f32(acc01);
+    acc10 = warp_sum_f32(acc10);
+    acc11 = warp_sum_f32(acc11);
+    if (lane == 0u) {
+        low[idx0] = acc00;
+        low[low_dim + idx0] = acc01;
+        if (have_row1) {
+            low[idx1] = acc10;
+            low[low_dim + idx1] = acc11;
+        }
+    }
+}
+
+template <uint32_t TOK_TILE>
+__global__ static void
+grouped_q8_0_a_f32_sharedx_rows_w32_2row_pack4_toktile_kernel(
+        float *low,
+        const unsigned char *w,
+        const float *heads,
+        uint32_t n_groups,
+        uint32_t n_blocks,
+        uint64_t rank,
+        uint32_t n_tokens,
+        uint64_t heads_row_stride,
+        uint64_t row_bytes) {
+    constexpr uint32_t BLOCK_TILE = 32u;
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t subgroup = lane >> 3u;
+    const uint32_t lane8 = lane & 7u;
+    const uint32_t rows_per_block = (blockDim.x >> 5u) << 1u;
+    const uint32_t group_dim = n_blocks << 5u;
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t base_idx = (uint64_t)blockIdx.x * rows_per_block;
+    if (base_idx >= low_dim) return;
+    const uint32_t g = (uint32_t)((base_idx / rank) % n_groups);
+    const uint64_t idx0 = base_idx + ((uint64_t)wave << 1u);
+    if (idx0 >= low_dim) return;
+    const uint64_t row0 = idx0 % rank;
+    const uint64_t idx1 = idx0 + 1u;
+    const uint64_t tensor_row0 = (uint64_t)g * rank + row0;
+    const unsigned char *wr0 = w + tensor_row0 * row_bytes;
+    const unsigned char *wr1 = wr0 + row_bytes;
+    const int have_row1 = row0 + 1u < rank && idx1 < low_dim;
+    float acc0[TOK_TILE];
+    float acc1[TOK_TILE];
+#pragma unroll
+    for (uint32_t t = 0; t < TOK_TILE; t++) {
+        acc0[t] = 0.0f;
+        acc1[t] = 0.0f;
+    }
+
+    for (uint32_t block0 = 0; block0 < n_blocks; block0 += BLOCK_TILE) {
+        const uint32_t block_count =
+            n_blocks - block0 < BLOCK_TILE ? n_blocks - block0 : BLOCK_TILE;
+        const uint32_t tile_elems = block_count << 5u;
+        for (uint32_t i = tid; i < n_tokens * tile_elems; i += blockDim.x) {
+            const uint32_t tok = i / tile_elems;
+            const uint32_t k = i - tok * tile_elems;
+            shx[i] = heads[(uint64_t)tok * heads_row_stride +
+                           (uint64_t)g * group_dim +
+                           ((uint64_t)block0 << 5u) + k];
+        }
+        __syncthreads();
+        for (uint32_t bb4 = 0; bb4 < block_count; bb4 += 4u) {
+            const uint32_t bb = bb4 + subgroup;
+            if (bb >= block_count) continue;
+            const uint32_t b = block0 + bb;
+            const uint32_t elem = (bb << 5u) + (lane8 << 2u);
+            const unsigned char *blk0 = wr0 + (uint64_t)b * 34u;
+            const float d0 = q8_0_scale_scalar(blk0);
+            const int8_t *q0 =
+                (const int8_t *)(blk0 + 2u + (lane8 << 2u));
+            const unsigned char *blk1 =
+                have_row1 ? wr1 + (uint64_t)b * 34u : NULL;
+            const float d1 = have_row1 ? q8_0_scale_scalar(blk1) : 0.0f;
+            const int8_t *q1 = have_row1 ?
+                (const int8_t *)(blk1 + 2u + (lane8 << 2u)) : NULL;
+#pragma unroll
+            for (uint32_t t = 0; t < TOK_TILE; t++) {
+                if (t >= n_tokens) continue;
+                const float4 xv = *reinterpret_cast<const float4 *>(
+                    shx + t * tile_elems + elem);
+                acc0[t] = q8_pack4_block_fma_serial_dag(
+                    acc0[t], d0, q0, xv);
+                if (have_row1) {
+                    acc1[t] = q8_pack4_block_fma_serial_odd_dag(
+                        acc1[t], d1, q1, xv);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < TOK_TILE; t++) {
+        acc0[t] = warp_sum_f32(acc0[t]);
+        acc1[t] = warp_sum_f32(acc1[t]);
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOK_TILE; t++) {
+            if (t >= n_tokens) continue;
+            low[(uint64_t)t * low_dim + idx0] = acc0[t];
+            if (have_row1) {
+                low[(uint64_t)t * low_dim + idx1] = acc1[t];
+            }
+        }
     }
 }
 

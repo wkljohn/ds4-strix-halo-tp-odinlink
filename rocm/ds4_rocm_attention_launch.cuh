@@ -1586,6 +1586,129 @@ extern "C" int ds4_gpu_attention_output_q8_tp_batch_tensor(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
+    const char *weight_outer_env =
+        getenv("DS4_ROCM_Q8_ATTN_OUT_WEIGHT_OUTER");
+    const unsigned weight_outer_low_threads =
+        attention_output_low_threads();
+    const unsigned weight_outer_expand_threads =
+        attention_output_expand_threads();
+    const unsigned weight_outer_low_rows =
+        (weight_outer_low_threads / 32u) * 2u;
+    const unsigned weight_outer_expand_rows =
+        weight_outer_expand_threads / 32u;
+    const bool weight_outer =
+        weight_outer_env && weight_outer_env[0] &&
+        strcmp(weight_outer_env, "0") != 0 &&
+        n_tokens >= 2u && n_tokens <= 5u &&
+        group_dim == 4096u && rank == 1024u &&
+        n_groups_total == 8u && group_cnt == 4u &&
+        (group0 == 0u || group0 == 4u) && out_dim == 4096u &&
+        /* The kernels return before an in-loop barrier for out-of-range
+         * waves, and derive the owned group from each block base.  Keep the
+         * exact shape gate responsible for proving that no partial block or
+         * cross-group block can exist for any supported thread override. */
+        rank % weight_outer_low_rows == 0u &&
+        out_dim % weight_outer_expand_rows == 0u;
+    if (weight_outer) {
+        const uint64_t blocks_a = group_dim / 32u;
+        const uint64_t row_a_bytes = blocks_a * 34u;
+        const uint64_t low_dim_total = (uint64_t)n_groups_total * rank;
+        const uint64_t blocks_b = low_dim_total / 32u;
+        const uint64_t row_b_bytes = blocks_b * 34u;
+        const uint64_t out_a_bytes =
+            (uint64_t)n_groups_total * rank * row_a_bytes;
+        const uint64_t out_b_bytes = out_dim * row_b_bytes;
+        if (out_a_offset > model_size || out_b_offset > model_size ||
+            out_a_bytes > model_size - out_a_offset ||
+            out_b_bytes > model_size - out_b_offset) {
+            return 0;
+        }
+        const unsigned char *out_a =
+            reinterpret_cast<const unsigned char *>(cuda_model_range_ptr(
+                model_map, out_a_offset, out_a_bytes,
+                "attn_out_a_weight_outer"));
+        const unsigned char *out_b =
+            reinterpret_cast<const unsigned char *>(cuda_model_range_ptr(
+                model_map, out_b_offset, out_b_bytes,
+                "attn_out_b_weight_outer"));
+        if (!out_a || !out_b) return 0;
+
+        const unsigned low_threads = weight_outer_low_threads;
+        const unsigned low_rows_per_block = (low_threads / 32u) * 2u;
+        const unsigned char *out_a_owned = out_a +
+            (uint64_t)group0 * rank * row_a_bytes;
+        const float *heads_owned = (const float *)heads->ptr +
+            (uint64_t)group0 * group_dim;
+        const dim3 low_grid(
+            (unsigned)((low_dim_owned + low_rows_per_block - 1u) /
+                       low_rows_per_block));
+        if (n_tokens == 2u) {
+            grouped_q8_0_a_f32_sharedx_rows_w32_2row_pack4_tok2_kernel<<<
+                    low_grid, low_threads,
+                    (size_t)(2u * group_dim) * sizeof(float)>>>(
+                    (float *)low->ptr, out_a_owned, heads_owned,
+                    group_cnt, (uint32_t)blocks_a, rank,
+                    (uint64_t)n_groups_total * group_dim, row_a_bytes);
+        } else {
+            const size_t tile_shmem =
+                (size_t)n_tokens * 32u * 32u * sizeof(float);
+#define DS4_Q8_ATTN_OUT_LOW_TOK_CASE(NT) \
+            case NT: \
+                grouped_q8_0_a_f32_sharedx_rows_w32_2row_pack4_toktile_kernel<NT> \
+                    <<<low_grid, low_threads, tile_shmem>>>( \
+                    (float *)low->ptr, out_a_owned, heads_owned, group_cnt, \
+                    (uint32_t)blocks_a, rank, n_tokens, \
+                    (uint64_t)n_groups_total * group_dim, row_a_bytes); \
+                break
+            switch (n_tokens) {
+                DS4_Q8_ATTN_OUT_LOW_TOK_CASE(3u);
+                DS4_Q8_ATTN_OUT_LOW_TOK_CASE(4u);
+                DS4_Q8_ATTN_OUT_LOW_TOK_CASE(5u);
+                default: return 0;
+            }
+#undef DS4_Q8_ATTN_OUT_LOW_TOK_CASE
+        }
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention_output_q8_tp weight-outer low launch")) {
+            return 0;
+        }
+
+        const uint64_t block_start = ((uint64_t)group0 * rank) / 32u;
+        const uint32_t slice_blocks = (uint32_t)(low_dim_owned / 32u);
+        const unsigned expand_threads = weight_outer_expand_threads;
+        const unsigned expand_rows_per_block = expand_threads / 32u;
+        const dim3 expand_grid(
+            (unsigned)((out_dim + expand_rows_per_block - 1u) /
+                       expand_rows_per_block));
+        if (n_tokens == 2u) {
+            matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_tok2_kernel<<<
+                    expand_grid, expand_threads,
+                    (size_t)(2u * low_dim_owned) * sizeof(float)>>>(
+                    (float *)out->ptr, out_b + block_start * 34u,
+                    (const float *)low->ptr, slice_blocks, out_dim,
+                    row_b_bytes);
+        } else {
+            const size_t tile_shmem =
+                (size_t)n_tokens * 32u * 32u * sizeof(float);
+#define DS4_Q8_ATTN_OUT_EXPAND_TOK_CASE(NT) \
+            case NT: \
+                matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel<NT> \
+                    <<<expand_grid, expand_threads, tile_shmem>>>( \
+                    (float *)out->ptr, out_b + block_start * 34u, \
+                    (const float *)low->ptr, slice_blocks, out_dim, n_tokens, \
+                    row_b_bytes); \
+                break
+            switch (n_tokens) {
+                DS4_Q8_ATTN_OUT_EXPAND_TOK_CASE(3u);
+                DS4_Q8_ATTN_OUT_EXPAND_TOK_CASE(4u);
+                DS4_Q8_ATTN_OUT_EXPAND_TOK_CASE(5u);
+                default: return 0;
+            }
+#undef DS4_Q8_ATTN_OUT_EXPAND_TOK_CASE
+        }
+        return cuda_ok(cudaGetLastError(),
+                       "attention_output_q8_tp weight-outer expand launch");
+    }
     /* Fidelity path for anchorless DSpark chaining.  Reuse the production
      * one-token TP projection for every verifier row so its split-K tree and
      * Q8 accumulation order are identical to ordinary decode.  Once the

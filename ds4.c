@@ -28279,6 +28279,14 @@ static bool metal_graph_encode_layer_attention_batch(
         tp_batch_attn_head_split && g->tp_batch_out && g->tp_batch_in &&
         (ds4_gpu_get_tp_runtime_features() &
          DS4_TP_FEATURE_VERIFY_ATTN_SLAB) != 0u;
+#ifdef DS4_ROCM_BUILD
+    const bool tp_batch_attn_weight_outer =
+        tp_batch_attn_head_split && n_tokens >= 2u && n_tokens <= 5u &&
+        layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+        layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+        (ds4_gpu_get_tp_runtime_features() &
+         DS4_TP_FEATURE_Q8_ATTN_OUT_WEIGHT_OUTER) != 0u;
+#endif
     /* Fidelity experiment for anchorless DSpark chaining.  Current one-token
      * ROCm TP decode contributes the first half of the grouped attention
      * output and a zero second-rank partial.  Reproduce that exact distributed
@@ -30222,29 +30230,51 @@ static bool metal_graph_encode_layer_attention_batch(
             const uint32_t group0 = g->tp_rank * owned_groups;
             const uint64_t owned_head_elems =
                 (uint64_t)owned_groups * group_dim;
-            for (uint32_t row = 0; ok && row < n_tokens; row++) {
-                ds4_gpu_tensor *heads_row = ds4_gpu_tensor_view(
-                        metal_graph_batch_heads(g),
-                        ((uint64_t)row * q_dim +
-                         (uint64_t)group0 * group_dim) * sizeof(float),
-                        owned_head_elems * sizeof(float));
-                ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+#ifdef DS4_ROCM_BUILD
+            if (tp_batch_attn_weight_outer) {
+                ok = ds4_gpu_attention_output_q8_tp_batch_tensor(
                         tp_batch_attn_slab ? g->tp_batch_out[il] :
                                              metal_graph_batch_attn_out(g),
-                        (uint64_t)row * DS4_N_EMBD * sizeof(float),
-                        (uint64_t)DS4_N_EMBD * sizeof(float));
-                ok = heads_row && out_row &&
-                     metal_graph_attention_output_dense_quant_tp(
-                             out_row,
-                             metal_graph_batch_attn_low(g),
-                             g, model,
-                             layer->attn_output_a,
-                             layer->attn_output_b,
-                             group_dim, rank, n_groups,
-                             group0, owned_groups, DS4_N_EMBD,
-                             heads_row);
-                ds4_gpu_tensor_free(out_row);
-                ds4_gpu_tensor_free(heads_row);
+                        metal_graph_batch_attn_low(g),
+                        model->map,
+                        model->size,
+                        layer->attn_output_a->abs_offset,
+                        layer->attn_output_b->abs_offset,
+                        group_dim,
+                        rank,
+                        n_groups,
+                        group0,
+                        owned_groups,
+                        DS4_N_EMBD,
+                        metal_graph_batch_heads(g),
+                        n_tokens) != 0;
+            } else
+#endif
+            {
+                for (uint32_t row = 0; ok && row < n_tokens; row++) {
+                    ds4_gpu_tensor *heads_row = ds4_gpu_tensor_view(
+                            metal_graph_batch_heads(g),
+                            ((uint64_t)row * q_dim +
+                             (uint64_t)group0 * group_dim) * sizeof(float),
+                            owned_head_elems * sizeof(float));
+                    ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+                            tp_batch_attn_slab ? g->tp_batch_out[il] :
+                                                 metal_graph_batch_attn_out(g),
+                            (uint64_t)row * DS4_N_EMBD * sizeof(float),
+                            (uint64_t)DS4_N_EMBD * sizeof(float));
+                    ok = heads_row && out_row &&
+                         metal_graph_attention_output_dense_quant_tp(
+                                 out_row,
+                                 metal_graph_batch_attn_low(g),
+                                 g, model,
+                                 layer->attn_output_a,
+                                 layer->attn_output_b,
+                                 group_dim, rank, n_groups,
+                                 group0, owned_groups, DS4_N_EMBD,
+                                 heads_row);
+                    ds4_gpu_tensor_free(out_row);
+                    ds4_gpu_tensor_free(heads_row);
+                }
             }
         } else if (ok && tp_batch_attn_legacy_decode) {
 #ifdef DS4_ROCM_BUILD
@@ -52198,12 +52228,22 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         verify_attn_slab && verify_attn_slab[0] &&
         strcmp(verify_attn_slab, "0") != 0 &&
         verify_row_batch_requested;
+#if defined(DS4_ROCM_BUILD)
     const bool q4k_verify_first_owner_requested =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
         metal_graph_tp_env_flag("DS4_DSPARK_VERIFY_BATCH_MOE", true) &&
         metal_graph_tp_env_flag("DS4_DSPARK_VERIFY_TP_SHARED_SPLIT", false) &&
         metal_graph_tp_env_flag("DS4_ROCM_Q4K_VERIFY_DIRECT_SUM6", false) &&
         metal_graph_tp_env_flag("DS4_ROCM_Q4K_VERIFY_FIRST_OWNER", false);
+    const bool q8_attn_out_weight_outer_requested =
+        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        batch_attn_head_split_requested &&
+        metal_graph_tp_env_flag(
+            "DS4_ROCM_Q8_ATTN_OUT_WEIGHT_OUTER", false);
+#else
+    const bool q4k_verify_first_owner_requested = false;
+    const bool q8_attn_out_weight_outer_requested = false;
+#endif
     const char *rdma_logits = getenv("DS4_TP_RDMA_LOGITS");
     const bool rdma_logits_requested =
         rdma_logits && rdma_logits[0] && strcmp(rdma_logits, "0") != 0;
@@ -52235,6 +52275,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
              DS4_TP_FEATURE_VERIFY_ATTN_SLAB : 0u) |
         (q4k_verify_first_owner_requested ?
              DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER : 0u) |
+        (q8_attn_out_weight_outer_requested ?
+             DS4_TP_FEATURE_Q8_ATTN_OUT_WEIGHT_OUTER : 0u) |
         (rdma_logits_requested && !greedy_top2_enabled ?
              DS4_TP_FEATURE_RDMA_LOGITS : 0u) |
         (rank0_full_logits_requested && !greedy_top2_enabled ?

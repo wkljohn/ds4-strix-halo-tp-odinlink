@@ -97,6 +97,10 @@ enum {
      * preserve the canonical six-slot down fold. Both independently launched
      * ranks must enter this arithmetic/scratch schedule together. */
     DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER = UINT32_C(1) << 21,
+    /* DSpark verifier attention-output Q8_0 projections reuse each owned
+     * weight tile across rows while retaining the one-row arithmetic tree.
+     * Negotiate the scratch/launch schedule across independent ranks. */
+    DS4_TP_FEATURE_Q8_ATTN_OUT_WEIGHT_OUTER = UINT32_C(1) << 22,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {

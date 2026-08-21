@@ -329,9 +329,73 @@ full attention/FFN callbacks average 204/408 us because it reaches both gates
 before rank 1; the extra time is peer compute skew, not verbs setup or link
 bandwidth. See [VERIFIER-LATENCY-PROFILE-20260821.md](VERIFIER-LATENCY-PROFILE-20260821.md)
 for the per-rank stage and transport tables.
-# Latest validated kernel stage
+# Exact Q8 attention-output weight-outer stage
 
-The Q4_K DSpark verifier first-owner stage is documented in
-[`Q4-FIRST-OWNER-20260821.md`](Q4-FIRST-OWNER-20260821.md). It preserves the
-W5 token fingerprint and acceptance histogram while raising matched RoCE v2
-decode from 11.35 t/s (best prior serial-row run) to a 13.03 t/s final median.
+The first Q8 multi-row attempt was correctly rejected: it produced 14.07 t/s
+but changed FNV64 from `7174e214e05fd83e` to `7ea6813f88bdea4d`, and a
+non-binary activation oracle exposed the changed rounding DAG. ISA inspection
+then showed that the shipped gfx1151 kernels form a four-value `q*x` dot before
+applying the FP16 block scale, with a distinct `q3,q1,q2,q0` schedule for the
+second low accumulator and the expansion projection.
+
+The final implementation transcribes those emitted DAGs with reassociation
+disabled, pairs adjacent low rows, and reuses each raw Q8_0 weight block across
+two to five verifier tokens. It creates no expanded-weight copy or persistent
+cache. The exact same-binary oracle uses non-power-of-two Q8 scales and
+non-binary activations, covers both TP-owned group halves, and reports the low
+and expansion results separately.
+
+| Verifier width | Serial projection | Weight-outer | Speedup | Exact |
+| ---: | ---: | ---: | ---: | :---: |
+| 2 | 0.250 ms | 0.150 ms | 1.661x | yes |
+| 3 | 0.367 ms | 0.287 ms | 1.280x | yes |
+| 4 | 0.476 ms | 0.349 ms | 1.365x | yes |
+| 5 | 0.592 ms | 0.415 ms | 1.428x | yes |
+
+All widths also remain bit-exact with both projection thread counts forced to
+256, exercising a different block/grid ownership. The launch gate requires
+that the low-row and expansion dimensions divide their rows-per-block, so a
+future shape cannot return some waves before an in-loop barrier. TP hello
+negotiates the feature explicitly and fails closed on a mismatch. ROCm-only
+calls and feature advertisement are compile-time guarded; a CPU build links
+successfully, and ordinary inference never selects the DSpark-only path.
+
+### Full `ds4-bench-tp` result
+
+All measurements use the fixed 2,048+300 Antirez workload, 118/138 DSpark
+expert split, Q8 drafter resident only on rank 0, no expanded-weight cache,
+and mandatory explicit RDMA.
+
+| Run | Provider | Prefill | Decode | FNV64 |
+| --- | --- | ---: | ---: | --- |
+| Final hardened r1 | RoCE v2 | 189.76 t/s | 13.71 t/s | `7174e214e05fd83e` |
+| Final hardened r2 | RoCE v2 | 189.71 t/s | 13.73 t/s | `7174e214e05fd83e` |
+| Final hardened r3 | RoCE v2 | 191.12 t/s | 13.71 t/s | `7174e214e05fd83e` |
+| Pre-review cross-provider check | OdinLink | 181.30 t/s | 13.86 t/s | `7174e214e05fd83e` |
+| Ordinary regression control | RoCE v2 | 256.59 t/s | 19.75 t/s | `b7694f9d11a3760e` |
+
+The final hardened RoCE v2 median is **189.76 prefill / 13.71 decode t/s**, a
+5.2% decode gain over the exact 13.03 t/s first-owner baseline. It does **not**
+clear the preset 13.80 t/s promotion gate, so the kernel remains opt-in and the
+Q8 lane stops here. An earlier pre-review binary measured 13.78/13.80/13.80
+t/s over RoCE v2 and 13.86 t/s over OdinLink with the same fingerprint; those
+numbers are retained as noise/cross-provider evidence, not substituted for
+the final median.
+
+Verifier time nevertheless fell from about 200.6 ms/cycle to a 107.6 ms/cycle
+final median. Acceptance did not move: 235 of 698 draft proposals were
+accepted across 143 cycles, producing about 2.10 final tokens/cycle. The
+milestone blocker is now acceptance/token yield rather than Q8 verifier
+latency; 32 t/s is not credible without roughly 4.2--5 final tokens/cycle.
+
+Enable the opt-in candidate symmetrically on both ranks with:
+
+```sh
+export DS4_ROCM_Q8_ATTN_OUT_WEIGHT_OUTER=1
+```
+
+The launcher command is the Q4 first-owner reproduction in
+[`Q4-FIRST-OWNER-20260821.md`](Q4-FIRST-OWNER-20260821.md) plus that switch.
+The next implementation lane is exact QKV-to-core/head-group/indexer
+multi-row reuse; its isolated stop gate remains at least 1.25x with the known
+fingerprint unchanged.
