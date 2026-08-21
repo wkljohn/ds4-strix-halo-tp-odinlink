@@ -8,21 +8,41 @@ with mandatory RDMA and cache-free model weights.
 
 ## Benchmark provenance
 
-| DeepSeek V4 0731 configuration | Accepted runs, prefill/decode t/s | Reported result |
-|---|---|---|
-| Original Q4_K TP=2 baseline | archived 34.11/9.96 | 34.11/9.96 |
-| Current Q2_K over RoCE v2 | 203.29/19.14, 203.00/19.11, 202.51/19.16 | three-run median 203.00/19.14 |
-| Current Q4_K over OdinLink | 218.24/19.02, 217.72/18.88, 220.39/18.83 | three-run median 218.24/18.88 |
-| Current Q4_K over RoCE v2 | 258.64/19.14, 256.90/19.22, 259.54/19.33 | three-run median 258.64/19.22 |
+The current Q4_K rows test
+[antirez/deepseek-v4-gguf](https://huggingface.co/antirez/deepseek-v4-gguf).
+The Q2_K row tests
+[huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF).
 
-The current Q4_K fingerprint is `5f8a983422299d76`; the current hybrid Q2_K
-fingerprint is `f9cb3a8a17e95c71`. Each fingerprint is specific to the
-documented model, prompt, balanced 128/128 expert split, and 300-token greedy
+| DeepSeek V4 0731 configuration | Tested model | Accepted runs, prefill/decode t/s | Reported result |
+|---|---|---|---|
+| Original Q4_K TP=2 baseline | archived Q4_K artifact | archived 34.11/9.96 | 34.11/9.96 |
+| Huihui Q2_K over RoCE v2 | Huihui `DeepSeek-V4-Flash-Q2_K-0731.gguf` | 202.86/19.49, 202.83/19.45, 201.68/19.51 | three-run median **202.83/19.49** |
+| Antirez Q4_K over OdinLink | Antirez `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` | 231.54/19.19, 231.46/19.13, 231.34/19.03 | three-run median **231.46/19.13** |
+| Antirez Q4_K over RoCE v2 | same Antirez model | 273.70/19.54, 272.51/19.70, 271.42/19.44 | three-run median **272.51/19.54** |
+| Current Q4_K + DSpark | target-model revalidation pending | — | opt-in; not a current performance claim |
+
+The current Antirez Q4_K fingerprint is `b7694f9d11a3760e`; the current Huihui
+hybrid Q2_K fingerprint is `f9cb3a8a17e95c71`. Each fingerprint is specific
+to the named model, prompt, balanced 128/128 expert split, and 300-token greedy
 workload. It is a deterministic self-regression gate, not proof of numerical
-parity with llama.cpp.
+parity with llama.cpp or between the two model releases.
 
-The RoCE runs used the same Q4_K model, binary, workload, and fingerprint as
-the matched OdinLink controls. Matched 2,048-token-chunk OdinLink runs measured
+All six current Antirez Q4_K runs used the same 164,633,502,592-byte model,
+`ds4` binary, 2,048+300 workload, balanced split, and cache-free settings. They
+produced the same token fingerprint over both providers. Comparing the two
+three-run medians, RoCE v2 was 17.7% faster for prefill and 2.1% faster for
+decode than OdinLink. The exact artifact identities, binary hashes, and run
+values are preserved in the
+[`Antirez Q4_K RDMA validation`](../antirez-q4-rdma-2026-08-21/).
+
+The previous public Q4_K results used Huihui
+`DeepSeek-V4-Flash-Q4_K-0731.gguf` and fingerprint `5f8a983422299d76`.
+Those values remain historical evidence rather than the current README claim:
+OdinLink runs were 218.24/19.02, 217.72/18.88, and 220.39/18.83; RoCE v2 runs
+were 258.64/19.14, 256.90/19.22, and 259.54/19.33.
+
+An earlier August 14 transport A/B used the same Q4_K model, binary, workload,
+and fingerprint on both providers. Matched 2,048-token-chunk OdinLink runs measured
 198.55/14.88 and 192.63/14.84 t/s. Their midpoint was 195.59/14.86 versus
 222.76/17.08 for RoCE v2: **+13.9% prefill and +14.9% decode**. RoCE replaces
 only the TP communication slab with a 77.4 MiB mapped allocation; it adds no
@@ -64,8 +84,8 @@ fingerprint.
 Where documented HIP signal memory is unavailable, ROCm TP gates use ordered
 HIP host callbacks before explicit RDMA exchange. The validated temporal
 compressor batches the repeated F16 projection at its natural four-token
-boundary. Together these exact, cache-free changes produced the current
-19.22 t/s Q4_K RoCE median. The benchmark and deployment launchers enable them
+boundary. Together these exact, cache-free changes produced the then-current
+19.22 t/s Huihui Q4_K RoCE median. The benchmark and deployment launchers enable them
 for ordinary inference and negotiate the temporal feature between both ranks.
 
 The current launcher adds two cache-free, non-DSpark prefill improvements. A
@@ -123,9 +143,9 @@ decode remains balanced 128/128.
 Run a normal benchmark three times and report the median:
 
 ```sh
-./run-tp-ds4-bench.sh q4-r1 /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
-./run-tp-ds4-bench.sh q4-r2 /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
-./run-tp-ds4-bench.sh q4-r3 /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
+./run-tp-ds4-bench.sh q4-r1 /absolute/path/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf
+./run-tp-ds4-bench.sh q4-r2 /absolute/path/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf
+./run-tp-ds4-bench.sh q4-r3 /absolute/path/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf
 ```
 
 RoCE v2 uses the same harness:
@@ -133,16 +153,16 @@ RoCE v2 uses the same harness:
 ```sh
 DS4_BENCH_RDMA_PROFILE=roce-v2 \
   ./run-tp-ds4-bench.sh q4-roce-r1 \
-  /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
+  /absolute/path/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf
 ```
 
 Optimization candidates must name the expected fingerprint:
 
 ```sh
 DS4_BENCH_CANDIDATE=1 \
-DS4_BENCH_EXPECT_FNV64=5f8a983422299d76 \
+DS4_BENCH_EXPECT_FNV64=b7694f9d11a3760e \
   ./run-tp-ds4-bench.sh q4-candidate \
-  /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf
+  /absolute/path/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf
 
 DS4_BENCH_CANDIDATE=1 \
 DS4_BENCH_EXPECT_FNV64=f9cb3a8a17e95c71 \
@@ -156,9 +176,15 @@ isolated arithmetic and 1,532-token retrieval semantic cases. Before merging
 a performance change, run the combined gate:
 
 ```sh
-./scripts/pre-main-tp-smoke.sh /absolute/path/DeepSeek-V4-Flash-Q4_K.gguf \
-  /absolute/path/DeepSeek-V4-Flash-Q2_K.gguf
+DS4_PREMAIN_Q4_FNV64=b7694f9d11a3760e \
+  ./scripts/pre-main-tp-smoke.sh \
+  /absolute/path/DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf \
+  /absolute/path/DeepSeek-V4-Flash-Q2_K-0731.gguf
 ```
+
+The pre-main script's built-in Q4_K default remains the historical Huihui
+fingerprint `5f8a983422299d76`; the explicit override above selects the current
+Antirez model without weakening either model-specific gate.
 
 An intentional numerical correction must not be forced to match an obsolete
 fingerprint. Pass the corrected 84-step teacher control, compare full logits at
