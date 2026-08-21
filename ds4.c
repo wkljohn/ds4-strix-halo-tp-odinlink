@@ -28275,6 +28275,10 @@ static bool metal_graph_encode_layer_attention_batch(
         g->tp_batch_rows == n_tokens &&
         (DS4_N_HEAD & 1u) == 0u &&
         metal_graph_tp_env_flag("DS4_TP_BATCH_ATTN_HEAD_SPLIT", false);
+    const bool tp_batch_attn_slab =
+        tp_batch_attn_head_split && g->tp_batch_out && g->tp_batch_in &&
+        (ds4_gpu_get_tp_runtime_features() &
+         DS4_TP_FEATURE_VERIFY_ATTN_SLAB) != 0u;
     /* Fidelity experiment for anchorless DSpark chaining.  Current one-token
      * ROCm TP decode contributes the first half of the grouped attention
      * output and a zero second-rank partial.  Reproduce that exact distributed
@@ -30225,7 +30229,8 @@ static bool metal_graph_encode_layer_attention_batch(
                          (uint64_t)group0 * group_dim) * sizeof(float),
                         owned_head_elems * sizeof(float));
                 ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
-                        metal_graph_batch_attn_out(g),
+                        tp_batch_attn_slab ? g->tp_batch_out[il] :
+                                             metal_graph_batch_attn_out(g),
                         (uint64_t)row * DS4_N_EMBD * sizeof(float),
                         (uint64_t)DS4_N_EMBD * sizeof(float));
                 ok = heads_row && out_row &&
@@ -30283,7 +30288,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                           pos0);
         }
         if (ok) {
-            metal_graph_debug_dump_tensor("attn_out", metal_graph_batch_attn_out(g),
+            metal_graph_debug_dump_tensor("attn_out",
+                                          tp_batch_attn_slab ?
+                                              g->tp_batch_out[il] :
+                                              metal_graph_batch_attn_out(g),
                                           (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
         }
     }
@@ -30298,21 +30306,27 @@ static bool metal_graph_encode_layer_attention_batch(
          * on both peers, matching the routed-FFN combine's commutative form. */
         const uint64_t bytes =
             (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
-        ok = metal_graph_ensure_batch_ffn_out(g) &&
-             ds4_gpu_tp_big_gate_encode(il, n_tokens,
-                                        metal_graph_batch_attn_out(g),
-                                        metal_graph_batch_ffn_out(g),
-                                        bytes) != 0;
+        if (tp_batch_attn_slab) {
+            ok = ds4_gpu_tp_batch_gate_encode(il, n_tokens) != 0;
+        } else {
+            ok = metal_graph_ensure_batch_ffn_out(g) &&
+                 ds4_gpu_tp_big_gate_encode(il, n_tokens,
+                                            metal_graph_batch_attn_out(g),
+                                            metal_graph_batch_ffn_out(g),
+                                            bytes) != 0;
+        }
         if (ok && tp_batch_attn_legacy_decode) {
             tp_batch_attn_a = g->tp_rank == 0 ?
                 metal_graph_batch_attn_out(g) : metal_graph_batch_ffn_out(g);
             tp_batch_attn_b = g->tp_rank == 0 ?
                 metal_graph_batch_ffn_out(g) : metal_graph_batch_attn_out(g);
         } else if (ok) {
-            ds4_gpu_tensor *first = g->tp_rank == 0 ?
-                metal_graph_batch_attn_out(g) : metal_graph_batch_ffn_out(g);
-            ds4_gpu_tensor *second = g->tp_rank == 0 ?
-                metal_graph_batch_ffn_out(g) : metal_graph_batch_attn_out(g);
+            ds4_gpu_tensor *local = tp_batch_attn_slab ?
+                g->tp_batch_out[il] : metal_graph_batch_attn_out(g);
+            ds4_gpu_tensor *peer = tp_batch_attn_slab ?
+                g->tp_batch_in[il] : metal_graph_batch_ffn_out(g);
+            ds4_gpu_tensor *first = g->tp_rank == 0 ? local : peer;
+            ds4_gpu_tensor *second = g->tp_rank == 0 ? peer : local;
             ok = ds4_gpu_add_tensor(metal_graph_batch_attn_out(g), first, second,
                                     (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
         }
@@ -30551,6 +30565,12 @@ static bool metal_graph_encode_layer_ffn_batch(
     const bool tp_verify_shared_split =
         g->tp_world == 2u && g->tp_batch_rows == n_tokens &&
         metal_graph_tp_env_flag("DS4_DSPARK_VERIFY_TP_SHARED_SPLIT", false);
+    const bool tp_verify_q4_exact_batch =
+        tp_verify_shared_split &&
+        metal_graph_tp_env_flag("DS4_ROCM_Q4K_VERIFY_DIRECT_SUM6", false) &&
+        layer->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q4_K;
     const bool layer_stage_profile = metal_graph_layer_stage_profile_enabled(il);
 #if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const bool verify_stage_events =
@@ -31012,7 +31032,8 @@ static bool metal_graph_encode_layer_ffn_batch(
         /* The original TP verifier fallback encoded each speculative row with
          * the one-token routed kernel.  Keep it as a rollback while testing
          * the already TP-shard-aware batch implementation on rows 2..5. */
-        if (tp_verify_batch_moe && !tp_verify_shared_split) {
+        if (tp_verify_batch_moe &&
+            (!tp_verify_shared_split || tp_verify_q4_exact_batch)) {
             static bool logged_tp_verify_batch_moe = false;
             if (!logged_tp_verify_batch_moe) {
                 fprintf(stderr,
@@ -31021,6 +31042,9 @@ static bool metal_graph_encode_layer_ffn_batch(
                         "DS4_DSPARK_VERIFY_BATCH_MOE=0 to disable)\n");
                 logged_tp_verify_batch_moe = true;
             }
+#if defined(DS4_ROCM_BUILD)
+            ds4_gpu_set_q4k_verify_batch_mode(tp_verify_q4_exact_batch);
+#endif
             ok = ds4_gpu_routed_moe_batch_tensor(
                     g->tp_batch_out[il],
                     metal_graph_batch_routed_gate(g),
@@ -31051,6 +31075,20 @@ static bool metal_graph_encode_layer_ffn_batch(
                     n_tokens,
                     &g->batch_routed_mid_is_f16,
                     false) != 0;
+#if defined(DS4_ROCM_BUILD)
+            ds4_gpu_set_q4k_verify_batch_mode(false);
+#endif
+            if (ok && tp_verify_q4_exact_batch) {
+                /* Match ordinary TP association before the rank gate:
+                 * (routed0 + shared0) + (routed1 + shared1).  The backend's
+                 * direct-sum6 mode separately preserves each row's serial
+                 * slot-ascending Q4 down reduction. */
+                ok = ds4_gpu_add_tensor(
+                        g->tp_batch_out[il],
+                        g->tp_batch_out[il],
+                        metal_graph_batch_shared_out(g),
+                        (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+            }
         } else {
             const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
             g->batch_routed_mid_is_f16 = false;
@@ -52150,6 +52188,22 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     const bool odinlink_batch_async_requested =
         odinlink_batch_async && odinlink_batch_async[0] &&
         strcmp(odinlink_batch_async, "0") != 0;
+    const char *verify_row_batch = getenv("DS4_TP_VERIFY_ROW_BATCH");
+    const bool verify_row_batch_requested =
+        verify_row_batch && verify_row_batch[0] &&
+        strcmp(verify_row_batch, "0") != 0 && e &&
+        e->support_kind == DS4_SUPPORT_DSPARK && e->dspark;
+    const char *verify_attn_slab = getenv("DS4_TP_VERIFY_ATTN_SLAB");
+    const bool verify_attn_slab_requested =
+        verify_attn_slab && verify_attn_slab[0] &&
+        strcmp(verify_attn_slab, "0") != 0 &&
+        verify_row_batch_requested;
+    const bool q4k_verify_first_owner_requested =
+        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        metal_graph_tp_env_flag("DS4_DSPARK_VERIFY_BATCH_MOE", true) &&
+        metal_graph_tp_env_flag("DS4_DSPARK_VERIFY_TP_SHARED_SPLIT", false) &&
+        metal_graph_tp_env_flag("DS4_ROCM_Q4K_VERIFY_DIRECT_SUM6", false) &&
+        metal_graph_tp_env_flag("DS4_ROCM_Q4K_VERIFY_FIRST_OWNER", false);
     const char *rdma_logits = getenv("DS4_TP_RDMA_LOGITS");
     const bool rdma_logits_requested =
         rdma_logits && rdma_logits[0] && strcmp(rdma_logits, "0") != 0;
@@ -52175,6 +52229,12 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
              DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT : 0u) |
         (odinlink_batch_async_requested ?
              DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC : 0u) |
+        (verify_row_batch_requested ?
+             DS4_TP_FEATURE_VERIFY_ROW_BATCH : 0u) |
+        (verify_attn_slab_requested ?
+             DS4_TP_FEATURE_VERIFY_ATTN_SLAB : 0u) |
+        (q4k_verify_first_owner_requested ?
+             DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER : 0u) |
         (rdma_logits_requested && !greedy_top2_enabled ?
              DS4_TP_FEATURE_RDMA_LOGITS : 0u) |
         (rank0_full_logits_requested && !greedy_top2_enabled ?

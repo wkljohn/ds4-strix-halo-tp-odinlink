@@ -13,6 +13,9 @@ static int routed_moe_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
 #ifndef DS4_TP_FEATURE_Q4K_FUSED_MID
 #define DS4_TP_FEATURE_Q4K_FUSED_MID (UINT32_C(1) << 16)
 #endif
+#ifndef DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER
+#define DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER (UINT32_C(1) << 21)
+#endif
 
 static int routed_moe_align256_checked(uint64_t v, uint64_t *out) {
     if (!out || v > UINT64_MAX - 255ull) return 0;
@@ -126,6 +129,28 @@ static int routed_moe_q4k_decode_stage_midq_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
         const char *env = getenv("DS4_ROCM_Q4K_DECODE_STAGE_MIDQ");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
+static int routed_moe_q4k_verify_direct_sum6_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_VERIFY_DIRECT_SUM6");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
+/* DSpark-only verifier experiment: group width-2..5 Q4_K routes by their
+ * live expert id so one expert tile consumes every matching activation row.
+ * The existing expert-tile kernel preserves each row's dot-product order;
+ * direct-sum6 separately preserves the ordinary slot-ascending down fold. */
+static int routed_moe_q4k_verify_first_owner_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_VERIFY_FIRST_OWNER");
         enabled = env && env[0] == '1' && env[1] == '\0';
     }
     return enabled;
@@ -1436,11 +1461,30 @@ static int routed_moe_launch(
         /* Correctness rollback for the optimized resident IQ2 prefill path. */
         const uint32_t disable_resident_iq2_sorted =
             iq2_gate_path && getenv("DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED") != NULL;
+        const uint32_t use_q4k_verify_first_owner =
+            q4k_path && n_tokens >= 2u && n_tokens <= 5u &&
+            n_expert == 6u &&
+            expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+            out_dim == 4096u && xq_blocks == 16u && midq_blocks == 8u &&
+            gate_row_bytes == 16u * sizeof(cuda_block_q4_K) &&
+            gate_expert_bytes ==
+                (uint64_t)expert_mid_dim * gate_row_bytes &&
+            down_row_bytes == 8u * sizeof(cuda_block_q4_K) &&
+            down_expert_bytes == (uint64_t)out_dim * down_row_bytes &&
+            g_q4k_verify_batch_mode &&
+            (!ds4_gpu_tp_expert_shard_active() ||
+             (g_q4k_wmma_tp_runtime_features_valid &&
+              (g_q4k_wmma_tp_runtime_features &
+               DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER))) &&
+            routed_moe_q4k_verify_direct_sum6_enabled() &&
+            routed_moe_q4k_verify_first_owner_enabled();
         const uint32_t use_sorted_pairs =
             n_tokens > 1u &&
             (!q4k_path ||
              n_tokens >= routed_moe_q4k_sorted_min_tokens()) &&
-            !disable_resident_iq2_sorted;
+            !disable_resident_iq2_sorted &&
+            !(q4k_path && n_tokens <= 5u &&
+              routed_moe_q4k_verify_direct_sum6_enabled());
         const uint32_t use_q4k_l2_pair_order =
             q4k_path && n_tokens == 5u && !use_sorted_pairs &&
             routed_moe_q4k_decode_stage_xq_enabled() &&
@@ -1498,7 +1542,11 @@ static int routed_moe_launch(
             }
         }
         const uint32_t routing_tile_m = use_q4k_wmma ? 16u : expert_tile_m;
-        const uint32_t write_gate_up = 0u;
+        /* Diagnostic-only verifier oracle hook. Production leaves the fused
+         * auxiliaries unwritten; the isolated oracle uses them to localize
+         * arithmetic drift before the SwiGLU epilogue. */
+        const uint32_t write_gate_up =
+            getenv("DS4_ROCM_Q4K_VERIFY_WRITE_AUX") != NULL;
         const uint32_t q4k_wmma_pair_active =
             use_q4k_wmma && routed_moe_q4k_wmma_pair_enabled();
         const uint32_t q4k_fused_feature_active =
@@ -1534,6 +1582,18 @@ static int routed_moe_launch(
         const uint32_t use_down_row2048 = !q4k_path && use_atomic_down && use_down_tile16;
         const uint32_t use_direct_down_sum6 =
             n_tokens == 1u && n_expert <= DS4_ROCM_N_EXPERT_USED;
+        const uint32_t use_q4k_verify_direct_sum6 =
+            q4k_path && n_tokens >= 2u && n_tokens <= 5u &&
+            n_expert == 6u &&
+            expert_in_dim == 4096u && expert_mid_dim == 2048u &&
+            out_dim == 4096u && xq_blocks == 16u && midq_blocks == 8u &&
+            gate_row_bytes == 16u * sizeof(cuda_block_q4_K) &&
+            gate_expert_bytes ==
+                (uint64_t)expert_mid_dim * gate_row_bytes &&
+            down_row_bytes == 8u * sizeof(cuda_block_q4_K) &&
+            down_expert_bytes == (uint64_t)out_dim * down_row_bytes &&
+            g_q4k_verify_batch_mode &&
+            routed_moe_q4k_verify_direct_sum6_enabled();
         uint32_t *sorted_pairs = NULL;
         uint32_t *sorted_offsets = NULL;
         uint32_t *sorted_counts = NULL;
@@ -2257,7 +2317,27 @@ static int routed_moe_launch(
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (q4k_path) {
-                    if (routed_moe_q4k_decode_split_gate_up_enabled() &&
+                    if (use_q4k_verify_first_owner) {
+#define DS4_Q4K_FIRST_OWNER_CASE(NT) \
+                        case NT: \
+                            moe_gate_up_mid_decode_q4K_first_owner_kernel<NT> \
+                                <<<qgrid, 256>>>( \
+                                (float *)gate->ptr, (float *)up->ptr, \
+                                (float *)mid->ptr, gate_w, up_w, xq, \
+                                (const int32_t *)selected_exec->ptr, \
+                                (const float *)weights->ptr, gate_expert_bytes, \
+                                gate_row_bytes, xq_blocks, expert_mid_dim, \
+                                n_expert, n_tokens, 1u, clamp); \
+                            break
+                        switch (n_tokens) {
+                            DS4_Q4K_FIRST_OWNER_CASE(2);
+                            DS4_Q4K_FIRST_OWNER_CASE(3);
+                            DS4_Q4K_FIRST_OWNER_CASE(4);
+                            DS4_Q4K_FIRST_OWNER_CASE(5);
+                            default: ok = 0; break;
+                        }
+#undef DS4_Q4K_FIRST_OWNER_CASE
+                    } else if (routed_moe_q4k_decode_split_gate_up_enabled() &&
                         !write_gate_up) {
                         dim3 split_grid((expert_mid_dim + 127u) / 128u,
                                         pair_count, 1);
@@ -2492,6 +2572,20 @@ static int routed_moe_launch(
             }
 #endif
         }
+        if (ok && use_q4k_verify_first_owner) {
+            const dim3 ep_grid((expert_mid_dim + 127u) / 128u,
+                               pair_count, 1u);
+            moe_weighted_swiglu_from_aux_kernel<<<ep_grid, 256>>>(
+                (float *)mid->ptr, (const float *)gate->ptr,
+                (const float *)up->ptr, (const float *)weights->ptr,
+                expert_mid_dim, pair_count, clamp);
+            ok = cuda_ok(cudaGetLastError(),
+                         "routed_moe Q4_K verifier SwiGLU epilogue launch");
+            /* The direct-sum6 candidate no longer needs the activation Q8_K
+             * scratch after gate/up. Reuse it for mid quantization so the
+             * isolated oracle can inspect the raw gate auxiliary. */
+            midq = (cuda_block_q8_K *)down->ptr;
+        }
         const uint32_t use_iq2_q2_float_down =
             ok && iq2_path && n_tokens > 1u &&
             n_expert <= DS4_ROCM_N_EXPERT_USED &&
@@ -2512,8 +2606,28 @@ static int routed_moe_launch(
                         DS4_ROCM_Q4K_DECODE_EVENT_MID_QUANT, n_tokens);
             }
         }
+        int direct_q4_down_done = 0;
+        if (ok && use_q4k_verify_direct_sum6) {
+            const dim3 sgrid((out_dim + 31u) / 32u, n_tokens, 1u);
+            moe_down_q4K_sum6_qwarp32_batch_kernel<<<sgrid, 256>>>(
+                    (float *)out->ptr,
+                    down_w,
+                    midq,
+                    (const int32_t *)selected_exec->ptr,
+                    (const float *)weights->ptr,
+                    down_expert_bytes,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim,
+                    n_expert,
+                    n_tokens,
+                    tp_skip_unowned);
+            ok = cuda_ok(cudaGetLastError(),
+                         "routed_moe Q4_K verifier direct-sum6 launch");
+            direct_q4_down_done = ok;
+        }
         int direct_iq2_down_done = 0;
-        if (ok && iq2_iq2_path) {
+        if (ok && !direct_q4_down_done && iq2_iq2_path) {
             dim3 dgrid((out_dim + 31u) / 32u, n_tokens, 1);
             if (split_gateup_done) {
                 moe_down_iq2_sum_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(
@@ -2543,7 +2657,7 @@ static int routed_moe_launch(
             direct_iq2_down_done = ok;
         }
         int split_ptr_down_done = 0;
-        if (ok && !direct_iq2_down_done && split_gateup_done) {
+        if (ok && !direct_q4_down_done && !direct_iq2_down_done && split_gateup_done) {
             moe_down_sum6_qwarp32_ptrs_kernel<<<(out_dim + 31u) / 32u, 256>>>(
                     (float *)out->ptr,
                     down_slot_ptrs,
@@ -2556,7 +2670,9 @@ static int routed_moe_launch(
             split_ptr_down_done = ok;
         }
         if (ok) {
-            if (direct_iq2_down_done) {
+            if (direct_q4_down_done) {
+                /* The Q4 verifier direct-sum kernel writes final token rows. */
+            } else if (direct_iq2_down_done) {
                 /* The IQ2 direct-sum kernel writes final token rows. */
             } else if (split_ptr_down_done) {
                 /* The split pointer-table path writes the final token row. */
@@ -2842,7 +2958,7 @@ static int routed_moe_launch(
             ok = cuda_ok(cudaGetLastError(), "routed_moe down launch");
             }
         }
-        if (ok && !direct_iq2_down_done && !use_atomic_down &&
+        if (ok && !direct_q4_down_done && !direct_iq2_down_done && !use_atomic_down &&
             !use_direct_down_sum6 && !use_iq2_q2_float_down) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
             if (tp_prefill_skip_unowned) {

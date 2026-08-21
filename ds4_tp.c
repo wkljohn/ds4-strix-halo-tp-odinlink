@@ -153,6 +153,8 @@ typedef struct {
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 32
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
+#define DS4_TP_RDMA_VERIFY_WR_TAG (UINT64_C(1) << 62)
+#define DS4_TP_RDMA_VERIFY_READY_WR_TAG (UINT64_C(1) << 61)
 
 typedef struct {
     ds4_tp_verbs_api api;
@@ -178,6 +180,11 @@ typedef struct {
     uint64_t recv_done;         /* highest gate seq whose recv completed */
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
+    bool verify_window_active;  /* next DSpark verifier layer is preposted */
+    uint32_t verify_window_layer;
+    uint32_t verify_window_rows;
+    uint64_t verify_window_seq;
+    uint64_t verify_ready_epoch;
     pthread_mutex_t post_lock;
 } ds4_tp_rdma;
 
@@ -287,6 +294,7 @@ struct ds4_tp {
     uint64_t in_off;
     uint64_t in_flags_off;
     uint64_t token_off;
+    uint64_t verify_ready_off;  /* two dedicated u64 verifier doorbells */
     uint64_t out_flags_off;     /* local staging for RDMA flag writes */
     uint64_t gpu_flags_off;     /* GPU-written gate-ready flags (u32/slot) */
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
@@ -793,6 +801,7 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
     return slots * vec * 2 +    /* out + in vectors */
            slots * 8 * 2 +      /* in flags + out flag staging */
            16 +                 /* token slot */
+           16 +                 /* verifier readiness in/out words */
            slots * 4 +          /* GPU-written gate-ready flags */
            (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2 + /* batch out+in */
            big_rows * vec * 2;  /* big-gate out+in (direct=1 prefill, opt-in) */
@@ -805,7 +814,8 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->in_off = slots * vec;
     tp->in_flags_off = tp->in_off + slots * vec;
     tp->token_off = tp->in_flags_off + slots * 8;
-    tp->out_flags_off = tp->token_off + 16;
+    tp->verify_ready_off = tp->token_off + 16;
+    tp->out_flags_off = tp->verify_ready_off + 16;
     tp->gpu_flags_off = tp->out_flags_off + slots * 8;
     tp->batch_out_off = tp->gpu_flags_off + slots * 4;
     tp->batch_in_off = tp->batch_out_off +
@@ -1083,6 +1093,67 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
 
 static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq);
 
+static int tp_rdma_connect_qp(ds4_tp *tp, struct ibv_qp *qp,
+                              uint32_t local_psn, uint32_t peer_qpn,
+                              uint32_t peer_psn, const char *label,
+                              char *err, size_t errlen) {
+    ds4_tp_rdma *r = &tp->rdma;
+    struct ibv_qp_attr a = {0};
+    a.qp_state = IBV_QPS_INIT;
+    a.pkey_index = 0;
+    a.port_num = 1;
+    a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                        IBV_ACCESS_REMOTE_WRITE;
+    if (r->api.modify_qp(qp, &a,
+            IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+            IBV_QP_ACCESS_FLAGS) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify %s INIT: %s", label,
+                   strerror(errno));
+        return 0;
+    }
+    memset(&a, 0, sizeof(a));
+    a.qp_state = IBV_QPS_RTR;
+    a.path_mtu = IBV_MTU_1024;
+    a.dest_qp_num = peer_qpn;
+    a.rq_psn = peer_psn;
+    a.ah_attr.dlid = (uint16_t)r->peer.lid;
+    a.ah_attr.port_num = 1;
+    a.ah_attr.is_global = 1;
+    memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
+    a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
+    a.ah_attr.grh.hop_limit = r->is_mlx5 ? 64 : 1;
+    int rtr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                   IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
+    if (r->is_mlx5) {
+        a.max_dest_rd_atomic = 1;
+        a.min_rnr_timer = 12;
+        rtr_mask |= IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
+    }
+    if (r->api.modify_qp(qp, &a, rtr_mask) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify %s RTR: %s", label,
+                   strerror(errno));
+        return 0;
+    }
+    memset(&a, 0, sizeof(a));
+    a.qp_state = IBV_QPS_RTS;
+    a.sq_psn = local_psn;
+    int rts_mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
+    if (r->is_mlx5) {
+        a.timeout = 14;
+        a.retry_cnt = 7;
+        a.rnr_retry = 7;
+        a.max_rd_atomic = 1;
+        rts_mask |= IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
+                    IBV_QP_MAX_QP_RD_ATOMIC;
+    }
+    if (r->api.modify_qp(qp, &a, rts_mask) != 0) {
+        tp_set_err(err, errlen, "tp rdma: modify %s RTS: %s", label,
+                   strerror(errno));
+        return 0;
+    }
+    return 1;
+}
+
 static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
     const int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
@@ -1155,55 +1226,9 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
 
     /* INIT -> RTR -> RTS with the exact recipe the driver accepts (same as
      * JACCL): MTU 1024 and GRH via the IPv4-mapped GID. */
-    struct ibv_qp_attr a = {0};
-    a.qp_state = IBV_QPS_INIT;
-    a.pkey_index = 0;
-    a.port_num = 1;
-    a.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                        IBV_ACCESS_REMOTE_WRITE;
-    if (r->api.modify_qp(r->qp, &a,
-            IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify INIT: %s", strerror(errno));
+    if (!tp_rdma_connect_qp(tp, r->qp, mine.psn, r->peer.qpn,
+                            r->peer.psn, "primary", err, errlen))
         return 0;
-    }
-    memset(&a, 0, sizeof(a));
-    a.qp_state = IBV_QPS_RTR;
-    a.path_mtu = IBV_MTU_1024;
-    a.dest_qp_num = r->peer.qpn;
-    a.rq_psn = r->peer.psn;
-    a.ah_attr.dlid = (uint16_t)r->peer.lid;
-    a.ah_attr.port_num = 1;
-    a.ah_attr.is_global = 1;
-    memcpy(a.ah_attr.grh.dgid.raw, r->peer.gid, 16);
-    a.ah_attr.grh.sgid_index = (uint8_t)r->gid_index;
-    a.ah_attr.grh.hop_limit = r->is_mlx5 ? 64 : 1;
-    int rtr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-                   IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
-    if (r->is_mlx5) {
-        a.max_dest_rd_atomic = 1;
-        a.min_rnr_timer = 12;
-        rtr_mask |= IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
-    }
-    if (r->api.modify_qp(r->qp, &a, rtr_mask) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTR: %s", strerror(errno));
-        return 0;
-    }
-    memset(&a, 0, sizeof(a));
-    a.qp_state = IBV_QPS_RTS;
-    a.sq_psn = mine.psn;
-    int rts_mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
-    if (r->is_mlx5) {
-        a.timeout = 14;
-        a.retry_cnt = 7;
-        a.rnr_retry = 7;
-        a.max_rd_atomic = 1;
-        rts_mask |= IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
-                    IBV_QP_MAX_QP_RD_ATOMIC;
-    }
-    if (r->api.modify_qp(r->qp, &a, rts_mask) != 0) {
-        tp_set_err(err, errlen, "tp rdma: modify RTS: %s", strerror(errno));
-        return 0;
-    }
     const uint64_t decode_chunks =
         (tp->vec_bytes + r->decode_max_msg - 1u) / r->decode_max_msg;
     if (decode_chunks > 2u) {
@@ -2105,6 +2130,7 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
     tp->slab = base;
     memset(tp->slab + tp->in_flags_off, 0, (uint64_t)tp->n_slots * 8);
     memset(tp->slab + tp->token_off, 0, 16);
+    memset(tp->slab + tp->verify_ready_off, 0, 16);
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) return tp_rdma_register_and_exchange(tp, err, errlen);
 #endif
@@ -2198,6 +2224,423 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
     return 1;
 }
 
+#ifdef DS4_TP_HAVE_VERBS
+/* Post the verifier destination rows before the peer can send them. On the
+ * first layer of a verify cycle, a one-byte RDMA SEND/RECV (queued before the
+ * data receives on both QPs) establishes readiness without touching TCP.
+ * Later layers are posted one layer ahead and require no readiness message. */
+static int tp_rdma_post_verify_window(ds4_tp *tp, uint32_t layer,
+                                      uint32_t rows, uint64_t seq,
+                                      int establish_ready) {
+    ds4_tp_rdma *r = &tp->rdma;
+    struct ibv_sge sge[DS4_TP_BATCH_MAX_ROWS + 1u];
+    struct ibv_recv_wr wr[DS4_TP_BATCH_MAX_ROWS + 1u];
+    memset(wr, 0, sizeof(wr));
+    const uint32_t first_data = establish_ready ? 1u : 0u;
+    uint32_t nwr = first_data + rows;
+    if (establish_ready) {
+        uint8_t *ready_in = tp->slab + tp->out_flags_off + 1u;
+        sge[0] = (struct ibv_sge) {
+            .addr = (uintptr_t)ready_in,
+            .length = 1u,
+            .lkey = tp_rdma_lkey(tp, ready_in, 1u),
+        };
+        wr[0].wr_id = DS4_TP_RDMA_VERIFY_READY_WR_TAG | seq;
+        wr[0].sg_list = &sge[0];
+        wr[0].num_sge = 1;
+    }
+    uint8_t *in = tp->slab + ds4_tp_slab_batch_in_offset(tp, layer);
+    const uint64_t wr_base = DS4_TP_RDMA_VERIFY_WR_TAG |
+        ((seq & UINT64_C(0x0000ffffffffffff)) << 14) |
+        (((uint64_t)layer & UINT64_C(0x3f)) << 8);
+    for (uint32_t row = 0; row < rows; ++row) {
+        const uint32_t i = first_data + row;
+        uint8_t *row_in = in + (uint64_t)row * tp->vec_bytes;
+        sge[i] = (struct ibv_sge) {
+            .addr = (uintptr_t)row_in,
+            .length = (uint32_t)tp->vec_bytes,
+            .lkey = tp_rdma_lkey(tp, row_in, tp->vec_bytes),
+        };
+        wr[i].wr_id = wr_base | ((uint64_t)row + 1u);
+        wr[i].sg_list = &sge[i];
+        wr[i].num_sge = 1;
+    }
+    for (uint32_t i = 0; i + 1u < nwr; ++i) wr[i].next = &wr[i + 1u];
+    struct ibv_recv_wr *bad_recv = NULL;
+    if (ibv_post_recv(r->qp, wr, &bad_recv) != 0) {
+        fprintf(stderr, "ds4-tp: verifier lookahead post_recv: %s\n",
+                strerror(errno));
+        return 0;
+    }
+
+    r->verify_window_active = true;
+    r->verify_window_layer = layer;
+    r->verify_window_rows = rows;
+    r->verify_window_seq = seq;
+    if (!establish_ready) return 1;
+
+    uint8_t *ready_out = tp->slab + tp->out_flags_off;
+    *ready_out = (uint8_t)(seq ^ layer ^ rows);
+    struct ibv_sge ready_sge = {
+        .addr = (uintptr_t)ready_out,
+        .length = 1u,
+        .lkey = tp_rdma_lkey(tp, ready_out, 1u),
+    };
+    struct ibv_send_wr ready_wr = {
+        .wr_id = DS4_TP_RDMA_VERIFY_READY_WR_TAG | seq,
+        .sg_list = &ready_sge,
+        .num_sge = 1,
+        .opcode = IBV_WR_SEND,
+        .send_flags = IBV_SEND_SIGNALED,
+    };
+    struct ibv_send_wr *bad_send = NULL;
+    if (ibv_post_send(r->qp, &ready_wr, &bad_send) != 0) {
+        fprintf(stderr, "ds4-tp: verifier ready post_send: %s\n",
+                strerror(errno));
+        return 0;
+    }
+    r->send_outstanding++;
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    int ready_received = 0;
+    while (!ready_received) {
+        struct ibv_wc wc[16];
+        int n = ibv_poll_cq(r->cq, 16, wc);
+        if (n < 0) return 0;
+        for (int i = 0; i < n; ++i) {
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                fprintf(stderr, "ds4-tp: verifier ready completion: %s\n",
+                        tp_wc_status_str(wc[i].status));
+                return 0;
+            }
+            if ((wc[i].opcode & IBV_WC_RECV) &&
+                (wc[i].wr_id & DS4_TP_RDMA_VERIFY_READY_WR_TAG)) {
+                ready_received = 1;
+            } else if (!(wc[i].opcode & IBV_WC_RECV) &&
+                       r->send_outstanding > 0u) {
+                r->send_outstanding--;
+            } else {
+                fprintf(stderr,
+                        "ds4-tp: unexpected completion during verifier ready "
+                        "(wr_id %llu opcode %u)\n",
+                        (unsigned long long)wc[i].wr_id, wc[i].opcode);
+                return 0;
+            }
+        }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr, "ds4-tp: timeout waiting verifier RDMA ready\n");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Record every verifier CQE, including rows that arrive ahead of the one the
+ * caller happens to be considering. ibv_poll_cq() may return a whole group at
+ * once; dropping a future row here creates a deterministic later timeout. */
+static int tp_rdma_verify_poll(ds4_tp *tp, uint64_t wr_base, uint32_t rows,
+                               uint32_t *recv_mask, int *final_send_done) {
+    ds4_tp_rdma *r = &tp->rdma;
+    struct ibv_wc wc[16];
+    const int n = ibv_poll_cq(r->cq, 16, wc);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; ++i) {
+        if (wc[i].status != IBV_WC_SUCCESS) {
+            fprintf(stderr, "ds4-tp: verifier completion error: %s\n",
+                    tp_wc_status_str(wc[i].status));
+            return 0;
+        }
+        if (wc[i].opcode & IBV_WC_RECV) {
+            if ((wc[i].wr_id & DS4_TP_RDMA_VERIFY_WR_TAG) == 0u ||
+                (wc[i].wr_id & ~UINT64_C(0xff)) != wr_base) {
+                fprintf(stderr,
+                        "ds4-tp: unexpected verifier receive wr_id=%llu\n",
+                        (unsigned long long)wc[i].wr_id);
+                return 0;
+            }
+            const uint32_t row_id = (uint32_t)(wc[i].wr_id & 0xffu);
+            if (row_id == 0u || row_id > rows ||
+                wc[i].byte_len != tp->vec_bytes) {
+                fprintf(stderr,
+                        "ds4-tp: invalid verifier receive row=%u bytes=%u "
+                        "expected_rows=%u expected_bytes=%llu\n",
+                        row_id, wc[i].byte_len, rows,
+                        (unsigned long long)tp->vec_bytes);
+                return 0;
+            }
+            const uint32_t bit = UINT32_C(1) << (row_id - 1u);
+            if ((*recv_mask & bit) != 0u) {
+                fprintf(stderr,
+                        "ds4-tp: duplicate verifier receive row=%u\n", row_id);
+                return 0;
+            }
+            *recv_mask |= bit;
+            continue;
+        }
+        if ((wc[i].wr_id & DS4_TP_RDMA_VERIFY_WR_TAG) != 0u) {
+            if (wc[i].wr_id != (wr_base | rows)) {
+                fprintf(stderr,
+                        "ds4-tp: unexpected verifier send wr_id=%llu\n",
+                        (unsigned long long)wc[i].wr_id);
+                return 0;
+            }
+            *final_send_done = 1;
+            if (r->send_outstanding > 0u) r->send_outstanding--;
+        } else if (r->send_outstanding > 0u) {
+            /* Retire a prior primary-QP signaled send. */
+            r->send_outstanding--;
+        } else {
+            fprintf(stderr,
+                    "ds4-tp: unexpected non-verifier send completion wr_id=%llu\n",
+                    (unsigned long long)wc[i].wr_id);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+typedef struct {
+    uint64_t count;
+    double lock_s;
+    double recv_post_s;
+    double ready_post_s;
+    double ready_wait_s;
+    double row_post_s;
+    double row_wait_s;
+    double total_s;
+} ds4_tp_verify_net_profile_stat;
+
+static ds4_tp_verify_net_profile_stat g_tp_verify_net_profile[2];
+static int g_tp_verify_net_profile_enabled = -1;
+static int g_tp_verify_net_profile_registered;
+static int g_tp_verify_net_profile_rank = -1;
+static uint32_t g_tp_verify_net_profile_phase;
+
+static void tp_rdma_verify_net_profile_print(void) {
+    static const char *const names[2] = {"attention", "ffn"};
+    for (uint32_t phase = 0; phase < 2u; ++phase) {
+        const ds4_tp_verify_net_profile_stat *s =
+            &g_tp_verify_net_profile[phase];
+        if (!s->count) continue;
+        const double scale = 1.0e6 / (double)s->count;
+        fprintf(stderr,
+                "{\"ds4_tp_verify_net_profile\":true,\"rank\":%d,"
+                "\"phase\":\"%s\",\"count\":%llu,"
+                "\"lock_us\":%.3f,\"recv_post_us\":%.3f,"
+                "\"ready_post_us\":%.3f,\"ready_wait_us\":%.3f,"
+                "\"row_post_us\":%.3f,\"row_wait_us\":%.3f,"
+                "\"total_us\":%.3f}\n",
+                g_tp_verify_net_profile_rank, names[phase],
+                (unsigned long long)s->count,
+                s->lock_s * scale, s->recv_post_s * scale,
+                s->ready_post_s * scale, s->ready_wait_s * scale,
+                s->row_post_s * scale, s->row_wait_s * scale,
+                s->total_s * scale);
+    }
+}
+
+static int tp_rdma_verify_net_profile_is_enabled(const ds4_tp *tp) {
+    if (g_tp_verify_net_profile_enabled < 0) {
+        const char *env = getenv("DS4_TP_VERIFY_NET_PROFILE");
+        g_tp_verify_net_profile_enabled =
+            env && env[0] && strcmp(env, "0") != 0;
+        if (g_tp_verify_net_profile_enabled &&
+            !g_tp_verify_net_profile_registered) {
+            g_tp_verify_net_profile_rank = tp->rank;
+            atexit(tp_rdma_verify_net_profile_print);
+            g_tp_verify_net_profile_registered = 1;
+        }
+    }
+    return g_tp_verify_net_profile_enabled;
+}
+#endif
+
+/* mlx5 verifier transport candidate. All receives are posted after the
+ * preceding attention exchange and removed before returning to attention.
+ * A write doorbell proves peer readiness without consuming a receive WQE;
+ * the five data SENDs are linked and only the final one is signaled. */
+static int tp_rdma_verify_row_batch_exchange(ds4_tp *tp, uint32_t layer,
+                                             uint32_t rows, uint64_t seq) {
+    ds4_tp_rdma *r = &tp->rdma;
+    if (!r->use_rc || !r->is_mlx5 || rows == 0u ||
+        rows > DS4_TP_BATCH_MAX_ROWS || r->recv_window_active) {
+        return 0;
+    }
+
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const int net_profile = tp_rdma_verify_net_profile_is_enabled(tp);
+    const uint32_t net_phase = net_profile ?
+        (g_tp_verify_net_profile_phase++ & 1u) : 0u;
+    const double net_start = net_profile ? tp_now_sec() : 0.0;
+#endif
+    pthread_mutex_lock(&r->post_lock);
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const double net_locked = net_profile ? tp_now_sec() : 0.0;
+#endif
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    uint8_t *out = tp->slab + ds4_tp_slab_batch_out_offset(tp, layer);
+    const uint64_t wr_base = DS4_TP_RDMA_VERIFY_WR_TAG |
+        ((seq & UINT64_C(0x0000ffffffffffff)) << 14) |
+        (((uint64_t)layer & UINT64_C(0x3f)) << 8);
+    if (r->verify_window_active) {
+        fprintf(stderr,
+                "ds4-tp: stale verifier receive window before layer=%u "
+                "rows=%u seq=%llu (posted layer=%u rows=%u seq=%llu)\n",
+                layer, rows, (unsigned long long)seq,
+                r->verify_window_layer, r->verify_window_rows,
+                (unsigned long long)r->verify_window_seq);
+        pthread_mutex_unlock(&r->post_lock);
+        return 0;
+    }
+    if (!tp_rdma_post_verify_window(tp, layer, rows, seq, 0)) {
+        pthread_mutex_unlock(&r->post_lock);
+        return 0;
+    }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const double net_recv_posted = net_profile ? tp_now_sec() : 0.0;
+#endif
+
+    /* The cookie is identical on both ranks and unique to this exact
+     * (sequence, layer, row-count) exchange. Dedicated words prevent GPU gate
+     * flags from aliasing the readiness protocol. */
+    uint64_t ready_cookie = UINT64_C(0xd54c4b3a291807f1) ^
+        (seq * UINT64_C(0x9e3779b97f4a7c15)) ^
+        ((uint64_t)layer << 40) ^ ((uint64_t)rows << 32);
+    if (ready_cookie == 0u) ready_cookie = 1u;
+    uint64_t *ready_in =
+        (uint64_t *)(tp->slab + tp->verify_ready_off);
+    uint64_t *ready_out =
+        (uint64_t *)(tp->slab + tp->verify_ready_off + 8u);
+    __atomic_store_n(ready_out, ready_cookie, __ATOMIC_RELEASE);
+    struct ibv_sge ready_sge = {
+        .addr = (uintptr_t)ready_out,
+        .length = sizeof(*ready_out),
+        .lkey = tp_rdma_lkey(tp, ready_out, sizeof(*ready_out)),
+    };
+    struct ibv_send_wr ready_wr = {
+        .wr_id = DS4_TP_RDMA_VERIFY_READY_WR_TAG |
+                 (seq & (DS4_TP_RDMA_VERIFY_READY_WR_TAG - 1u)),
+        .sg_list = &ready_sge,
+        .num_sge = 1,
+        .opcode = IBV_WR_RDMA_WRITE,
+        .send_flags = 0,
+    };
+    ready_wr.wr.rdma.remote_addr =
+        r->peer.slab_base + tp->verify_ready_off;
+    ready_wr.wr.rdma.rkey = r->peer.rkey;
+    struct ibv_send_wr *ready_bad = NULL;
+    if (ibv_post_send(r->qp, &ready_wr, &ready_bad) != 0) {
+        fprintf(stderr, "ds4-tp: verifier ready RDMA WRITE post: %s\n",
+                strerror(errno));
+        pthread_mutex_unlock(&r->post_lock);
+        return 0;
+    }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const double net_ready_posted = net_profile ? tp_now_sec() : 0.0;
+#endif
+    uint32_t recv_mask = 0u;
+    int final_send_done = 0;
+    uint32_t ready_poll = 0u;
+    while (__atomic_load_n(ready_in, __ATOMIC_ACQUIRE) != ready_cookie) {
+        if (!tp_rdma_verify_poll(tp, wr_base, rows, &recv_mask,
+                                 &final_send_done)) {
+            pthread_mutex_unlock(&r->post_lock);
+            return 0;
+        }
+        if ((ready_poll++ & 0x3fffu) == 0u && tp_peer_closed(tp)) {
+            fprintf(stderr,
+                    "ds4-tp: peer disconnected waiting verifier RDMA ready\n");
+            pthread_mutex_unlock(&r->post_lock);
+            return 0;
+        }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr,
+                    "ds4-tp: timeout waiting verifier RDMA ready "
+                    "seq=%llu layer=%u rows=%u\n",
+                    (unsigned long long)seq, layer, rows);
+            pthread_mutex_unlock(&r->post_lock);
+            return 0;
+        }
+    }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const double net_ready_seen = net_profile ? tp_now_sec() : 0.0;
+#endif
+    struct ibv_sge send_sge[DS4_TP_BATCH_MAX_ROWS];
+    struct ibv_send_wr send_wr[DS4_TP_BATCH_MAX_ROWS];
+    memset(send_wr, 0, sizeof(send_wr));
+    for (uint32_t row = 0; row < rows; ++row) {
+        uint8_t *row_out = out + (uint64_t)row * tp->vec_bytes;
+        const uint64_t wr_id = wr_base | ((uint64_t)row + 1u);
+        send_sge[row] = (struct ibv_sge) {
+            .addr = (uintptr_t)row_out,
+            .length = (uint32_t)tp->vec_bytes,
+            .lkey = tp_rdma_lkey(tp, row_out, tp->vec_bytes),
+        };
+        send_wr[row].wr_id = wr_id;
+        send_wr[row].sg_list = &send_sge[row];
+        send_wr[row].num_sge = 1;
+        send_wr[row].opcode = IBV_WR_SEND;
+        send_wr[row].send_flags = row + 1u == rows ? IBV_SEND_SIGNALED : 0;
+        if (row + 1u < rows) send_wr[row].next = &send_wr[row + 1u];
+    }
+    struct ibv_send_wr *bad_send = NULL;
+    if (ibv_post_send(r->qp, send_wr, &bad_send) != 0) {
+        fprintf(stderr, "ds4-tp: verifier linked row post_send: %s\n",
+                strerror(errno));
+        pthread_mutex_unlock(&r->post_lock);
+        return 0;
+    }
+    r->send_outstanding++;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const double net_rows_posted = net_profile ? tp_now_sec() : 0.0;
+#endif
+
+    const uint32_t want_mask = (UINT32_C(1) << rows) - 1u;
+    uint32_t peer_poll = 0u;
+    while (recv_mask != want_mask || !final_send_done) {
+        if (!tp_rdma_verify_poll(tp, wr_base, rows, &recv_mask,
+                                 &final_send_done)) {
+            pthread_mutex_unlock(&r->post_lock);
+            return 0;
+        }
+        if ((peer_poll++ & 0x3fffu) == 0u && tp_peer_closed(tp)) {
+            fprintf(stderr,
+                    "ds4-tp: peer disconnected during verifier row batch\n");
+            pthread_mutex_unlock(&r->post_lock);
+            return 0;
+        }
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr,
+                    "ds4-tp: timeout waiting verifier row batch seq=%llu "
+                    "layer=%u rows=%u recv_mask=0x%x send_done=%d\n",
+                    (unsigned long long)seq, layer, rows, recv_mask,
+                    final_send_done);
+            pthread_mutex_unlock(&r->post_lock);
+            return 0;
+        }
+    }
+    r->verify_window_active = false;
+    atomic_thread_fence(memory_order_acquire);
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    if (net_profile) {
+        const double net_done = tp_now_sec();
+        ds4_tp_verify_net_profile_stat *s =
+            &g_tp_verify_net_profile[net_phase];
+        s->count++;
+        s->lock_s += net_locked - net_start;
+        s->recv_post_s += net_recv_posted - net_locked;
+        s->ready_post_s += net_ready_posted - net_recv_posted;
+        s->ready_wait_s += net_ready_seen - net_ready_posted;
+        s->row_post_s += net_rows_posted - net_ready_seen;
+        s->row_wait_s += net_done - net_rows_posted;
+        s->total_s += net_done - net_start;
+    }
+#endif
+    pthread_mutex_unlock(&r->post_lock);
+    return 1;
+}
+#endif
+
 /* Verify-block batch gate: one exchange per layer moving all block rows at
  * once. The payload lives in the registered slab, so RDMA sends it directly;
  * TCP remains the symmetric write-then-read fallback. */
@@ -2209,6 +2652,15 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                              (uint16_t)rows, seq };
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
+        const bool verify_row_batch = tp->rdma.is_mlx5 &&
+            (tp->runtime_features & DS4_TP_FEATURE_VERIFY_ROW_BATCH) != 0u;
+        if (verify_row_batch) {
+            /* Both ranks negotiate this fixed wire schedule. Existing decode
+             * receives are already posted, so symmetric dummy SENDs can
+             * retire them without a TCP transition barrier. */
+            if (!tp_rdma_drain_decode_window(tp)) return 0;
+            return tp_rdma_verify_row_batch_exchange(tp, layer, rows, seq);
+        }
         const bool odinlink_async = tp->rdma.is_odinlink &&
             (tp->runtime_features & DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC) != 0;
         /* A normal decode receive window must still be drained behind the TCP
@@ -2284,6 +2736,34 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+#ifdef DS4_TP_HAVE_VERBS
+    /* DSpark attention head-split carries the same width-1..5 row shape as
+     * the verifier FFN exchange. Avoid the generic big-gate's per-layer TCP
+     * rendezvous and completion-heavy bulk schedule: stage into the already
+     * registered verifier rows, use the exact negotiated bitmap protocol,
+     * then copy the peer partial back. The call returns with no verifier RQ
+     * entries and the final SEND complete, so the following FFN exchange can
+     * safely reuse the same rows. */
+    if (tp->rdma_active && tp->rdma.is_mlx5 &&
+        (tp->runtime_features & DS4_TP_FEATURE_VERIFY_ROW_BATCH) != 0u &&
+        tp_rdma_big_gate_capable(tp) && layer < tp->n_layer &&
+        bytes % tp->vec_bytes == 0u) {
+        const uint64_t rows64 = bytes / tp->vec_bytes;
+        if (rows64 >= 1u && rows64 <= DS4_TP_BATCH_MAX_ROWS) {
+            if (!tp_rdma_drain_decode_window(tp)) return 0;
+            uint8_t *stage_out = tp->slab +
+                ds4_tp_slab_batch_out_offset(tp, layer);
+            uint8_t *stage_in = tp->slab +
+                ds4_tp_slab_batch_in_offset(tp, layer);
+            if (out != stage_out) tp_stage_copy(stage_out, out, bytes);
+            if (!tp_rdma_verify_row_batch_exchange(
+                    tp, layer, (uint32_t)rows64, seq))
+                return 0;
+            if (in != stage_in) tp_stage_copy(in, stage_in, bytes);
+            return 1;
+        }
+    }
+#endif
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;

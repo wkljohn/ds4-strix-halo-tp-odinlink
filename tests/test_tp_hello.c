@@ -114,6 +114,12 @@ int main(void) {
     ok &= check("hello mismatched-indexer-topk-radix-tree",
                 DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00040000 peer=0x00000000)");
+    ok &= check("hello equal-q4k-verify-first-owner",
+                DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER,
+                DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER, 1, NULL);
+    ok &= check("hello mismatched-q4k-verify-first-owner",
+                DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00200000 peer=0x00000000)");
     ok &= check("hello equal-batch-attn-head-split",
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);

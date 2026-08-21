@@ -288,6 +288,76 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
 }
 
+__device__ static float quarter_warp_sum_f32(float v, uint32_t lane8);
+
+/* Keep the verifier first-owner experiment's per-column arithmetic identical
+ * to the shipped one-column kernel even under -ffast-math. A noinline column
+ * boundary prevents LLVM from reassociating independent token accumulators;
+ * immediate same-CTA reuse can still hit the gfx1151 vector caches. */
+__device__ __noinline__ static float2 dev_q4_K_gate_up_column_exact(
+        const cuda_block_q4_K *gr,
+        const cuda_block_q4_K *ur,
+        const cuda_block_q8_K *xq,
+        uint32_t xq_blocks,
+        uint32_t lane) {
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+        gate += dev_dot_q4_K_q8_K_block(gr + b, xq + b);
+        up += dev_dot_q4_K_q8_K_block(ur + b, xq + b);
+    }
+    gate = quarter_warp_sum_f32(gate, lane);
+    up = quarter_warp_sum_f32(up, lane);
+    return make_float2(gate, up);
+}
+
+__device__ __noinline__ static float dev_weighted_swiglu_column_exact(
+        float gate, float up, float weight, float clamp) {
+    if (clamp > 1.0e-6f) {
+        if (gate > clamp) gate = clamp;
+        if (up > clamp) up = clamp;
+        if (up < -clamp) up = -clamp;
+    }
+    return (gate / (1.0f + expf(-gate))) * up * weight;
+}
+
+__global__ static void moe_weighted_swiglu_from_aux_kernel(
+        float *mid_out,
+        const float *gate_in,
+        const float *up_in,
+        const float *weights,
+        uint32_t expert_mid_dim,
+        uint32_t pair_count,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t pair = blockIdx.y;
+    if (pair >= pair_count) return;
+    for (uint32_t rr = 0; rr < 4u; ++rr) {
+        const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= expert_mid_dim || lane != 0u) continue;
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        float gate = gate_in[off];
+        float up = up_in[off];
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        /* Match the shipped fused kernel's gfx1151 ISA exactly:
+         * ((route_weight * gate) * up) * rcp(1 + exp(-gate)).
+         * Empty VGPR barriers prevent -ffast-math from commuting the first
+         * two multiplies back to (up * gate) * route_weight. */
+        float numerator = weights[pair] * gate;
+        __asm__ volatile("" : "+v"(numerator));
+        numerator *= up;
+        __asm__ volatile("" : "+v"(numerator));
+        float inv_sigmoid_den = 1.0f / (1.0f + expf(-gate));
+        __asm__ volatile("" : "+v"(inv_sigmoid_den));
+        mid_out[off] = numerator * inv_sigmoid_den;
+    }
+}
+
 __device__ static void dev_dot_q4_K_q8_K_block4(
         const cuda_block_q4_K *x,
         const cuda_block_q8_K *y0,
@@ -2137,6 +2207,103 @@ __global__ static void moe_gate_up_mid_decode_q4K_staged_xq_kernel(
     }
 }
 
+/* DSpark verifier first-owner Q4_K gate/up. The grid remains pair-major so
+ * live route contents do not change launch geometry: only the first pair for
+ * an expert executes, then writes every matching verifier column. Unlike the
+ * older expert_tile4/8 path, each column calls the shipped scalar Q4_K dot in
+ * its original block order; this is required for bit-exact parity under
+ * -ffast-math. MAX_TOKENS is safe because router top-k has no duplicate expert
+ * within one token, hence one expert can occur at most once per token. */
+template <uint32_t MAX_TOKENS>
+__global__ static void moe_gate_up_mid_decode_q4K_first_owner_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        uint32_t write_aux,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t owner_pair = blockIdx.y;
+    const uint32_t pair_count = n_tokens * n_expert;
+    if (owner_pair >= pair_count) return;
+
+    const int32_t expert_i = selected[owner_pair];
+    const float owner_weight = weights[owner_pair];
+    if (expert_i < 0 || owner_weight == 0.0f) {
+        for (uint32_t rr = 0; rr < 4u; ++rr) {
+            const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+            if (row >= expert_mid_dim || lane != 0u) continue;
+            const uint64_t off = (uint64_t)owner_pair * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = 0.0f;
+                up_out[off] = 0.0f;
+            }
+            mid_out[off] = 0.0f;
+        }
+        return;
+    }
+    for (uint32_t pair = 0; pair < owner_pair; ++pair) {
+        if (weights[pair] != 0.0f && selected[pair] == expert_i) return;
+    }
+
+    uint32_t matches[MAX_TOKENS] = {};
+    uint32_t nm = 0u;
+    for (uint32_t pair = owner_pair; pair < pair_count; ++pair) {
+        if (weights[pair] != 0.0f && selected[pair] == expert_i &&
+            nm < MAX_TOKENS) {
+            matches[nm++] = pair;
+        }
+    }
+
+    __shared__ cuda_block_q8_K staged_xq[MAX_TOKENS][16];
+    for (uint32_t i = threadIdx.x; i < nm * xq_blocks; i += blockDim.x) {
+        const uint32_t m = i / xq_blocks;
+        const uint32_t b = i - m * xq_blocks;
+        const uint32_t tok = matches[m] / n_expert;
+        staged_xq[m][b] = xq[(uint64_t)tok * xq_blocks + b];
+    }
+    __syncthreads();
+
+    const uint32_t expert = (uint32_t)expert_i;
+    for (uint32_t rr = 0; rr < 4u; ++rr) {
+        const uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_q4_K *gr = (const cuda_block_q4_K *)(
+            gate_base + (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row * gate_row_bytes);
+        const cuda_block_q4_K *ur = (const cuda_block_q4_K *)(
+            up_base + (uint64_t)expert * gate_expert_bytes +
+            (uint64_t)row * gate_row_bytes);
+        for (uint32_t m = 0; m < MAX_TOKENS; ++m) {
+            if (m >= nm) continue;
+            float2 gu = dev_q4_K_gate_up_column_exact(
+                gr, ur, staged_xq[m], xq_blocks, lane);
+            if (lane == 0u) {
+                const uint64_t off =
+                    (uint64_t)matches[m] * expert_mid_dim + row;
+                if (write_aux) {
+                    gate_out[off] = gu.x;
+                    up_out[off] = gu.y;
+                } else {
+                    mid_out[off] = dev_weighted_swiglu_column_exact(
+                        gu.x, gu.y, weights[matches[m]], clamp);
+                }
+            }
+        }
+    }
+}
+
 /* Experimental one-token Q4_K path with one weight projection per kernel.
  * The fused gate/up kernel keeps both Q4_K dot products live and is register
  * heavy on gfx1151.  Splitting the projections may admit another resident
@@ -2475,6 +2642,51 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
         if (lane == 0) total += acc;
     }
     if (lane == 0) out[row] = add_in ? total + add_in[row] : total;
+}
+
+/* Small verifier-width form of the one-token Q4_K direct-sum kernel above.
+ * One grid row is one token, and every token retains the exact slot-ascending
+ * dot/reduction association used by ordinary decode.  This avoids the batch
+ * fallback's pair-major down buffer followed by a separate scalar sum, whose
+ * few-ULP difference compounds across the target verifier's 43 layers. */
+__global__ static void moe_down_q4K_sum6_qwarp32_batch_kernel(
+        float *out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        uint32_t skip_zero_weight) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tokens) return;
+    const uint64_t pair0 = (uint64_t)tok * n_expert;
+    float total = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        const uint64_t pair = pair0 + slot;
+        if (skip_zero_weight && weights[pair] == 0.0f) continue;
+        const int32_t expert_i = selected[pair];
+        if (expert_i < 0) continue;
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+            down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+            (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + pair * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
 }
 
 /* One-token Q4_K down with the six mid-Q8_K slots staged in LDS.  Default-off

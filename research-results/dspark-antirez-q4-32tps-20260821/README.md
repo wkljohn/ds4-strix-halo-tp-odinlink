@@ -168,6 +168,49 @@ far from the 32 t/s target: about 275 ms per cycle is spent in verification.
 The next optimization must keep the exact topology while sharing weight reads
 across rows; merely replaying the one-row route five times cannot win.
 
+### TP transport attribution (2026-08-21)
+
+A separate `PROFILE=1` build measured the exact width-5 verifier over RoCE v2
+with `DS4_TP_RDMA_GATE_PROFILE=1`,
+`DS4_TP_SERVICE_INTERVAL_PROFILE=1`, and
+`DS4_TP_BIGGATE_PROFILE=1`. These switches remain compiled out of production
+builds. The profiling run retained the Q8 drafter, 118/138 expert split, and
+the exact serial-routed-MoE verifier. Its token rate is diagnostic only; the
+transport counters are the evidence of interest.
+
+The first 48 bulk gates included the fixed 2,048-token prefill. Subtracting
+that prefix from the final 544-gate cumulative counters isolates 496 verifier
+exchanges across eight speculative cycles:
+
+| Rank | Verifier wire/wait | Staging copy | Combined | Per cycle | Share of 2,892.5 ms verifier |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 0 | 932.5 ms | 87.1 ms | 1,019.6 ms | 127.5 ms | 35.3% |
+| 1 | 999.5 ms | 89.7 ms | 1,089.2 ms | 136.2 ms | 37.7% |
+
+The critical-path estimate is therefore about 136 ms of TP transport and
+staging per speculative cycle. Each verifier exchange carries approximately
+75 KiB, but the current bulk protocol costs about 1.9--2.0 ms per exchange.
+This is a latency/barrier problem rather than saturation of the 25 Gbit/s
+link. For comparison, ordinary 16 KiB row gates in the same run cost roughly
+57--116 us depending on rank and gate.
+
+This changes the next-step ordering. Do not continue broad drafter or kernel
+tuning until one bounded transport experiment tests a persistent verifier
+receive window on the decode-latency QP (16 KiB chunks, pre-posted receives,
+deferred send completions), or an RC `RDMA_WRITE_WITH_IMM` equivalent into
+fixed registered verifier slots. The protocol must retain exact sequence/slot
+validation and fail closed. If it cannot reduce an isolated 75--80 KiB
+exchange below 250 us and the full verifier below two ordinary target steps,
+stop the DSpark performance effort.
+
+Relevant prior art supports this shape of experiment rather than a new
+drafter quantization: RCCL recommends aggregating/batching small collectives,
+DeepEP exposes persistent registered low-latency receive buffers and async
+completion, and libibverbs defines `RDMA_WRITE_WITH_IMM` specifically to place
+data at a fixed remote address while producing a remote completion. These are
+design references only; none is assumed to work correctly on gfx1151 without
+the isolated two-rank harness and kernel-panic-safe failure tests.
+
 ### Rejected batched-routed-MoE transplant
 
 One short experiment re-enabled the existing batched routed-MoE kernel while
@@ -271,3 +314,24 @@ binary  da669e37ea50e473c8a8dfe5d81d888b09f1d42894519075a0e3bf9b2a5c3b10
 The fingerprint exactly matches the clean 273.57/19.61 production control and
 the throughput remains in its established noise envelope. The DSpark-only
 fidelity work therefore does not regress ordinary Q4 TP=2 inference.
+
+### Slab-direct verifier latency profile
+
+The current verifier and its two per-layer RoCE exchanges were profiled before
+the next optimization. The exact diagnostic fingerprint remained
+`7174e214e05fd83e`. A 43-layer verifier invocation costs about 246.0 ms wall
+time: approximately 102 ms attention, 94--101 ms routed MoE, and 24--32 ms in
+the FFN combine/residual tail. The Q8 proposal costs only 14.6 ms per
+speculative cycle.
+
+The registered five-row payload itself completes in about 62--69 us. Rank 0's
+full attention/FFN callbacks average 204/408 us because it reaches both gates
+before rank 1; the extra time is peer compute skew, not verbs setup or link
+bandwidth. See [VERIFIER-LATENCY-PROFILE-20260821.md](VERIFIER-LATENCY-PROFILE-20260821.md)
+for the per-rank stage and transport tables.
+# Latest validated kernel stage
+
+The Q4_K DSpark verifier first-owner stage is documented in
+[`Q4-FIRST-OWNER-20260821.md`](Q4-FIRST-OWNER-20260821.md). It preserves the
+W5 token fingerprint and acceptance histogram while raising matched RoCE v2
+decode from 11.35 t/s (best prior serial-row run) to a 13.03 t/s final median.

@@ -118,6 +118,12 @@ typedef struct {
 
 #include "rocm/ds4_rocm_matmul.cuh"
 
+static int g_q4k_verify_batch_mode;
+
+extern "C" void ds4_gpu_set_q4k_verify_batch_mode(bool enabled) {
+    g_q4k_verify_batch_mode = enabled ? 1 : 0;
+}
+
 extern "C" void ds4_gpu_rocm_mark_speculative_decode(void) {
     g_q8_decode_pair_dp4a_speculative = 1;
     const char *pair = getenv("DS4_ROCM_Q8_DECODE_PAIR_DP4A");
@@ -873,7 +879,11 @@ static void *ds4_tp_service_thread(void *arg) {
                                   g_tp_ffn_range_host[0] &&
                                   g_tp_ffn_range_host[1];
     struct ds4_tp_interval_profile profile = {};
-    profile.next_report = 500;
+    /* DSpark can perform many channel-1 batch/big exchanges while producing
+     * fewer than 500 channel-0 row exchanges, then exit before the service
+     * thread's final summary is joined.  A shorter interval makes opt-in
+     * diagnostic runs self-report without affecting the profiling-off path. */
+    profile.next_report = 100;
     while (g_tp_run) {
         int did;
         if (__builtin_expect(profile_enabled, 0)) {
@@ -881,7 +891,7 @@ static void *ds4_tp_service_thread(void *arg) {
                   ds4_tp_pump_profile(1, &next[1], &profile);
             if (profile.callback[0].count >= profile.next_report) {
                 ds4_tp_interval_print(&profile);
-                profile.next_report += 500;
+                profile.next_report += 100;
             }
         } else if (__builtin_expect(ffn_range_enabled, 0)) {
             did = ds4_tp_pump_ffn_range(0, &next[0]) |

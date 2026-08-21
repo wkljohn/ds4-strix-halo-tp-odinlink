@@ -84,6 +84,19 @@ enum {
      * bitonic chunk tree with an exact packed-key radix tree.  Negotiate it
      * because independently launched ranks must select identical index rows. */
     DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE = UINT32_C(1) << 18,
+    /* DSpark verifier rows use the low-latency RC SEND/RECV framing instead
+     * of the synchronous bulk protocol. Exact-match in the TP hello prevents
+     * independently launched ranks from choosing different wire schedules. */
+    DS4_TP_FEATURE_VERIFY_ROW_BATCH = UINT32_C(1) << 19,
+    /* The DSpark attention output projection writes its rank partial directly
+     * into the registered verifier slab and consumes the peer slab in the
+     * rank-ordered add. This changes the fixed gate/buffer schedule and must
+     * therefore match exactly across independently launched ranks. */
+    DS4_TP_FEATURE_VERIFY_ATTN_SLAB = UINT32_C(1) << 20,
+    /* DSpark Q4_K verifier batches deduplicate live expert gate/up reads and
+     * preserve the canonical six-slot down fold. Both independently launched
+     * ranks must enter this arithmetic/scratch schedule together. */
+    DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER = UINT32_C(1) << 21,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {
