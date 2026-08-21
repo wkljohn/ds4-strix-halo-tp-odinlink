@@ -135,3 +135,139 @@ about 5.20 ordinary token steps per cycle while producing only 2.94 output
 tokens per cycle, and width 1 shows that verifier arithmetic is not yet on the
 serial trajectory. Correctness and verifier cost must be repaired before
 higher acceptance can become useful throughput.
+
+## Exact verifier checkpoint and production-width cost
+
+The FFN bisect identified the remaining fidelity error as the association of
+the shared expert with each rank's routed partial. Ordinary serial TP computes
+and reduces:
+
+```text
+(routed rank 0 + shared rank 0) + (routed rank 1 + shared rank 1)
+```
+
+The original batch verifier instead reduced routed rank partials first and
+then added a replicated full shared expert. Although algebraically similar,
+the float association differs and the error compounds through 43 layers.
+`DS4_DSPARK_VERIFY_TP_SHARED_SPLIT=1` restores the serial TP association.
+
+With Q8 activation reuse, 32-head ownership, per-row serial attention, the
+owned-group Q8 output projection, fused serial head norm/RoPE, and shared
+expert split enabled, a width-1 capture was bit-exact at every recorded stage
+and at the end of all 43 layers across consecutive cycles.
+
+The corresponding instrumentation-free runs establish the current cost:
+
+| Verifier | Prefill | Decode | Acceptance / yield | Verifier cost | Fingerprint |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Exact width 1 | 200.11 t/s | 4.25 t/s | 68.90%; 206/299 drafts | 59,989 ms / 299 cycles | `f16349df33cf1d37` |
+| Exact width 5, serial routed MoE | 200.91 t/s | 6.55 t/s | 33.67%; 235/698 drafts; 1.643 accepted/cycle | 39,363 ms / 143 cycles | `7174e214e05fd83e` |
+
+The exact width-5 verifier is therefore correctness-green but economically
+far from the 32 t/s target: about 275 ms per cycle is spent in verification.
+The next optimization must keep the exact topology while sharing weight reads
+across rows; merely replaying the one-row route five times cannot win.
+
+### Rejected batched-routed-MoE transplant
+
+One short experiment re-enabled the existing batched routed-MoE kernel while
+retaining rank-owned shared partials. It generated the expected short-run token
+fingerprint but was not verifier-equivalent: layer 0 already differed by
+0.00932 max / 0.00133 RMS, growing to 4.28 / 0.358 by layer 42. At selected
+layer 1 the first visible inputs were already different and the error grew at
+attention output. The experiment is rejected and its code was reverted. Token
+agreement over three generated tokens is not sufficient evidence for a kernel
+substitution.
+
+## Detailed `ds4-on-spark` implementation audit
+
+The source audit was expanded from the v0.5.0 snapshot to its full history.
+The most relevant upstream commits and their actual mechanisms are:
+
+| Commit | Implementation | Reported single-GPU effect | TP=2 disposition |
+| --- | --- | --- | --- |
+| [`7ffe821`](https://github.com/Entrpi/ds4/commit/7ffe82141df6da30b9674cf198df1670f3b0c1e6) | Aligned Q8_0 weight-outer kernel for verifier widths 2–8; reads each weight stream once and accumulates all activation columns | 240K step 59.4→55.2 ms | Highest-priority dense Q8 idea; implement against rank-owned shapes and require exact row outputs |
+| [`6e27e1e`](https://github.com/Entrpi/ds4/commit/6e27e1e7ebcb9cb42dafd31a17a1a478690beee9) | First-owner expert dedup: the first slot for an expert reads its weights once and computes every matching verifier column | gate/up family 22.0→18.9 ms/step; 1.53× at 18 distinct of 30 slots | Strongest MoE idea, but their kernel is IQ2_XXS on CUDA; ours needs Q4_K, per-rank IDs, and serial-equivalent folds |
+| [`18b40d7`](https://github.com/Entrpi/ds4/commit/18b40d77626125aa4cf17bbfd5f35f90a28ae34e) | Indexer token loop: one CTA stages a K tile once, then evaluates consecutive verifier tokens | 240K 55.2→50.6 ms; width-5 isolated 897→566 µs | Useful mainly at deep context; preserve each token's visibility and TP ownership |
+| [`17a7d76`](https://github.com/Entrpi/ds4/commit/17a7d76) | Head-group flash decode: eight heads share each staged KV row tile with online softmax and fixed-order split combine | 240K 76.3→66.2 ms; 515K 95.0→73.5 ms | CUDA kernel is not portable, but row staging across owned heads is architecturally transferable |
+| [`e0ed742`](https://github.com/Entrpi/ds4/commit/e0ed742) | Indexed-attention gather version of the same head-group design | smaller incremental gain after head-group decode | Lower priority until our verifier ledger shows indexed attention dominant |
+| [`4ad0c9b`](https://github.com/Entrpi/ds4/commit/4ad0c9b) | WMMA indexer scoring for multi-sequence decode | 3.97× scorer, about 13% deep-decode reduction | gfx1151 requires a separate WMMA mapping and isolated ISA/correctness harness |
+
+Two implementation details matter more than the headline numbers:
+
+1. The Spark verifier is explicitly hybrid: weight-bound dense/MoE work is
+   multi-column, while KV/state-sensitive operations preserve deterministic
+   ordering. It is not one generic batched forward.
+2. Its first-owner expert optimization is content-driven inside a fixed launch
+   grid, so it remains graph-capture-safe. The performance benefit comes from
+   duplicate expert selections across verifier rows, not from changing routing.
+
+The fork reports a width-5 verifier cost around 2.03–2.08 ordinary decode steps
+on GB10, giving a break-even near 51% draft acceptance. Our exact width-5 path
+currently costs much more because routed Q4 is replayed row-by-row and TP adds
+communication/reduction. Its terminal quench policy can protect poor prompts,
+but it cannot create the required verifier speed and will be considered only
+after our measured TP break-even is competitive.
+
+### Transfer order after the audit
+
+1. Build an isolated Q4_K first-owner/deduplicated gate+up test using captured
+   live per-rank routes. Require bit-exact outputs versus the exact serial
+   verifier for overlap counts from zero to the measured maximum.
+2. Build an exact width-2–5 Q8 weight-outer projection harness for gfx1151.
+   Reuse Q8_1 activations, inspect emitted ISA, and compare each column with
+   repeated one-row projections before integrating it.
+3. Profile an exact width-5 cycle to quantify routed MoE, dense Q8, attention,
+   indexer, RDMA, proposal, and target-anchor time. Port indexer/head-group
+   designs only if those families are in the top ledger.
+4. Keep every new dispatch behind DSpark-only shape gates and rerun ordinary
+   128/128 Q4 control after shared backend changes.
+
+This is a design transfer, not a source transplant: GB10 uses CUDA warp-32 and
+different quantized model tensors, while gfx1151 uses wavefront-32 ROCm plus a
+two-rank expert and attention decomposition. The reusable idea is to amortize
+immutable weight/KV reads across verifier columns without altering target
+arithmetic, ownership, or state order.
+
+### Current Entrpi main ROCm DSpark audit
+
+The audit also fetched current `Entrpi/ds4` main at
+[`84cc882`](https://github.com/Entrpi/ds4/commit/84cc882352757baf628a1776badf7cc54d584e28)
+(2026-08-09), which newly enables DSpark on ROCm. That commit adds two missing
+backend primitives rather than a fast TP verifier:
+
+- non-causal raw batch attention for the three-layer DSpark draft model;
+- an on-device Q8_0 Markov correction plus vocabulary argmax, avoiding a host
+  logits round trip.
+
+Our fork already contains the non-causal ROCm draft-attention kernel. It still
+routes `ds4_gpu_dspark_markov_argmax_tensor` to the unavailable stub, so the
+on-device Markov primitive is a clean, directly portable proposal-side change.
+It is not the current main bottleneck: our exact width-5 measurement spends
+about 14.6 ms/cycle proposing but 275.3 ms/cycle verifying. Port it only after
+an isolated output/argmax test, and expect a modest gain rather than a verifier
+breakthrough.
+
+Entrpi's own release gate records single-node Strix Halo IQ2 results of 16.70
+t/s ordinary and 11.40 t/s with DSpark (64-token C fixture). It explicitly
+states that ROCm DSpark is not yet expected to beat ordinary decode. This
+supports our diagnosis: merely enabling the drafter or committing batched
+verifier state directly is insufficient; the weight-bound verifier families
+must be made width-efficient. Our `replay=0` exact runs already use direct
+state commit, so their 6.55 t/s is not caused by replay fallback.
+
+### Ordinary-path isolation gate after fidelity work
+
+After reverting the rejected batched-MoE experiment, both nodes were rebuilt
+from identical source and the full ordinary 2,048+300-token control was rerun:
+
+```text
+prefill 275.65 t/s
+decode  19.54 t/s (19.58 steady)
+FNV64   b7694f9d11a3760e
+binary  da669e37ea50e473c8a8dfe5d81d888b09f1d42894519075a0e3bf9b2a5c3b10
+```
+
+The fingerprint exactly matches the clean 273.57/19.61 production control and
+the throughput remains in its established noise envelope. The DSpark-only
+fidelity work therefore does not regress ordinary Q4 TP=2 inference.
