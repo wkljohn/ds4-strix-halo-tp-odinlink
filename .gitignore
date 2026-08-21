@@ -28,6 +28,7 @@
 /tests/test_q4k_dot
 /tests/test_sampling
 /tests/test_tp_hello
+/tests/test_tp_completion_ordering
 /tests/test_rocm_q4k_fused_mid
 /tests/test_rocm_attention_prefill_static_flash
 /tests/test_rocm_attention_decode_mixed
