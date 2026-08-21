@@ -20,6 +20,7 @@ PREMAIN_OUT=${DS4_BENCH_OUT:-$REPO/research-results/bench-runs}
 
 # The hello regression test proves independently launched ranks reject an
 # IQ2 integer-WMMA mismatch before entering a different MoE arithmetic path.
+"$REPO/tests/test_bench_env_precedence.sh"
 make -C "$REPO" test-tp-hello
 
 # Keep the production metadata classifier in the gate: both paths must select
@@ -37,6 +38,27 @@ DS4_BENCH_CANDIDATE=1 DS4_BENCH_EXPECT_FNV64="$Q4_FNV64" \
   "$REPO/run-tp-ds4-bench.sh" "premain-q4-$STAMP" "$Q4_MODEL"
 DS4_BENCH_CANDIDATE=1 DS4_BENCH_EXPECT_FNV64="$Q2_FNV64" \
   "$REPO/run-tp-ds4-bench.sh" "premain-q2-$STAMP" "$Q2_MODEL"
+
+require_feature_bit() {
+  local log=$1 bit=$2 hex value
+  hex=$(sed -n 's/.* negotiated=0x\([0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' "$log" | head -n 1)
+  [[ -n $hex ]] || { echo "error: no negotiated feature mask in $log" >&2; return 1; }
+  value=$((16#$hex))
+  (( (value & bit) != 0 )) || {
+    printf 'error: required TP feature bit 0x%x absent from %s (mask=0x%s)\n' \
+      "$bit" "$log" "$hex" >&2
+    return 1
+  }
+}
+
+# These exact kernels are production defaults. Check both independently
+# launched ranks rather than relying only on the model-level fingerprint.
+for model in q4 q2; do
+  require_feature_bit "$PREMAIN_OUT/coordinator-premain-$model-$STAMP.log" $((1 << 17))
+  require_feature_bit "$PREMAIN_OUT/worker-premain-$model-$STAMP.log" $((1 << 17))
+  require_feature_bit "$PREMAIN_OUT/coordinator-premain-$model-$STAMP.log" $((1 << 18))
+  require_feature_bit "$PREMAIN_OUT/worker-premain-$model-$STAMP.log" $((1 << 18))
+done
 
 grep -q 'negotiated=0x.* iq2_i8=1 ' \
   "$PREMAIN_OUT/coordinator-premain-q2-$STAMP.log"

@@ -64,7 +64,7 @@ def classify(suffix: str) -> tuple[str, float, str]:
         return "collective_required", 1.0, "replicated state/top-k builder"
     if suffix in {"attn_q_a.weight", "attn_kv.weight"}:
         return "collective_required", 1.0, "paired shared Q-lora/KV projection"
-    if suffix.startswith("ffn_gate_inp"):
+    if suffix.startswith("ffn_gate_inp") or suffix == "exp_probs_b.bias":
         return "replicated", 1.0, "router input"
     if suffix.startswith("hc_"):
         return "replicated", 1.0, "shared HC control path"
@@ -95,6 +95,10 @@ def main() -> int:
                         help="routed experts selected by the model (default: 6)")
     parser.add_argument("--selected-per-rank", type=float, default=3.0,
                         help="balanced routed experts executed per rank (default: 3)")
+    parser.add_argument("--fail-closed", action="store_true",
+                        help="exit 1 if any blk tensor is classified as other")
+    parser.add_argument("--expect-collective-mib", type=float, default=None,
+                        help="require collective_required rank-read MiB within 0.02")
     args = parser.parse_args()
     if args.selected <= 0 or not 0 <= args.selected_per_rank <= args.selected:
         parser.error("selected counts must satisfy 0 <= per-rank <= selected")
@@ -104,6 +108,7 @@ def main() -> int:
     categories: dict[str, float] = defaultdict(float)
     full_categories: dict[str, float] = defaultdict(float)
     reasons: dict[str, set[str]] = defaultdict(set)
+    reason_bytes: dict[str, float] = defaultdict(float)
     layer_ids: set[int] = set()
     unmatched: list[str] = []
 
@@ -123,6 +128,8 @@ def main() -> int:
         categories[category] += tensor.n_bytes * fraction
         full_categories[category] += tensor.n_bytes
         reasons[category].add(reason)
+        if category == "collective_required":
+            reason_bytes[reason] += tensor.n_bytes * fraction
         if category == "other":
             unmatched.append(tensor.name)
 
@@ -160,10 +167,25 @@ def main() -> int:
     print(f"all classified layer tensor reads/rank/token: {mib(total)} MiB")
     print("routed-expert estimate assumes a balanced 3/3 split of six selected experts")
     print("collective_required is not free TP work: splitting it needs a new exchange/top-k design")
+    print("collective_required families:")
+    for reason in sorted(reason_bytes):
+        print(f"  {reason}: {mib(reason_bytes[reason])} MiB")
+    coll_mib = categories.get("collective_required", 0.0) / (1 << 20)
+    print(f"collective_required_mib={coll_mib:.2f}")
+    if args.expect_collective_mib is not None:
+        if abs(coll_mib - args.expect_collective_mib) > 0.02:
+            print(f"FAIL: collective_required {coll_mib:.2f} MiB != "
+                  f"{args.expect_collective_mib:.2f}")
+            return 1
     if unmatched:
         print(f"other tensors ({len(unmatched)}):")
         for name in unmatched:
             print(f"  {name}")
+        if args.fail_closed:
+            print("FAIL: unknown blk tensor classifications")
+            return 1
+    elif args.fail_closed:
+        print("fail_closed: no unknown blk classifications")
     return 0
 
 

@@ -200,6 +200,117 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
             n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps, norm_eps);
     return cuda_ok(cudaGetLastError(), "hc split weighted sum norm launch");
 }
+
+extern "C" int ds4_gpu_hc_stage_exact_coop_supported(void) {
+#if !defined(__HIP_PLATFORM_AMD__)
+    return 0;
+#else
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    cached = 0;
+    int device = 0;
+    hipDeviceProp_t prop{};
+    int cooperative = 0;
+    int blocks_per_cu = 0;
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipGetDeviceProperties(&prop, device) != hipSuccess ||
+        strncmp(prop.gcnArchName, "gfx1151", 7) != 0 ||
+        hipDeviceGetAttribute(&cooperative,
+                              hipDeviceAttributeCooperativeLaunch,
+                              device) != hipSuccess ||
+        !cooperative ||
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                &blocks_per_cu, hc_stage_exact_coop_kernel, 256u, 0u) !=
+            hipSuccess ||
+        blocks_per_cu <= 0 || prop.multiProcessorCount <= 0 ||
+        (uint64_t)blocks_per_cu * (uint64_t)prop.multiProcessorCount < 24u) {
+        return cached;
+    }
+    cached = 1;
+    return cached;
+#endif
+}
+
+extern "C" int ds4_gpu_hc_stage_exact_coop_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *flat_scratch,
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps) {
+#if !defined(__HIP_PLATFORM_AMD__)
+    (void)out; (void)norm_out; (void)flat_scratch; (void)mix; (void)split;
+    (void)residual_hc; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)scale_offset; (void)base_offset; (void)norm_weight_offset;
+    (void)n_embd; (void)n_hc; (void)sinkhorn_iters; (void)eps; (void)norm_eps;
+    return 0;
+#else
+    constexpr uint64_t hc_dim = 4096ull * 4ull;
+    constexpr uint64_t mix_hc = 24ull;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+    const uint64_t row_bytes = 4096ull * sizeof(float);
+    const uint64_t mix_bytes = mix_hc * sizeof(float);
+    const uint64_t weight_bytes = mix_hc * hc_dim * sizeof(uint16_t);
+    if (!out || !norm_out || !flat_scratch || !mix || !split ||
+        !residual_hc || !model_map || n_embd != 4096u || n_hc != 4u ||
+        out->bytes < row_bytes || norm_out->bytes < row_bytes ||
+        flat_scratch->bytes < hc_bytes || residual_hc->bytes < hc_bytes ||
+        mix->bytes < mix_bytes || split->bytes < mix_bytes ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_model_range_fits(model_size, scale_offset, 3ull * sizeof(float)) ||
+        !cuda_model_range_fits(model_size, base_offset, mix_bytes) ||
+        !cuda_model_range_fits(model_size, norm_weight_offset, row_bytes) ||
+        !ds4_gpu_hc_stage_exact_coop_supported()) {
+        return 0;
+    }
+    const __half *weight = (const __half *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "hc exact coop weight");
+    const float *scale = (const float *)cuda_model_range_ptr(
+            model_map, scale_offset, 3ull * sizeof(float), "hc exact coop scale");
+    const float *base = (const float *)cuda_model_range_ptr(
+            model_map, base_offset, mix_bytes, "hc exact coop base");
+    const float *norm_w = (const float *)cuda_model_range_ptr(
+            model_map, norm_weight_offset, row_bytes, "hc exact coop norm");
+    if (!weight || !scale || !base || !norm_w) return 0;
+
+    float *out_ptr = (float *)out->ptr;
+    float *norm_ptr = (float *)norm_out->ptr;
+    float *flat_ptr = (float *)flat_scratch->ptr;
+    float *mix_ptr = (float *)mix->ptr;
+    float *split_ptr = (float *)split->ptr;
+    const float *residual_ptr = (const float *)residual_hc->ptr;
+    void *args[] = {&out_ptr, &norm_ptr, &flat_ptr, &mix_ptr, &split_ptr,
+                    &weight, &residual_ptr, &scale, &base, &norm_w,
+                    &sinkhorn_iters, &eps, &norm_eps};
+    const hipError_t launch = hipLaunchCooperativeKernel(
+            reinterpret_cast<const void *>(hc_stage_exact_coop_kernel),
+            dim3(24u), dim3(256u), args, 0u, nullptr);
+    if (launch != hipSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "exact cooperative HC stage launch failed: %s\n",
+                hipGetErrorString(launch));
+        return 0;
+    }
+    static int reported = 0;
+    if (!reported) {
+        reported = 1;
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "exact cooperative HC decode stage active (24 blocks, no cache)\n");
+    }
+    return 1;
+#endif
+}
 extern "C" int ds4_gpu_output_hc_weights_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *pre,

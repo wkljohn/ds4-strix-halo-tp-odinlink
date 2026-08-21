@@ -34,7 +34,9 @@ assert_not_grep() {
 BINS=(./ds4 ./ds4-server ./ds4-bench ./ds4-agent)
 NAMES=(ds4 ds4-server ds4-bench ds4-agent)
 
-# 1: each binary's --help mentions both flags.
+# 1: CUDA builds advertise the CUDA placement flags. ROCm/Metal-only builds
+# still share the parser, but must not be required to advertise unavailable
+# CUDA placement in their user-facing help.
 for i in "${!BINS[@]}"; do
     name=${NAMES[$i]}; bin=${BINS[$i]}
     if [ ! -x "$bin" ]; then
@@ -42,9 +44,13 @@ for i in "${!BINS[@]}"; do
         continue
     fi
     "$bin" --help > "$LOG" 2>&1 || true
-    assert_grep "$name --help mentions --gpu-vram" "gpu-vram" "$LOG"
-    assert_grep "$name --help mentions --gpu-devices" "gpu-devices" "$LOG"
-    assert_grep "$name --help mentions --cuda-tensor-parallel" "cuda-tensor-parallel" "$LOG"
+    if grep -qE '(^|[[:space:]])--cuda([[:space:]]|\||$)' "$LOG"; then
+        assert_grep "$name --help mentions --gpu-vram" "gpu-vram" "$LOG"
+        assert_grep "$name --help mentions --gpu-devices" "gpu-devices" "$LOG"
+        assert_grep "$name --help mentions --cuda-tensor-parallel" "cuda-tensor-parallel" "$LOG"
+    else
+        ok "$name non-CUDA help does not require CUDA placement flags"
+    fi
     if [ "$name" = "ds4" ]; then
         "$bin" --help distributed > "$LOG" 2>&1 || true
         assert_grep "$name --help distributed mentions --tensor-parallel-token-prefill" \

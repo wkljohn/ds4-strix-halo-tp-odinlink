@@ -225,6 +225,10 @@ uint32_t ds4_gpu_iq2_i8_wmma_runtime_features(
 void ds4_gpu_set_tp_runtime_features(uint32_t rank, uint32_t features);
 /* Exact-matched TP hello feature word supplied at bind time. */
 uint32_t ds4_gpu_get_tp_runtime_features(void);
+/* gfx1151-only exact cooperative one-token HC pre-chain. */
+int ds4_gpu_hc_stage_exact_coop_supported(void);
+/* gfx1151 exact long-context indexer top-k radix tree capability. */
+int ds4_gpu_indexer_topk_radix_tree_supported(void);
 void ds4_gpu_set_glm_model(bool enabled);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
@@ -2614,6 +2618,28 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         const ds4_gpu_tensor *residual_hc,
         const void             *model_map,
         uint64_t                model_size,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint64_t                norm_weight_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps);
+
+/* Fuse the ordinary one-token RMSNorm -> F16 HC projection -> split,
+ * weighted sum, and weighted RMSNorm chain without changing its arithmetic.
+ * The caller must negotiate DS4_TP_FEATURE_HC_STAGE_EXACT_COOP first. */
+int ds4_gpu_hc_stage_exact_coop_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *flat_scratch,
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
         uint64_t                scale_offset,
         uint64_t                base_offset,
         uint64_t                norm_weight_offset,

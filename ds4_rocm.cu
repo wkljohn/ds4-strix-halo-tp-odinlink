@@ -4,6 +4,7 @@
 
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm.h"
+#include <hip/hip_cooperative_groups.h>
 #include <hipblaslt/hipblaslt.h>
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
@@ -1849,6 +1850,10 @@ extern "C" int ds4_gpu_tp_expert_shard_remap(
 /* Exposed so callers can size the scratch buffer and know whether to bother. */
 extern "C" int ds4_gpu_tp_expert_shard_active(void) {
     return (g_tp_split_world == 2 && !g_tp_expert_shard_suspended) ? 1 : 0;
+}
+
+extern "C" int ds4_gpu_tp_split_rank(void) {
+    return (int)g_tp_split_rank;
 }
 
 

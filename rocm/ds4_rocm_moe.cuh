@@ -2477,6 +2477,55 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = add_in ? total + add_in[row] : total;
 }
 
+/* One-token Q4_K down with the six mid-Q8_K slots staged in LDS.  Default-off
+ * via DS4_ROCM_Q4K_DECODE_STAGE_MIDQ.  6 slots × 8 cuda_block_q8_K × 292 B =
+ * 14,016 B.  The cooperative copy of all 48 blocks runs before any row,
+ * slot, zero-weight, or selected-expert divergence so the 256-thread
+ * workgroup hits one syncthreads; the slot loop then preserves the shipped
+ * sum6 association, reduction, and fused-addend order bitwise. */
+static_assert(sizeof(cuda_block_q8_K) == 292,
+              "staged MIDQ LDS size assumes packed cuda_block_q8_K");
+static_assert(sizeof(cuda_block_q8_K) * 48u == 14016u,
+              "staged MIDQ copies 14,016 bytes");
+
+__global__ static void moe_down_q4K_sum6_staged_midq_kernel(
+        float *out,
+        const float *add_in,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t skip_zero_weight) {
+    __shared__ cuda_block_q8_K staged_midq[48];
+    for (uint32_t i = threadIdx.x; i < 48u; i += blockDim.x) {
+        staged_midq[i] = midq[i];
+    }
+    __syncthreads();
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        if (skip_zero_weight && weights[slot] == 0.0f) continue;
+        int32_t expert_i = selected[slot];
+        if (expert_i < 0) continue;
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = staged_midq + (uint64_t)slot * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q4_K_q8_K_block(wr + b, xq + b);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[row] = add_in ? total + add_in[row] : total;
+}
+
 __global__ static void moe_down_q4K_qwarp32_kernel(
         float *down_out,
         const char *down_base,

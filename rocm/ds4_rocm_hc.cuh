@@ -371,3 +371,108 @@ __global__ static void hc_split_weighted_sum_norm_fused_kernel(
         norm_out[(uint64_t)t * n_embd + col] = v * norm_scale * norm_w[col];
     }
 }
+
+#if defined(__HIP_PLATFORM_AMD__)
+/* Exact one-token HC pre-chain for the DeepSeek-V4 4096x4 HC layout.
+ *
+ * Phase 1 is the established 256-thread RMS reduction and materializes the
+ * same F32 flat scratch.  Phase 2 is the established 32-lane ordered F16 dot
+ * product, one resident block per output row.  Phase 3 runs the established
+ * HC split/weighted-sum/norm body in block zero.  Grid barriers replace two
+ * host-visible launch boundaries; split[0] temporarily holds the RMS scale
+ * and is overwritten by hc4_split_one before it can be observed.
+ */
+__global__ static void hc_stage_exact_coop_kernel(
+        float *out,
+        float *norm_out,
+        float *flat,
+        float *mix,
+        float *split,
+        const __half *weight,
+        const float *residual_hc,
+        const float *scale,
+        const float *base,
+        const float *norm_w,
+        uint32_t sinkhorn_iters,
+        float epsv,
+        float norm_eps) {
+    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+    constexpr uint32_t n_embd = 4096u;
+    constexpr uint32_t n_hc = 4u;
+    constexpr uint32_t hc_dim = n_embd * n_hc;
+    constexpr uint32_t mix_hc = 24u;
+    const uint32_t tid = threadIdx.x;
+
+    if (blockIdx.x == 0) {
+        float sum = 0.0f;
+        for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
+            const float v = residual_hc[i];
+            sum += v * v;
+        }
+        __shared__ float rms_partial[256];
+        rms_partial[tid] = sum;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) rms_partial[tid] += rms_partial[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            split[0] = rsqrtf(rms_partial[0] / (float)hc_dim + norm_eps);
+        }
+        __syncthreads();
+        for (uint32_t i = tid; i < hc_dim; i += blockDim.x) {
+            flat[i] = residual_hc[i] * split[0];
+        }
+    }
+    grid.sync();
+
+    const uint32_t row = blockIdx.x;
+    __shared__ float dot_partial[32];
+    if (tid < 32u) {
+        constexpr uint32_t chunk = (hc_dim + 31u) / 32u;
+        const uint32_t k0 = tid * chunk;
+        const uint32_t k1 = min(k0 + chunk, hc_dim);
+        const __half *wr = weight + (uint64_t)row * hc_dim;
+        float sum = 0.0f;
+        for (uint32_t i = k0; i < k1; ++i) {
+            sum += __half2float(wr[i]) * flat[i];
+        }
+        dot_partial[tid] = sum;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint32_t i = 0; i < 32u; ++i) total += dot_partial[i];
+        mix[row] = total;
+    }
+    grid.sync();
+
+    if (blockIdx.x == 0) {
+        if (tid == 0) {
+            hc4_split_one(split, mix, scale, base, sinkhorn_iters, epsv);
+        }
+        __syncthreads();
+        float sum = 0.0f;
+        for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+            float acc = 0.0f;
+            for (uint32_t h = 0; h < n_hc; ++h) {
+                acc += residual_hc[(uint64_t)h * n_embd + col] * split[h];
+            }
+            out[col] = acc;
+            sum += acc * acc;
+        }
+        __shared__ float norm_partial[256];
+        norm_partial[tid] = sum;
+        __syncthreads();
+        for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) norm_partial[tid] += norm_partial[tid + stride];
+            __syncthreads();
+        }
+        const float norm_scale =
+            rsqrtf(norm_partial[0] / (float)n_embd + norm_eps);
+        for (uint32_t col = tid; col < n_embd; col += blockDim.x) {
+            norm_out[col] = out[col] * norm_scale * norm_w[col];
+        }
+    }
+}
+#endif

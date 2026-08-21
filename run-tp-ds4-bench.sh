@@ -16,9 +16,47 @@ EXTRA_ENV=("$@")
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BENCH_CONFIG=${DS4_BENCH_CONFIG:-$SCRIPT_DIR/bench.env.local}
+
+# bench.env.local supplies machine-local defaults. Preserve every explicitly
+# exported DS4_* value from the invoking command so a one-run provider/address
+# override cannot be silently clobbered by a plain assignment in that file.
+# Use indirect expansion and printf -v rather than eval so arbitrary values are
+# restored byte-for-byte. Process substitution plus `|| true` is intentional:
+# compgen returns nonzero when a clean environment has no matching variables.
+declare -A DS4_INVOKING_ENV=()
+while IFS= read -r ds4_env_name; do
+  DS4_INVOKING_ENV["$ds4_env_name"]=${!ds4_env_name}
+done < <(compgen -e DS4_ || true)
 if [[ -r $BENCH_CONFIG ]]; then
   # shellcheck disable=SC1090
   source "$BENCH_CONFIG"
+fi
+DS4_CONFIG_RDMA_PROFILE=${DS4_BENCH_RDMA_PROFILE-}
+if (( ${#DS4_INVOKING_ENV[@]} )); then
+  for ds4_env_name in "${!DS4_INVOKING_ENV[@]}"; do
+    printf -v "$ds4_env_name" '%s' "${DS4_INVOKING_ENV[$ds4_env_name]}"
+    export "$ds4_env_name"
+  done
+fi
+unset ds4_env_name
+if [[ ${DS4_INVOKING_ENV[DS4_BENCH_RDMA_PROFILE]+set} == set &&
+      ${DS4_INVOKING_ENV[DS4_BENCH_RDMA_PROFILE]} != "$DS4_CONFIG_RDMA_PROFILE" ]]; then
+  # Provider-specific values from a different config profile are unsafe. Keep
+  # only values explicitly supplied with this invocation; otherwise use the
+  # selected provider's device defaults and require its address explicitly.
+  [[ ${DS4_INVOKING_ENV[DS4_LOCAL_RDMA_DEVICE]+set} == set ]] ||
+    unset DS4_LOCAL_RDMA_DEVICE
+  [[ ${DS4_INVOKING_ENV[DS4_PEER_RDMA_DEVICE]+set} == set ]] ||
+    unset DS4_PEER_RDMA_DEVICE
+  [[ ${DS4_INVOKING_ENV[DS4_RDMA_GID_INDEX]+set} == set ]] ||
+    unset DS4_RDMA_GID_INDEX
+  [[ ${DS4_INVOKING_ENV[DS4_COORDINATOR_ADDR]+set} == set ]] ||
+    unset DS4_COORDINATOR_ADDR
+fi
+if [[ -r $BENCH_CONFIG ]]; then
+  BENCH_CONFIG_SHA256=$(sha256sum "$BENCH_CONFIG" | awk '{print $1}')
+else
+  BENCH_CONFIG_SHA256=none
 fi
 REPO=${DS4_BENCH_REPO:-$SCRIPT_DIR}
 PEER_REPO=${DS4_PEER_REPO:-$REPO}
@@ -26,6 +64,10 @@ PEER_MGMT=${DS4_PEER_MGMT:-}
 PEER_HOST_KEY_ALIAS=${DS4_PEER_HOST_KEY_ALIAS:-${PEER_MGMT#*@}}
 RDMA_PROFILE=${DS4_BENCH_RDMA_PROFILE:-odinlink}
 PREFILL_CHUNK_EXPLICIT=${DS4_BENCH_PREFILL_CHUNK+x}
+if [[ -n $PREFILL_CHUNK_EXPLICIT && -z ${DS4_BENCH_PREFILL_CHUNK-} ]]; then
+  echo "error: DS4_BENCH_PREFILL_CHUNK cannot be empty" >&2
+  exit 2
+fi
 case $RDMA_PROFILE in
   odinlink)
     COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
@@ -36,6 +78,7 @@ case $RDMA_PROFILE in
     COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
     LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
     PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
+    RDMA_GID_INDEX=${DS4_RDMA_GID_INDEX:-3}
     ;;
   *)
     echo "error: DS4_BENCH_RDMA_PROFILE must be odinlink or roce-v2" >&2
@@ -257,18 +300,18 @@ if [[ $DECODE_SELF_CHECK == 1 || $TEACHER_FORCE_CONTROL == 1 ]]; then
   EXPECT_GREEDY_TOP2=0
 fi
 
+[[ -n $COORDINATOR_ADDR ]] || {
+  echo "error: set DS4_COORDINATOR_ADDR in bench.env.local or the invoking environment" >&2; exit 2;
+}
+
 if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
-  echo "validated_config routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
+  echo "validated_config rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
   exit 0
 fi
 
 [[ -n $PEER_MGMT ]] || {
   echo "error: set DS4_PEER_MGMT in bench.env.local" >&2; exit 2;
 }
-[[ -n $COORDINATOR_ADDR ]] || {
-  echo "error: set DS4_COORDINATOR_ADDR in bench.env.local" >&2; exit 2;
-}
-
 COMMON_ENV=(DS4_TP_TIMEOUT_SEC="$TP_TIMEOUT_SEC" "${CURRENT_OPT_ENV[@]}")
 RDMA_ARGS=(--rdma-device "$LOCAL_RDMA_DEVICE")
 WORKER_RDMA_ARGS=(--rdma-device "$PEER_RDMA_DEVICE")
@@ -285,7 +328,6 @@ if [[ $RDMA_PROFILE == odinlink ]]; then
     LD_LIBRARY_PATH="$ODL_LD_PATH"
   )
 else
-  RDMA_GID_INDEX=${DS4_RDMA_GID_INDEX:-3}
   RDMA_ARGS+=(--rdma-gid-index "$RDMA_GID_INDEX")
   WORKER_RDMA_ARGS+=(--rdma-gid-index "$RDMA_GID_INDEX")
 fi
@@ -445,6 +487,8 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'tag=%s\n' "$TAG"
   printf 'source_commit=%s\n' "$SOURCE_COMMIT"
   printf 'source_dirty=%s\n' "$SOURCE_DIRTY"
+  printf 'bench_config=%s\n' "$BENCH_CONFIG"
+  printf 'bench_config_sha256=%s\n' "$BENCH_CONFIG_SHA256"
   printf 'ds4_sha256=%s\n' "$LOCAL_DS4_HASH"
   printf 'peer_ds4_sha256=%s\n' "$PEER_DS4_HASH"
   printf 'ds4_bench_tp_sha256=%s\n' "$LOCAL_BENCH_HASH"
@@ -459,6 +503,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'context=%s\n' "$CONTEXT"
   printf 'prefill_chunk=%s\n' "$PREFILL_CHUNK"
   printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
+  printf 'coordinator_addr=%s\n' "$COORDINATOR_ADDR"
   printf 'coordinator_rdma_device=%s\n' "$LOCAL_RDMA_DEVICE"
   printf 'worker_rdma_device=%s\n' "$PEER_RDMA_DEVICE"
   printf 'rdma_gid_index=%s\n' "${RDMA_GID_INDEX:-n/a}"
