@@ -28286,6 +28286,11 @@ static bool metal_graph_encode_layer_attention_batch(
         layer->attn_output_b->type == DS4_TENSOR_Q8_0 &&
         (ds4_gpu_get_tp_runtime_features() &
          DS4_TP_FEATURE_Q8_ATTN_OUT_WEIGHT_OUTER) != 0u;
+    const bool tp_batch_exact_attn_head2 =
+        tp_batch_attn_head_split && n_tokens >= 2u && n_tokens <= 5u &&
+        ratio == 4u && !metal_graph_attn_comp_cache_is_f16() &&
+        (ds4_gpu_get_tp_runtime_features() &
+         DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2) != 0u;
 #endif
     /* Fidelity experiment for anchorless DSpark chaining.  Current one-token
      * ROCm TP decode contributes the first half of the grouped attention
@@ -29923,6 +29928,92 @@ static bool metal_graph_encode_layer_attention_batch(
             }
         }
 
+        bool exact_head2_done = false;
+#ifdef DS4_ROCM_BUILD
+        /* The serial verifier selects an unsorted exact top-k independently
+         * for every row, appends that row's raw KV, then launches one 256-
+         * thread CTA per owned head.  Preserve those selections and raw-ring
+         * states, but consume all rows with two independent heads per CTA.
+         * Pre-store the raw rows only when later appends cannot overwrite any
+         * earlier row's visible window; otherwise retain the interleaved
+         * serial path below. */
+        if (ok && tp_batch_exact_attn_head2 && raw_prefix_tokens == 0u &&
+            comp_counts && index_counts) {
+            uint32_t n_raw_by_token[5] = {0u};
+            uint32_t raw_start_by_token[5] = {0u};
+            uint32_t n_comp_by_token[5] = {0u};
+            uint32_t visible_comp_by_token[5] = {0u};
+            bool eligible = true;
+            for (uint32_t t = 0u; eligible && t < n_tokens; t++) {
+                const uint32_t pos = pos0 + t;
+                n_raw_by_token[t] = metal_graph_raw_span_for_batch(g, pos, 1u);
+                raw_start_by_token[t] = metal_graph_raw_start_for_span(
+                        g, pos, n_raw_by_token[t]);
+                n_comp_by_token[t] = comp_counts[t];
+                visible_comp_by_token[t] = (pos + 1u) / ratio;
+                if (visible_comp_by_token[t] > n_comp_by_token[t])
+                    visible_comp_by_token[t] = n_comp_by_token[t];
+                eligible = n_raw_by_token[t] != 0u &&
+                    n_comp_by_token[t] > DS4_N_INDEXER_TOP_K &&
+                    index_counts[t] >= DS4_N_INDEXER_TOP_K &&
+                    visible_comp_by_token[t] != 0u;
+            }
+            if (eligible &&
+                g->raw_cap - n_raw_by_token[0] >= n_tokens) {
+                const float index_scale = 1.0f /
+                    sqrtf((float)(DS4_N_INDEXER_HEAD_DIM *
+                                  DS4_N_INDEXER_HEAD));
+                for (uint32_t t = 0u; ok && t < n_tokens; t++) {
+                    ds4_gpu_tensor *indexer_q_view = metal_graph_tensor_row_view(
+                            metal_graph_batch_indexer_q(g), t,
+                            (uint64_t)DS4_N_INDEXER_HEAD *
+                                DS4_N_INDEXER_HEAD_DIM);
+                    ds4_gpu_tensor *indexer_w_view = metal_graph_tensor_row_view(
+                            metal_graph_batch_indexer_weights(g), t,
+                            DS4_N_INDEXER_HEAD);
+                    ds4_gpu_tensor *selected_view = metal_graph_tensor_row_view(
+                            metal_graph_comp_selected(g), t,
+                            DS4_N_INDEXER_TOP_K);
+                    ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(
+                            metal_graph_batch_kv(g), t, DS4_N_HEAD_DIM);
+                    ok = indexer_q_view && indexer_w_view && selected_view &&
+                         kv_view &&
+                         ds4_gpu_indexer_score_one_tensor(
+                             metal_graph_indexer_scores(g), indexer_q_view,
+                             indexer_w_view, g->layer_index_comp_cache[il],
+                             index_counts[t], DS4_N_INDEXER_HEAD,
+                             DS4_N_INDEXER_HEAD_DIM, index_scale) != 0 &&
+                         ds4_gpu_indexer_topk_tensor(
+                             selected_view, metal_graph_indexer_scores(g),
+                             index_counts[t], 1u,
+                             DS4_N_INDEXER_TOP_K) != 0 &&
+                         ds4_gpu_store_raw_kv_tensor(
+                             g->layer_raw_cache[il], kv_view, g->raw_cap,
+                             (pos0 + t) % g->raw_cap,
+                             DS4_N_HEAD_DIM) != 0;
+                    ds4_gpu_tensor_free(kv_view);
+                    ds4_gpu_tensor_free(selected_view);
+                    ds4_gpu_tensor_free(indexer_w_view);
+                    ds4_gpu_tensor_free(indexer_q_view);
+                }
+                if (ok) {
+                    ok = ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
+                            metal_graph_batch_heads(g), model->map, model->size,
+                            tp_batch_sinks_offset, metal_graph_batch_q(g),
+                            g->layer_raw_cache[il],
+                            g->layer_attn_comp_cache[il],
+                            metal_graph_attn_comp_cache_is_f16(),
+                            metal_graph_comp_selected(g), n_tokens,
+                            g->raw_cap, DS4_N_INDEXER_TOP_K,
+                            tp_batch_heads, DS4_N_HEAD_DIM,
+                            n_raw_by_token, raw_start_by_token,
+                            n_comp_by_token, visible_comp_by_token) != 0;
+                }
+                exact_head2_done = ok;
+            }
+        }
+#endif
+
         if (raw_prefix_tokens != 0) {
             if (tp_row_split_attn && raw_prefix_tokens == n_tokens) {
                 /* tp_attn_full_raw guarantees the whole chunk stays raw
@@ -29952,7 +30043,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                   DS4_N_HEAD_DIM) != 0;
             }
         }
-        if (raw_prefix_tokens < n_tokens) {
+        if (!exact_head2_done && raw_prefix_tokens < n_tokens) {
             for (uint32_t t = raw_prefix_tokens; ok && t < n_tokens; t++) {
                 const uint32_t pos = pos0 + t;
                 const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
@@ -52240,9 +52331,15 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         batch_attn_head_split_requested &&
         metal_graph_tp_env_flag(
             "DS4_ROCM_Q8_ATTN_OUT_WEIGHT_OUTER", false);
+    const bool dspark_exact_attn_head2_requested =
+        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        batch_attn_head_split_requested &&
+        metal_graph_tp_env_flag(
+            "DS4_ROCM_DSPARK_EXACT_ATTN_HEAD2", false);
 #else
     const bool q4k_verify_first_owner_requested = false;
     const bool q8_attn_out_weight_outer_requested = false;
+    const bool dspark_exact_attn_head2_requested = false;
 #endif
     const char *rdma_logits = getenv("DS4_TP_RDMA_LOGITS");
     const bool rdma_logits_requested =
@@ -52277,6 +52374,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
              DS4_TP_FEATURE_Q4K_VERIFY_FIRST_OWNER : 0u) |
         (q8_attn_out_weight_outer_requested ?
              DS4_TP_FEATURE_Q8_ATTN_OUT_WEIGHT_OUTER : 0u) |
+        (dspark_exact_attn_head2_requested ?
+             DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2 : 0u) |
         (rdma_logits_requested && !greedy_top2_enabled ?
              DS4_TP_FEATURE_RDMA_LOGITS : 0u) |
         (rank0_full_logits_requested && !greedy_top2_enabled ?

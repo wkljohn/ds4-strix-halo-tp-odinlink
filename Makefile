@@ -55,7 +55,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-big-gate-overlap test-tp-verify-gate-latency test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-q4k-verify-batch-oracle test-rocm-q8-attn-out-weight-outer test-rocm-indexer-exact-token-loop test-rocm-compressor-row-shard-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-big-gate-overlap test-tp-verify-gate-latency test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-q4k-verify-batch-oracle test-rocm-q8-attn-out-weight-outer test-rocm-indexer-exact-token-loop test-rocm-attention-exact-head2 test-rocm-compressor-row-shard-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
 	python3 tests/test_frontier_logits_gate.py
@@ -554,6 +554,18 @@ test-rocm-indexer-exact-token-loop: tests/test_rocm_indexer_exact_token_loop
 	./tests/test_rocm_indexer_exact_token_loop 3
 	./tests/test_rocm_indexer_exact_token_loop 4
 	./tests/test_rocm_indexer_exact_token_loop 5
+
+tests/test_rocm_attention_exact_head2.o: tests/test_rocm_attention_exact_head2.cu ds4_gpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_attention_exact_head2: tests/test_rocm_attention_exact_head2.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-attention-exact-head2: tests/test_rocm_attention_exact_head2
+	./tests/test_rocm_attention_exact_head2 2
+	./tests/test_rocm_attention_exact_head2 3
+	./tests/test_rocm_attention_exact_head2 4
+	./tests/test_rocm_attention_exact_head2 5
 
 test-rocm-q4k-staged-midq-oracle: tests/test_rocm_q4k_staged_midq_oracle
 	@set -e; control=$$(mktemp); candidate=$$(mktemp); \

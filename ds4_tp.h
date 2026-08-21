@@ -101,6 +101,10 @@ enum {
      * weight tile across rows while retaining the one-row arithmetic tree.
      * Negotiate the scratch/launch schedule across independent ranks. */
     DS4_TP_FEATURE_Q8_ATTN_OUT_WEIGHT_OUTER = UINT32_C(1) << 22,
+    /* The exact DSpark indexed-attention verifier packs two independent
+     * 256-thread head reductions into one gfx1151 workgroup and batches the
+     * verifier rows.  Both ranks must select the same launch schedule. */
+    DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2 = UINT32_C(1) << 23,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {

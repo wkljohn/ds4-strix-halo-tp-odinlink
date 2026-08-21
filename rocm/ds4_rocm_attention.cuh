@@ -624,6 +624,158 @@ __global__ static void attention_decode_indexed_mixed_one_fast_oldhip_kernel(
     }
 }
 
+/* Two independent 256-thread copies of the shipped old-HIP reduction tree in
+ * one workgroup.  blockDim.x must be exactly 512.  The hard-coded eight-wave
+ * second stage is what makes each subgroup bit-identical to a 256-thread
+ * attention_block_{max,sum}_oldhip_w32 call; deriving nwarp from blockDim.x
+ * would mix the two heads. */
+__device__ __forceinline__ static float attention_subgroup_max_oldhip_w32(
+        float v, float *sh, uint32_t sub_tid) {
+    const uint32_t lane = sub_tid & 31u;
+    const uint32_t wid = sub_tid >> 5u;
+    v = attention_warp_max_oldhip_w32(v);
+    if (lane == 0u) sh[wid] = v;
+    __syncthreads();
+    v = (sub_tid < 8u) ? sh[lane] : -3.4e38f;
+    if (wid == 0u) v = attention_warp_max_oldhip_w32(v);
+    if (sub_tid == 0u) sh[0] = v;
+    __syncthreads();
+    return sh[0];
+}
+
+__device__ __forceinline__ static float attention_subgroup_sum_oldhip_w32(
+        float v, float *sh, uint32_t sub_tid) {
+    const uint32_t lane = sub_tid & 31u;
+    const uint32_t wid = sub_tid >> 5u;
+    v = attention_warp_sum_oldhip_w32(v);
+    if (lane == 0u) sh[wid] = v;
+    __syncthreads();
+    v = (sub_tid < 8u) ? sh[lane] : 0.0f;
+    if (wid == 0u) v = attention_warp_sum_oldhip_w32(v);
+    if (sub_tid == 0u) sh[0] = v;
+    __syncthreads();
+    return sh[0];
+}
+
+__device__ __forceinline__ static uint4 attention_exact_state_for_token(
+        uint32_t t, uint4 s0, uint4 s1, uint4 s2, uint4 s3, uint4 s4) {
+    switch (t) {
+        case 0u: return s0;
+        case 1u: return s1;
+        case 2u: return s2;
+        case 3u: return s3;
+        default: return s4;
+    }
+}
+
+/* Exact H=2 indexed-attention batch prototype. Each token remains a separate
+ * grid row; each 256-thread subgroup owns one head and retains the shipped
+ * row striding, serial float4 dot, softmax reduction, and raw-then-comp output
+ * recurrence. The raw top-k order is compacted once per CTA and shared by the
+ * two heads; it must never pass through the sorted multi-token path. */
+__global__ static void attention_decode_indexed_exact_head2_batch_kernel(
+        float *heads,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const int32_t *topk,
+        const float *sinks,
+        uint32_t n_tokens,
+        uint32_t raw_cap,
+        uint32_t top_k,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t score_stride,
+        uint4 state0,
+        uint4 state1,
+        uint4 state2,
+        uint4 state3,
+        uint4 state4) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t subgroup = threadIdx.x >> 8u;
+    const uint32_t sub_tid = threadIdx.x & 255u;
+    const uint32_t h = blockIdx.y * 2u + subgroup;
+    if (t >= n_tokens || blockDim.x != 512u || head_dim != 512u) return;
+
+    extern __shared__ int32_t smem[];
+    uint32_t *comp_rows = (uint32_t *)smem;
+    float *scores = (float *)(comp_rows + top_k);
+    float *reduce = scores + 2u * score_stride;
+    float *head_scores = scores + subgroup * score_stride;
+    float *head_reduce = reduce + subgroup * 8u;
+
+    const uint4 state = attention_exact_state_for_token(
+        t, state0, state1, state2, state3, state4);
+    const uint32_t n_raw = state.x;
+    const uint32_t raw_start = state.y;
+    const uint32_t n_comp = state.z;
+    const uint32_t visible_comp = state.w;
+
+    __shared__ uint32_t comp_count_s;
+    if (threadIdx.x == 0u) {
+        comp_count_s = 0u;
+        for (uint32_t i = 0u;
+             i < top_k && comp_count_s < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
+             i++) {
+            const int32_t ci = topk[(uint64_t)t * top_k + i];
+            if (ci < 0) continue;
+            const uint32_t c = (uint32_t)ci;
+            if (c < n_comp && c < visible_comp) {
+                comp_rows[comp_count_s++] = c;
+            }
+        }
+    }
+    __syncthreads();
+    const uint32_t comp_count = comp_count_s;
+    const uint32_t n_rows = n_raw + comp_count;
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+
+    float local_max = sinks[h];
+    for (uint32_t r = sub_tid; r < n_raw; r += 256u) {
+        const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
+        const float *kv = raw_kv + (uint64_t)row * head_dim;
+        float s = attention_dot_f32_vec4_oldhip(qh, kv, head_dim);
+        s *= scale;
+        head_scores[r] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    for (uint32_t c = sub_tid; c < comp_count; c += 256u) {
+        const uint32_t row = comp_rows[c];
+        const float *kv = comp_kv + (uint64_t)row * head_dim;
+        const float s = attention_dot_f32_vec4_oldhip(qh, kv, head_dim) * scale;
+        head_scores[n_raw + c] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    const float max_score = attention_subgroup_max_oldhip_w32(
+        local_max, head_reduce, sub_tid);
+
+    float local_sum = 0.0f;
+    for (uint32_t r = sub_tid; r < n_rows; r += 256u) {
+        const float w = expf(head_scores[r] - max_score);
+        head_scores[r] = w;
+        local_sum += w;
+    }
+    if (sub_tid == 0u) local_sum += expf(sinks[h] - max_score);
+    const float denom = attention_subgroup_sum_oldhip_w32(
+        local_sum, head_reduce, sub_tid);
+    const float inv_denom = 1.0f / denom;
+
+    for (uint32_t d = sub_tid; d < head_dim; d += 256u) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
+            acc += head_scores[r] * raw_kv[(uint64_t)row * head_dim + d];
+        }
+        for (uint32_t c = 0; c < comp_count; c++) {
+            const uint32_t row = comp_rows[c];
+            acc += head_scores[n_raw + c] *
+                   comp_kv[(uint64_t)row * head_dim + d];
+        }
+        heads[((uint64_t)t * n_head + h) * head_dim + d] = acc * inv_denom;
+    }
+}
+
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,

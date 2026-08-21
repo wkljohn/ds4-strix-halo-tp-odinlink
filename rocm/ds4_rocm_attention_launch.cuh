@@ -727,6 +727,100 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 
+extern "C" int ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        uint32_t              n_tokens,
+        uint32_t              raw_cap,
+        uint32_t              top_k,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        const uint32_t       *n_raw_by_token,
+        const uint32_t       *raw_start_by_token,
+        const uint32_t       *n_comp_by_token,
+        const uint32_t       *visible_comp_by_token) {
+    if (!heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
+        comp_kv_f16 != 0u ||
+        !n_raw_by_token || !raw_start_by_token || !n_comp_by_token ||
+        !visible_comp_by_token || n_tokens < 2u || n_tokens > 5u ||
+        raw_cap == 0u || top_k == 0u ||
+        top_k > DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP ||
+        n_head == 0u || (n_head & 1u) != 0u || head_dim != 512u ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
+        topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
+        return 0;
+    }
+    uint4 states[5] = {};
+    uint32_t max_comp = 0u;
+    uint32_t score_stride = 0u;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        if (n_raw_by_token[t] == 0u || n_raw_by_token[t] > raw_cap ||
+            raw_start_by_token[t] >= raw_cap ||
+            visible_comp_by_token[t] == 0u ||
+            visible_comp_by_token[t] > n_comp_by_token[t]) return 0;
+        states[t] = make_uint4(n_raw_by_token[t], raw_start_by_token[t],
+                               n_comp_by_token[t], visible_comp_by_token[t]);
+        if (n_comp_by_token[t] > max_comp) max_comp = n_comp_by_token[t];
+        const uint32_t rows = n_raw_by_token[t] +
+            (top_k < visible_comp_by_token[t] ? top_k : visible_comp_by_token[t]);
+        if (rows > score_stride) score_stride = rows;
+    }
+    if (comp_kv->bytes < (uint64_t)max_comp * head_dim * sizeof(float)) return 0;
+    const float *sinks = (const float *)cuda_model_range_ptr(
+        model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
+        "attn_sinks");
+    if (!sinks) return 0;
+
+    /* A post-window raw ring cannot reproduce an earlier token if later
+     * appends overwrote one of its visible slots. Keep the exact serial oracle
+     * for this boundary and for any future shape that exceeds the LDS budget. */
+    const size_t shmem = (size_t)top_k * sizeof(uint32_t) +
+                         (size_t)2u * score_stride * sizeof(float) +
+                         (size_t)16u * sizeof(float);
+    const bool serial_fallback = raw_cap - n_raw_by_token[0] < n_tokens ||
+                                 shmem > 32768u;
+    if (serial_fallback) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            const uint32_t rows = n_raw_by_token[t] +
+                (top_k < visible_comp_by_token[t] ? top_k : visible_comp_by_token[t]);
+            attention_decode_indexed_mixed_one_fast_oldhip_kernel<<<
+                (unsigned)n_head, 256, (size_t)rows * sizeof(float)>>>(
+                    (float *)heads->ptr + (uint64_t)t * n_head * head_dim,
+                    (const float *)q->ptr + (uint64_t)t * n_head * head_dim,
+                    (const float *)raw_kv->ptr,
+                    (const float *)comp_kv->ptr,
+                    (const int32_t *)topk->ptr + (uint64_t)t * top_k,
+                    sinks, n_raw_by_token[t], raw_cap, raw_start_by_token[t],
+                    n_comp_by_token[t], top_k,
+                    visible_comp_by_token[t] - 1u, 1u,
+                    n_head, head_dim, 1u);
+        }
+        return cuda_ok(cudaGetLastError(),
+                       "attention indexed exact head2 serial fallback");
+    }
+
+    const dim3 grid(n_tokens, n_head / 2u, 1u);
+    attention_decode_indexed_exact_head2_batch_kernel<<<grid, 512, shmem>>>(
+        (float *)heads->ptr, (const float *)q->ptr,
+        (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
+        (const int32_t *)topk->ptr, sinks, n_tokens, raw_cap, top_k,
+        n_head, head_dim, score_stride, states[0], states[1], states[2],
+        states[3], states[4]);
+    return cuda_ok(cudaGetLastError(),
+                   "attention indexed exact head2 batch launch");
+}
+
 static uint64_t attention_mixed_cublas_tmp_bytes(
         uint32_t n_keys,
         uint32_t n_tokens,
