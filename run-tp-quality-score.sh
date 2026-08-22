@@ -31,6 +31,7 @@ COORD_LOG=$OUT/coordinator-$TAG.log
 WORKER_LOG=$OUT/worker-$TAG.log
 REMOTE_WORKER_LOG=$PEER_OUT/worker-$TAG.log
 SCORES=$OUT/$TAG.tsv
+SCORES_MANIFEST=$OUT/$TAG.manifest
 WORKER_PIDFILE=$PEER_OUT/worker-$TAG.pid
 PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes
   -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS" "$PEER_MGMT")
@@ -89,6 +90,14 @@ PEER_MODEL_FINGERPRINT=$("${PEER_SSH[@]}" "p=$MODEL_Q; s=\$(stat -c %s \"\$p\");
 LOCAL_HASH=$(sha256sum "$REPO/ds4" | awk '{print $1}')
 PEER_HASH=$("${PEER_SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}')
 [[ $LOCAL_HASH == "$PEER_HASH" ]] || { echo "error: rank binary hashes differ" >&2; exit 1; }
+SOURCE_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+if git -C "$REPO" diff --quiet --ignore-submodules -- 2>/dev/null &&
+   git -C "$REPO" diff --cached --quiet --ignore-submodules -- 2>/dev/null &&
+   [[ -z $(git -C "$REPO" ls-files --others --exclude-standard) ]]; then
+  SOURCE_DIRTY=0
+else
+  SOURCE_DIRTY=1
+fi
 
 if pgrep -af '[s]core_official.*--role coordinator' >/dev/null; then
   echo "error: a quality coordinator is already running" >&2; exit 1
@@ -164,6 +173,26 @@ for log in "$COORD_LOG" "$WORKER_LOG"; do
     echo "error: fallback or transport failure in $log" >&2; exit 1;
   }
 done
+TARGET_TOKENS=$(awk -F'\t' 'NR > 1 {sum += $3} END {print sum+0}' "$SCORES")
+printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
+{
+  printf 'tag=%s\n' "$TAG"
+  printf 'source_commit=%s\n' "$SOURCE_COMMIT"
+  printf 'source_dirty=%s\n' "$SOURCE_DIRTY"
+  printf 'model=%s\n' "$MODEL"
+  printf 'model_size=%s\n' "$LOCAL_SIZE"
+  printf 'model_sample_sha256=%s\n' "$LOCAL_MODEL_FINGERPRINT"
+  printf 'ds4_sha256=%s\n' "$LOCAL_HASH"
+  printf 'scorer_sha256=%s\n' "$(sha256sum "$SCORER" | awk '{print $1}')"
+  printf 'quality_input_sha256=%s\n' "$(sha256sum "$MANIFEST" | awk '{print $1}')"
+  printf 'cases=%s\n' "$MAX_CASES"
+  printf 'target_tokens=%s\n' "$TARGET_TOKENS"
+  printf 'context=%s\n' "$CONTEXT"
+  printf 'rdma_profile=odinlink\n'
+  printf 'dspark=0\n'
+  printf 'extra_env=%s\n' "$EXTRA_ENV_Q"
+} > "$SCORES_MANIFEST"
 echo "scores=$SCORES"
+echo "scores_manifest=$SCORES_MANIFEST"
 grep -E 'cases=|api_ref_tokens=' "$COORD_LOG" | tail -2
 echo QUALITY_RUN_DONE

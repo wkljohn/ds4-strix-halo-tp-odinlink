@@ -113,6 +113,8 @@ ROCPROF_REGION=${DS4_BENCH_ROCPROF_REGION:-decode}
 ROCPROF_RANK=${DS4_BENCH_ROCPROF_RANK:-coordinator}
 SHOW_OUTPUT=${DS4_BENCH_SHOW_OUTPUT:-0}
 CANDIDATE=${DS4_BENCH_CANDIDATE:-0}
+CANDIDATE_LANE=${DS4_BENCH_LANE:-A}
+BASELINE_ID=${DS4_BENCH_BASELINE_ID:-}
 EXPECTED_FNV64=${DS4_BENCH_EXPECT_FNV64:-}
 TP_TIMEOUT_SEC=${DS4_BENCH_TP_TIMEOUT_SEC:-60}
 TP_TIMEOUT_EXPLICIT=${DS4_BENCH_TP_TIMEOUT_SEC+x}
@@ -124,6 +126,9 @@ QUALITY=${DS4_BENCH_QUALITY:-0}
 ALLOW_NONSTANDARD_SPLIT=${DS4_BENCH_ALLOW_NONSTANDARD_SPLIT:-0}
 VALIDATE_CONFIG_ONLY=${DS4_BENCH_VALIDATE_CONFIG_ONLY:-0}
 DUMP_FRONTIER_LOGITS_DIR=${DS4_BENCH_DUMP_FRONTIER_LOGITS_DIR:-}
+FROZEN_TOKEN_FILE=${DS4_BENCH_FROZEN_TOKEN_FILE:-}
+FROZEN_LOGITS_DIR=${DS4_BENCH_FROZEN_LOGITS_DIR:-}
+TOOLCHAIN_ID=${DS4_BENCH_TOOLCHAIN_ID:-}
 EXPECT_GREEDY_TOP2=0
 CANDIDATE_ARGS=()
 CLEAN_ENV=(env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8)
@@ -158,9 +163,24 @@ if [[ -n ${DS4_TP_EXPERT_SPLIT+x} ]]; then
   exit 2
 fi
 if [[ $CANDIDATE == 1 ]]; then
-  [[ $EXPECTED_FNV64 =~ ^[0-9a-fA-F]{16}$ ]] || {
-    echo "error: candidate runs require DS4_BENCH_EXPECT_FNV64" >&2; exit 2;
+  [[ $CANDIDATE_LANE == A || $CANDIDATE_LANE == B || $CANDIDATE_LANE == C ]] || {
+    echo "error: DS4_BENCH_LANE must be A, B, or C" >&2; exit 2;
   }
+  if [[ $CANDIDATE_LANE == A ]]; then
+    [[ $EXPECTED_FNV64 =~ ^[0-9a-fA-F]{16}$ ]] || {
+      echo "error: lane A candidates require DS4_BENCH_EXPECT_FNV64" >&2; exit 2;
+    }
+    [[ -z $BASELINE_ID ]] || {
+      echo "error: lane A uses the exact expected fingerprint, not DS4_BENCH_BASELINE_ID" >&2; exit 2;
+    }
+  else
+    [[ $BASELINE_ID =~ ^sha256:[0-9a-f]{64}$ ]] || {
+      echo "error: lane $CANDIDATE_LANE candidates require a content-addressed DS4_BENCH_BASELINE_ID" >&2; exit 2;
+    }
+    [[ -z $EXPECTED_FNV64 ]] || {
+      echo "error: lane $CANDIDATE_LANE records a proposed new fingerprint; do not pin it to the predecessor FNV" >&2; exit 2;
+    }
+  fi
   SHOW_OUTPUT=1
   CANDIDATE_ARGS=(--semantic-smoke)
   if [[ $ROCPROF != 0 ]]; then
@@ -248,6 +268,24 @@ if [[ $DECODE_SELF_CHECK == 1 && $TEACHER_FORCE_CONTROL == 1 ]]; then
   echo "error: choose only one TP decode diagnostic per run" >&2
   exit 2
 fi
+if [[ -n $FROZEN_TOKEN_FILE || -n $FROZEN_LOGITS_DIR ]]; then
+  [[ -n $FROZEN_TOKEN_FILE && -n $FROZEN_LOGITS_DIR ]] || {
+    echo "error: DS4_BENCH_FROZEN_TOKEN_FILE and DS4_BENCH_FROZEN_LOGITS_DIR must be used together" >&2
+    exit 2
+  }
+  [[ -n $TOOLCHAIN_ID ]] || {
+    echo "error: frozen-token evidence requires DS4_BENCH_TOOLCHAIN_ID" >&2
+    exit 2
+  }
+  [[ $CANDIDATE == 0 && $ROCPROF == 0 ]] || {
+    echo "error: frozen-token full-logit comparison is diagnostic, not benchmark evidence" >&2
+    exit 2
+  }
+  [[ $DECODE_SELF_CHECK == 0 && $TEACHER_FORCE_CONTROL == 0 ]] || {
+    echo "error: choose only one TP decode diagnostic per run" >&2
+    exit 2
+  }
+fi
 
 [[ -r $MODEL && -r $PROMPT_FILE ]] || { echo "error: missing local model or prompt" >&2; exit 1; }
 CURRENT_OPT_ENV=(
@@ -304,7 +342,8 @@ fi
 # Production greedy-top2 deliberately exposes only two global candidates and
 # therefore cannot serve as a full-logit oracle. This override is symmetric
 # across ranks and applies only to the pre-timing diagnostic modes.
-if [[ $DECODE_SELF_CHECK == 1 || $TEACHER_FORCE_CONTROL == 1 ]]; then
+if [[ $DECODE_SELF_CHECK == 1 || $TEACHER_FORCE_CONTROL == 1 ||
+      -n $FROZEN_TOKEN_FILE ]]; then
   CURRENT_OPT_ENV+=(DS4_TP_GREEDY_TOP2=0)
   EXPECT_GREEDY_TOP2=0
 fi
@@ -314,7 +353,7 @@ fi
 }
 
 if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
-  echo "validated_config rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
+  echo "validated_config rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE candidate_lane=$CANDIDATE_LANE baseline_id=${BASELINE_ID:-n/a} tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
   exit 0
 fi
 
@@ -370,6 +409,27 @@ if [[ -n $DUMP_FRONTIER_LOGITS_DIR ]]; then
   esac
   mkdir -p "$DUMP_FRONTIER_LOGITS_DIR"
   COORD_ARGS+=(--dump-frontier-logits-dir "$DUMP_FRONTIER_LOGITS_DIR")
+fi
+if [[ -n $FROZEN_TOKEN_FILE ]]; then
+  [[ -r $FROZEN_TOKEN_FILE ]] || {
+    echo "error: missing frozen token file: $FROZEN_TOKEN_FILE" >&2
+    exit 1
+  }
+  case $FROZEN_TOKEN_FILE in
+    "$DS4_RESEARCH_ROOT"/*) ;;
+    *) echo "error: frozen token file must be under $DS4_RESEARCH_ROOT" >&2; exit 2 ;;
+  esac
+  case $FROZEN_LOGITS_DIR/ in
+    "$DS4_RESEARCH_ROOT/"*) ;;
+    *) echo "error: frozen logits directory must be under $DS4_RESEARCH_ROOT" >&2; exit 2 ;;
+  esac
+  mkdir -p "$FROZEN_LOGITS_DIR"
+  if find "$FROZEN_LOGITS_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    echo "error: frozen logits directory must be empty: $FROZEN_LOGITS_DIR" >&2
+    exit 2
+  fi
+  COORD_ARGS+=(--teacher-force-token-file "$FROZEN_TOKEN_FILE"
+               --teacher-force-logits-dir "$FROZEN_LOGITS_DIR")
 fi
 if [[ $DSPARK == 1 ]]; then
   DSPARK_ENV=(
@@ -477,16 +537,25 @@ PEER_DS4_HASH=$("${PEER_SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}'
 LOCAL_BENCH_HASH=$(sha256sum "$REPO/ds4-bench-tp" | awk '{print $1}')
 PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
 PROMPT_SIZE=$(stat -c %s "$PROMPT_FILE")
+if [[ -n $FROZEN_TOKEN_FILE ]]; then
+  FROZEN_TOKEN_HASH=$(sha256sum "$FROZEN_TOKEN_FILE" | awk '{print $1}')
+else
+  FROZEN_TOKEN_HASH=
+fi
 
 # Preserve the complete non-secret control configuration beside every run.
 # Performance numbers without this record are not eligible for a baseline or
 # candidate comparison because a single environment drift can change both the
 # token trajectory and the selected kernel path.
 SOURCE_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
+RUN_ID="$(date -u +%Y%m%dT%H%M%S.%NZ)-$$-${RANDOM}"
 if git -C "$REPO" diff --quiet --ignore-submodules -- 2>/dev/null &&
    git -C "$REPO" diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
   SOURCE_DIRTY=0
 else
+  SOURCE_DIRTY=1
+fi
+if [[ -n $FROZEN_TOKEN_FILE && -n $(git -C "$REPO" ls-files --others --exclude-standard) ]]; then
   SOURCE_DIRTY=1
 fi
 printf -v COMMON_ENV_Q '%q ' "${COMMON_ENV[@]}"
@@ -495,6 +564,7 @@ printf -v COORD_ENV_Q '%q ' "${COORD_ENV[@]}"
 printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
 {
   printf 'tag=%s\n' "$TAG"
+  printf 'run_id=%s\n' "$RUN_ID"
   printf 'source_commit=%s\n' "$SOURCE_COMMIT"
   printf 'source_dirty=%s\n' "$SOURCE_DIRTY"
   printf 'bench_config=%s\n' "$BENCH_CONFIG"
@@ -508,6 +578,10 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'prompt=%s\n' "$PROMPT_FILE"
   printf 'prompt_size=%s\n' "$PROMPT_SIZE"
   printf 'prompt_sha256=%s\n' "$PROMPT_HASH"
+  printf 'frozen_token_file=%s\n' "$FROZEN_TOKEN_FILE"
+  printf 'frozen_token_sha256=%s\n' "$FROZEN_TOKEN_HASH"
+  printf 'frozen_logits_dir=%s\n' "$FROZEN_LOGITS_DIR"
+  printf 'toolchain_id=%s\n' "$TOOLCHAIN_ID"
   printf 'frontier=%s\n' "$FRONTIER"
   printf 'generated_tokens=%s\n' "$TOKENS"
   printf 'context=%s\n' "$CONTEXT"
@@ -518,6 +592,8 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'worker_rdma_device=%s\n' "$PEER_RDMA_DEVICE"
   printf 'rdma_gid_index=%s\n' "${RDMA_GID_INDEX:-n/a}"
   printf 'candidate=%s\n' "$CANDIDATE"
+  printf 'candidate_lane=%s\n' "$CANDIDATE_LANE"
+  printf 'baseline_id=%s\n' "$BASELINE_ID"
   printf 'expected_fnv64=%s\n' "${EXPECTED_FNV64,,}"
   printf 'dspark=%s\n' "$DSPARK"
   printf 'common_env=%s\n' "$COMMON_ENV_Q"
@@ -699,6 +775,48 @@ if [[ $TEACHER_FORCE_CONTROL == 1 ]]; then
       exit 1
     }
   echo "TP_TEACHER_FORCE_CONTROL_PASSED"
+  exit 0
+fi
+if [[ -n $FROZEN_TOKEN_FILE ]]; then
+  "$REPO/scripts/check-tp-rdma-logs.sh" \
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE"
+  completion=$(grep -E 'ds4-bench: frozen teacher logits complete prefix=[0-9]+ tokens=[0-9]+ ' \
+    "$COORD_LOG" | tail -1 || true)
+  [[ -n $completion ]] || {
+    echo "error: frozen teacher full-logit diagnostic did not complete" >&2
+    exit 1
+  }
+  FROZEN_COUNT=$(sed -n 's/.* tokens=\([0-9][0-9]*\) .*/\1/p' <<<"$completion")
+  FROZEN_PREFIX=$(sed -n 's/.* prefix=\([0-9][0-9]*\) .*/\1/p' <<<"$completion")
+  ACTUAL_DUMPS=$(find "$FROZEN_LOGITS_DIR" -maxdepth 1 -type f \
+    -name 'decode_*.logits.json' | wc -l)
+  [[ $FROZEN_COUNT =~ ^[1-9][0-9]*$ && $ACTUAL_DUMPS == "$FROZEN_COUNT" ]] || {
+    echo "error: frozen teacher dump count mismatch: expected=$FROZEN_COUNT actual=$ACTUAL_DUMPS" >&2
+    exit 1
+  }
+  [[ $SOURCE_DIRTY == 0 ]] || {
+    echo "error: frozen numerical evidence requires a clean source tree" >&2
+    exit 1
+  }
+  {
+    printf 'tag=%s\n' "$TAG"
+    printf 'source_commit=%s\n' "$SOURCE_COMMIT"
+    printf 'source_dirty=%s\n' "$SOURCE_DIRTY"
+    printf 'toolchain_id=%s\n' "$TOOLCHAIN_ID"
+    printf 'model=%s\n' "$MODEL"
+    printf 'model_size=%s\n' "$LOCAL_MODEL_SIZE"
+    printf 'model_sample_sha256=%s\n' "$LOCAL_MODEL_FINGERPRINT"
+    printf 'ds4_sha256=%s\n' "$LOCAL_DS4_HASH"
+    printf 'ds4_bench_tp_sha256=%s\n' "$LOCAL_BENCH_HASH"
+    printf 'prompt_sha256=%s\n' "$PROMPT_HASH"
+    printf 'prefix_tokens=%s\n' "$FROZEN_PREFIX"
+    printf 'frozen_token_sha256=%s\n' "$FROZEN_TOKEN_HASH"
+    printf 'file_count=%s\n' "$FROZEN_COUNT"
+    printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
+    printf 'dspark=0\n'
+  } > "$FROZEN_LOGITS_DIR/manifest"
+  echo "frozen_logits_manifest=$FROZEN_LOGITS_DIR/manifest"
+  echo "TP_FROZEN_TEACHER_LOGITS_RECORDED_NOT_BENCHMARKED"
   exit 0
 fi
 "$REPO/scripts/check-ds4-bench-result.sh" \

@@ -381,6 +381,8 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--decode-self-check", "Require incremental and fresh batched-prefix argmax to match at every fixed checkpoint.");
     opt(fp, c, "--teacher-force-control", "Measure top-token margins while teacher-forcing the known-good llama.cpp control reply.");
     opt(fp, c, "--teacher-force-expect-fnv64 HEX", "Require the exact recorded teacher mismatch signature (16 hex digits).");
+    opt(fp, c, "--teacher-force-token-file FILE", "Force frozen token IDs after ctx-max prompt tokens for cross-build comparison.");
+    opt(fp, c, "--teacher-force-logits-dir DIR", "Write full-vocabulary logits before every frozen teacher token.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
     fputc('\n', fp);

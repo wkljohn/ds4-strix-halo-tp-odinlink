@@ -59,6 +59,10 @@ endif
 
 test-quality-gates:
 	python3 tests/test_frontier_logits_gate.py
+	python3 tests/test_compare_teacher_logits.py
+	python3 tests/test_compare_quality_scores.py
+	python3 tests/test_lane_c_oracle_gate.py
+	./tests/test_candidate_gate.sh
 
 test-moe-wave-plan:
 	python3 tests/test_moe_wave_plan.py

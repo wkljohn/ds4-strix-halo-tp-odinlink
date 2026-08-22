@@ -55,10 +55,16 @@ def main() -> int:
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--max-tvd", type=float, default=1.0e-4)
     parser.add_argument("--max-kl", type=float, default=1.0e-4)
+    parser.add_argument("--e-bound", type=float, default=0.0)
+    parser.add_argument("--min-top5-overlap", type=int, default=4)
+    parser.add_argument("--min-top20-overlap", type=int, default=18)
     args = parser.parse_args()
     if not (math.isfinite(args.max_tvd) and args.max_tvd >= 0.0 and
-            math.isfinite(args.max_kl) and args.max_kl >= 0.0):
+            math.isfinite(args.max_kl) and args.max_kl >= 0.0 and
+            math.isfinite(args.e_bound) and args.e_bound >= 0.0):
         parser.error("thresholds must be finite and nonnegative")
+    if not 0 <= args.min_top5_overlap <= 5 or not 0 <= args.min_top20_overlap <= 20:
+        parser.error("top-k overlap thresholds are out of range")
 
     try:
         reference = load_dump(args.reference)
@@ -81,15 +87,27 @@ def main() -> int:
     ref_top5 = ref_top20[:min(5, len(ref_top20))]
     cand_top5 = cand_top20[:min(5, len(cand_top20))]
     argmax_ok = ref_top20[0] == cand_top20[0]
-    top5_ok = ref_top5 == cand_top5
-    top20_ok = set(ref_top20) == set(cand_top20)
+    top5_overlap = len(set(ref_top5) & set(cand_top5))
+    top20_overlap = len(set(ref_top20) & set(cand_top20))
+    reference_margin = (ref_logits[ref_top20[0]] - ref_logits[ref_top20[1]]
+                        if len(ref_top20) > 1 else math.inf)
+    far_margin_inversion = not argmax_ok and reference_margin > 2.0 * args.e_bound
     tvd, kl = distribution_metrics(ref_logits, cand_logits)
-    passed = (argmax_ok and top5_ok and top20_ok and
+    passed = (not far_margin_inversion and
+              top5_overlap >= args.min_top5_overlap and
+              top20_overlap >= args.min_top20_overlap and
               tvd <= args.max_tvd and kl <= args.max_kl)
     print(json.dumps({
         "argmax_equal": argmax_ok,
-        "top5_rank_equal": top5_ok,
-        "top20_set_equal": top20_ok,
+        "reference_top1_margin": reference_margin,
+        "far_margin_inversion": far_margin_inversion,
+        "e_bound": args.e_bound,
+        "top5_rank_equal": ref_top5 == cand_top5,
+        "top5_overlap": top5_overlap,
+        "min_top5_overlap": args.min_top5_overlap,
+        "top20_set_equal": set(ref_top20) == set(cand_top20),
+        "top20_overlap": top20_overlap,
+        "min_top20_overlap": args.min_top20_overlap,
         "tvd": tvd,
         "kl_reference_to_candidate": kl,
         "max_tvd": args.max_tvd,
