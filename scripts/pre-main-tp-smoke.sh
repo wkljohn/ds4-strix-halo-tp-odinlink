@@ -25,6 +25,7 @@ PREMAIN_OUT=${DS4_BENCH_OUT:-$DS4_RESEARCH_ROOT/bench-runs}
 # IQ2 integer-WMMA mismatch before entering a different MoE arithmetic path.
 "$REPO/tests/test_bench_env_precedence.sh"
 "$REPO/tests/test_research_root_contract.sh"
+"$REPO/tests/test_candidate_gate.sh"
 make -C "$REPO" test-tp-hello
 
 # Keep the production metadata classifier in the gate: both paths must select

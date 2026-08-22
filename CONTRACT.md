@@ -22,6 +22,10 @@ by `DS4_RESEARCH_ROOT`, whose default is the sibling directory
 
 Run `scripts/check-research-root-contract.sh` before committing.
 
+Classify performance candidates and validate their immutable evidence dossier
+with `scripts/candidate-gate.py`. The authoritative lane A/B/C policy is
+`$DS4_RESEARCH_ROOT/policies/GATE-PROMOTION.md`.
+
 ## Performance candidates
 
 Performance work must remain on a named research branch until its applicable
