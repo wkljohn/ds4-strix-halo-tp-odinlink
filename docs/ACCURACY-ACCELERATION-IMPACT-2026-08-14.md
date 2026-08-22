@@ -122,8 +122,8 @@ Run the causal Q2 pair:
   DS4_ROCM_DISABLE_IQ2_I8_WMMA=1
 
 python3 gguf-tools/quality-testing/compare_scores.py \
-  research-results/accuracy-acceleration-2026-08-14/q2-iq2-disabled-full.tsv \
-  research-results/accuracy-acceleration-2026-08-14/q2-current-full.tsv
+  "$DS4_RESEARCH_ROOT/accuracy-acceleration-2026-08-14/q2-iq2-disabled-full.tsv" \
+  "$DS4_RESEARCH_ROOT/accuracy-acceleration-2026-08-14/q2-current-full.tsv"
 ```
 
 Run the short-prompt Q4 pair by setting
@@ -134,7 +134,7 @@ The full raw artifacts, including rank logs, score tables, frontier logits,
 remote requests, and remote responses, live in the ignored local directory:
 
 ```text
-research-results/accuracy-acceleration-2026-08-14/
+$DS4_RESEARCH_ROOT/accuracy-acceleration-2026-08-14/
 ```
 
 ## Limits and next accuracy gate

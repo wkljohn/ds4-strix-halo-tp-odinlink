@@ -64,6 +64,7 @@ __pycache__/
 *.pyc
 /misc/
 /research-results/
+/research-results
 /deploy/config.env.local
 /bench.env.local
 /deploy/runtime/

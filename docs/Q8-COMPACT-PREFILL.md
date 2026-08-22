@@ -3,7 +3,7 @@
 This report records the investigation that removed the need for DS4's optional
 9.85--9.91 GiB-per-rank Q8-to-F16 weight cache on the reference two-node
 Strix Halo setup. Raw logs and profiler CSVs are kept under the ignored local
-`research-results/2026-08-06/raw/q8-cache-research/` tree.
+`$DS4_RESEARCH_ROOT/2026-08-06/raw/q8-cache-research/` tree.
 
 ## Result
 

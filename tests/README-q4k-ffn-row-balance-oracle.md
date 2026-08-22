@@ -1,6 +1,6 @@
 # FFN output-row balance oracle (Mechanism I)
 
-See `research-results/decode-25tps-2026-08-20/CODEX-GATE-7.md`.
+See `$DS4_RESEARCH_ROOT/decode-25tps-2026-08-20/CODEX-GATE-7.md`.
 
 ```
 make test-rocm-q4k-ffn-row-balance-oracle

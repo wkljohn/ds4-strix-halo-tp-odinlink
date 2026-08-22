@@ -262,7 +262,7 @@ exact coordinator/worker command, not broad system processes.
 All relevant logs are persistent and intentionally outside `/tmp`:
 
 ```text
-research-results/dspark-resident-2026-08-07/clean-width-sweep/
+$DS4_RESEARCH_ROOT/dspark-resident-2026-08-07/clean-width-sweep/
 ```
 
 Most useful files:

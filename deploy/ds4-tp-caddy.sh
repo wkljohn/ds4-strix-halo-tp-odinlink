@@ -4,6 +4,8 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck disable=SC1091
+source "$REPO/scripts/ds4-research-root.sh"
 CONFIG=${DS4_DEPLOY_CONFIG:-$SCRIPT_DIR/config.env.local}
 [[ -r $CONFIG ]] || {
   echo "error: copy $SCRIPT_DIR/config.env.example to $CONFIG and edit it" >&2
@@ -11,6 +13,7 @@ CONFIG=${DS4_DEPLOY_CONFIG:-$SCRIPT_DIR/config.env.local}
 }
 # shellcheck disable=SC1090
 source "$CONFIG"
+ds4_resolve_research_roots "$REPO"
 
 : "${MODEL:?MODEL is required}"
 : "${PEER_MGMT:?PEER_MGMT is required}"
@@ -55,9 +58,9 @@ PEER_HOST_KEY_ALIAS=${PEER_HOST_KEY_ALIAS:-$PEER_MGMT}
 RUNTIME=$SCRIPT_DIR/runtime
 LOCAL_PIDFILE=$RUNTIME/coordinator.pid
 COORD_UNIT=${COORD_UNIT:-ds4-tp-coordinator}
-WORKER_PIDFILE=$PEER_REPO/research-results/deployment/worker.pid
-LOCAL_LOG=$REPO/research-results/deployment/coordinator.log
-WORKER_LOG=$PEER_REPO/research-results/deployment/worker.log
+WORKER_PIDFILE=$DS4_PEER_RESEARCH_ROOT/deployment/worker.pid
+LOCAL_LOG=$DS4_RESEARCH_ROOT/deployment/coordinator.log
+WORKER_LOG=$DS4_PEER_RESEARCH_ROOT/deployment/worker.log
 if [[ $RDMA_PROFILE == odinlink ]]; then
   VERBS_LIB=$ODINLINK_ROOT/build/verbs/libodl_tb5_verbs.so.0.1.0
   ODL_LD_PATH=$ODINLINK_ROOT/build/lib:$ODINLINK_ROOT/build/verbs
@@ -200,7 +203,8 @@ preflight() {
   systemctl is-active --quiet caddy || { echo "error: Caddy is not active" >&2; exit 1; }
   caddy validate --config /etc/caddy/Caddyfile >/dev/null
   mkdir -p "$RUNTIME" "$(dirname -- "$LOCAL_LOG")"
-  "${SSH[@]}" "mkdir -p '$PEER_REPO/research-results/deployment'"
+  printf -v peer_research_deploy_q '%q' "$DS4_PEER_RESEARCH_ROOT/deployment"
+  "${SSH[@]}" "mkdir -p $peer_research_deploy_q"
 }
 
 start() {

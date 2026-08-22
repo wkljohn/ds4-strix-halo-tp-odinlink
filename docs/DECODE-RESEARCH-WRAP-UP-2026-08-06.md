@@ -59,6 +59,6 @@ and is unlikely to recover the entire arrival floor. It must remain capability
 negotiated so the generic/Mellanox SEND/RECV path has no added hot-path cost.
 
 All raw two-node logs are retained under the Git-ignored
-`research-results/2026-08-06/raw/` tree. The next decode investigation should
+`$DS4_RESEARCH_ROOT/2026-08-06/raw/` tree. The next decode investigation should
 start from new evidence supplied after this checkpoint rather than repeating
 the rejected candidates above.

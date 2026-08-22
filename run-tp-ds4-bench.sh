@@ -60,6 +60,9 @@ else
 fi
 REPO=${DS4_BENCH_REPO:-$SCRIPT_DIR}
 PEER_REPO=${DS4_PEER_REPO:-$REPO}
+# shellcheck disable=SC1091
+source "$REPO/scripts/ds4-research-root.sh"
+ds4_resolve_research_roots "$REPO"
 PEER_MGMT=${DS4_PEER_MGMT:-}
 PEER_HOST_KEY_ALIAS=${DS4_PEER_HOST_KEY_ALIAS:-${PEER_MGMT#*@}}
 RDMA_PROFILE=${DS4_BENCH_RDMA_PROFILE:-odinlink}
@@ -98,7 +101,13 @@ fi
 DSPARK=${DS4_BENCH_DSPARK:-0}
 DSPARK_STRICT=${DS4_BENCH_DSPARK_STRICT:-0}
 MTP=${DS4_BENCH_MTP:-}
-OUT=${DS4_BENCH_OUT:-"$REPO/research-results/bench-runs"}
+if [[ ${DS4_BENCH_OUT+x} ]]; then
+  OUT=$DS4_BENCH_OUT
+  PEER_OUT=${DS4_PEER_BENCH_OUT:-$OUT}
+else
+  OUT=$DS4_RESEARCH_ROOT/bench-runs
+  PEER_OUT=$DS4_PEER_RESEARCH_ROOT/bench-runs
+fi
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
 ROCPROF_RUNTIME=${DS4_BENCH_ROCPROF_RUNTIME:-1}
 ROCPROF_REGION=${DS4_BENCH_ROCPROF_REGION:-decode}
@@ -354,9 +363,9 @@ elif [[ $SHOW_OUTPUT != 0 ]]; then
 fi
 if [[ -n $DUMP_FRONTIER_LOGITS_DIR ]]; then
   case $DUMP_FRONTIER_LOGITS_DIR/ in
-    "$REPO/research-results/"*) ;;
+    "$DS4_RESEARCH_ROOT/"*) ;;
     *)
-      echo "error: frontier logits directory must be under $REPO/research-results" >&2
+      echo "error: frontier logits directory must be under $DS4_RESEARCH_ROOT" >&2
       exit 2
       ;;
   esac
@@ -405,9 +414,10 @@ COORD_ENV+=("${EXTRA_ENV[@]}")
 
 COORD_LOG="$OUT/coordinator-$TAG.log"
 WORKER_LOG="$OUT/worker-$TAG.log"
+REMOTE_WORKER_LOG="$PEER_OUT/worker-$TAG.log"
 CSV="$OUT/$TAG.csv"
 MANIFEST="$OUT/$TAG.manifest"
-WORKER_PIDFILE="$OUT/worker-$TAG.pid"
+WORKER_PIDFILE="$PEER_OUT/worker-$TAG.pid"
 mkdir -p "$OUT"
 
 sample_fingerprint() {
@@ -575,7 +585,8 @@ cleanup() {
   return "$rc"
 }
 trap cleanup EXIT
-"${PEER_SSH[@]}" "mkdir -p '$OUT'"
+printf -v PEER_OUT_Q '%q' "$PEER_OUT"
+"${PEER_SSH[@]}" "mkdir -p $PEER_OUT_Q"
 
 # The two TP nodes do not share a filesystem. Diagnostic graph-dump prefixes
 # are passed to both ranks, so create their parent directory on both machines
@@ -588,12 +599,16 @@ for env_kv in "${EXTRA_ENV[@]}"; do
       dump_prefix=${env_kv#*=}
       dump_dir=$(dirname -- "$dump_prefix")
       case $dump_dir/ in
-        "$REPO/research-results/"*) ;;
+        "$DS4_RESEARCH_ROOT/"*) ;;
         *)
-          echo "error: graph dump directory must be under $REPO/research-results: $dump_dir" >&2
+          echo "error: graph dump directory must be under $DS4_RESEARCH_ROOT: $dump_dir" >&2
           exit 2
           ;;
       esac
+      if [[ $DS4_RESEARCH_ROOT != "$DS4_PEER_RESEARCH_ROOT" ]]; then
+        echo "error: graph dumps currently require matching canonical paths on both independent filesystems" >&2
+        exit 2
+      fi
       mkdir -p "$dump_dir"
       printf -v dump_dir_q '%q' "$dump_dir"
       "${PEER_SSH[@]}" "mkdir -p $dump_dir_q"
@@ -621,7 +636,7 @@ WORKER_APP=(./ds4
   "${WORKER_ARGS[@]}")
 WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}" "${WORKER_APP[@]}")
 if [[ $ROCPROF == 1 && $ROCPROF_RANK == worker ]]; then
-  ROCPROF_OUT="$OUT/rocprof-$TAG-worker"
+  ROCPROF_OUT="$PEER_OUT/rocprof-$TAG-worker"
   printf -v ROCPROF_OUT_Q '%q' "$ROCPROF_OUT"
   "${PEER_SSH[@]}" "mkdir -p $ROCPROF_OUT_Q"
   # The worker has no benchmark-level ROCTx boundary. Trace its complete
@@ -634,7 +649,7 @@ if [[ $ROCPROF == 1 && $ROCPROF_RANK == worker ]]; then
 fi
 printf -v WORKER_CMD_Q '%q ' "${WORKER_CMD[@]}"
 printf -v PEER_REPO_Q '%q' "$PEER_REPO"
-printf -v WORKER_LOG_Q '%q' "$WORKER_LOG"
+printf -v WORKER_LOG_Q '%q' "$REMOTE_WORKER_LOG"
 printf -v WORKER_PIDFILE_Q '%q' "$WORKER_PIDFILE"
 "${PEER_SSH[@]}" "cd $PEER_REPO_Q || exit 1; nohup setsid $WORKER_CMD_Q > $WORKER_LOG_Q 2>&1 < /dev/null & p=\$!; echo \$p > $WORKER_PIDFILE_Q"
 WORKER_STARTED=1
@@ -671,7 +686,7 @@ wait_worker 180 || {
 }
 WORKER_STARTED=0
 trap - EXIT
-"${PEER_SCP[@]}" "$PEER_MGMT:$WORKER_LOG" "$WORKER_LOG"
+"${PEER_SCP[@]}" "$PEER_MGMT:$REMOTE_WORKER_LOG" "$WORKER_LOG"
 if [[ $DECODE_SELF_CHECK == 1 ]]; then
   grep -q 'ds4-bench: decode self-check complete .*argmax_mismatches=0 ' \
     "$COORD_LOG" || {

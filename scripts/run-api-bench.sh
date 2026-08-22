@@ -9,6 +9,9 @@ set -euo pipefail
 LLAMA_BENCHY_COMMIT=e9be344578cec17745066b220798b80a0d2686d3
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd -- "$SCRIPT_DIR/.." && pwd)
+# shellcheck disable=SC1091
+source "$REPO/scripts/ds4-research-root.sh"
+ds4_resolve_research_roots "$REPO"
 
 PORT=${PORT:-8090}
 BASE_URL=${BASE_URL:-http://127.0.0.1:$PORT/v1}
@@ -20,7 +23,7 @@ TG=(32 128 300)
 DEPTH=(0 4096 16384)
 RUNS=3
 WARMUP_RUNS=1
-OUT=${OUT:-$REPO/research-results/api-bench/$(date -u +%Y%m%dT%H%M%SZ).csv}
+OUT=${OUT:-$DS4_RESEARCH_ROOT/api-bench/$(date -u +%Y%m%dT%H%M%SZ).csv}
 CONFIRMED=0
 DRY_RUN=0
 
@@ -42,7 +45,7 @@ Options:
   --depth N...        Existing-context depths
   --runs N            Measured runs per shape (default: 3)
   --warmup-runs N     Discarded warmups per shape (default: 1)
-  --out FILE.csv      Result path under research-results/ by default
+  --out FILE.csv      Result path under DS4_RESEARCH_ROOT by default
   --confirm-dedicated-server
                       Required: this benchmark replaces the server's live session
   --dry-run           Validate and print the pinned command without contacting API

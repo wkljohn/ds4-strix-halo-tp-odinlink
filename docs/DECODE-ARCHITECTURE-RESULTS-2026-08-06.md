@@ -2,7 +2,7 @@
 
 This note records the retained measurements and rejected candidates from the
 first post-prefill decode pass. Raw coordinator and worker logs are kept in the
-local, Git-ignored `research-results/2026-08-06/` archive.
+local, Git-ignored `$DS4_RESEARCH_ROOT/2026-08-06/` archive.
 
 ## Current reference
 

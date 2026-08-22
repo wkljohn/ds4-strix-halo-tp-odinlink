@@ -14,8 +14,11 @@ shift 2
 EXTRA=("$@")
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+source "$REPO/scripts/ds4-research-root.sh"
+ds4_resolve_research_roots "$REPO"
 MODEL=${DS4_BENCH_MODEL:-}
-OUT=${DS4_BENCH_OUT:-$REPO/research-results/q2k-singlenode}
+OUT=${DS4_BENCH_OUT:-$DS4_RESEARCH_ROOT/q2k-singlenode}
 [[ -r $MODEL ]] || {
   echo "error: set DS4_BENCH_MODEL to the local Q2_K GGUF" >&2
   exit 2
