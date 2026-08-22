@@ -5125,6 +5125,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     }
 
     cudaError_t err = cudaSuccess;
+    int overlapping_host_registration = 0;
     if (g_model_range_mapping_supported && model_map == g_model_host_base) {
         const long page_sz_l = sysconf(_SC_PAGESIZE);
         const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
@@ -5149,6 +5150,15 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             (void)cudaHostUnregister((void *)reg_addr);
             (void)cudaGetLastError();
         } else {
+#if defined(__HIP_PLATFORM_AMD__)
+            overlapping_host_registration =
+                err == hipErrorHostMemoryAlreadyRegistered ||
+                err == hipErrorAlreadyMapped;
+#else
+            overlapping_host_registration =
+                err == cudaErrorHostMemoryAlreadyRegistered ||
+                err == cudaErrorAlreadyMapped;
+#endif
             if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
             (void)cudaGetLastError();
         }
@@ -5165,20 +5175,48 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
     const char *src = (const char *)model_map + offset;
     const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    void *pinned_stage = NULL;
+    uint64_t pinned_stage_bytes = 0;
+    if (overlapping_host_registration) {
+        pinned_stage_bytes = bytes < chunk ? bytes : chunk;
+        err = cudaMallocHost(&pinned_stage, (size_t)pinned_stage_bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "overlapping model range staging allocation failed for %s "
+                    "(%.2f MiB): %s\n",
+                    what ? what : "weights",
+                    (double)pinned_stage_bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            (void)cudaFree(dev);
+            (void)cudaGetLastError();
+            return NULL;
+        }
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "overlapping host-registered model range for %s; "
+                "using transient pinned staging\n",
+                what ? what : "weights");
+    }
     for (uint64_t done = 0; done < bytes; done += chunk) {
         uint64_t n = bytes - done < chunk ? bytes - done : chunk;
-        err = cudaMemcpy((char *)dev + done, src + done, (size_t)n, cudaMemcpyHostToDevice);
+        const void *copy_src = src + done;
+        if (pinned_stage) {
+            memcpy(pinned_stage, copy_src, (size_t)n);
+            copy_src = pinned_stage;
+        }
+        err = cudaMemcpy((char *)dev + done, copy_src, (size_t)n, cudaMemcpyHostToDevice);
         if (err != cudaSuccess) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "model range copy failed for %s at %.2f/%.2f MiB: %s\n",
                     what ? what : "weights",
                     (double)done / 1048576.0,
                     (double)bytes / 1048576.0,
                     cudaGetErrorString(err));
+            if (pinned_stage) (void)cudaFreeHost(pinned_stage);
             (void)cudaFree(dev);
             (void)cudaGetLastError();
             return NULL;
         }
     }
+    if (pinned_stage) (void)cudaFreeHost(pinned_stage);
     g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
