@@ -33,6 +33,23 @@ read_csv_field() {
   ' "$CSV"
 }
 
+if ! awk -F, -v expected="$EXPECTED_TOKENS" '
+  NR == 1 {
+    for (i = 1; i <= NF; i++) {
+      if ($i == "ctx_tokens") ctx = i
+      if ($i == "gen_tokens") gen = i
+    }
+    next
+  }
+  NF && (!ctx || !gen || $gen != expected) {
+    printf "error: benchmark row ctx=%s generated %s/%s tokens\n", \
+           (ctx ? $ctx : "unknown"), (gen ? $gen : "unknown"), expected > "/dev/stderr"
+    bad = 1
+  }
+  END { exit bad }
+' "$CSV"; then
+  exit 1
+fi
 ACTUAL_TOKENS=$(read_csv_field gen_tokens) || {
   echo "error: benchmark CSV has no gen_tokens result" >&2; exit 1;
 }
