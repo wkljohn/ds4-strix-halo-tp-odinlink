@@ -247,6 +247,11 @@ def check_candidate(root: Path, candidate_id: str) -> tuple[Path, dict]:
     summary = json.loads(diverse_summaries[0].read_text(encoding="utf-8"))
     if str(summary.get("lane", "")).upper() != lane:
         raise GateError("cross-disciplinary long evidence uses a different lane")
+    expected_diverse_mode = "dspark" if value.get("dspark") is True else "ordinary"
+    if summary.get("mode") != expected_diverse_mode:
+        raise GateError(
+            f"cross-disciplinary evidence mode must be {expected_diverse_mode}"
+        )
 
     claims = value.get("claims")
     if not isinstance(claims, dict):

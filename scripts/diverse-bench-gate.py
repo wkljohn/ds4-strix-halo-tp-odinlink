@@ -64,7 +64,9 @@ def manifest_for(path: Path) -> Path:
     return path.with_suffix(".manifest")
 
 
-def read_manifest(path: Path) -> dict[str, str]:
+def read_manifest(path: Path, mode: str) -> dict[str, str]:
+    if mode not in {"ordinary", "dspark"}:
+        raise Error("mode must be ordinary or dspark")
     values: dict[str, str] = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         key, separator, value = line.partition("=")
@@ -76,18 +78,36 @@ def read_manifest(path: Path) -> dict[str, str]:
         "generated_tokens": "300",
         "context": "4608",
         "prefill_chunk": "2048",
-        "dspark": "0",
+        "dspark": "1" if mode == "dspark" else "0",
     }
     for key, wanted in expected.items():
         if values.get(key) != wanted:
             raise Error(f"unexpected {key} in {path}: {values.get(key)!r}")
+    if values.get("candidate") != "1":
+        raise Error(f"diverse run did not use candidate-validation mode: {path}")
+    if mode == "dspark":
+        if values.get("dspark_strict") != "0":
+            raise Error(f"DSpark performance evidence cannot use strict serial mode: {path}")
+        if not values.get("mtp_size", "").isdigit() or int(values["mtp_size"]) <= 0:
+            raise Error(f"missing DSpark support size in {path}")
+        if not re.fullmatch(r"[0-9a-f]{64}", values.get("mtp_sample_sha256", "")):
+            raise Error(f"missing DSpark support fingerprint in {path}")
+        for env_key in ("worker_env", "coordinator_env"):
+            env_value = values.get(env_key, "")
+            for setting in (
+                "DS4_TP_EXPERT_SPLIT=118",
+                "DS4_DSPARK_MAX_DRAFT_TOKENS=5",
+                "DS4_DSPARK_SCHEDULER=0",
+            ):
+                if setting not in env_value:
+                    raise Error(f"missing {setting} in {env_key} of {path}")
     return values
 
 
-def ref(path: Path) -> dict:
+def ref(path: Path, mode: str) -> dict:
     path = path.resolve()
     manifest = manifest_for(path).resolve()
-    read_manifest(manifest)
+    read_manifest(manifest, mode)
     return {
         "path": str(path),
         "sha256": digest(path),
@@ -100,23 +120,34 @@ def cv(values: list[float]) -> float:
     return statistics.stdev(values) / statistics.mean(values) if len(values) > 1 else 0.0
 
 
-def calculate(baseline_paths: list[Path], candidate_path: Path, lane: str) -> dict:
+def calculate(
+    baseline_paths: list[Path],
+    candidate_path: Path,
+    lane: str,
+    mode: str,
+    ordinary_paths: list[Path] | None = None,
+) -> dict:
     if lane not in {"A", "B", "C"}:
         raise Error("lane must be A, B, or C")
     if len(baseline_paths) != 3:
         raise Error("exactly three frozen baseline runs are required")
+    ordinary_paths = ordinary_paths or []
+    if mode == "dspark" and len(ordinary_paths) != 3:
+        raise Error("DSpark diversity promotion requires three same-binary ordinary controls")
+    if mode == "ordinary" and ordinary_paths:
+        raise Error("ordinary diversity summaries do not accept ordinary-control inputs")
     baseline = [read_run(path.resolve()) for path in baseline_paths]
     candidate = read_run(candidate_path.resolve())
-    manifests = [read_manifest(manifest_for(path.resolve())) for path in baseline_paths]
-    candidate_manifest = read_manifest(manifest_for(candidate_path.resolve()))
-    if any(manifest.get("candidate") != "1" for manifest in [*manifests, candidate_manifest]):
-        raise Error("all diverse baseline/candidate runs must use candidate-validation mode")
+    manifests = [read_manifest(manifest_for(path.resolve()), mode) for path in baseline_paths]
+    candidate_manifest = read_manifest(manifest_for(candidate_path.resolve()), mode)
     identity_keys = (
         "bench_config_sha256", "model_size", "model_sample_sha256",
         "prompt_sha256", "frontier", "generated_tokens", "context",
         "prefill_chunk", "rdma_profile", "coordinator_rdma_device",
         "worker_rdma_device", "rdma_gid_index", "dspark",
     )
+    if mode == "dspark":
+        identity_keys += ("dspark_strict", "mtp_size", "mtp_sample_sha256")
     for manifest in manifests:
         if any(manifest.get(key) != candidate_manifest.get(key) for key in identity_keys):
             raise Error("baseline/candidate diverse manifests do not describe a matched workload")
@@ -136,6 +167,57 @@ def calculate(baseline_paths: list[Path], candidate_path: Path, lane: str) -> di
     prefill_change = 100.0 * (candidate["prefill_tps"] / prefill_median - 1.0)
     decode_change = 100.0 * (candidate["decode_tps"] / decode_median - 1.0)
     passed = prefill_change >= -allowed_prefill and decode_change >= -allowed_decode
+    ordinary_refs: list[dict] = []
+    ordinary_metrics: dict[str, float | bool] = {}
+    if mode == "dspark":
+        ordinary = [read_run(path.resolve()) for path in ordinary_paths]
+        ordinary_manifests = [
+            read_manifest(manifest_for(path.resolve()), "ordinary")
+            for path in ordinary_paths
+        ]
+        # DSpark-specific state intentionally differs from ordinary inference;
+        # every transport/workload/model and executable identity must not.
+        same_binary_keys = (
+            "bench_config_sha256", "model_size", "model_sample_sha256",
+            "prompt_sha256", "frontier", "generated_tokens", "context",
+            "prefill_chunk", "rdma_profile", "coordinator_rdma_device",
+            "worker_rdma_device", "rdma_gid_index", "ds4_sha256",
+            "ds4_bench_tp_sha256",
+        )
+        for manifest in ordinary_manifests:
+            if any(manifest.get(key) != candidate_manifest.get(key) for key in same_binary_keys):
+                raise Error("DSpark candidate and ordinary control are not same-binary matched runs")
+        ordinary_prefill_values = [run["prefill_tps"] for run in ordinary]
+        ordinary_decode_values = [run["decode_tps"] for run in ordinary]
+        ordinary_prefill_median = statistics.median(ordinary_prefill_values)
+        ordinary_decode_median = statistics.median(ordinary_decode_values)
+        ordinary_prefill_cv = cv(ordinary_prefill_values)
+        ordinary_decode_cv = cv(ordinary_decode_values)
+        ordinary_allowed_prefill = max(5.0, 200.0 * ordinary_prefill_cv)
+        ordinary_allowed_decode = max(3.0, 200.0 * ordinary_decode_cv)
+        versus_ordinary_prefill = 100.0 * (
+            candidate["prefill_tps"] / ordinary_prefill_median - 1.0
+        )
+        versus_ordinary_decode = 100.0 * (
+            candidate["decode_tps"] / ordinary_decode_median - 1.0
+        )
+        ordinary_pass = (
+            versus_ordinary_prefill >= -ordinary_allowed_prefill
+            and versus_ordinary_decode >= -ordinary_allowed_decode
+        )
+        passed = passed and ordinary_pass
+        ordinary_refs = [ref(path, "ordinary") for path in ordinary_paths]
+        ordinary_metrics = {
+            "ordinary_prefill_median": ordinary_prefill_median,
+            "ordinary_decode_median": ordinary_decode_median,
+            "ordinary_prefill_cv": ordinary_prefill_cv,
+            "ordinary_decode_cv": ordinary_decode_cv,
+            "versus_ordinary_prefill_pct": versus_ordinary_prefill,
+            "versus_ordinary_decode_pct": versus_ordinary_decode,
+            "ordinary_allowed_prefill_regression_pct": ordinary_allowed_prefill,
+            "ordinary_allowed_decode_regression_pct": ordinary_allowed_decode,
+            "ordinary_non_regression_pass": ordinary_pass,
+        }
     return {
         "schema_version": 1,
         "workload_id": "cross-discipline-long-v1",
@@ -148,8 +230,10 @@ def calculate(baseline_paths: list[Path], candidate_path: Path, lane: str) -> di
         "shape": {"frontier": 4096, "generated_tokens": 300,
                   "context": 4608, "prefill_chunk": 2048},
         "lane": lane,
-        "baseline": [ref(path) for path in baseline_paths],
-        "candidate": ref(candidate_path),
+        "mode": mode,
+        "baseline": [ref(path, mode) for path in baseline_paths],
+        "candidate": ref(candidate_path, mode),
+        "ordinary_controls": ordinary_refs,
         "metrics": {
             "baseline_prefill_median": prefill_median,
             "baseline_decode_median": decode_median,
@@ -161,6 +245,7 @@ def calculate(baseline_paths: list[Path], candidate_path: Path, lane: str) -> di
             "decode_change_pct": decode_change,
             "allowed_prefill_regression_pct": allowed_prefill,
             "allowed_decode_regression_pct": allowed_decode,
+            **ordinary_metrics,
         },
         "passed": passed,
     }
@@ -180,18 +265,31 @@ def verify(summary_path: Path) -> dict:
         raise Error("invalid diverse benchmark schema/workload")
     baseline = value.get("baseline", [])
     candidate = value.get("candidate", {})
+    mode = str(value.get("mode", ""))
+    ordinary = value.get("ordinary_controls", [])
+    if mode not in {"ordinary", "dspark"}:
+        raise Error("invalid diverse benchmark mode")
     if len(baseline) != 3 or not isinstance(candidate, dict):
         raise Error("diverse benchmark requires three baselines and one candidate")
+    if mode == "dspark" and len(ordinary) != 3:
+        raise Error("DSpark diverse summary requires three ordinary controls")
+    if mode == "ordinary" and ordinary:
+        raise Error("ordinary diverse summary cannot contain ordinary controls")
     paths = [confined(Path(item["path"]), root) for item in baseline]
     candidate_path = confined(Path(candidate["path"]), root)
-    for item, path in zip([*baseline, candidate], [*paths, candidate_path]):
+    ordinary_paths = [confined(Path(item["path"]), root) for item in ordinary]
+    for item, path in zip(
+        [*baseline, candidate, *ordinary], [*paths, candidate_path, *ordinary_paths]
+    ):
         if digest(path) != item.get("sha256"):
             raise Error(f"diverse evidence hash mismatch: {path}")
         manifest = confined(Path(item["manifest_path"]), root)
         if digest(manifest) != item.get("manifest_sha256"):
             raise Error(f"diverse manifest hash mismatch: {manifest}")
-    recalculated = calculate(paths, candidate_path, str(value.get("lane", "")))
-    for key in ("workload_id", "disciplines", "shape", "lane", "baseline", "candidate", "metrics", "passed"):
+    recalculated = calculate(
+        paths, candidate_path, str(value.get("lane", "")), mode, ordinary_paths
+    )
+    for key in ("workload_id", "disciplines", "shape", "lane", "mode", "baseline", "candidate", "ordinary_controls", "metrics", "passed"):
         if value.get(key) != recalculated.get(key):
             raise Error(f"diverse summary does not match source evidence: {key}")
     if value["passed"] is not True:
@@ -204,7 +302,9 @@ def main() -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     create = sub.add_parser("create")
     create.add_argument("--lane", choices=("A", "B", "C"), required=True)
+    create.add_argument("--mode", choices=("ordinary", "dspark"), default="ordinary")
     create.add_argument("--baseline", action="append", type=Path, required=True)
+    create.add_argument("--ordinary", action="append", type=Path, default=[])
     create.add_argument("--candidate", type=Path, required=True)
     create.add_argument("--output", type=Path, required=True)
     check = sub.add_parser("verify")
@@ -212,7 +312,9 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "create":
-            value = calculate(args.baseline, args.candidate, args.lane)
+            value = calculate(
+                args.baseline, args.candidate, args.lane, args.mode, args.ordinary
+            )
             value["created_utc"] = datetime.now(timezone.utc).isoformat()
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")

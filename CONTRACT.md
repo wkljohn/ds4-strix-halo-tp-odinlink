@@ -39,3 +39,12 @@ candidate must also pass `scripts/run-tp-diverse-bench.sh`: one 4,096+300 run
 over the frozen cross-disciplinary v1 prompt. Its manifest and CSV are checked
 against the versioned three-run baseline by `scripts/diverse-bench-gate.py`.
 The diverse run is a regression screen, not another headline benchmark.
+
+DSpark candidates use the same frozen prompt and workload with
+`DS4_BENCH_DSPARK=1`. Their diversity summary must be created in `dspark` mode
+from three frozen DSpark baselines, the candidate run, and three ordinary runs
+made by the same binary. The gate requires the 118/138 expert split, five-token
+draft width, a matching support-model fingerprint, no main confidence knob,
+and no regression against either the DSpark baseline or the same-stack
+ordinary control. This is a final candidate-promotion gate, not a per-kernel
+microbenchmark.

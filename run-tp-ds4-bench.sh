@@ -537,6 +537,13 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'expected_fnv64=%s\n' "${EXPECTED_FNV64,,}"
   printf 'dspark=%s\n' "$DSPARK"
   printf 'dspark_strict=%s\n' "$DSPARK_STRICT"
+  if [[ $DSPARK == 1 ]]; then
+    printf 'mtp=%s\n' "$MTP"
+    printf 'mtp_size=%s\n' "$LOCAL_MTP_SIZE"
+    printf 'mtp_sample_sha256=%s\n' "$LOCAL_MTP_FINGERPRINT"
+  else
+    printf 'mtp=\nmtp_size=\nmtp_sample_sha256=\n'
+  fi
   printf 'common_env=%s\n' "$COMMON_ENV_Q"
   printf 'worker_env=%s\n' "$WORKER_ENV_Q"
   printf 'coordinator_env=%s\n' "$COORD_ENV_Q"

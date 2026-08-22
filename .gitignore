@@ -45,6 +45,7 @@
 /tests/test_rocm_q4k_slot_balance_oracle
 /tests/test_rocm_compressor_row_shard_oracle
 /tests/test_rocm_f16_pair_temporal_exact
+/tests/test_rocm_f16_ordered_rows_exact
 /tests/test_rocm_q8_decode_rows_exact
 /tests/test_rocm_prefill_wavefront_projections
 /tests/test_rocm_q4k_skip_unowned
