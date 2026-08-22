@@ -1805,6 +1805,61 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
             full_in_dim, out_dim, k_off, k_cnt, &x_slice, 1u);
 }
 
+extern "C" int ds4_gpu_matmul_q8_0_kslice_verify_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              full_in_dim,
+        uint64_t              k_off,
+        uint64_t              k_cnt,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out || !x || !model_map || n_rows < 2u || n_rows > 5u ||
+        full_in_dim != 2048u || (k_off != 0u && k_off != 1024u) ||
+        k_cnt != 1024u || out_dim != 4096u) return 0;
+    const uint64_t full_blocks = (full_in_dim + 31u) / 32u;
+    const uint64_t block_start = k_off / 32u;
+    const uint64_t slice_blocks = k_cnt / 32u;
+    const uint64_t row_bytes = full_blocks * 34u;
+    uint64_t weight_bytes = 0u, x_bytes = 0u, out_bytes = 0u;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        !cuda_u64_mul3_checked(n_rows, k_cnt, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, out_dim, sizeof(float), &out_bytes) ||
+        !cuda_tensor_has_bytes(x, x_bytes) ||
+        !cuda_tensor_has_bytes(out, out_bytes)) return 0;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset,
+                                             weight_bytes,
+                                             "q8_0_kslice_verify_rows_exact");
+    if (!wptr) return 0;
+    const unsigned threads = attention_output_expand_threads();
+    const unsigned rows_per_block = threads / 32u;
+    const dim3 grid((unsigned)((out_dim + rows_per_block - 1u) /
+                               rows_per_block), 1u, 1u);
+    const size_t shmem = (size_t)n_rows * 16u * 32u * sizeof(float);
+#define DS4_LAUNCH_SHARED_DOWN_VERIFY_WEIGHT_OUTER(NR) \
+        matmul_q8_0_f32_kslice_verify_weight_outer_exact_w32_kernel<NR><<< \
+                grid, threads, shmem>>>( \
+                (float *)out->ptr, \
+                reinterpret_cast<const unsigned char *>(wptr) + \
+                    block_start * 34u, \
+                (const float *)x->ptr, (uint32_t)slice_blocks, out_dim, \
+                row_bytes)
+    switch (n_rows) {
+        case 2u: DS4_LAUNCH_SHARED_DOWN_VERIFY_WEIGHT_OUTER(2u); break;
+        case 3u: DS4_LAUNCH_SHARED_DOWN_VERIFY_WEIGHT_OUTER(3u); break;
+        case 4u: DS4_LAUNCH_SHARED_DOWN_VERIFY_WEIGHT_OUTER(4u); break;
+        case 5u: DS4_LAUNCH_SHARED_DOWN_VERIFY_WEIGHT_OUTER(5u); break;
+        default: return 0;
+    }
+#undef DS4_LAUNCH_SHARED_DOWN_VERIFY_WEIGHT_OUTER
+    return cuda_ok(cudaGetLastError(),
+                   "q8_0 kslice verifier weight-outer exact launch");
+}
+
 /* ------------------------------------------------------------------------
  * DS4-TP-gfx1151 (patch 14): generic dense-quant K-slice.
  *

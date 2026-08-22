@@ -30645,6 +30645,35 @@ static bool metal_graph_encode_verify_shared_rank_rows(
     const uint64_t mid_bytes = half * sizeof(float);
     const uint64_t out_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     bool ok = true;
+#if defined(DS4_ROCM_BUILD)
+    const bool batched_exact = n_tokens >= 2u && n_tokens <= 5u &&
+        (ds4_gpu_get_tp_runtime_features() &
+         DS4_TP_FEATURE_DSPARK_SHARED_Q8_ROWS_EXACT) != 0u;
+    if (batched_exact) {
+        static bool logged = false;
+        if (!logged) {
+            fprintf(stderr,
+                    "ds4: exact batched TP verifier shared-Q8 rows enabled\n");
+            logged = true;
+        }
+        return ds4_gpu_shared_gate_up_swiglu_q8_0_verify_rows_exact_tensor(
+                   metal_graph_batch_shared_gate(g),
+                   metal_graph_batch_shared_up(g),
+                   metal_graph_batch_shared_mid(g),
+                   model->map, model->size,
+                   layer->ffn_gate_shexp->abs_offset + lane_offset,
+                   layer->ffn_up_shexp->abs_offset + lane_offset,
+                   DS4_N_EMBD, half, metal_graph_batch_ffn_norm(g),
+                   n_tokens, DS4_SWIGLU_CLAMP_EXP) != 0 &&
+               ds4_gpu_matmul_q8_0_kslice_verify_rows_exact_tensor(
+                   metal_graph_batch_shared_out(g),
+                   model->map, model->size,
+                   layer->ffn_down_shexp->abs_offset,
+                   shared_dim, (uint64_t)g->tp_rank * half, half,
+                   DS4_N_EMBD, metal_graph_batch_shared_mid(g),
+                   n_tokens) != 0;
+    }
+#endif
     for (uint32_t row = 0u; ok && row < n_tokens; row++) {
         ds4_gpu_tensor *x_row = ds4_gpu_tensor_view(
                 metal_graph_batch_ffn_norm(g), (uint64_t)row * x_bytes,
@@ -52408,12 +52437,17 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
         metal_graph_tp_env_flag(
             "DS4_ROCM_Q4K_VERIFY_DOWN_FIRST_OWNER", false);
+    const bool dspark_shared_q8_rows_exact_requested =
+        e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        metal_graph_tp_env_flag(
+            "DS4_ROCM_DSPARK_SHARED_Q8_ROWS_EXACT", false);
 #else
     const bool q4k_verify_first_owner_requested = false;
     const bool q8_attn_out_weight_outer_requested = false;
     const bool dspark_exact_attn_head2_requested = false;
     const bool dspark_batch_argmax_requested = false;
     const bool q4k_verify_down_first_owner_requested = false;
+    const bool dspark_shared_q8_rows_exact_requested = false;
 #endif
     const char *rdma_logits = getenv("DS4_TP_RDMA_LOGITS");
     const bool rdma_logits_requested =
@@ -52454,6 +52488,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
              DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX : 0u) |
         (q4k_verify_down_first_owner_requested ?
              DS4_TP_FEATURE_Q4K_VERIFY_DOWN_FIRST_OWNER : 0u) |
+        (dspark_shared_q8_rows_exact_requested ?
+             DS4_TP_FEATURE_DSPARK_SHARED_Q8_ROWS_EXACT : 0u) |
         (rdma_logits_requested && !greedy_top2_enabled ?
              DS4_TP_FEATURE_RDMA_LOGITS : 0u) |
         (rank0_full_logits_requested && !greedy_top2_enabled ?

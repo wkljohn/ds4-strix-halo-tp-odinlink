@@ -112,6 +112,9 @@ enum {
     /* DSpark Q4_K verifier down projection groups repeated expert rows while
      * retaining the shipped two-half wave reduction and slot fold. */
     DS4_TP_FEATURE_Q4K_VERIFY_DOWN_FIRST_OWNER = UINT32_C(1) << 25,
+    /* DSpark TP verifier shared-Q8 rows reuse compact weights across exact
+     * gate/up/SwiGLU and rank K-sliced down projections. */
+    DS4_TP_FEATURE_DSPARK_SHARED_Q8_ROWS_EXACT = UINT32_C(1) << 26,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {

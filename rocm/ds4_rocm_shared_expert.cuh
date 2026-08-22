@@ -125,6 +125,77 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
     return 0;
 }
 
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_verify_rows_exact_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows,
+        float                 clamp) {
+    if (!gate || !up || !mid || !model_map || !x || n_rows < 2u ||
+        n_rows > 5u || in_dim != 4096u || out_dim != 1024u) return 0;
+    const uint64_t blocks = in_dim / 32u;
+    uint64_t row_bytes = 0u, weight_bytes = 0u;
+    uint64_t x_bytes = 0u, out_bytes = 0u;
+    if (!cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, out_dim, sizeof(float), &out_bytes) ||
+        !cuda_model_range_fits(model_size, gate_offset, weight_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, weight_bytes) ||
+        !cuda_tensor_has_bytes(x, x_bytes) ||
+        !cuda_tensor_has_bytes(gate, out_bytes) ||
+        !cuda_tensor_has_bytes(up, out_bytes) ||
+        !cuda_tensor_has_bytes(mid, out_bytes)) return 0;
+    const char *wg = cuda_model_range_ptr(model_map, gate_offset,
+                                           weight_bytes,
+                                           "shared_gate_q8_verify_rows_exact");
+    const char *wu = cuda_model_range_ptr(model_map, up_offset,
+                                           weight_bytes,
+                                           "shared_up_q8_verify_rows_exact");
+    if (!wg || !wu) return 0;
+    /* The production verifier's one-row path uses pair-F32 + SwiGLU when the
+     * experimental fused shared-X switch is off.  Match that dispatch rather
+     * than merely matching its algebra. */
+    if (shared_gate_up_swiglu_sharedx_enabled() ||
+        !cuda_runtime_config()->disable_shared_gate_up_fused_w32) return 0;
+    const unsigned rows_per_block = 32u;
+    const dim3 grid((unsigned)((out_dim + rows_per_block - 1u) /
+                               rows_per_block), 1u, 1u);
+    const size_t shmem =
+        (size_t)n_rows * 16u * 32u * sizeof(float);
+#define DS4_LAUNCH_SHARED_PAIR_VERIFY_WEIGHT_OUTER(NR) \
+        matmul_q8_0_pair_f32_verify_weight_outer_exact_w32_kernel<NR><<< \
+                grid, rows_per_block * 32u, shmem>>>( \
+                (float *)gate->ptr, (float *)up->ptr, \
+                reinterpret_cast<const unsigned char *>(wg), \
+                reinterpret_cast<const unsigned char *>(wu), \
+                (const float *)x->ptr, (uint32_t)blocks, out_dim, out_dim, \
+                row_bytes)
+    switch (n_rows) {
+        case 2u: DS4_LAUNCH_SHARED_PAIR_VERIFY_WEIGHT_OUTER(2u); break;
+        case 3u: DS4_LAUNCH_SHARED_PAIR_VERIFY_WEIGHT_OUTER(3u); break;
+        case 4u: DS4_LAUNCH_SHARED_PAIR_VERIFY_WEIGHT_OUTER(4u); break;
+        case 5u: DS4_LAUNCH_SHARED_PAIR_VERIFY_WEIGHT_OUTER(5u); break;
+        default: return 0;
+    }
+#undef DS4_LAUNCH_SHARED_PAIR_VERIFY_WEIGHT_OUTER
+    if (!cuda_ok(cudaGetLastError(),
+                 "shared gate/up verifier rows exact pair launch")) return 0;
+    swiglu_kernel<<<((uint64_t)n_rows * out_dim + 255u) / 256u, 256u>>>(
+            (float *)mid->ptr, (const float *)gate->ptr,
+            (const float *)up->ptr, (uint32_t)((uint64_t)n_rows * out_dim),
+            clamp, 1.0f);
+    return cuda_ok(cudaGetLastError(),
+                   "shared verifier rows exact swiglu launch");
+}
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

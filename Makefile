@@ -617,6 +617,18 @@ tests/test_rocm_shared_gu_swiglu_fused: tests/test_rocm_shared_gu_swiglu_fused.o
 test-rocm-shared-gu-swiglu-fused: tests/test_rocm_shared_gu_swiglu_fused
 	./tests/test_rocm_shared_gu_swiglu_fused
 
+tests/test_rocm_shared_verify_rows_exact.o: tests/test_rocm_shared_verify_rows_exact.cu ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_shared_verify_rows_exact: tests/test_rocm_shared_verify_rows_exact.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-shared-verify-rows-exact: tests/test_rocm_shared_verify_rows_exact
+	./tests/test_rocm_shared_verify_rows_exact 2
+	./tests/test_rocm_shared_verify_rows_exact 3
+	./tests/test_rocm_shared_verify_rows_exact 4
+	./tests/test_rocm_shared_verify_rows_exact 5
+
 tests/test_rocm_q8_pair_pack4.o: tests/test_rocm_q8_pair_pack4.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(HIPFLAGS) -I. -c $< -o $@
 

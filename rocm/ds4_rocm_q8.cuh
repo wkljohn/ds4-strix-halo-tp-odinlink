@@ -1310,6 +1310,166 @@ __global__ static void matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel(
     }
 }
 
+/* Exact verifier weight-outer pair projection.  For each activation row the
+ * Q8 block traversal, per-lane accumulation, and wave reduction are identical
+ * to the one-row pair kernel.  The only cross-row reuse is loading each Q8
+ * scale/value once before applying it to N_ROWS independent accumulators. */
+template <uint32_t N_ROWS, uint32_t BLOCK_TILE = 16u>
+__global__ static void
+matmul_q8_0_pair_f32_verify_weight_outer_exact_w32_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    const bool row0_valid = row < out0_dim;
+    const bool row1_valid = row < out1_dim;
+    const unsigned char *wr0 = row0_valid ? w0 + row * row_bytes : NULL;
+    const unsigned char *wr1 = row1_valid ? w1 + row * row_bytes : NULL;
+    const uint32_t in_dim = n_blocks << 5u;
+    float acc0[N_ROWS];
+    float acc1[N_ROWS];
+#pragma unroll
+    for (uint32_t token = 0u; token < N_ROWS; token++) {
+        acc0[token] = 0.0f;
+        acc1[token] = 0.0f;
+    }
+    for (uint32_t b0 = 0u; b0 < n_blocks; b0 += BLOCK_TILE) {
+        const uint32_t count = min(BLOCK_TILE, n_blocks - b0);
+        for (uint32_t i = tid; i < N_ROWS * BLOCK_TILE * 32u;
+             i += blockDim.x) {
+            const uint32_t token = i / (BLOCK_TILE * 32u);
+            const uint32_t within = i - token * BLOCK_TILE * 32u;
+            const uint32_t bb = within >> 5u;
+            const uint32_t k = within & 31u;
+            shx[i] = bb < count
+                ? x[(uint64_t)token * in_dim +
+                    ((uint64_t)(b0 + bb) << 5u) + k]
+                : 0.0f;
+        }
+        __syncthreads();
+        for (uint32_t bb = 0u; bb < count; bb++) {
+            if (row0_valid) {
+                const unsigned char *blk =
+                    wr0 + (uint64_t)(b0 + bb) * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+#pragma unroll
+                for (uint32_t token = 0u; token < N_ROWS; token++) {
+                    const float xv =
+                        shx[(token * BLOCK_TILE + bb) * 32u + lane];
+                    float scaled;
+                    asm volatile("v_mul_f32_e32 %0, %1, %2"
+                                 : "=v"(scaled) : "v"(xv), "v"(d));
+                    acc0[token] += scaled * (float)q;
+                }
+            }
+            if (row1_valid) {
+                const unsigned char *blk =
+                    wr1 + (uint64_t)(b0 + bb) * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+#pragma unroll
+                for (uint32_t token = 0u; token < N_ROWS; token++) {
+                    const float xv =
+                        shx[(token * BLOCK_TILE + bb) * 32u + lane];
+                    float scaled;
+                    asm volatile("v_mul_f32_e32 %0, %1, %2"
+                                 : "=v"(scaled) : "v"(xv), "v"(d));
+                    acc1[token] += scaled * (float)q;
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t token = 0u; token < N_ROWS; token++) {
+        acc0[token] = warp_sum_f32(acc0[token]);
+        acc1[token] = warp_sum_f32(acc1[token]);
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t token = 0u; token < N_ROWS; token++) {
+            if (row0_valid) out0[(uint64_t)token * out0_dim + row] = acc0[token];
+            if (row1_valid) out1[(uint64_t)token * out1_dim + row] = acc1[token];
+        }
+    }
+}
+
+template <uint32_t N_ROWS, uint32_t BLOCK_TILE = 16u>
+__global__ static void
+matmul_q8_0_f32_kslice_verify_weight_outer_exact_w32_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    const bool row_valid = row < out_dim;
+    const unsigned char *wr = row_valid ? w + row * row_bytes : NULL;
+    const uint32_t in_dim = n_blocks << 5u;
+    float acc[N_ROWS];
+#pragma unroll
+    for (uint32_t token = 0u; token < N_ROWS; token++) acc[token] = 0.0f;
+    for (uint32_t b0 = 0u; b0 < n_blocks; b0 += BLOCK_TILE) {
+        const uint32_t count = min(BLOCK_TILE, n_blocks - b0);
+        for (uint32_t i = tid; i < N_ROWS * BLOCK_TILE * 32u;
+             i += blockDim.x) {
+            const uint32_t token = i / (BLOCK_TILE * 32u);
+            const uint32_t within = i - token * BLOCK_TILE * 32u;
+            const uint32_t bb = within >> 5u;
+            const uint32_t k = within & 31u;
+            shx[i] = bb < count
+                ? x[(uint64_t)token * in_dim +
+                    ((uint64_t)(b0 + bb) << 5u) + k]
+                : 0.0f;
+        }
+        __syncthreads();
+        if (row_valid) {
+            for (uint32_t bb = 0u; bb < count; bb++) {
+                const unsigned char *blk =
+                    wr + (uint64_t)(b0 + bb) * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+#pragma unroll
+                for (uint32_t token = 0u; token < N_ROWS; token++) {
+                    const float xv =
+                        shx[(token * BLOCK_TILE + bb) * 32u + lane];
+                    acc[token] = __builtin_fmaf(d * (float)q, xv,
+                                                acc[token]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t token = 0u; token < N_ROWS; token++) {
+        acc[token] = warp_sum_f32(acc[token]);
+    }
+    if (lane == 0u && row_valid) {
+#pragma unroll
+        for (uint32_t token = 0u; token < N_ROWS; token++) {
+            out[(uint64_t)token * out_dim + row] = acc[token];
+        }
+    }
+}
+
 /* Exact-F32 packed-four pair projection for gfx1151 decode. Four eight-lane
  * subgroups consume four Q8 blocks per wave iteration, retaining both pair
  * accumulators and the original compact weights. No activation quantization

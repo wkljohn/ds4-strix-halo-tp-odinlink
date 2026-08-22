@@ -144,6 +144,12 @@ int main(void) {
     ok &= check("hello mismatched-q4k-verify-down-first-owner",
                 DS4_TP_FEATURE_Q4K_VERIFY_DOWN_FIRST_OWNER, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x02000000 peer=0x00000000)");
+    ok &= check("hello equal-dspark-shared-q8-rows-exact",
+                DS4_TP_FEATURE_DSPARK_SHARED_Q8_ROWS_EXACT,
+                DS4_TP_FEATURE_DSPARK_SHARED_Q8_ROWS_EXACT, 1, NULL);
+    ok &= check("hello mismatched-dspark-shared-q8-rows-exact",
+                DS4_TP_FEATURE_DSPARK_SHARED_Q8_ROWS_EXACT, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x04000000 peer=0x00000000)");
     ok &= check("hello equal-batch-attn-head-split",
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);

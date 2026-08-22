@@ -617,3 +617,19 @@ The implementation adds no persistent allocation or expanded-weight cache and
 is negotiated with TP feature bit 25.  Detailed arithmetic, rejected-path,
 oracle, profiler, and reproduction evidence is in
 [Q4-DOWN-FIRST-OWNER-20260822.md](Q4-DOWN-FIRST-OWNER-20260822.md).
+
+## Exact shared-Q8 verifier weight reuse
+
+The next accepted kernel collapses the verifier's per-row Q8 shared-expert
+gate/up and K-sliced down projections into weight-outer W2--W5 kernels.  An
+inline gfx1151 multiply preserves the shipped `activation * scale` rounding
+point before each FMA; the full-mantissa oracle is bit-exact and measures
+2.00x--4.20x isolated speedups.
+
+The final three-run RoCE v2 median is **190.38 prefill / 16.01 decode t/s**;
+OdinLink measures **181.04 / 16.35 t/s** with zero fallback calls, and the
+ordinary control remains **258.45 / 19.65 t/s**.  FNV64, the acceptance
+histogram, and 2.098 final tokens/cycle are unchanged.  Verifier latency falls
+from 161.66 to 145.21 ms/invocation without persistent memory.  Full design,
+failure, ISA, oracle, and run evidence is in
+[SHARED-Q8-WEIGHT-OUTER-20260822.md](SHARED-Q8-WEIGHT-OUTER-20260822.md).
