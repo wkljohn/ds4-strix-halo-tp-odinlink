@@ -7,6 +7,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -73,6 +74,110 @@ def sha256(path: Path) -> str:
 def canonical_sha256(value: object) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def resolve_scoped_path(repo: Path, root: Path, item: dict) -> Path:
+    scope = item.get("scope")
+    relative = item.get("path")
+    if scope not in {"repo", "research", "system"} or not isinstance(relative, str) or not relative:
+        raise GateError("oracle closure entries require repo/research/system scope and a path")
+    if scope == "system":
+        path = Path(relative)
+        if not path.is_absolute():
+            raise GateError("system-scoped oracle closure paths must be absolute")
+        return path.resolve()
+    if Path(relative).is_absolute():
+        raise GateError("repo/research oracle closure paths must be relative")
+    base = repo if scope == "repo" else root
+    path = (base / relative).resolve()
+    if path == base or base not in path.parents:
+        raise GateError("oracle closure path escapes its declared scope")
+    return path
+
+
+def verify_generator_closure(repo: Path, root: Path,
+                             generator: dict) -> tuple[Path, Path]:
+    closure = generator.get("closure")
+    entrypoint = generator.get("entrypoint")
+    runner = generator.get("runner")
+    environment = generator.get("environment")
+    if (not isinstance(closure, list) or not closure or
+            not isinstance(entrypoint, dict) or not isinstance(runner, dict) or
+            not isinstance(environment, dict) or not environment or
+            not re.fullmatch(r"[0-9a-f]{64}",
+                             str(generator.get("environment_id", ""))) or
+            generator["environment_id"] != canonical_sha256(environment) or
+            generator.get("closure_sha256") != canonical_sha256(closure)):
+        raise GateError("approved oracle generator has an invalid dependency closure")
+    resolved: dict[tuple[str, str], Path] = {}
+    for item in closure:
+        if (not isinstance(item, dict) or
+                not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))):
+            raise GateError("approved oracle closure has an invalid file hash")
+        path = resolve_scoped_path(repo, root, item)
+        if not path.is_file() or sha256(path) != item["sha256"]:
+            raise GateError(f"approved oracle dependency differs: {path}")
+        key = (str(item["scope"]), str(item["path"]))
+        if key in resolved:
+            raise GateError("approved oracle closure contains duplicate paths")
+        resolved[key] = path
+    entry_key = (str(entrypoint.get("scope")), str(entrypoint.get("path")))
+    runner_key = (str(runner.get("scope")), str(runner.get("path")))
+    if entry_key not in resolved or entrypoint.get("sha256") != sha256(resolved[entry_key]):
+        raise GateError("oracle generator entrypoint is not bound by its closure")
+    if runner_key not in resolved or runner.get("sha256") != sha256(resolved[runner_key]):
+        raise GateError("oracle generator runner is not bound by its closure")
+    return resolved[entry_key], resolved[runner_key]
+
+
+def validate_numerical_thresholds(thresholds: object, label: str) -> dict:
+    if not isinstance(thresholds, dict):
+        raise GateError(f"{label} thresholds are missing")
+    required = {"e_bound", "max_abs", "p99_abs", "nmse", "tvd", "kl",
+                "min_top5_overlap", "min_top20_overlap", "min_teacher_steps"}
+    if required - thresholds.keys():
+        raise GateError(f"{label} thresholds are incomplete")
+    if set(thresholds) - (required | {"allow_quality_difference"}):
+        raise GateError(f"{label} thresholds contain unknown keys")
+    for key in ("e_bound", "max_abs", "p99_abs", "nmse", "tvd", "kl"):
+        value = thresholds[key]
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise GateError(f"{label}.{key} must be finite and nonnegative")
+    for key, limit in (("min_top5_overlap", 5), ("min_top20_overlap", 20)):
+        if not isinstance(thresholds[key], int) or not 0 <= thresholds[key] <= limit:
+            raise GateError(f"{label}.{key} is outside its valid range")
+    if (not isinstance(thresholds["min_teacher_steps"], int) or
+            thresholds["min_teacher_steps"] < MIN_TEACHER_STEPS):
+        raise GateError(f"{label} must require at least {MIN_TEACHER_STEPS} teacher steps")
+    if ("allow_quality_difference" in thresholds and
+            type(thresholds["allow_quality_difference"]) is not bool):
+        raise GateError(f"{label}.allow_quality_difference must be boolean")
+    return thresholds
+
+
+def validate_quality_thresholds(thresholds: object, label: str) -> dict:
+    if not isinstance(thresholds, dict):
+        raise GateError(f"{label} thresholds are missing")
+    required = {"min_cases", "min_target_tokens", "max_mean_nll_delta",
+                "max_ci95_high_nll_delta", "min_api_top1_rate_delta",
+                "min_api_pair_rate_delta"}
+    if required - thresholds.keys():
+        raise GateError(f"{label} thresholds are incomplete")
+    if set(thresholds) != required:
+        raise GateError(f"{label} thresholds contain unknown keys")
+    if (not isinstance(thresholds["min_cases"], int) or
+            thresholds["min_cases"] < MIN_QUALITY_CASES or
+            not isinstance(thresholds["min_target_tokens"], int) or
+            thresholds["min_target_tokens"] < MIN_QUALITY_TOKENS):
+        raise GateError(f"{label} coverage is below production floors")
+    for key in ("max_mean_nll_delta", "max_ci95_high_nll_delta",
+                "min_api_top1_rate_delta", "min_api_pair_rate_delta"):
+        value = thresholds[key]
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise GateError(f"{label}.{key} must be finite")
+    if thresholds["max_ci95_high_nll_delta"] <= 0:
+        raise GateError(f"{label}.max_ci95_high_nll_delta must be positive")
+    return thresholds
 
 
 def sampled_model_sha256(path: Path) -> tuple[int, str]:
@@ -172,29 +277,37 @@ def load_baseline(root: Path, baseline_id: str) -> tuple[Path, dict]:
         raise GateError(f"baseline oracle_generators must be a list: {path}")
     for generator in generators:
         if (not isinstance(generator, dict) or not isinstance(generator.get("id"), str) or
-                not generator["id"] or not re.fullmatch(
-                    r"[0-9a-f]{64}", str(generator.get("sha256", "")))):
+                not generator["id"] or not isinstance(generator.get("entrypoint"), dict) or
+                not isinstance(generator.get("runner"), dict) or
+                not isinstance(generator.get("environment"), dict) or
+                not re.fullmatch(r"[0-9a-f]{64}",
+                                 str(generator.get("environment_id", ""))) or
+                not isinstance(generator.get("closure"), list) or not generator["closure"] or
+                not re.fullmatch(r"[0-9a-f]{64}",
+                                 str(generator.get("closure_sha256", "")))):
             raise GateError(f"baseline has an invalid approved oracle generator: {path}")
+        if generator.get("closure_sha256") != canonical_sha256(generator["closure"]):
+            raise GateError(f"baseline oracle generator closure digest is invalid: {path}")
+        if generator.get("environment_id") != canonical_sha256(generator["environment"]):
+            raise GateError(f"baseline oracle generator environment digest is invalid: {path}")
     if (not isinstance(quality, dict) or
             not re.fullmatch(r"[0-9a-f]{64}", str(quality.get("sha256", ""))) or
             not re.fullmatch(r"[0-9a-f]{64}", str(quality.get("manifest_sha256", "")))):
         raise GateError(f"baseline has no bound quality reference: {path}")
-    numerical_thresholds = value["thresholds"].get("numerical")
-    if (not isinstance(numerical_thresholds, dict) or
-            not isinstance(numerical_thresholds.get("min_teacher_steps"), int) or
-            numerical_thresholds["min_teacher_steps"] < MIN_TEACHER_STEPS):
-        raise GateError(f"baseline must require at least {MIN_TEACHER_STEPS} teacher steps: {path}")
+    quality_anchor = value["reference"].get("quality_anchor", quality)
+    if (not isinstance(quality_anchor, dict) or
+            not re.fullmatch(r"[0-9a-f]{64}", str(quality_anchor.get("sha256", ""))) or
+            not re.fullmatch(r"[0-9a-f]{64}",
+                             str(quality_anchor.get("manifest_sha256", "")))):
+        raise GateError(f"baseline has no bound quality anchor: {path}")
+    numerical_thresholds = validate_numerical_thresholds(
+        value["thresholds"].get("numerical"), "numerical")
     if len(numerical["files"]) < numerical_thresholds["min_teacher_steps"]:
         raise GateError(f"baseline numerical reference is shorter than its threshold: {path}")
-    quality_thresholds = value["thresholds"].get("quality")
-    if (not isinstance(quality_thresholds, dict) or
-            not isinstance(quality_thresholds.get("min_cases"), int) or
-            quality_thresholds["min_cases"] < MIN_QUALITY_CASES or
-            not isinstance(quality_thresholds.get("min_target_tokens"), int) or
-            quality_thresholds["min_target_tokens"] < MIN_QUALITY_TOKENS or
-            not isinstance(quality_thresholds.get("max_ci95_high_nll_delta"), (int, float)) or
-            quality_thresholds["max_ci95_high_nll_delta"] <= 0):
-        raise GateError(f"baseline quality thresholds are below the production floor: {path}")
+    oracle_thresholds = value["thresholds"].get("oracle_numerical")
+    if oracle_thresholds is not None:
+        validate_numerical_thresholds(oracle_thresholds, "oracle_numerical")
+    validate_quality_thresholds(value["thresholds"].get("quality"), "quality")
     return path, value
 
 
@@ -325,13 +438,15 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
             raise GateError(f"numerical source escapes canonical research root: {path}")
     if reference_dir == candidate_dir:
         raise GateError("numerical reference and candidate directories must differ")
+    definition_changed = lane == "C" and target_definition.get("changed") is True
+    threshold_section = "oracle_numerical" if lane == "C" else "numerical"
     with tempfile.TemporaryDirectory() as raw:
-        threshold = threshold_file(baseline, baseline_id, "numerical", Path(raw))
+        threshold = threshold_file(baseline, baseline_id, threshold_section, Path(raw))
         command = [
             sys.executable, str(repo / "scripts" / "compare-teacher-logits.py"),
             str(reference_dir), str(candidate_dir), "--thresholds", str(threshold),
         ]
-        allow_quality_difference = baseline["thresholds"]["numerical"].get(
+        allow_quality_difference = baseline["thresholds"][threshold_section].get(
             "allow_quality_difference", False)
         if recorded.get("allow_quality_difference") is not allow_quality_difference:
             raise GateError("numerical comparison mode differs from the baseline contract")
@@ -346,21 +461,16 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
         {"name": item.get("name"), "sha256": item.get("reference_sha256")}
         for item in recorded.get("sources", {}).get("pairs", [])
     ]
-    definition_changed = lane == "C" and target_definition.get("changed") is True
     if definition_changed:
         oracle_identity = read_manifest(reference_manifest)
         approved_generators = {
-            item["id"]: item["sha256"] for item in baseline.get("oracle_generators", [])
+            item["id"]: item for item in baseline.get("oracle_generators", [])
         }
         generator_id = oracle_identity.get("generator_id")
-        generator_path = Path(oracle_identity.get("generator_path", "")).resolve()
-        if (generator_path != repo and repo not in generator_path.parents and
-                generator_path != root and root not in generator_path.parents):
-            raise GateError("Lane C oracle generator escapes the repository/research root")
-        try:
-            generator_sha256 = sha256(generator_path)
-        except OSError as error:
-            raise GateError(f"cannot hash Lane C oracle generator: {error}") from error
+        approved = approved_generators.get(generator_id)
+        if not isinstance(approved, dict):
+            raise GateError("Lane C oracle generator is not approved by the predecessor")
+        generator_path, runner_path = verify_generator_closure(repo, root, approved)
         file_list_hash = hashlib.sha256("".join(
             f"{item['name']} {item['sha256']}\n" for item in reference_hashes
         ).encode()).hexdigest()
@@ -376,10 +486,10 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
                 oracle_identity.get("model") != candidate_model["path"] or
                 oracle_identity.get("model_size") != str(candidate_model["size"]) or
                 oracle_identity.get("model_sample_sha256") != candidate_model["sample_sha256"] or
-                oracle_identity.get("source_commit") != source["commit"] or
-                oracle_identity.get("source_dirty") != "0" or
-                oracle_identity.get("generator_sha256") != generator_sha256 or
-                generator_sha256 != approved_generators.get(generator_id) or
+                oracle_identity.get("generator_closure_sha256") !=
+                    approved["closure_sha256"] or
+                oracle_identity.get("generator_environment_id") !=
+                    approved["environment_id"] or
                 not oracle_identity.get("toolchain_id") or
                 oracle_identity.get("prefix_tokens") != str(
                     baseline["key"]["workload"]["frontier"]) or
@@ -391,12 +501,18 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
             raise GateError("Lane C oracle token sequence differs from the frozen workload")
         with tempfile.TemporaryDirectory() as generated_raw:
             generated_dir = Path(generated_raw)
-            result = subprocess.run([
-                str(generator_path), "--model", candidate_model["path"],
-                "--definition", target_definition["id"],
+            command = ([str(generator_path)] if runner_path == generator_path else
+                       [str(runner_path), str(generator_path)])
+            command.extend([
+                "--model", candidate_model["path"], "--definition", target_definition["id"],
                 "--prefix", str(baseline["key"]["workload"]["frontier"]),
                 "--token-file", str(token_file), "--output-dir", str(generated_dir),
-            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            ])
+            try:
+                result = subprocess.run(command, text=True, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+            except OSError as error:
+                raise GateError(f"cannot execute approved Lane C oracle: {error}") from error
             if result.returncode != 0:
                 detail = result.stderr.strip() or result.stdout.strip()
                 raise GateError(f"approved Lane C oracle generator failed: {detail}")
@@ -426,9 +542,14 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
     for item in recorded["sources"]["pairs"]:
         reference_dump = json.loads((reference_dir / item["name"]).read_text(encoding="utf-8"))
         candidate_dump = json.loads((candidate_dir / item["name"]).read_text(encoding="utf-8"))
+        expected_reference_source = (
+            "ds4-canonical-oracle" if lane == "C"
+            else "ds4-bench-frozen-teacher")
+        if reference_dump.get("source") != expected_reference_source:
+            raise GateError("reference logit dump has an unexpected producer schema")
+        if candidate_dump.get("source") != "ds4-bench-frozen-teacher":
+            raise GateError("candidate logit dump has an unexpected producer schema")
         for dump in (reference_dump, candidate_dump):
-            if dump.get("source") != "ds4-bench-frozen-teacher":
-                raise GateError("teacher-logit dump has an unexpected producer schema")
             if expected_bits is not None and dump.get("quant_bits") != expected_bits:
                 raise GateError("teacher-logit quantization differs from the baseline model")
             if dump.get("prefix_tokens") != expected_prefix:
@@ -452,7 +573,7 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
                 baseline["key"]["workload"].get("frozen_token_sha256") or
             candidate_identity.get("dspark") != "0"):
         raise GateError("numerical candidate manifest does not match the ordinary candidate")
-    minimum = baseline["thresholds"]["numerical"]["min_teacher_steps"]
+    minimum = baseline["thresholds"][threshold_section]["min_teacher_steps"]
     if (recorded.get("baseline_id") != baseline_id or
             recorded.get("passed") is not True or
             recorded.get("far_margin_inversions") != 0 or
@@ -464,7 +585,9 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
 
 def verify_quality_evidence(repo: Path, root: Path, summary_path: Path,
                             baseline_id: str, baseline: dict,
-                            candidate_model: dict, source: dict) -> dict:
+                            candidate_model: dict, source: dict,
+                            reference_section: dict | None = None,
+                            label: str = "predecessor") -> dict:
     try:
         recorded = json.loads(summary_path.read_text(encoding="utf-8"))
         sources = recorded["sources"]
@@ -489,11 +612,13 @@ def verify_quality_evidence(repo: Path, root: Path, summary_path: Path,
     if {key: value for key, value in recorded.items() if key not in ignored} != {
             key: value for key, value in recomputed.items() if key not in ignored}:
         raise GateError("reference-score summary does not match its source TSVs")
-    if recorded.get("sources", {}).get("reference_sha256") != baseline["reference"]["quality"]["sha256"]:
-        raise GateError("quality reference is not the predecessor baseline artifact")
+    if reference_section is None:
+        reference_section = baseline["reference"]["quality"]
+    if recorded.get("sources", {}).get("reference_sha256") != reference_section["sha256"]:
+        raise GateError(f"quality reference is not the {label} artifact")
     if (recorded.get("sources", {}).get("reference_manifest_sha256") !=
-            baseline["reference"]["quality"]["manifest_sha256"]):
-        raise GateError("quality reference manifest is not the predecessor baseline artifact")
+            reference_section["manifest_sha256"]):
+        raise GateError(f"quality reference manifest is not the {label} artifact")
     candidate_identity = read_manifest(candidate_manifest)
     if (candidate_identity.get("model") != candidate_model["path"] or
             candidate_identity.get("model_size") != str(candidate_model["size"]) or
@@ -519,6 +644,10 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         raise GateError("source.commit must be a full Git object id")
     if source.get("dirty") is not False:
         raise GateError("performance promotion requires a clean source worktree snapshot")
+    if run_git(repo, "rev-parse", "HEAD") != source["commit"]:
+        raise GateError("gate must run from the candidate source commit")
+    if run_git(repo, "status", "--porcelain=v1", "-uall"):
+        raise GateError("gate must run from a clean candidate worktree")
     baseline = None
     if lane in {"B", "C"}:
         _, baseline = load_baseline(root, str(value.get("baseline_id", "")))
@@ -537,6 +666,10 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         expected = str(item.get("sha256", ""))
         if not kind or not re.fullmatch(r"[0-9a-f]{64}", expected):
             raise GateError(f"evidence[{index}] has invalid kind or SHA-256")
+        allowed_kinds = (COMMON_KINDS | set().union(*LANE_KINDS.values()) |
+                         DSPARK_KINDS | {"candidate-benchmark", "quality-anchor-score"})
+        if kind not in allowed_kinds:
+            raise GateError(f"evidence[{index}] uses unknown kind: {kind}")
         path = Path(path_text)
         if not path.is_absolute():
             path = dossier / path
@@ -651,6 +784,8 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         if (not isinstance(providers, list) or not providers or
                 any(provider not in {"odinlink", "roce-v2"} for provider in providers)):
             raise GateError("candidate transport.providers must name validated RDMA providers")
+        if lane == "C" and set(providers) != {"odinlink", "roce-v2"}:
+            raise GateError("Lane C requires both OdinLink and RoCE v2 validation")
         for _, manifest, _ in benchmark_rows:
             if (manifest.get("model_sample_sha256") != model.get("sample_sha256") or
                     manifest.get("model_size") != str(model.get("size", "")) or
@@ -681,6 +816,17 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
             model, lane, source, toolchain, target_definition)
         quality_result = verify_quality_evidence(
             repo, root, quality_paths[0], value["baseline_id"], baseline, model, source)
+        quality_anchor = baseline["reference"].get(
+            "quality_anchor", baseline["reference"]["quality"])
+        if quality_anchor == baseline["reference"]["quality"]:
+            quality_anchor_result = quality_result
+        else:
+            anchor_paths = paths_by_kind.get("quality-anchor-score", [])
+            if len(anchor_paths) != 1:
+                raise GateError("lane B/C requires one cumulative quality-anchor summary")
+            quality_anchor_result = verify_quality_evidence(
+                repo, root, anchor_paths[0], value["baseline_id"], baseline,
+                model, source, quality_anchor, "immutable anchor")
 
     print(f"PASS candidate={candidate_id} lane={lane} evidence={len(evidence)}")
     return dossier, value, {
@@ -689,6 +835,7 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         "benchmark_manifests": [manifest for _, manifest, _ in benchmark_rows],
         "numerical_result": numerical_result if lane in {"B", "C"} else None,
         "quality_result": quality_result if lane in {"B", "C"} else None,
+        "quality_anchor_result": quality_anchor_result if lane in {"B", "C"} else None,
         "target_definition": value.get("target_definition"),
     }
 
@@ -738,6 +885,8 @@ def promote_candidate(repo: Path, root: Path, candidate_id: str) -> None:
                     "sha256": derived["quality_result"]["sources"]["candidate_sha256"],
                     "manifest_sha256": derived["quality_result"]["sources"]["candidate_manifest_sha256"],
                 },
+                "quality_anchor": derived["baseline"]["reference"].get(
+                    "quality_anchor", derived["baseline"]["reference"]["quality"]),
             },
             "thresholds": derived["baseline"]["thresholds"],
             "provenance": {
@@ -781,6 +930,113 @@ def promote_candidate(repo: Path, root: Path, candidate_id: str) -> None:
     print(dossier / "PROMOTED.json")
 
 
+def amend_baseline(repo: Path, root: Path, amendment_path: Path) -> None:
+    amendment_path = amendment_path.resolve()
+    if amendment_path != root and root not in amendment_path.parents:
+        raise GateError("baseline amendment must live in the canonical research root")
+    try:
+        amendment = json.loads(amendment_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise GateError(f"invalid baseline amendment: {error}") from error
+    if (amendment.get("schema_version") != 1 or
+            amendment.get("kind") != "ds4-baseline-amendment" or
+            not ID_RE.fullmatch(str(amendment.get("amendment_id", ""))) or
+            not isinstance(amendment.get("rationale"), str) or
+            not amendment["rationale"].strip()):
+        raise GateError("invalid baseline amendment identity or rationale")
+    _, predecessor = load_baseline(root, str(amendment.get("baseline_id", "")))
+    reviews = amendment.get("evidence")
+    if not isinstance(reviews, list):
+        raise GateError("baseline amendment requires review evidence")
+    review_kinds = set()
+    for item in reviews:
+        if (not isinstance(item, dict) or item.get("kind") not in
+                {"fable-review", "grok-review"} or
+                not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))):
+            raise GateError("baseline amendment has invalid review evidence")
+        path = Path(str(item.get("path", ""))).resolve()
+        if path != root and root not in path.parents:
+            raise GateError("baseline amendment review escapes canonical research root")
+        if not path.is_file() or sha256(path) != item["sha256"]:
+            raise GateError("baseline amendment review hash mismatch")
+        review_kinds.add(item["kind"])
+    if review_kinds != {"fable-review", "grok-review"}:
+        raise GateError("baseline amendment requires both Fable and Grok reviews")
+
+    record = json.loads(json.dumps(predecessor))
+    generator = amendment.get("add_oracle_generator")
+    if generator is not None:
+        if (not isinstance(generator, dict) or
+                not ID_RE.fullmatch(str(generator.get("id", "")))):
+            raise GateError("baseline amendment has an invalid oracle generator")
+        if any(item.get("id") == generator["id"]
+               for item in record.get("oracle_generators", [])):
+            raise GateError("oracle generator id already exists in the baseline lineage")
+        verify_generator_closure(repo, root, generator)
+        record.setdefault("oracle_generators", []).append(generator)
+
+    updates = amendment.get("threshold_updates", {})
+    if not isinstance(updates, dict) or any(
+            key not in {"numerical", "oracle_numerical", "quality"} for key in updates):
+        raise GateError("baseline amendment has unsupported threshold updates")
+    for section, thresholds in updates.items():
+        if not isinstance(thresholds, dict):
+            raise GateError(f"invalid {section} threshold update")
+        if section in {"numerical", "oracle_numerical"}:
+            validate_numerical_thresholds(thresholds, section)
+            previous = record["thresholds"].get(
+                section, record["thresholds"]["numerical"])
+            for key in ("e_bound", "max_abs", "p99_abs", "nmse", "tvd", "kl"):
+                if thresholds[key] > previous[key]:
+                    raise GateError(f"{section} amendment weakens {key}")
+            for key in ("min_top5_overlap", "min_top20_overlap", "min_teacher_steps"):
+                if thresholds[key] < previous[key]:
+                    raise GateError(f"{section} amendment weakens {key}")
+            if (previous.get("allow_quality_difference", False) is False and
+                    thresholds.get("allow_quality_difference", False) is True):
+                raise GateError(f"{section} amendment enables quality differences")
+        else:
+            validate_quality_thresholds(thresholds, "quality")
+            previous = record["thresholds"]["quality"]
+            for key in ("min_cases", "min_target_tokens", "min_api_top1_rate_delta",
+                        "min_api_pair_rate_delta"):
+                if key in previous and thresholds.get(key, previous[key]) < previous[key]:
+                    raise GateError(f"quality amendment weakens {key}")
+            for key in ("max_mean_nll_delta", "max_ci95_high_nll_delta"):
+                if key in previous and thresholds.get(key, previous[key]) > previous[key]:
+                    raise GateError(f"quality amendment weakens {key}")
+        record.setdefault("thresholds", {})[section] = thresholds
+    if generator is None and not updates:
+        raise GateError("baseline amendment contains no governed change")
+    if ("oracle_numerical" in updates and
+            "oracle_numerical" not in predecessor["thresholds"] and generator is None):
+        raise GateError("first canonical-oracle envelope must adopt its generator")
+    if generator is not None and "oracle_numerical" not in record["thresholds"]:
+        raise GateError("an adopted oracle generator requires a canonical-oracle envelope")
+    if (len(record["reference"]["numerical"]["files"]) <
+            record["thresholds"]["numerical"]["min_teacher_steps"]):
+        raise GateError("numerical threshold update exceeds the bound reference length")
+    if ("oracle_numerical" in record["thresholds"] and
+            len(record["reference"]["numerical"]["files"]) <
+            record["thresholds"]["oracle_numerical"]["min_teacher_steps"]):
+        raise GateError("oracle threshold update exceeds the frozen reference length")
+
+    record["reference"].setdefault("quality_anchor", record["reference"]["quality"])
+    record["provenance"] = {
+        "amendment_id": amendment["amendment_id"],
+        "amendment_kind": "governance-only",
+        "replaces": amendment["baseline_id"],
+        "amendment_json_sha256": sha256(amendment_path),
+        "evidence": reviews,
+    }
+    digest = canonical_sha256(record)
+    baseline_path = root / "baselines" / "sha256" / f"{digest}.json"
+    if baseline_path.exists():
+        raise GateError(f"refusing to overwrite existing baseline: {baseline_path}")
+    atomic_json(baseline_path, record)
+    print(f"sha256:{digest}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -790,6 +1046,8 @@ def main() -> int:
     for command in ("check", "promote"):
         child = sub.add_parser(command)
         child.add_argument("candidate_id")
+    amend = sub.add_parser("amend-baseline")
+    amend.add_argument("amendment", type=Path)
     args = parser.parse_args()
     try:
         repo, root = roots()
@@ -797,8 +1055,10 @@ def main() -> int:
             init_candidate(repo, root, args.candidate_id, args.lane)
         elif args.command == "check":
             check_candidate(repo, root, args.candidate_id)
-        else:
+        elif args.command == "promote":
             promote_candidate(repo, root, args.candidate_id)
+        else:
+            amend_baseline(repo, root, args.amendment)
     except (GateError, subprocess.CalledProcessError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

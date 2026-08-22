@@ -11,10 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "compare-teacher-logits.py"
 
 
-def dump(path: Path, logits: list[float], quality: bool = False) -> None:
+def dump(path: Path, logits: list[float], quality: bool = False,
+         source: str = "ds4-bench-frozen-teacher") -> None:
     order = sorted(range(len(logits)), key=lambda idx: (-logits[idx], idx))
     value = {
-        "source": "ds4-bench-frozen-teacher",
+        "source": source,
         "model": "/model.gguf",
         "backend": "rocm",
         "quality": quality,
@@ -57,6 +58,15 @@ def main() -> int:
         exact = run(str(reference), str(candidate))
         assert exact.returncode == 0, exact.stderr
         assert json.loads(exact.stdout)["argmax_mismatches"] == 0
+
+        dump(reference / "decode_000000.logits.json", [0.0, 1.0, 2.0, 3.0],
+             source="ds4-canonical-oracle")
+        canonical = run(str(reference), str(candidate))
+        assert canonical.returncode == 0, canonical.stderr
+        dump(candidate / "decode_000000.logits.json", [0.0, 1.0, 2.0, 3.0],
+             source="ds4-canonical-oracle")
+        assert run(str(reference), str(candidate)).returncode == 1
+        dump(candidate / "decode_000000.logits.json", [0.0, 1.0, 2.0, 3.0])
 
         dump(candidate / "decode_000000.logits.json",
              [0.0, 1.0, 2.0, 3.0], quality=True)

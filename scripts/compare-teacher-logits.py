@@ -26,7 +26,7 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load(path: Path) -> dict:
+def load(path: Path, *, reference: bool = False) -> dict:
     with path.open("r", encoding="utf-8") as handle:
         value = json.load(handle)
     logits = value.get("logits")
@@ -36,8 +36,12 @@ def load(path: Path) -> dict:
     if any(not isinstance(item, (int, float)) or not math.isfinite(item)
            for item in logits):
         raise ValueError(f"{path}: logits contain null, NaN, Inf, or non-numbers")
-    if value.get("source") != "ds4-bench-frozen-teacher":
-        raise ValueError(f"{path}: not a frozen-teacher logit dump")
+    allowed_sources = {"ds4-bench-frozen-teacher"}
+    if reference:
+        allowed_sources.add("ds4-canonical-oracle")
+    if value.get("source") not in allowed_sources:
+        role = "reference" if reference else "candidate"
+        raise ValueError(f"{path}: invalid {role} logit producer")
     for field in ("prefix_tokens", "decode_step", "position", "teacher_token",
                   "quant_bits", "argmax_id", "runner_up_id"):
         if not isinstance(value.get(field), int):
@@ -171,7 +175,7 @@ def main() -> int:
         candidate_files = sorted(args.candidate_dir.glob("decode_*.logits.json"))
         if not reference_files or [p.name for p in reference_files] != [p.name for p in candidate_files]:
             raise ValueError("reference and candidate decode-logit file sets must be non-empty and identical")
-        steps = [compare_pair(load(ref), load(cand), thresholds,
+        steps = [compare_pair(load(ref, reference=True), load(cand), thresholds,
                               args.allow_quality_difference)
                  for ref, cand in zip(reference_files, candidate_files)]
     except (OSError, ValueError, json.JSONDecodeError) as error:
