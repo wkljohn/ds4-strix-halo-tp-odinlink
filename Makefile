@@ -656,6 +656,12 @@ test-rocm-q8-decode-rows-exact: tests/test_rocm_q8_decode_rows_exact
 	./tests/test_rocm_q8_decode_rows_exact 4
 	./tests/test_rocm_q8_decode_rows_exact 5
 
+test-rocm-q8-output-tp-split-exact: tests/test_rocm_q8_decode_rows_exact
+	./tests/test_rocm_q8_decode_rows_exact 2 output-head
+	./tests/test_rocm_q8_decode_rows_exact 3 output-head
+	./tests/test_rocm_q8_decode_rows_exact 4 output-head
+	./tests/test_rocm_q8_decode_rows_exact 5 output-head
+
 tests/test_rocm_q8_pair_pack4.o: tests/test_rocm_q8_pair_pack4.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(HIPFLAGS) -I. -c $< -o $@
 

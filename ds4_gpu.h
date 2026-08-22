@@ -660,6 +660,17 @@ int ds4_gpu_argmax_rows_tensor(
         uint32_t                n_vocab,
         uint32_t                n_rows);
 
+/* ROCm verifier helper for a contiguous vocabulary shard. Writes global ids
+ * and their exact F32 values, preserving the full-head column-zero NaN rule
+ * only for the shard whose global index offset is zero. */
+int ds4_gpu_argmax_rows_value_tensor(
+        ds4_gpu_tensor       *out_idx,
+        ds4_gpu_tensor       *out_value,
+        const ds4_gpu_tensor *logits,
+        uint32_t              n_vocab,
+        uint32_t              n_rows,
+        uint32_t              index_offset);
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,

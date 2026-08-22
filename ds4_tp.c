@@ -46,7 +46,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 9u
+#define DS4_TP_PROTOCOL_VERSION 10u
 
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
@@ -3189,10 +3189,33 @@ int ds4_tp_recv_logits_top2(ds4_tp *tp, ds4_tp_logits_top2 *top2) {
     return tp_read_full(tp->control_fd, top2, sizeof(*top2));
 }
 
+int ds4_tp_send_verify_tops(ds4_tp *tp, const ds4_tp_verify_tops *tops) {
+    if (!tp || !tops || tops->count > DS4_TP_VERIFY_TOPS_MAX) return 0;
+    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_TOPS,
+                         tops, sizeof(*tops));
+}
+
+int ds4_tp_recv_verify_tops(ds4_tp *tp, ds4_tp_verify_tops *tops) {
+    uint32_t type = 0u, bytes = 0u;
+    if (!tp || !tops ||
+        !tp_read_frame_header(tp->control_fd, &type, &bytes) ||
+        type != DS4_TP_FRAME_VERIFY_TOPS || bytes != sizeof(*tops) ||
+        !tp_read_full(tp->control_fd, tops, sizeof(*tops)) ||
+        tops->count > DS4_TP_VERIFY_TOPS_MAX) {
+        fprintf(stderr,
+                "ds4-tp: bad verify-tops frame (type %u bytes %u)\n",
+                type, bytes);
+        return 0;
+    }
+    return 1;
+}
+
 int ds4_tp_exchange_logits_halves(ds4_tp *tp, float *logits,
                                   uint32_t half_count) {
     if (!tp || !logits || half_count == 0u ||
-        (tp->runtime_features & DS4_TP_FEATURE_RDMA_LOGITS) == 0u) {
+        (tp->runtime_features &
+         (DS4_TP_FEATURE_RDMA_LOGITS |
+          DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT)) == 0u) {
         return 0;
     }
 #ifdef DS4_TP_HAVE_VERBS
