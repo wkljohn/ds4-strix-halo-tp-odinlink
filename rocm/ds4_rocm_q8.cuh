@@ -1406,6 +1406,100 @@ matmul_q8_0_pair_f32_verify_weight_outer_exact_w32_kernel(
     }
 }
 
+/* Pack4 equivalent of the verifier pair projection.  This mirrors the two
+ * distinct accumulator DAGs emitted by the established one-row gfx1151 pair
+ * kernel while loading each compact Q8 word once for all verifier rows. */
+template <uint32_t N_ROWS, uint32_t BLOCK_TILE = 32u>
+__global__ static void
+matmul_q8_0_pair_f32_verify_weight_outer_pack4_exact_w32_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t row_bytes) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t subgroup = lane >> 3u;
+    const uint32_t lane8 = lane & 7u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    const bool row0_valid = row < out0_dim;
+    const bool row1_valid = row < out1_dim;
+    const unsigned char *wr0 = row0_valid ? w0 + row * row_bytes : NULL;
+    const unsigned char *wr1 = row1_valid ? w1 + row * row_bytes : NULL;
+    const uint32_t in_dim = n_blocks << 5u;
+    float acc0[N_ROWS];
+    float acc1[N_ROWS];
+#pragma unroll
+    for (uint32_t token = 0u; token < N_ROWS; token++) {
+        acc0[token] = 0.0f;
+        acc1[token] = 0.0f;
+    }
+    for (uint32_t block0 = 0u; block0 < n_blocks; block0 += BLOCK_TILE) {
+        const uint32_t block_count =
+            min(BLOCK_TILE, n_blocks - block0);
+        const uint32_t tile_elems = block_count << 5u;
+        for (uint32_t i = tid; i < N_ROWS * tile_elems; i += blockDim.x) {
+            const uint32_t token = i / tile_elems;
+            const uint32_t k = i - token * tile_elems;
+            shx[i] = x[(uint64_t)token * in_dim +
+                       ((uint64_t)block0 << 5u) + k];
+        }
+        __syncthreads();
+        for (uint32_t bb4 = 0u; bb4 < block_count; bb4 += 4u) {
+            const uint32_t bb = bb4 + subgroup;
+            if (bb >= block_count) continue;
+            const uint32_t b = block0 + bb;
+            const uint32_t elem = (bb << 5u) + (lane8 << 2u);
+            if (row0_valid) {
+                const unsigned char *blk = wr0 + (uint64_t)b * 34u;
+                const float d = q8_0_scale_scalar(blk);
+                const int8_t *q =
+                    (const int8_t *)(blk + 2u + (lane8 << 2u));
+#pragma unroll
+                for (uint32_t token = 0u; token < N_ROWS; token++) {
+                    const float4 xv = *reinterpret_cast<const float4 *>(
+                        shx + token * tile_elems + elem);
+                    acc0[token] = q8_pack4_block_fma_serial_dag(
+                        acc0[token], d, q, xv);
+                }
+            }
+            if (row1_valid) {
+                const unsigned char *blk = wr1 + (uint64_t)b * 34u;
+                const float d = q8_0_scale_scalar(blk);
+                const int8_t *q =
+                    (const int8_t *)(blk + 2u + (lane8 << 2u));
+#pragma unroll
+                for (uint32_t token = 0u; token < N_ROWS; token++) {
+                    const float4 xv = *reinterpret_cast<const float4 *>(
+                        shx + token * tile_elems + elem);
+                    acc1[token] = q8_pack4_block_fma_serial_odd_dag(
+                        acc1[token], d, q, xv);
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t token = 0u; token < N_ROWS; token++) {
+        acc0[token] = warp_sum_f32(acc0[token]);
+        acc1[token] = warp_sum_f32(acc1[token]);
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t token = 0u; token < N_ROWS; token++) {
+            if (row0_valid) out0[(uint64_t)token * out0_dim + row] = acc0[token];
+            if (row1_valid) out1[(uint64_t)token * out1_dim + row] = acc1[token];
+        }
+    }
+}
+
 template <uint32_t N_ROWS, uint32_t BLOCK_TILE = 16u>
 __global__ static void
 matmul_q8_0_f32_kslice_verify_weight_outer_exact_w32_kernel(

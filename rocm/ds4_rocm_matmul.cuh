@@ -1233,6 +1233,176 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair f32 warp launch");
 }
 
+/* Multi-row verifier projections that retain the one-row F32 traversal and
+ * reduction tree.  ROCm used to define these symbols as aliases to the
+ * ordinary batch path, which dynamically quantizes activations and therefore
+ * did not satisfy the API's exactness contract. */
+extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out || !x || !model_map || n_rows < 2u || n_rows > 5u ||
+        in_dim == 0u || out_dim == 0u || (in_dim & 31u) != 0u ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX) return 0;
+    const uint64_t blocks = in_dim / 32u;
+    uint64_t row_bytes = 0u, weight_bytes = 0u;
+    uint64_t x_bytes = 0u, out_bytes = 0u;
+    if (!cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, out_dim, sizeof(float), &out_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_bytes(x, x_bytes) ||
+        !cuda_tensor_has_bytes(out, out_bytes)) return 0;
+    const char *w = cuda_model_range_ptr(model_map, weight_offset,
+                                          weight_bytes,
+                                          "q8_0 decode rows exact");
+    if (!w) return 0;
+    const unsigned threads = 1024u;
+    const unsigned rows_per_block = threads / 32u;
+    const dim3 grid((unsigned)((out_dim + rows_per_block - 1u) /
+                               rows_per_block), 1u, 1u);
+    const size_t shmem = (size_t)n_rows * 32u * 32u * sizeof(float);
+#define DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(NR) \
+        matmul_q8_0_f32_kslice_verify_weight_outer_exact_w32_kernel<NR><<< \
+                grid, threads, shmem>>>( \
+                (float *)out->ptr, \
+                reinterpret_cast<const unsigned char *>(w), \
+                (const float *)x->ptr, (uint32_t)blocks, out_dim, row_bytes)
+    if (attention_q_b_pack4_enabled() && in_dim == 1024u &&
+        out_dim == 16384u && blocks == 32u) {
+#undef DS4_LAUNCH_Q8_DECODE_ROWS_EXACT
+#define DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(NR) \
+        matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel<NR><<< \
+                grid, threads, shmem>>>( \
+                (float *)out->ptr, \
+                reinterpret_cast<const unsigned char *>(w), \
+                (const float *)x->ptr, (uint32_t)blocks, out_dim, n_rows, \
+                row_bytes)
+        switch (n_rows) {
+            case 2u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(2u); break;
+            case 3u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(3u); break;
+            case 4u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(4u); break;
+            case 5u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(5u); break;
+            default: return 0;
+        }
+    } else {
+#undef DS4_LAUNCH_Q8_DECODE_ROWS_EXACT
+#define DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(NR) \
+        matmul_q8_0_f32_kslice_verify_weight_outer_exact_w32_kernel<NR><<< \
+                grid, threads, shmem>>>( \
+                (float *)out->ptr, \
+                reinterpret_cast<const unsigned char *>(w), \
+                (const float *)x->ptr, (uint32_t)blocks, out_dim, row_bytes)
+        switch (n_rows) {
+            case 2u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(2u); break;
+            case 3u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(3u); break;
+            case 4u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(4u); break;
+            case 5u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(5u); break;
+            default: return 0;
+        }
+    }
+#undef DS4_LAUNCH_Q8_DECODE_ROWS_EXACT
+    return cuda_ok(cudaGetLastError(), "q8_0 decode rows exact launch");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight0_offset,
+        uint64_t              weight1_offset,
+        uint64_t              in_dim,
+        uint64_t              out0_dim,
+        uint64_t              out1_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out0 || !out1 || !x || !model_map ||
+        n_rows < 2u || n_rows > 5u || in_dim == 0u ||
+        out0_dim == 0u || out1_dim == 0u || (in_dim & 31u) != 0u ||
+        in_dim > UINT32_MAX || out0_dim > UINT32_MAX ||
+        out1_dim > UINT32_MAX) return 0;
+    const uint64_t blocks = in_dim / 32u;
+    uint64_t row_bytes = 0u, weight0_bytes = 0u, weight1_bytes = 0u;
+    uint64_t x_bytes = 0u, out0_bytes = 0u, out1_bytes = 0u;
+    if (!cuda_u64_mul_checked(blocks, 34u, &row_bytes) ||
+        !cuda_u64_mul_checked(out0_dim, row_bytes, &weight0_bytes) ||
+        !cuda_u64_mul_checked(out1_dim, row_bytes, &weight1_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, out0_dim, sizeof(float), &out0_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, out1_dim, sizeof(float), &out1_bytes) ||
+        !cuda_model_range_fits(model_size, weight0_offset, weight0_bytes) ||
+        !cuda_model_range_fits(model_size, weight1_offset, weight1_bytes) ||
+        !cuda_tensor_has_bytes(x, x_bytes) ||
+        !cuda_tensor_has_bytes(out0, out0_bytes) ||
+        !cuda_tensor_has_bytes(out1, out1_bytes)) return 0;
+    const char *w0 = cuda_model_range_ptr(model_map, weight0_offset,
+                                           weight0_bytes,
+                                           "q8_0 pair decode rows exact 0");
+    const char *w1 = cuda_model_range_ptr(model_map, weight1_offset,
+                                           weight1_bytes,
+                                           "q8_0 pair decode rows exact 1");
+    if (!w0 || !w1) return 0;
+    const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
+    const unsigned threads = 1024u;
+    const unsigned rows_per_block = threads / 32u;
+    const dim3 grid((unsigned)((max_out + rows_per_block - 1u) /
+                               rows_per_block), 1u, 1u);
+    const size_t shmem = (size_t)n_rows * 32u * 32u * sizeof(float);
+#define DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(NR) \
+        matmul_q8_0_pair_f32_verify_weight_outer_exact_w32_kernel<NR><<< \
+                grid, threads, shmem>>>( \
+                (float *)out0->ptr, (float *)out1->ptr, \
+                reinterpret_cast<const unsigned char *>(w0), \
+                reinterpret_cast<const unsigned char *>(w1), \
+                (const float *)x->ptr, (uint32_t)blocks, \
+                out0_dim, out1_dim, row_bytes)
+    if (q8_pair_f32_pack4_enabled() && in_dim == 4096u &&
+        out0_dim == 1024u && out1_dim == 512u) {
+#undef DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT
+#define DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(NR) \
+        matmul_q8_0_pair_f32_verify_weight_outer_pack4_exact_w32_kernel<NR><<< \
+                grid, threads, shmem>>>( \
+                (float *)out0->ptr, (float *)out1->ptr, \
+                reinterpret_cast<const unsigned char *>(w0), \
+                reinterpret_cast<const unsigned char *>(w1), \
+                (const float *)x->ptr, (uint32_t)blocks, \
+                out0_dim, out1_dim, row_bytes)
+        switch (n_rows) {
+            case 2u: DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(2u); break;
+            case 3u: DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(3u); break;
+            case 4u: DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(4u); break;
+            case 5u: DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(5u); break;
+            default: return 0;
+        }
+    } else {
+#undef DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT
+#define DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(NR) \
+        matmul_q8_0_pair_f32_verify_weight_outer_exact_w32_kernel<NR><<< \
+                grid, threads, shmem>>>( \
+                (float *)out0->ptr, (float *)out1->ptr, \
+                reinterpret_cast<const unsigned char *>(w0), \
+                reinterpret_cast<const unsigned char *>(w1), \
+                (const float *)x->ptr, (uint32_t)blocks, \
+                out0_dim, out1_dim, row_bytes)
+        switch (n_rows) {
+            case 2u: DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(2u); break;
+            case 3u: DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(3u); break;
+            case 4u: DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(4u); break;
+            case 5u: DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT(5u); break;
+            default: return 0;
+        }
+    }
+#undef DS4_LAUNCH_Q8_PAIR_DECODE_ROWS_EXACT
+    return cuda_ok(cudaGetLastError(), "q8_0 pair decode rows exact launch");
+}
+
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
@@ -1486,7 +1656,8 @@ extern "C" int ds4_gpu_matmul_f16_pair_temporal_tensor(
         return 0;
     }
     const int temporal_shape = n_tok >= 2u && n_tok <= 4u && in_dim == 4096u &&
-        (out_dim == 256u || out_dim == 512u || out_dim == 1024u);
+        (out_dim == 128u || out_dim == 256u ||
+         out_dim == 512u || out_dim == 1024u);
     if (!temporal_shape || !f16_pair_temporal_supported()) return 0;
     uint64_t weight_bytes = 0, x_bytes = 0, out_bytes = 0;
     if (weight0_offset > model_size || weight1_offset > model_size ||

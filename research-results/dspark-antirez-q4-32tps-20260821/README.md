@@ -633,3 +633,125 @@ histogram, and 2.098 final tokens/cycle are unchanged.  Verifier latency falls
 from 161.66 to 145.21 ms/invocation without persistent memory.  Full design,
 failure, ISA, oracle, and run evidence is in
 [SHARED-Q8-WEIGHT-OUTER-20260822.md](SHARED-Q8-WEIGHT-OUTER-20260822.md).
+
+## Fresh post-change verifier ledger
+
+The exact PROFILE=1 trace now separates the 145.21 ms clean verifier into a
+112.40 ms profiled GPU-kernel floor, about 21.95 ms median attention/FFN
+exchange and peer-skew gaps, and 13.05 ms median other idle time. Only 7.67 ms
+of GPU-idle intervals overlap launch APIs, so HIP graph islands fail their
+20 ms entry gate. Exact K=64 attention-output staging and four-/two-column Q4
+first-owner reuse also failed their isolated performance gates and were
+removed. See
+[FRESH-VERIFIER-LEDGER-20260822.md](FRESH-VERIFIER-LEDGER-20260822.md) for
+the kernel table, reproducible SQLite analyzer, and stop decisions.
+
+## Prefix-commit correction and exact vocabulary-head boundary
+
+The TP worker previously committed prefix snapshot 1 for every partial
+verifier accept while the coordinator committed the selected prefix N.  The
+worker now validates and commits the received replay/prefix length.  A separate
+mid-block EOS guard prevents a full-accept block from installing post-EOS
+state.  The short 60-token gate then matched the strict fingerprint at
+**16.61 decode t/s**, but this is not a long-run performance claim.
+
+On the fixed 2,048+300 workload, the corrected fast path matched the strict
+trajectory through generated token 291 and first diverged at token 292.  A
+selector-scoped verifier capture compared the accepted batch row with serial
+replay and found all 43 post-layer HC tensors bit-exact.  A subsequent
+zero-GPU-capture logits oracle forced replay only at checkpoint 2338 and
+localized the difference to the vocabulary head:
+
+| Range | Batch vs serial max abs | RMS | Interpretation |
+| --- | ---: | ---: | --- |
+| Leader-local vocab half | 0.178668 | 0.039135 | Batched-head numerical drift |
+| Worker-merged vocab half | 0.186690 | 0.039510 | Same magnitude; RDMA assembly is healthy |
+
+The batch row selected token 6621 at 31.1660 while serial replay selected token
+8641 at 31.1589.  The symmetric half errors rule out missing/stale remote
+logits.  The source is the small-row Q8 vocabulary projection: the fast batch
+path dynamically quantizes activations, while ordinary decode retains the
+one-row F32 reduction order.
+
+Two lossless repairs were tested independently over mandatory RoCE v2:
+
+| Candidate | Prefill | Decode | Outer cycles | FNV64 | Verdict |
+| --- | ---: | ---: | ---: | --- | --- |
+| Full 2--5-row exact Q8 head | 200.14 t/s | 13.73 t/s | 68 | `2aa153138c195efc` | Exact, retained as opt-in oracle; too slow to promote |
+| Fast acceptance + exact continuation row | 201.19 t/s | 13.44 t/s | 70 | `2aa153138c195efc` | Rejected and removed |
+
+The continuation-only form paid for another full one-row vocabulary projection
+and allowed approximate intermediate tops to reject drafts earlier.  The
+existing multi-row exact kernel is both safer and faster because it reads each
+Q8 weight stream once across all verifier rows.
+
+The standalone exact-row oracle now has an `output-head` mode using the real
+7168-by-129280 shape.  It compares every output bit with repeated one-row
+decode and adds no model-weight cache:
+
+| Width | Serial rows | Exact weight-outer | Speedup | Exact |
+| ---: | ---: | ---: | ---: | :---: |
+| 2 | 23.558 ms | 12.265 ms | 1.92x | yes |
+| 3 | 32.827 ms | 12.968 ms | 2.53x | yes |
+| 4 | 43.831 ms | 13.241 ms | 3.31x | yes |
+| 5 | 54.803 ms | 13.755 ms | 3.98x | yes |
+
+A 32-block input tile remained exact but improved the production width-5
+shape only from 13.755 to 13.626 ms (0.94%) and did not help width 2.  It was
+reverted rather than changing the global exact-row launch for a sub-noise
+end-to-end opportunity.  The 300-token strict oracle remains 15.42 t/s and the
+validated ordinary no-DSpark reference remains 19.57 t/s; neither lossless
+DSpark head repair clears the milestone.
+
+## Proposal-state and forced-first experiments
+
+Three diagnostics separated proposal quality from cache or capture bugs:
+
+| Experiment | Prefill | Decode | FNV64 | Result |
+| --- | ---: | ---: | --- | --- |
+| Replay every accepted prefix serially | 200.98 t/s | 8.05 t/s | `2aa153138c195efc` | Exact; fast capture/commit state is not the acceptance defect |
+| Reseed the full support cache each cycle | 188.15 t/s | 12.24 t/s | `2aa153138c195efc` | Exact but worse acceptance and speed; rolling append is retained |
+| Existing exact rolling path | about 200 t/s | 13.73 t/s | `2aa153138c195efc` | Long-run reference |
+
+A teacher-forced diagnostic ran the production proposer after each ordinary
+target token without installing draft tokens. Across 299 starts, the trained
+Markov path matched proposal positions 1--5 independently at 69.90%, 53.36%,
+44.11%, 36.49%, and 29.83%; the average matching prefix was 2.010 drafts.
+Disabling the Markov correction reduced the average prefix to 0.532, so the
+trained Markov path is essential. These runs retain the target trajectory and
+exist only as proposal-quality measurements.
+
+A lossless-looking scheduling experiment then forced proposal row 0 to the
+target argmax already available after the anchor evaluation. Under TP, rank 0
+deferred proposal preparation until after the peer vocabulary half had been
+merged. The 2,048+60 candidate passed its exact fingerprint and semantic suite
+at 190.55 prefill / 17.59 decode t/s, with zero first misses and 3.11 accepted
+drafts per verifier cycle. The authoritative 2,048+300 gate rejected it:
+
+| Long candidate | Prefill | Decode | Tokens/cycle | FNV64 |
+| --- | ---: | ---: | ---: | --- |
+| Forced target-first | 190.82 t/s | 13.48 t/s | 2.500 | `644ef4d47b1faef1` (rejected) |
+| Required exact trajectory | — | 13.73 t/s reference | 1.961 | `2aa153138c195efc` |
+
+The forced schedule raised accepted yield but increased expensive verifier
+work and changed the long trajectory. Its runtime switch was removed; the logs
+and manifests remain under `runs/` as negative evidence. At roughly 159.8 ms
+per width-five verifier invocation versus 51.1 ms per ordinary token,
+acceptance-only scheduling cannot beat the 19.57 t/s ordinary reference.
+Further DSpark work should first reduce the exact width-five verifier toward
+120 ms or less while preserving the long fingerprint.
+
+## Exact temporal F16-pair reuse
+
+The exact verifier's paired F16 compressor projections now reuse each weight
+stream across two to four token rows; width five runs as exact 4+1 to remain
+within gfx1151's 64 KiB LDS limit. A production-shape bitwise oracle measured
+2.00x--3.70x for widths two through four and 2.17x--2.36x for width five across
+the real 128/256 output widths and the supported 512/1024 shapes.
+
+Three exact RoCE v2 runs measured 14.09/14.00/14.08 decode t/s, for a
+**14.08 t/s median** with 190.65 t/s median prefill. OdinLink passed at
+182.44/14.19 t/s, and the ordinary no-DSpark control remained
+258.79/19.52 t/s. Verifier time falls by 5.96 ms per full invocation with no
+acceptance change and no persistent allocation. See
+[F16-PAIR-TEMPORAL-EXACT-20260822.md](F16-PAIR-TEMPORAL-EXACT-20260822.md).

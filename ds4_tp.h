@@ -115,6 +115,25 @@ enum {
     /* DSpark TP verifier shared-Q8 rows reuse compact weights across exact
      * gate/up/SwiGLU and rank K-sliced down projections. */
     DS4_TP_FEATURE_DSPARK_SHARED_Q8_ROWS_EXACT = UINT32_C(1) << 26,
+    /* DSpark TP verifier Q_A/KV and rank-owned Q_B projections use the
+     * one-row gfx1151 arithmetic DAG for every verifier row, and retain the
+     * rank-ordered attention add inside HC expansion. */
+    DS4_TP_FEATURE_DSPARK_ATTN_ROWS_EXACT = UINT32_C(1) << 27,
+    /* DSpark compressed-attention verifier rows evaluate the paired F16
+     * compressor/indexer projections with the shipped one-row decode DAG.
+     * This is an exactness oracle first; negotiate it because the recurrent
+     * compressor and indexer state must receive identical values on both
+     * independently launched ranks. */
+    DS4_TP_FEATURE_DSPARK_F16_PAIR_ROWS_EXACT = UINT32_C(1) << 28,
+    /* DSpark verifier vocabulary projection reuses each Q8_0 weight row
+     * across 2--5 rows while retaining the one-row decode reduction tree. */
+    DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_ROWS_EXACT = UINT32_C(1) << 29,
+    /* Ratio-4 DSpark verifier indexer-weight projection may be evaluated with
+     * the shipped one-row decode DAG as an independent oracle. */
+    DS4_TP_FEATURE_DSPARK_INDEXER_W_ROWS_EXACT = UINT32_C(1) << 30,
+    /* The F16 router oracle changes expert selection inputs.  It must never be
+     * enabled on only one of the independently launched TP ranks. */
+    DS4_TP_FEATURE_DSPARK_ROUTER_ROWS_EXACT = UINT32_C(1) << 31,
 };
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {

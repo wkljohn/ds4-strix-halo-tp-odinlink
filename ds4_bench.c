@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <dlfcn.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <stdbool.h>
@@ -1422,6 +1423,8 @@ int main(int argc, char **argv) {
         int gen_first_tokens = 0;
         uint64_t gen_cycles = 0;
         uint64_t gen_token_hash = UINT64_C(14695981039346656037);
+        const bool gen_token_trace =
+            getenv("DS4_BENCH_TOKEN_TRACE") != NULL;
         uint64_t accept_len_hist[17] = {0};
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
@@ -1480,6 +1483,18 @@ int main(int argc, char **argv) {
                 gen_token_hash = bench_token_hash_update(gen_token_hash,
                                                          accepted[j]);
                 if (gen_token_buf) gen_token_buf[gen_token_count++] = accepted[j];
+                if (gen_token_trace) {
+                    fprintf(stderr,
+                            "ds4-bench: token trace pos=%d cycle=%" PRIu64
+                            " slot=%d accepted_n=%d token=%d fnv64=%016" PRIx64
+                            "\n",
+                            gen_done,
+                            gen_cycles,
+                            j,
+                            accepted_n,
+                            accepted[j],
+                            gen_token_hash);
+                }
                 gen_done++;
             }
         }

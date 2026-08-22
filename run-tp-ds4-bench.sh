@@ -96,6 +96,7 @@ if [[ $RDMA_PROFILE == roce-v2 && -z $PREFILL_CHUNK_EXPLICIT ]]; then
   PREFILL_CHUNK=2048
 fi
 DSPARK=${DS4_BENCH_DSPARK:-0}
+DSPARK_STRICT=${DS4_BENCH_DSPARK_STRICT:-0}
 MTP=${DS4_BENCH_MTP:-}
 OUT=${DS4_BENCH_OUT:-"$REPO/research-results/bench-runs"}
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
@@ -195,7 +196,7 @@ for env_kv in "${EXTRA_ENV[@]}"; do
   esac
   if [[ $CANDIDATE == 1 ]]; then
     case $env_kv in
-      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*)
+      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*|DS4_BENCH_TOKEN_TRACE=*)
         echo "error: candidate timing cannot enable graph dumps, profilers, or reference oracles: ${env_kv%%=*}" >&2
         exit 2
         ;;
@@ -374,10 +375,25 @@ if [[ $DSPARK == 1 ]]; then
   )
   WORKER_ENV+=("${DSPARK_ENV[@]}")
   COORD_ENV+=("${DSPARK_ENV[@]}" DS4_DSPARK_RESIDENT_Q8=1)
-  WORKER_ARGS=(--mtp "$MTP" --dspark)
-  COORD_ARGS+=(--mtp "$MTP" --dspark)
+  if [[ $DSPARK_STRICT == 1 ]]; then
+    # Load the same support model and preserve every DSpark-compatible target
+    # arithmetic switch, but keep generation on the serial target path.  This
+    # is the authoritative oracle for deciding whether a speculative schedule
+    # is actually lossless rather than merely self-consistent.
+    WORKER_ARGS=(--mtp "$MTP" --dspark-strict)
+    COORD_ARGS+=(--mtp "$MTP" --dspark-strict)
+  elif [[ $DSPARK_STRICT == 0 ]]; then
+    WORKER_ARGS=(--mtp "$MTP" --dspark)
+    COORD_ARGS+=(--mtp "$MTP" --dspark)
+  else
+    echo "error: DS4_BENCH_DSPARK_STRICT must be 0 or 1" >&2
+    exit 2
+  fi
 elif [[ $DSPARK != 0 ]]; then
   echo "error: DS4_BENCH_DSPARK must be 0 or 1" >&2
+  exit 2
+elif [[ $DSPARK_STRICT != 0 ]]; then
+  echo "error: DS4_BENCH_DSPARK_STRICT=1 requires DS4_BENCH_DSPARK=1" >&2
   exit 2
 fi
 
@@ -510,6 +526,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'candidate=%s\n' "$CANDIDATE"
   printf 'expected_fnv64=%s\n' "${EXPECTED_FNV64,,}"
   printf 'dspark=%s\n' "$DSPARK"
+  printf 'dspark_strict=%s\n' "$DSPARK_STRICT"
   printf 'common_env=%s\n' "$COMMON_ENV_Q"
   printf 'worker_env=%s\n' "$WORKER_ENV_Q"
   printf 'coordinator_env=%s\n' "$COORD_ENV_Q"
@@ -588,7 +605,7 @@ echo "=== ds4-bench $TAG ==="
 echo "model: $MODEL"
 echo "workload: frontier=$FRONTIER generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK"
 echo "rdma_profile: $RDMA_PROFILE coordinator_device=$LOCAL_RDMA_DEVICE worker_device=$PEER_RDMA_DEVICE"
-if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
+if [[ $DSPARK == 1 ]]; then echo "dspark: 1 strict=$DSPARK_STRICT mtp=$MTP"; else echo "dspark: 0"; fi
 if [[ $DSPARK == 0 ]]; then echo "routed_expert_family: $ROUTED_FAMILY"; fi
 if [[ $ROCPROF == 1 ]]; then echo "rocprof: rank=$ROCPROF_RANK kernel trace (diagnostic; timing is not benchmark evidence)"; fi
 echo "ds4_sha256: $LOCAL_DS4_HASH"
