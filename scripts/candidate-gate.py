@@ -22,6 +22,7 @@ COMMON_KINDS = {
     "long-context",
     "transport-proof",
     "ordinary-regression",
+    "cross-discipline-long",
     "fable-review",
     "grok-review",
 }
@@ -49,6 +50,7 @@ COMMON_CLAIMS = {
     "no_persistent_weight_cache",
     "ordinary_no_regression",
     "long_context_pass",
+    "cross_discipline_long_pass",
 }
 LANE_CLAIMS = {
     "A": {"exact_fingerprint", "rollback_reproduces_baseline"},
@@ -195,6 +197,7 @@ def check_candidate(root: Path, candidate_id: str) -> tuple[Path, dict]:
     if not isinstance(evidence, list):
         raise GateError("evidence must be a list")
     kinds: list[str] = []
+    diverse_summaries: list[Path] = []
     for index, item in enumerate(evidence):
         if not isinstance(item, dict):
             raise GateError(f"evidence[{index}] must be an object")
@@ -215,6 +218,8 @@ def check_candidate(root: Path, candidate_id: str) -> tuple[Path, dict]:
         if actual != expected:
             raise GateError(f"evidence hash mismatch: {path}")
         kinds.append(kind)
+        if kind == "cross-discipline-long":
+            diverse_summaries.append(path)
 
     required_kinds = COMMON_KINDS | LANE_KINDS[lane]
     if value.get("dspark") is True:
@@ -224,6 +229,24 @@ def check_candidate(root: Path, candidate_id: str) -> tuple[Path, dict]:
         raise GateError("missing evidence kinds: " + ", ".join(missing_kinds))
     if kinds.count("candidate-benchmark") < 3:
         raise GateError("at least three candidate-benchmark artifacts are required")
+    if len(diverse_summaries) != 1:
+        raise GateError("exactly one cross-disciplinary long summary is required")
+    diverse_tool = Path(__file__).with_name("diverse-bench-gate.py")
+    diverse_env = os.environ.copy()
+    diverse_env["DS4_RESEARCH_ROOT"] = str(root)
+    result = subprocess.run(
+        [sys.executable, str(diverse_tool), "verify", str(diverse_summaries[0])],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=diverse_env,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise GateError(f"cross-disciplinary long evidence failed: {detail}")
+    summary = json.loads(diverse_summaries[0].read_text(encoding="utf-8"))
+    if str(summary.get("lane", "")).upper() != lane:
+        raise GateError("cross-disciplinary long evidence uses a different lane")
 
     claims = value.get("claims")
     if not isinstance(claims, dict):
