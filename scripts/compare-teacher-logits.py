@@ -86,10 +86,13 @@ def load_thresholds(path: Path | None) -> dict | None:
     return value
 
 
-def compare_pair(reference: dict, candidate: dict, thresholds: dict | None) -> dict:
+def compare_pair(reference: dict, candidate: dict, thresholds: dict | None,
+                 allow_quality_difference: bool = False) -> dict:
     for field in ("vocab", "prefix_tokens", "decode_step", "position",
                   "teacher_token", "quant_bits", "quality", "dspark",
                   "dspark_strict"):
+        if field == "quality" and allow_quality_difference:
+            continue
         if reference.get(field) != candidate.get(field):
             raise ValueError(f"metadata {field}: {reference.get(field)!r} != {candidate.get(field)!r}")
 
@@ -150,6 +153,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--steps-output", type=Path,
                         help="write every per-position metric as JSON Lines")
+    parser.add_argument("--allow-quality-difference", action="store_true",
+                        help="explicitly compare an unfused quality oracle with an optimized path")
     args = parser.parse_args()
     try:
         thresholds = load_thresholds(args.thresholds)
@@ -157,7 +162,8 @@ def main() -> int:
         candidate_files = sorted(args.candidate_dir.glob("decode_*.logits.json"))
         if not reference_files or [p.name for p in reference_files] != [p.name for p in candidate_files]:
             raise ValueError("reference and candidate decode-logit file sets must be non-empty and identical")
-        steps = [compare_pair(load(ref), load(cand), thresholds)
+        steps = [compare_pair(load(ref), load(cand), thresholds,
+                              args.allow_quality_difference)
                  for ref, cand in zip(reference_files, candidate_files)]
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"teacher-logits: FAIL {error}", file=sys.stderr)
@@ -168,6 +174,7 @@ def main() -> int:
                 if thresholds is not None else [])
     summary = {
         "baseline_id": thresholds["baseline_id"] if thresholds else None,
+        "allow_quality_difference": args.allow_quality_difference,
         "mode": "gate" if thresholds else "diagnostic",
         "steps": len(steps),
         "argmax_mismatches": len(mismatches),

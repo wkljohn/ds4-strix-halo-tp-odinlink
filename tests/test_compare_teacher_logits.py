@@ -11,13 +11,13 @@ ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "compare-teacher-logits.py"
 
 
-def dump(path: Path, logits: list[float]) -> None:
+def dump(path: Path, logits: list[float], quality: bool = False) -> None:
     order = sorted(range(len(logits)), key=lambda idx: (-logits[idx], idx))
     value = {
         "source": "ds4-bench-frozen-teacher",
         "model": "/model.gguf",
         "backend": "rocm",
-        "quality": False,
+        "quality": quality,
         "dspark": False,
         "dspark_strict": False,
         "quant_bits": 4,
@@ -56,6 +56,13 @@ def main() -> int:
         assert exact.returncode == 0, exact.stderr
         assert json.loads(exact.stdout)["argmax_mismatches"] == 0
 
+        dump(candidate / "decode_000000.logits.json",
+             [0.0, 1.0, 2.0, 3.0], quality=True)
+        assert run(str(reference), str(candidate)).returncode == 1
+        oracle = run(str(reference), str(candidate), "--allow-quality-difference")
+        assert oracle.returncode == 0, oracle.stderr
+        assert json.loads(oracle.stdout)["allow_quality_difference"] is True
+
         dump(candidate / "decode_000000.logits.json", [0.0, 1.0, 4.0, 3.0])
         diagnostic = run(str(reference), str(candidate))
         assert diagnostic.returncode == 0, diagnostic.stderr
@@ -76,6 +83,13 @@ def main() -> int:
         gated = run(str(reference), str(candidate), "--thresholds", str(thresholds))
         assert gated.returncode == 1
         assert json.loads(gated.stdout)["passed"] is False
+        dump(candidate / "decode_000000.logits.json",
+             [0.0, 1.0, 4.0, 3.0], quality=True)
+        oracle_gated = run(str(reference), str(candidate),
+                           "--allow-quality-difference",
+                           "--thresholds", str(thresholds))
+        assert oracle_gated.returncode == 1
+        assert json.loads(oracle_gated.stdout)["passed"] is False
     print("test_compare_teacher_logits: PASS")
     return 0
 
