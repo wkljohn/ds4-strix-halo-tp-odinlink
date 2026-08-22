@@ -956,6 +956,16 @@ int ds4_gpu_matmul_f16_pair_tensor(
         uint64_t                n_tok);
 
 #ifdef DS4_ROCM_BUILD
+/* Explicit exact multi-row form of the ordered one-token F16 projection. */
+int ds4_gpu_matmul_f16_ordered_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows);
 /* Explicit gfx1151 temporal-compressor primitive.  Unlike the generic paired
  * API, this never changes unrelated prefill or verifier dispatch. */
 int ds4_gpu_f16_pair_temporal_supported(void);

@@ -55,7 +55,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-big-gate-overlap test-tp-verify-gate-latency test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-q4k-verify-batch-oracle test-rocm-q8-attn-out-weight-outer test-rocm-indexer-exact-token-loop test-rocm-attention-exact-head2 test-rocm-argmax-rows test-rocm-compressor-row-shard-oracle test-rocm-f16-pair-temporal-exact dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-big-gate-overlap test-tp-verify-gate-latency test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-q4k-verify-batch-oracle test-rocm-q8-attn-out-weight-outer test-rocm-indexer-exact-token-loop test-rocm-attention-exact-head2 test-rocm-argmax-rows test-rocm-compressor-row-shard-oracle test-rocm-f16-pair-temporal-exact test-rocm-f16-ordered-rows-exact dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
 	python3 tests/test_frontier_logits_gate.py
@@ -622,6 +622,22 @@ test-rocm-f16-pair-temporal-exact: tests/test_rocm_f16_pair_temporal_exact
 	./tests/test_rocm_f16_pair_temporal_exact 5 256
 	./tests/test_rocm_f16_pair_temporal_exact 5 512
 	./tests/test_rocm_f16_pair_temporal_exact 5 1024
+
+tests/test_rocm_f16_ordered_rows_exact.o: tests/test_rocm_f16_ordered_rows_exact.cu ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_f16_ordered_rows_exact: tests/test_rocm_f16_ordered_rows_exact.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-f16-ordered-rows-exact: tests/test_rocm_f16_ordered_rows_exact
+	./tests/test_rocm_f16_ordered_rows_exact token 2 1024 8192 16
+	./tests/test_rocm_f16_ordered_rows_exact token 3 1024 8192 16
+	./tests/test_rocm_f16_ordered_rows_exact token 4 1024 8192 16
+	./tests/test_rocm_f16_ordered_rows_exact token 5 1024 8192 16
+	./tests/test_rocm_f16_ordered_rows_exact token 2 4096 64 64
+	./tests/test_rocm_f16_ordered_rows_exact token 3 4096 64 64
+	./tests/test_rocm_f16_ordered_rows_exact token 4 4096 64 64
+	./tests/test_rocm_f16_ordered_rows_exact token 5 4096 64 64
 
 tests/test_rocm_shared_gu_swiglu_fused.o: tests/test_rocm_shared_gu_swiglu_fused.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<

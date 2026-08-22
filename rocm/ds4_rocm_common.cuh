@@ -171,6 +171,51 @@ __global__ static void matmul_f16_ordered_chunks_kernel(
     }
 }
 
+/* Exact multi-row counterpart of matmul_f16_ordered_chunks_kernel.  Each
+ * token keeps the same per-lane K traversal and the same lane-0 reduction;
+ * only the F16 weight load is shared across independent token accumulators. */
+template <uint32_t N_ROWS>
+__global__ static void matmul_f16_ordered_rows_exact_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    if (row >= out_dim) return;
+
+    __shared__ float partial[N_ROWS][32];
+    const uint32_t tid = threadIdx.x;
+    float sum[N_ROWS] = {};
+    const uint64_t chunk = (in_dim + 31u) / 32u;
+    const uint64_t k0 = (uint64_t)tid * chunk;
+    uint64_t k1 = k0 + chunk;
+    if (k1 > in_dim) k1 = in_dim;
+    const __half *wr = w + row * in_dim;
+    for (uint64_t i = k0; i < k1; i++) {
+        const float weight = __half2float(wr[i]);
+#pragma unroll
+        for (uint32_t token = 0u; token < N_ROWS; token++) {
+            sum[token] += weight * x[(uint64_t)token * in_dim + i];
+        }
+    }
+#pragma unroll
+    for (uint32_t token = 0u; token < N_ROWS; token++) {
+        partial[token][tid] = sum[token];
+    }
+    __syncthreads();
+    if (tid == 0u) {
+#pragma unroll
+        for (uint32_t token = 0u; token < N_ROWS; token++) {
+            float total = 0.0f;
+            for (uint32_t lane = 0u; lane < 32u; lane++) {
+                total += partial[token][lane];
+            }
+            out[(uint64_t)token * out_dim + row] = total;
+        }
+    }
+}
+
 __global__ static void matmul_f16_f32_sharedx_warp_rows_w32_kernel(
         float *out,
         const __half *w,

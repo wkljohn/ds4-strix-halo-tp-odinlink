@@ -1602,6 +1602,45 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
+extern "C" int ds4_gpu_matmul_f16_ordered_rows_exact_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out || !x || !model_map || n_rows < 2u || n_rows > 5u ||
+        in_dim == 0u || out_dim == 0u) return 0;
+    uint64_t weight_bytes = 0u, x_bytes = 0u, out_bytes = 0u;
+    if (!cuda_u64_mul3_checked(out_dim, in_dim, sizeof(uint16_t),
+                               &weight_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, in_dim, sizeof(float), &x_bytes) ||
+        !cuda_u64_mul3_checked(n_rows, out_dim, sizeof(float), &out_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_bytes(x, x_bytes) ||
+        !cuda_tensor_has_bytes(out, out_bytes)) return 0;
+    const __half *w = reinterpret_cast<const __half *>(
+        cuda_model_range_ptr(model_map, weight_offset, weight_bytes,
+                             "f16 ordered rows exact"));
+    if (!w) return 0;
+#define DS4_LAUNCH_F16_ORDERED_ROWS_EXACT(NR) \
+    matmul_f16_ordered_rows_exact_kernel<NR><<< \
+        (unsigned)out_dim, 32u>>>( \
+        (float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim)
+    switch (n_rows) {
+        case 2u: DS4_LAUNCH_F16_ORDERED_ROWS_EXACT(2u); break;
+        case 3u: DS4_LAUNCH_F16_ORDERED_ROWS_EXACT(3u); break;
+        case 4u: DS4_LAUNCH_F16_ORDERED_ROWS_EXACT(4u); break;
+        case 5u: DS4_LAUNCH_F16_ORDERED_ROWS_EXACT(5u); break;
+        default: return 0;
+    }
+#undef DS4_LAUNCH_F16_ORDERED_ROWS_EXACT
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_f16 ordered rows exact launch");
+}
+
 extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
