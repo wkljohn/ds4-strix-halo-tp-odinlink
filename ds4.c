@@ -23731,6 +23731,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                        layer->hc_ffn_base->abs_offset);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_pre");
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_FFN_HC_PRE);
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre_mixes", metal_graph_hc_mix(g), mix_hc, il, pos);
         metal_graph_debug_dump_tensor("hc_ffn_pre_weights", metal_graph_hc_pre(g), DS4_N_HC, il, pos);
@@ -23756,6 +23757,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 metal_graph_ffn_norm(g), 0, DS4_N_EMBD);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_norm");
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_FFN_NORM);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", metal_graph_ffn_norm(g), DS4_N_EMBD, il, pos);
     }
@@ -23793,6 +23795,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                    g);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_ROUTER);
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_router_logits(g), DS4_N_EXPERT, il, pos);
@@ -24757,6 +24760,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                            shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_SHARED_GATE_UP);
     if (ok && cuda_tp_ep_reduce_deferred) {
         ok = metal_graph_cuda_tp_ep_finish_reduce(
                 g,
@@ -24885,6 +24889,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                    1);
     }
     DS4_METAL_PROFILE_DECODE_STAGE("shared_down");
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_SHARED_DOWN);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", metal_graph_shared_out(g), DS4_N_EMBD, il, pos);
     }
@@ -24913,6 +24918,7 @@ static bool metal_graph_encode_decode_layer_phase(
                 il,
                 false) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe_folded");
+        DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_ROUTED_MOE);
     }
     ds4_gpu_tensor *tp_ffn_a = NULL;    /* rank0/rank1 partials consumed */
     ds4_gpu_tensor *tp_ffn_b = NULL;    /* directly by the HC expand */
@@ -24940,6 +24946,7 @@ static bool metal_graph_encode_decode_layer_phase(
             }
         }
     }
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_FFN_GATE);
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_ffn_out(g) &&
              ds4_gpu_add_tensor(metal_graph_ffn_out(g),
@@ -24971,6 +24978,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                   DS4_N_HC) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
+    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_FFN_HC_POST);
 #undef DS4_METAL_PROFILE_DECODE_STAGE
 #undef DS4_ROCM_DECODE_ATTN_EVENT
     if (ok) {

@@ -6732,7 +6732,8 @@ static const char *const g_decode_attn_event_names[DS4_GPU_DECODE_ATTN_EVENT_COU
     "start", "qkv_proj", "qkv_norm_rope", "q_b_proj", "q_norm_rope",
     "kv_path", "compressor_proj", "compressor_update", "compressor_indexer",
     "attn_inv_rope", "attn_output_low", "attn_output_expand", "attn_gate",
-    "attn_output", "attn_hc_post"
+    "attn_output", "attn_hc_post", "ffn_hc_pre", "ffn_norm", "router",
+    "shared_gate_up", "shared_down", "routed_moe", "ffn_gate", "ffn_hc_post"
 };
 
 static void ds4_rocm_decode_attn_event_print(void) {
@@ -6796,7 +6797,7 @@ static int ds4_rocm_decode_attn_event_harvest(
      * do not replace this with hipEventSynchronize: a busy slot drops the new
      * sample below so profiling cannot stall the decode/TP streams. */
     hipError_t query = hipEventQuery(
-            slot->events[DS4_GPU_DECODE_ATTN_EVENT_ATTN_HC_POST]);
+            slot->events[DS4_GPU_DECODE_ATTN_EVENT_FFN_HC_POST]);
     if (query == hipErrorNotReady) {
         /* Not an error, but hipGetLastError() returns the last error from
          * ANYWHERE in this thread - if left latched, the next unrelated
@@ -6887,7 +6888,7 @@ extern "C" void ds4_gpu_decode_attn_event_profile_record(
         return;
     }
     slot->valid_mask |= 1u << stage;
-    if (stage == DS4_GPU_DECODE_ATTN_EVENT_ATTN_HC_POST) {
+    if (stage == DS4_GPU_DECODE_ATTN_EVENT_FFN_HC_POST) {
         slot->complete = 1;
         g_decode_attn_event_active_slot = -1;
     }
