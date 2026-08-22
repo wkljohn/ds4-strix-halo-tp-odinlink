@@ -2,7 +2,7 @@
 
 This note records the staged validation of DS4's row-parallel routed-MoE
 gate/up epilogue. Raw two-node logs and profiler CSVs are retained locally in
-the ignored `research-results/2026-08-06/raw/moe-epilogue-research/` tree.
+the ignored `$DS4_RESEARCH_ROOT/2026-08-06/raw/moe-epilogue-research/` tree.
 
 ## Result
 

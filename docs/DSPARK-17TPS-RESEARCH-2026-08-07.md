@@ -4,7 +4,7 @@ Research pass on top of `DSPARK-17TPS-HANDOVER-2026-08-07.md`.
 Sources: Codex deep code investigation (session 019fdccb-105c-7031-bb96-b4cdf13ff719),
 a Fable literature/outside-view pass, an independent roofline cross-check against
 `ROOFLINE-AND-STRATEGY.md` (corrected block), and the raw logs in
-`research-results/dspark-resident-2026-08-07/clean-width-sweep/`.
+`$DS4_RESEARCH_ROOT/dspark-resident-2026-08-07/clean-width-sweep/`.
 
 No code was changed while producing this document.
 
@@ -270,7 +270,7 @@ drafting.**
 
 Both were measured with the historical DSpark harness, using three identical `/reset` repetitions in one
 loaded process, on the build with the DP4A launch reverted to 8 waves / 256 threads.
-Logs in `research-results/dspark-17tps-2026-08-07/`.
+Logs in `$DS4_RESEARCH_ROOT/dspark-17tps-2026-08-07/`.
 
 | | baseline | chain-cycles |
 |---|---:|---:|
@@ -354,7 +354,7 @@ worth anything.
 
 §5 below was written BEFORE any of it was measured. **Most of it is now falsified.**
 Kept for the reasoning trail; the measured record is
-`research-results/dspark-17tps-2026-08-07/EXPERIMENT-LOG.md`.
+`$DS4_RESEARCH_ROOT/dspark-17tps-2026-08-07/EXPERIMENT-LOG.md`.
 
 | §5 rank | lever | predicted | MEASURED | verdict |
 |---:|---|---:|---:|---|

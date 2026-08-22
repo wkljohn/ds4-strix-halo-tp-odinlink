@@ -41,8 +41,8 @@ schedule.
 
 The table reports reproducible inference results, not a single-node scaling
 claim. Raw runs, fingerprints, kernel decisions, rejected candidates, memory
-policy, and maintainer gates are preserved in the
-[August 2026 validation record](research-results/strix-halo-tp-validation-2026-08/).
+policy, and maintainer gates are preserved locally under
+`$DS4_RESEARCH_ROOT/reports/strix-halo-tp-validation-2026-08/`.
 
 ## Supported and tested models
 
@@ -92,7 +92,8 @@ Run one fixed Q4_K benchmark:
 Select `DS4_BENCH_RDMA_PROFILE=roce-v2` in `bench.env.local` for Mellanox.
 Use distinct tags (`q4-r1`, `q4-r2`, `q4-r3`) and report the median. Candidate
 fingerprints and the combined pre-main test belong to the
-[validation record](research-results/strix-halo-tp-validation-2026-08/), not
+local validation archive at
+`$DS4_RESEARCH_ROOT/reports/strix-halo-tp-validation-2026-08/`, not
 normal installation.
 
 ## OdinLink over USB4/TB5
@@ -158,7 +159,7 @@ The GID output must be `RoCE v2`; the probe must pass its mapped-host,
 three-MR layout. Put the coordinator address, both device names, and GID index
 in `bench.env.local`, set `DS4_BENCH_RDMA_PROFILE=roce-v2`, and run the same
 benchmark command. Reference hardware details and the registration pitfall are
-documented in the [RoCE v2 bring-up record](research-results/roce-v2-2026-08-14/).
+documented locally under `$DS4_RESEARCH_ROOT/reports/roce-v2-2026-08-14/`.
 
 ## Production server
 
@@ -182,8 +183,8 @@ a stalled request even while decode is progressing.
 
 ## Research and maintenance
 
-- [TP optimization and validation record](research-results/strix-halo-tp-validation-2026-08/)
-- [RoCE v2 bring-up and A/B results](research-results/roce-v2-2026-08-14/)
+- Local TP validation archive: `$DS4_RESEARCH_ROOT/reports/strix-halo-tp-validation-2026-08/`
+- Local RoCE v2 A/B archive: `$DS4_RESEARCH_ROOT/reports/roce-v2-2026-08-14/`
 - [OdinLink integration record](ODINLINK.md)
 - [Kernel and architecture reports](docs/)
 - [OpenAI-compatible server benchmark](docs/API-BENCHMARK.md)

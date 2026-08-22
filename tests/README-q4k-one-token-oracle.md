@@ -1,6 +1,6 @@
 # Isolated Q4_K one-token oracle
 
-See also `research-results/decode-25tps-2026-08-20/ORACLE.md`.
+See also `$DS4_RESEARCH_ROOT/decode-25tps-2026-08-20/ORACLE.md`.
 
 ```
 make test-rocm-q4k-one-token-oracle

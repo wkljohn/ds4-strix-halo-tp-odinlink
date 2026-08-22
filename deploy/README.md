@@ -50,7 +50,7 @@ in `config.env.local`; the OdinLink profile also needs its provider.
 Experimental DSpark additionally
 requires the drafter GGUF on both nodes. Their filesystems are not assumed to
 be shared. Logs are retained under
-`research-results/deployment/` and are excluded from Git.
+`$DS4_RESEARCH_ROOT/deployment/` and are excluded from the source branches.
 
 Set `RDMA_PROFILE=roce-v2`, `COORDINATOR_RDMA_ADDR=192.168.99.1`,
 `LOCAL_RDMA_DEVICE=mlx5_0`, `PEER_RDMA_DEVICE=mlx5_1`, and

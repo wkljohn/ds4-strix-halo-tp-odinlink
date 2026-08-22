@@ -129,4 +129,4 @@ the roughly 9.85--9.91 GiB/rank Q8-to-F16 cache. Kernel dispatch is independent
 of the verbs provider; OdinLink-specific transport behavior remains capability
 gated, so Mellanox/generic verbs paths retain their existing protocol. Raw CSV
 and rank logs are preserved under
-`research-results/quant-comparison-2026-08-10/` on the test machine.
+`$DS4_RESEARCH_ROOT/quant-comparison-2026-08-10/` on the test machine.

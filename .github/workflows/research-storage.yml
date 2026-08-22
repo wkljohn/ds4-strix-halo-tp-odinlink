@@ -1,0 +1,12 @@
+name: Research storage contract
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  no-worktree-research-results:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-research-root-contract.sh

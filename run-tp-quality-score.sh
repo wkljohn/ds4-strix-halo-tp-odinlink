@@ -10,8 +10,11 @@ EXTRA_ENV=("$@")
 [[ $TAG =~ ^[A-Za-z0-9._-]+$ ]] || { echo "error: invalid tag" >&2; exit 2; }
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck disable=SC1091
+source "$REPO/scripts/ds4-research-root.sh"
 BENCH_CONFIG=${DS4_BENCH_CONFIG:-$REPO/bench.env.local}
 [[ ! -r $BENCH_CONFIG ]] || source "$BENCH_CONFIG"
+ds4_resolve_research_roots "$REPO"
 PEER_REPO=${DS4_PEER_REPO:-$REPO}
 PEER_MGMT=${DS4_PEER_MGMT:-}
 PEER_HOST_KEY_ALIAS=${DS4_PEER_HOST_KEY_ALIAS:-${PEER_MGMT#*@}}
@@ -21,12 +24,14 @@ PORT=${DS4_QUALITY_PORT:-9002}
 CONTEXT=${DS4_QUALITY_CONTEXT:-4096}
 MAX_CASES=${DS4_QUALITY_MAX_CASES:-100}
 MANIFEST=${DS4_QUALITY_MANIFEST:-$REPO/gguf-tools/quality-testing/data/flash/manifest.tsv}
-OUT=${DS4_QUALITY_OUT:-$REPO/research-results/accuracy-acceleration-2026-08-14}
+OUT=${DS4_QUALITY_OUT:-$DS4_RESEARCH_ROOT/accuracy-acceleration-2026-08-14}
+PEER_OUT=${DS4_PEER_QUALITY_OUT:-$DS4_PEER_RESEARCH_ROOT/accuracy-acceleration-2026-08-14}
 SCORER=$REPO/gguf-tools/quality-testing/score_official
 COORD_LOG=$OUT/coordinator-$TAG.log
 WORKER_LOG=$OUT/worker-$TAG.log
+REMOTE_WORKER_LOG=$PEER_OUT/worker-$TAG.log
 SCORES=$OUT/$TAG.tsv
-WORKER_PIDFILE=$OUT/worker-$TAG.pid
+WORKER_PIDFILE=$PEER_OUT/worker-$TAG.pid
 PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes
   -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS" "$PEER_MGMT")
 PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes
@@ -93,7 +98,8 @@ if "${PEER_SSH[@]}" "pgrep -af '[d]s4 .*--role worker.*--tensor-parallel'" >/dev
 fi
 
 mkdir -p "$OUT"
-"${PEER_SSH[@]}" "mkdir -p '$OUT'"
+printf -v PEER_OUT_Q '%q' "$PEER_OUT"
+"${PEER_SSH[@]}" "mkdir -p $PEER_OUT_Q"
 COMMON_ENV=(
   env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8
   DS4_TP_TIMEOUT_SEC=60
@@ -134,7 +140,7 @@ WORKER_APP=(./ds4 --role worker --tensor-parallel --coordinator "$COORDINATOR_AD
   --transport rdma --rocm -m "$MODEL" -c "$CONTEXT" --prefill-chunk 4096)
 printf -v WORKER_CMD_Q '%q ' "${COMMON_ENV[@]}" "${WORKER_APP[@]}"
 printf -v PEER_REPO_Q '%q' "$PEER_REPO"
-printf -v WORKER_LOG_Q '%q' "$WORKER_LOG"
+printf -v WORKER_LOG_Q '%q' "$REMOTE_WORKER_LOG"
 printf -v WORKER_PIDFILE_Q '%q' "$WORKER_PIDFILE"
 "${PEER_SSH[@]}" "cd $PEER_REPO_Q || exit 1; nohup setsid $WORKER_CMD_Q > $WORKER_LOG_Q 2>&1 < /dev/null & p=\$!; echo \$p > $WORKER_PIDFILE_Q"
 WORKER_STARTED=1
@@ -147,7 +153,7 @@ for _ in $(seq 1 180); do worker_running || break; sleep 1; done
 worker_running && { echo "error: worker did not exit after STOP" >&2; exit 1; }
 WORKER_STARTED=0
 trap - EXIT
-"${PEER_SCP[@]}" "$PEER_MGMT:$WORKER_LOG" "$WORKER_LOG"
+"${PEER_SCP[@]}" "$PEER_MGMT:$REMOTE_WORKER_LOG" "$WORKER_LOG"
 
 [[ $(awk 'NR > 1 {n++} END {print n+0}' "$SCORES") == "$MAX_CASES" ]] || {
   echo "error: incomplete score table" >&2; exit 1;

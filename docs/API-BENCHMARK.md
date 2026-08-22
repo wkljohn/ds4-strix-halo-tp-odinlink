@@ -43,13 +43,13 @@ scripts/run-api-bench.sh --confirm-dedicated-server \
   --tg 32 128 300 \
   --depth 0 4096 16384 65536 \
   --runs 3 \
-  --out research-results/api-bench/q4-roce.csv
+  --out "$DS4_RESEARCH_ROOT/api-bench/q4-roce.csv"
 ```
 
 Use `--api-key` when benchmarking through an authenticated proxy. The key is
 never written to the metadata sidecar or printed by `--dry-run`.
 
-The default output is an ignored CSV under `research-results/api-bench/`, plus
+The default output is an ignored CSV under `$DS4_RESEARCH_ROOT/api-bench/`, plus
 a `.meta.txt` sidecar containing the DS4 commit, pinned benchmark version, and
 test matrix. Review and explicitly add selected result files when publishing
 them.

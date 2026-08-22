@@ -1,6 +1,6 @@
 # Staged-MIDQ Q4_K one-token oracle
 
-See also `research-results/decode-25tps-2026-08-20/CODEX-GATE-5.md`.
+See also `$DS4_RESEARCH_ROOT/decode-25tps-2026-08-20/CODEX-GATE-5.md`.
 
 ```
 make test-rocm-q4k-staged-midq-oracle

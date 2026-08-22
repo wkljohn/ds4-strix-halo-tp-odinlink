@@ -4,6 +4,8 @@
 set -euo pipefail
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck disable=SC1091
+source "$REPO/scripts/ds4-research-root.sh"
 Q4_MODEL=${1:?usage: pre-main-tp-smoke.sh Q4_MODEL Q2_MODEL}
 Q2_MODEL=${2:?usage: pre-main-tp-smoke.sh Q4_MODEL Q2_MODEL}
 Q4_FNV64=${DS4_PREMAIN_Q4_FNV64:-5f8a983422299d76}
@@ -16,11 +18,13 @@ if [[ -r $BENCH_CONFIG ]]; then
   # shellcheck disable=SC1090
   source "$BENCH_CONFIG"
 fi
-PREMAIN_OUT=${DS4_BENCH_OUT:-$REPO/research-results/bench-runs}
+ds4_resolve_research_roots "$REPO"
+PREMAIN_OUT=${DS4_BENCH_OUT:-$DS4_RESEARCH_ROOT/bench-runs}
 
 # The hello regression test proves independently launched ranks reject an
 # IQ2 integer-WMMA mismatch before entering a different MoE arithmetic path.
 "$REPO/tests/test_bench_env_precedence.sh"
+"$REPO/tests/test_research_root_contract.sh"
 make -C "$REPO" test-tp-hello
 
 # Keep the production metadata classifier in the gate: both paths must select

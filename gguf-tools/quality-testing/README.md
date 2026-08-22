@@ -126,7 +126,7 @@ The wrapper requires identical rank binaries and model sizes, explicit
 OdinLink devices, full-vocabulary RDMA logits, a balanced expert split, and
 zero transport fallbacks. `DS4_QUALITY_MAX_CASES=N` selects a pilot subset;
 the default is all 100 cases. Raw output is retained under
-`research-results/accuracy-acceleration-2026-08-14/`.
+`$DS4_RESEARCH_ROOT/accuracy-acceleration-2026-08-14/`.
 
 For a full-residency vs SSD-streaming comparison, score the same model twice and
 add the streaming flags to one run:
