@@ -25635,13 +25635,6 @@ static bool metal_graph_output_logits_head_matmul(
         weights->output->type == DS4_TENSOR_Q8_0 &&
         (ds4_gpu_get_tp_runtime_features() &
          DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_ROWS_EXACT) != 0u;
-    const bool exact_q8_output_tp_split = exact_q8_output_rows &&
-        g->tp_world == 2 && (vocab_dim & 1u) == 0u &&
-        (ds4_gpu_get_tp_runtime_features() &
-         DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT) != 0u &&
-        getenv("DS4_ROCM_DSPARK_OUTPUT_Q8_TP_SPLIT_PROTOCOL_ONLY") == NULL;
-    const uint64_t output_vocab_dim = exact_q8_output_tp_split ?
-        vocab_dim / 2u : vocab_dim;
     const uint32_t head_rows =
         (!exact_q8_output_rows && n_tokens > 1 && n_tokens < 8 &&
          ds4_gpu_tensor_bytes(dst_logits) >= 8u * vocab_dim * sizeof(float) &&
@@ -25654,8 +25647,7 @@ static bool metal_graph_output_logits_head_matmul(
     ds4_gpu_tensor *logits =
         ds4_gpu_tensor_view(dst_logits,
                             0,
-                            (uint64_t)head_rows * output_vocab_dim *
-                                sizeof(float));
+                            (uint64_t)head_rows * vocab_dim * sizeof(float));
     bool ok = output_norm && logits;
     if (ok && head_rows > n_tokens) {
         ds4_gpu_tensor *pad =
@@ -25770,17 +25762,13 @@ static bool metal_graph_output_logits_head_matmul(
             }
         }
     } else if (ok && exact_q8_output_rows) {
-        const uint64_t row_bytes = metal_graph_q8_0_row_bytes(DS4_N_EMBD);
         ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 logits,
                 model->map,
                 model->size,
-                weights->output->abs_offset +
-                    (exact_q8_output_tp_split ?
-                         (uint64_t)g->tp_rank * output_vocab_dim * row_bytes :
-                         0u),
+                weights->output->abs_offset,
                 DS4_N_EMBD,
-                output_vocab_dim,
+                vocab_dim,
                 output_norm,
                 n_tokens) != 0;
     } else if (ok && !(g->cuda_tp_ep && g->cuda_tp_output)) {
@@ -28605,7 +28593,10 @@ static bool metal_graph_encode_layer_attention_batch(
     /* Bit 29 was reassigned to the output-head exact-row path after this
      * indexer-Q oracle showed no end-to-end effect. */
     const bool tp_batch_indexer_q_rows_exact = false;
-    const bool tp_batch_indexer_w_rows_exact = false;
+    const bool tp_batch_indexer_w_rows_exact =
+        tp_batch_attn_head_split && n_tokens >= 2u && n_tokens <= 5u &&
+        (ds4_gpu_get_tp_runtime_features() &
+         DS4_TP_FEATURE_DSPARK_INDEXER_W_ROWS_EXACT) != 0u;
 #else
     const bool tp_batch_attn_rows_exact = false;
     const bool tp_batch_f16_pair_rows_exact = false;
@@ -37293,15 +37284,6 @@ static bool metal_graph_rocm_dspark_batch_argmax_requested(void) {
 #endif
 }
 
-static bool metal_graph_rocm_dspark_output_tp_split_requested(void) {
-#if defined(DS4_ROCM_BUILD)
-    return (ds4_gpu_get_tp_runtime_features() &
-            DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT) != 0u;
-#else
-    return false;
-#endif
-}
-
 /* Layer-major speculative target verifier for tiny MTP suffixes.
  *
  * This is the first production-shaped verifier attempt: unlike repeated decode
@@ -37322,7 +37304,6 @@ static bool metal_graph_verify_suffix_tops_impl(
         uint32_t               capture_prefix_len,
         bool                   capture_dspark_hidden,
         int                   *row_tops,
-        float                 *row_top_values,
         float                 *row_logits,
         ds4_verify_suffix_timing *timing) {
     if (timing) memset(timing, 0, sizeof(*timing));
@@ -37330,16 +37311,6 @@ static bool metal_graph_verify_suffix_tops_impl(
     if (start > (uint32_t)prompt->len || n_tokens > (uint32_t)prompt->len - start) return false;
     const uint32_t top_rows = n_tokens > 1 ? n_tokens - 1 : 0;
     if (top_rows && !row_tops) return false;
-    const bool output_tp_protocol =
-        top_rows != 0u && g->tp_world == 2 &&
-        metal_graph_rocm_dspark_output_tp_split_requested();
-    const bool output_tp_split = output_tp_protocol &&
-        getenv("DS4_ROCM_DSPARK_OUTPUT_Q8_TP_SPLIT_PROTOCOL_ONLY") == NULL;
-    const uint32_t output_top_vocab = output_tp_split ?
-        (uint32_t)DS4_N_VOCAB / 2u : (uint32_t)DS4_N_VOCAB;
-    const uint32_t output_top_offset = output_tp_split ?
-        g->tp_rank * output_top_vocab : 0u;
-    if (output_tp_protocol && !row_top_values) return false;
 
     const double upload_t0 = timing ? now_sec() : 0.0;
     bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
@@ -37447,12 +37418,7 @@ static bool metal_graph_verify_suffix_tops_impl(
                                                   weights->output->dim[1]);
     }
     if (ok && fuse_head) {
-        if (output_tp_protocol) {
-            ok = ds4_gpu_argmax_rows_value_tensor(
-                    metal_graph_comp_selected(g), metal_graph_comp_mask(g),
-                    g->spec_logits, output_top_vocab, top_rows,
-                    output_top_offset) != 0;
-        } else if (top_rows == 1) {
+        if (top_rows == 1) {
             ok = ds4_gpu_argmax_tensor(metal_graph_comp_selected(g),
                                        g->spec_logits,
                                        DS4_N_VOCAB) != 0;
@@ -37497,12 +37463,7 @@ static bool metal_graph_verify_suffix_tops_impl(
                                                           n_tokens,
                                                           weights->output->dim[1]);
         if (ok) {
-            if (output_tp_protocol) {
-                ok = ds4_gpu_argmax_rows_value_tensor(
-                        metal_graph_comp_selected(g), metal_graph_comp_mask(g),
-                        g->spec_logits, output_top_vocab, top_rows,
-                        output_top_offset) != 0;
-            } else if (top_rows == 1) {
+            if (top_rows == 1) {
                 /* Common K=2 verify case: top_k=1 over n_vocab → use the dedicated
                  * argmax kernel (single-block tree-reduce) instead of the legacy
                  * indexer_topk_kernel's single-thread O(n_vocab * top_k) fall-through. */
@@ -37542,13 +37503,7 @@ static bool metal_graph_verify_suffix_tops_impl(
                                    0,
                                    row_tops,
                                    (uint64_t)top_rows * sizeof(row_tops[0])) != 0;
-        if (ok && row_top_values) {
-            ok = ds4_gpu_tensor_read(
-                    metal_graph_comp_mask(g), 0, row_top_values,
-                    (uint64_t)top_rows * sizeof(row_top_values[0])) != 0;
-        }
-        if (ok && !output_tp_split &&
-            getenv("DS4_DSPARK_VERIFY_TOPS_CHECK") != NULL) {
+        if (ok && getenv("DS4_DSPARK_VERIFY_TOPS_CHECK") != NULL) {
             float *chk = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
             for (uint32_t r = 0; r < top_rows; r++) {
                 if (ds4_gpu_tensor_read(g->spec_logits,
@@ -37596,7 +37551,6 @@ static bool metal_graph_verify_suffix_tops(
         uint32_t               capture_prefix_len,
         bool                   capture_dspark_hidden,
         int                   *row_tops,
-        float                 *row_top_values,
         float                 *row_logits,
         ds4_verify_suffix_timing *timing) {
     ds4_gpu_tp_keepalive_pause(1);
@@ -37605,8 +37559,7 @@ static bool metal_graph_verify_suffix_tops(
                                                         n_tokens,
                                                         capture_prefix_len,
                                                         capture_dspark_hidden,
-                                                        row_tops, row_top_values,
-                                                        row_logits,
+                                                        row_tops, row_logits,
                                                         timing);
     ds4_gpu_tp_keepalive_pause(0);
     return ok;
@@ -37619,17 +37572,6 @@ static bool metal_graph_read_spec_logits_row(ds4_gpu_graph *g, uint32_t row, flo
                                  (uint64_t)row * row_bytes,
                                  logits,
                                  row_bytes) != 0;
-}
-
-static bool metal_graph_read_spec_logits_local_half_row(
-        ds4_gpu_graph *g, uint32_t row, float *logits) {
-    if (!g || !g->spec_logits || !logits || row >= g->prefill_cap ||
-        g->tp_world != 2 || (DS4_N_VOCAB & 1u) != 0u) return false;
-    const uint64_t vhalf = (uint64_t)DS4_N_VOCAB / 2u;
-    return ds4_gpu_tensor_read(
-            g->spec_logits, row * vhalf * sizeof(float),
-            logits + (uint64_t)g->tp_rank * vhalf,
-            vhalf * sizeof(float)) != 0;
 }
 
 /* Exact N=2 target verifier for MTP.
@@ -52991,10 +52933,11 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
         metal_graph_tp_env_flag(
             "DS4_ROCM_DSPARK_OUTPUT_Q8_ROWS_EXACT", false);
-    const bool dspark_output_q8_tp_split_requested =
+    const bool dspark_indexer_w_rows_exact_requested =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
+        batch_attn_head_split_requested &&
         metal_graph_tp_env_flag(
-            "DS4_ROCM_DSPARK_OUTPUT_Q8_TP_SPLIT", false);
+            "DS4_ROCM_DSPARK_INDEXER_W_ROWS_EXACT", false);
     const bool dspark_router_rows_exact_requested =
         e && e->support_kind == DS4_SUPPORT_DSPARK && e->dspark &&
         metal_graph_tp_env_flag(
@@ -53009,7 +52952,7 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     const bool dspark_attn_rows_exact_requested = false;
     const bool dspark_f16_pair_rows_exact_requested = false;
     const bool dspark_output_q8_rows_exact_requested = false;
-    const bool dspark_output_q8_tp_split_requested = false;
+    const bool dspark_indexer_w_rows_exact_requested = false;
     const bool dspark_router_rows_exact_requested = false;
 #endif
     const char *rdma_logits = getenv("DS4_TP_RDMA_LOGITS");
@@ -53059,8 +53002,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
              DS4_TP_FEATURE_DSPARK_F16_PAIR_ROWS_EXACT : 0u) |
         (dspark_output_q8_rows_exact_requested ?
              DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_ROWS_EXACT : 0u) |
-        (dspark_output_q8_tp_split_requested ?
-             DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT : 0u) |
+        (dspark_indexer_w_rows_exact_requested ?
+             DS4_TP_FEATURE_DSPARK_INDEXER_W_ROWS_EXACT : 0u) |
         (dspark_router_rows_exact_requested ?
              DS4_TP_FEATURE_DSPARK_ROUTER_ROWS_EXACT : 0u) |
         (rdma_logits_requested && !greedy_top2_enabled ?
@@ -55102,7 +55045,6 @@ static int ds4_session_eval_splitkv_spec_after_first(
                                                  true,
                                                  false,
                                                  &row0_top,
-                                                 NULL,
                                                  row_logits,
                                                  NULL);
         const double t_verify = timing ? now_sec() : 0.0;
@@ -65485,13 +65427,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
     memset(&frontier, 0, sizeof(frontier));
     int row_tops_buf[DS4_DSPARK_MAX_BLOCK_SIZE];
     int *row_tops = draft_n > 1 ? row_tops_buf : NULL;
-    float row_top_values_buf[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
-    const bool output_tp_protocol = draft_n > 1 && e->tp.active &&
-        (ds4_tp_runtime_features(e->tp.ctx) &
-         DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT) != 0u;
-    const bool output_tp_split = output_tp_protocol &&
-        getenv("DS4_ROCM_DSPARK_OUTPUT_Q8_TP_SPLIT_PROTOCOL_ONLY") == NULL;
-    float *row_top_values = output_tp_protocol ? row_top_values_buf : NULL;
     float *row_logits = s->spec_row_logits;
     const int start = s->checkpoint.len;
     const double snapshot_t0 = stats_enabled ? now_sec() : 0.0;
@@ -65529,7 +65464,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
                                             draft_n > 1 ? (uint32_t)draft_n - 1u : 0u,
                                             true,
                                             row_tops,
-                                            row_top_values,
                                             NULL,
                                             stats_enabled ? &verify_timing : NULL);
         if (verifier_roctx) (void)ds4_profile_roctx_verifier_range(false);
@@ -65541,46 +65475,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
             s->dspark_stats.verify_read_ms += verify_timing.read_ms;
             if (verify_timing.fused_head) {
                 s->dspark_stats.verifier_fused_head++;
-            }
-        }
-    }
-
-    if (tp_verify_sent && output_tp_protocol) {
-        ds4_tp_verify_tops peer_tops;
-        memset(&peer_tops, 0, sizeof(peer_tops));
-        if (!ds4_tp_recv_verify_tops(e->tp.ctx, &peer_tops)) {
-            snprintf(err, errlen, "tp: verifier local maxima missing");
-            spec_frontier_free(&frontier);
-            DS4_DSPARK_STATS_FINISH();
-            return -1;
-        }
-        const uint32_t top_rows = (uint32_t)draft_n - 1u;
-        if (!peer_tops.ok || peer_tops.count != top_rows) {
-            ok = false;
-        } else if (ok && output_tp_split) {
-            for (uint32_t i = 0u; i < top_rows; i++) {
-                const float peer_value = peer_tops.value[i];
-                const int peer_id = peer_tops.id[i];
-                if (peer_value > row_top_values[i] ||
-                    (peer_value == row_top_values[i] &&
-                     peer_id < row_tops[i])) {
-                    row_tops[i] = peer_id;
-                    row_top_values[i] = peer_value;
-                }
-            }
-        } else if (ok) {
-            for (uint32_t i = 0u; i < top_rows; i++) {
-                if (peer_tops.id[i] != row_tops[i] ||
-                    memcmp(&peer_tops.value[i], &row_top_values[i],
-                           sizeof(float)) != 0) {
-                    fprintf(stderr,
-                            "ds4: DSpark verifier output protocol mismatch "
-                            "row=%u leader=(%d,%a) worker=(%d,%a)\n",
-                            i, row_tops[i], row_top_values[i],
-                            peer_tops.id[i], peer_tops.value[i]);
-                    ok = false;
-                    break;
-                }
             }
         }
     }
@@ -65619,11 +65513,10 @@ static int ds4_session_eval_dspark_speculative_argmax(
         drafts[commit_drafts - 1] != eos_token;
     if (ok && (commit_drafts == draft_n || captured_partial)) {
         const double read_t0 = stats_enabled ? now_sec() : 0.0;
-        final_logits_ok = output_tp_split ?
-            metal_graph_read_spec_logits_local_half_row(
-                    &s->graph, (uint32_t)(commit_drafts - 1), row_logits) :
-            metal_graph_read_spec_logits_row(
-                    &s->graph, (uint32_t)(commit_drafts - 1), row_logits);
+        final_logits_ok =
+            metal_graph_read_spec_logits_row(&s->graph,
+                                             (uint32_t)(commit_drafts - 1),
+                                             row_logits);
         if (stats_enabled) {
             s->dspark_stats.verify_read_ms += (now_sec() - read_t0) * 1000.0;
         }
@@ -65635,16 +65528,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
         if (tp_verify_sent &&
             !ds4_tp_send_verify_commit(e->tp.ctx, 1, 0)) {
             snprintf(err, errlen, "tp: verify commit send failed");
-            s->checkpoint_valid = false;
-            spec_frontier_free(&frontier);
-            DS4_DSPARK_STATS_FINISH();
-            return -1;
-        }
-        if (output_tp_split &&
-            !ds4_tp_exchange_logits_halves(
-                    e->tp.ctx, row_logits, (uint32_t)DS4_N_VOCAB / 2u)) {
-            snprintf(err, errlen,
-                     "tp: verifier selected logits RDMA exchange failed");
             s->checkpoint_valid = false;
             spec_frontier_free(&frontier);
             DS4_DSPARK_STATS_FINISH();
@@ -65706,16 +65589,6 @@ static int ds4_session_eval_dspark_speculative_argmax(
         if (tp_verify_sent &&
             !ds4_tp_send_verify_commit(e->tp.ctx, 2, commit_drafts)) {
             snprintf(err, errlen, "tp: verify prefix commit send failed");
-            s->checkpoint_valid = false;
-            spec_frontier_free(&frontier);
-            DS4_DSPARK_STATS_FINISH();
-            return -1;
-        }
-        if (output_tp_split &&
-            !ds4_tp_exchange_logits_halves(
-                    e->tp.ctx, row_logits, (uint32_t)DS4_N_VOCAB / 2u)) {
-            snprintf(err, errlen,
-                     "tp: verifier prefix logits RDMA exchange failed");
             s->checkpoint_valid = false;
             spec_frontier_free(&frontier);
             DS4_DSPARK_STATS_FINISH();
@@ -66339,12 +66212,6 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
     }
     for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
     int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
-    float row_top_values[DS4_DSPARK_MAX_BLOCK_SIZE] = {0};
-    const bool output_tp_protocol = draft_n > 1 &&
-        (ds4_tp_runtime_features(e->tp.ctx) &
-         DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT) != 0u;
-    const bool output_tp_split = output_tp_protocol &&
-        getenv("DS4_ROCM_DSPARK_OUTPUT_Q8_TP_SPLIT_PROTOCOL_ONLY") == NULL;
     bool ok = metal_graph_verify_suffix_tops(&s->graph,
                                              &e->model,
                                              &e->weights,
@@ -66355,27 +66222,8 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                                                  (uint32_t)draft_n - 1u : 0u,
                                              false,
                                              draft_n > 1 ? row_tops : NULL,
-                                             output_tp_protocol ?
-                                                 row_top_values : NULL,
                                              NULL,
                                              NULL);
-    if (output_tp_protocol) {
-        ds4_tp_verify_tops local_tops;
-        memset(&local_tops, 0, sizeof(local_tops));
-        local_tops.ok = ok ? 1 : 0;
-        local_tops.count = (uint32_t)draft_n - 1u;
-        if (ok) {
-            for (uint32_t i = 0u; i < local_tops.count; i++) {
-                local_tops.id[i] = row_tops[i];
-                local_tops.value[i] = row_top_values[i];
-            }
-        }
-        if (!ds4_tp_send_verify_tops(e->tp.ctx, &local_tops)) {
-            spec_frontier_free(&frontier);
-            snprintf(err, errlen, "tp: verifier local maxima send failed");
-            return 1;
-        }
-    }
     int32_t full_accept = 0, replay_n = 0;
     if (!ds4_tp_recv_verify_commit(e->tp.ctx, &full_accept, &replay_n)) {
         spec_frontier_free(&frontier);
@@ -66383,55 +66231,21 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
         return 1;
     }
     if (full_accept == 1) {
+        spec_frontier_free(&frontier);
         if (!ok) {
-            spec_frontier_free(&frontier);
             /* The leader committed a block our verify failed to apply:
              * the states have diverged and lockstep cannot continue. */
             snprintf(err, errlen, "tp: worker verify failed on accepted block");
             s->checkpoint_valid = false;
             return 1;
         }
-        if (output_tp_split &&
-            (!s->spec_row_logits ||
-             !metal_graph_read_spec_logits_local_half_row(
-                    &s->graph, (uint32_t)draft_n - 1u,
-                    s->spec_row_logits) ||
-             !ds4_tp_exchange_logits_halves(
-                    e->tp.ctx, s->spec_row_logits,
-                    (uint32_t)DS4_N_VOCAB / 2u))) {
-            spec_frontier_free(&frontier);
-            snprintf(err, errlen,
-                     "tp: worker selected logits RDMA exchange failed");
-            s->checkpoint_valid = false;
-            return 1;
-        }
-        spec_frontier_free(&frontier);
         s->checkpoint_valid = true;
         return 0;
     }
     if (full_accept == 2) {
         if (!ok || replay_n <= 0 || replay_n >= draft_n ||
-            replay_n > (int32_t)DS4_SPEC_PREFIX_SLOTS) {
-            spec_frontier_free(&frontier);
-            snprintf(err, errlen, "tp: worker prefix commit failed");
-            s->checkpoint_valid = false;
-            return 1;
-        }
-        if (output_tp_split &&
-            (!s->spec_row_logits ||
-             !metal_graph_read_spec_logits_local_half_row(
-                    &s->graph, (uint32_t)replay_n - 1u,
-                    s->spec_row_logits) ||
-             !ds4_tp_exchange_logits_halves(
-                    e->tp.ctx, s->spec_row_logits,
-                    (uint32_t)DS4_N_VOCAB / 2u))) {
-            spec_frontier_free(&frontier);
-            snprintf(err, errlen,
-                     "tp: worker prefix logits RDMA exchange failed");
-            s->checkpoint_valid = false;
-            return 1;
-        }
-        if (!spec_frontier_commit_prefix(s, (uint32_t)replay_n)) {
+            replay_n > (int32_t)DS4_SPEC_PREFIX_SLOTS ||
+            !spec_frontier_commit_prefix(s, (uint32_t)replay_n)) {
             spec_frontier_free(&frontier);
             snprintf(err, errlen, "tp: worker prefix commit failed");
             s->checkpoint_valid = false;
@@ -69732,7 +69546,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                 false,
                                                 row_tops,
                                                 NULL,
-                                                NULL,
                                                 NULL);
         }
         const double micro_verify_done = mtp_timing ? now_sec() : 0.0;
@@ -69897,7 +69710,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                     false,
                                                     false,
                                                     row_tops,
-                                                    NULL,
                                                     NULL,
                                                     NULL);
                 if (ok) ok = metal_graph_read_spec_logits_row(&s->graph,

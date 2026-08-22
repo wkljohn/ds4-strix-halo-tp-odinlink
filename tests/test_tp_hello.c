@@ -156,12 +156,6 @@ int main(void) {
     ok &= check("hello mismatched-dspark-output-q8-rows-exact",
                 DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_ROWS_EXACT, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x20000000 peer=0x00000000)");
-    ok &= check("hello equal-dspark-output-q8-tp-split",
-                DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT,
-                DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT, 1, NULL);
-    ok &= check("hello mismatched-dspark-output-q8-tp-split",
-                DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT, 0, 0,
-                "tp hello: runtime feature mismatch (local=0x40000000 peer=0x00000000)");
     ok &= check("hello equal-batch-attn-head-split",
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);

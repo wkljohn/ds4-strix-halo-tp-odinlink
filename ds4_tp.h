@@ -128,10 +128,9 @@ enum {
     /* DSpark verifier vocabulary projection reuses each Q8_0 weight row
      * across 2--5 rows while retaining the one-row decode reduction tree. */
     DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_ROWS_EXACT = UINT32_C(1) << 29,
-    /* DSpark verifier output-head rows are split across the two ranks. Each
-     * independently launched rank must enter the same maxima/commit/RDMA-row
-     * protocol or the typed control stream would deadlock. */
-    DS4_TP_FEATURE_DSPARK_OUTPUT_Q8_TP_SPLIT = UINT32_C(1) << 30,
+    /* Ratio-4 DSpark verifier indexer-weight projection may be evaluated with
+     * the shipped one-row decode DAG as an independent oracle. */
+    DS4_TP_FEATURE_DSPARK_INDEXER_W_ROWS_EXACT = UINT32_C(1) << 30,
     /* The F16 router oracle changes expert selection inputs.  It must never be
      * enabled on only one of the independently launched TP ranks. */
     DS4_TP_FEATURE_DSPARK_ROUTER_ROWS_EXACT = UINT32_C(1) << 31,
@@ -361,21 +360,12 @@ typedef enum {
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
     DS4_TP_FRAME_LOGITS_TOP2 = 18,
-    DS4_TP_FRAME_VERIFY_TOPS = 19,
 } ds4_tp_frame_type;
 
 typedef struct {
     int32_t id[2];
     float value[2];
 } ds4_tp_logits_top2;
-
-enum { DS4_TP_VERIFY_TOPS_MAX = 4 };
-typedef struct {
-    int32_t ok;
-    uint32_t count;
-    int32_t id[DS4_TP_VERIFY_TOPS_MAX];
-    float value[DS4_TP_VERIFY_TOPS_MAX];
-} ds4_tp_verify_tops;
 
 typedef struct {
     ds4_tp_frame_type type;
@@ -407,8 +397,6 @@ int ds4_tp_exchange_logits_halves(ds4_tp *tp, float *logits,
                                   uint32_t half_count);
 int ds4_tp_send_logits_top2(ds4_tp *tp, const ds4_tp_logits_top2 *top2);
 int ds4_tp_recv_logits_top2(ds4_tp *tp, ds4_tp_logits_top2 *top2);
-int ds4_tp_send_verify_tops(ds4_tp *tp, const ds4_tp_verify_tops *tops);
-int ds4_tp_recv_verify_tops(ds4_tp *tp, ds4_tp_verify_tops *tops);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks

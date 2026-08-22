@@ -5,12 +5,6 @@ branch. The target is 32 decode tok/s under `ds4-bench-tp`, with mandatory RDMA,
 without regressing ordinary non-DSpark inference. Results in this directory are
 research evidence, not README performance claims.
 
-The exact two-rank Q8 verifier output-head split was rejected after its long
-results (14.02 and 13.99 tok/s) could no longer exceed the accepted 14.08 tok/s
-median.  The isolated head nearly halved, but saved only about 0.10 tok/s at the
-whole-workload ceiling.  See
-[`OUTPUT-HEAD-TP-SPLIT-REJECTED-20260822.md`](OUTPUT-HEAD-TP-SPLIT-REJECTED-20260822.md).
-
 ## Fixed test identity
 
 - Target: `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf`

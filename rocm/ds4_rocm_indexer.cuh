@@ -399,56 +399,6 @@ __global__ static void argmax_rows_kernel(
     if (tid == 0u) out_idx[row_idx] = sm_idx[0];
 }
 
-__global__ static void argmax_rows_value_kernel(
-        uint32_t *out_idx, float *out_value, const float *logits,
-        uint32_t n_vocab, uint32_t n_rows, uint32_t index_offset) {
-    enum { THREADS = 1024 };
-    __shared__ float sm_val[THREADS];
-    __shared__ uint32_t sm_idx[THREADS];
-
-    const uint32_t row_idx = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    if (row_idx >= n_rows) return;
-    const float *row = logits + (uint64_t)row_idx * n_vocab;
-    if (index_offset == 0u && isnan(row[0])) {
-        if (tid == 0u) {
-            out_idx[row_idx] = 0u;
-            out_value[row_idx] = row[0];
-        }
-        return;
-    }
-    float local_v = -INFINITY;
-    uint32_t local_i = 0u;
-    for (uint32_t i = tid; i < n_vocab; i += THREADS) {
-        const float v = row[i];
-        if (v > local_v) {
-            local_v = v;
-            local_i = i;
-        }
-    }
-    sm_val[tid] = local_v;
-    sm_idx[tid] = local_i;
-    __syncthreads();
-
-    for (uint32_t s = THREADS / 2u; s > 0u; s >>= 1u) {
-        if (tid < s) {
-            const float vr = sm_val[tid + s];
-            const uint32_t ir = sm_idx[tid + s];
-            const float vl = sm_val[tid];
-            const uint32_t il = sm_idx[tid];
-            if ((vr > vl) || (vr == vl && ir < il)) {
-                sm_val[tid] = vr;
-                sm_idx[tid] = ir;
-            }
-        }
-        __syncthreads();
-    }
-    if (tid == 0u) {
-        out_idx[row_idx] = index_offset + sm_idx[0];
-        out_value[row_idx] = sm_val[0];
-    }
-}
-
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -1457,29 +1407,6 @@ extern "C" int ds4_gpu_argmax_rows_tensor(
                                          n_vocab,
                                          n_rows);
     return cuda_ok(cudaGetLastError(), "argmax rows launch");
-}
-
-extern "C" int ds4_gpu_argmax_rows_value_tensor(
-        ds4_gpu_tensor       *out_idx,
-        ds4_gpu_tensor       *out_value,
-        const ds4_gpu_tensor *logits,
-        uint32_t              n_vocab,
-        uint32_t              n_rows,
-        uint32_t              index_offset) {
-    uint64_t logits_bytes = 0u, idx_bytes = 0u, value_bytes = 0u;
-    if (!out_idx || !out_value || !logits || n_vocab == 0u || n_rows == 0u ||
-        index_offset > UINT32_MAX - n_vocab ||
-        !cuda_u64_mul3_checked(n_vocab, n_rows, sizeof(float), &logits_bytes) ||
-        !cuda_u64_mul3_checked(n_rows, 1u, sizeof(uint32_t), &idx_bytes) ||
-        !cuda_u64_mul3_checked(n_rows, 1u, sizeof(float), &value_bytes) ||
-        logits->bytes < logits_bytes || out_idx->bytes < idx_bytes ||
-        out_value->bytes < value_bytes) {
-        return 0;
-    }
-    argmax_rows_value_kernel<<<n_rows, 1024>>>(
-            (uint32_t *)out_idx->ptr, (float *)out_value->ptr,
-            (const float *)logits->ptr, n_vocab, n_rows, index_offset);
-    return cuda_ok(cudaGetLastError(), "argmax rows value launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
