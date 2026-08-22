@@ -8,10 +8,13 @@ It never turns its built-in defaults into a lane-B acceptance policy.
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import math
 import sys
 from pathlib import Path
+
+import numpy as np
 
 
 def load(path: Path) -> dict:
@@ -37,35 +40,26 @@ def load(path: Path) -> dict:
 
 
 def top_ids(values: list[float], count: int) -> list[int]:
-    return sorted(range(len(values)), key=lambda idx: (-values[idx], idx))[:count]
+    selected = heapq.nlargest(
+        count, enumerate(values), key=lambda item: (item[1], -item[0]))
+    return [index for index, _ in selected]
 
 
-def probability_metrics(reference: list[float], candidate: list[float]) -> tuple[float, float]:
-    ref_max = max(reference)
-    cand_max = max(candidate)
-    ref_exp = [math.exp(item - ref_max) for item in reference]
-    cand_exp = [math.exp(item - cand_max) for item in candidate]
-    ref_sum = math.fsum(ref_exp)
-    cand_sum = math.fsum(cand_exp)
+def probability_metrics(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, float]:
+    ref_max = float(reference.max())
+    cand_max = float(candidate.max())
+    ref_exp = np.exp(reference - ref_max)
+    cand_exp = np.exp(candidate - cand_max)
+    ref_sum = float(ref_exp.sum(dtype=np.float64))
+    cand_sum = float(cand_exp.sum(dtype=np.float64))
     ref_log_z = ref_max + math.log(ref_sum)
     cand_log_z = cand_max + math.log(cand_sum)
-    tvd = 0.0
-    kl = 0.0
-    for ref_logit, cand_logit, ref_e, cand_e in zip(
-            reference, candidate, ref_exp, cand_exp):
-        p = ref_e / ref_sum
-        q = cand_e / cand_sum
-        tvd += abs(p - q)
-        if p:
-            kl += p * ((ref_logit - ref_log_z) - (cand_logit - cand_log_z))
-    return 0.5 * tvd, max(0.0, kl)
-
-
-def percentile(sorted_values: list[float], fraction: float) -> float:
-    if not sorted_values:
-        return 0.0
-    index = math.ceil(fraction * len(sorted_values)) - 1
-    return sorted_values[max(0, min(index, len(sorted_values) - 1))]
+    p = ref_exp / ref_sum
+    q = cand_exp / cand_sum
+    tvd = 0.5 * float(np.abs(p - q).sum(dtype=np.float64))
+    kl = float(np.sum(p * ((reference - ref_log_z) -
+                           (candidate - cand_log_z)), dtype=np.float64))
+    return tvd, max(0.0, kl)
 
 
 def load_thresholds(path: Path | None) -> dict | None:
@@ -99,13 +93,15 @@ def compare_pair(reference: dict, candidate: dict, thresholds: dict | None) -> d
         if reference.get(field) != candidate.get(field):
             raise ValueError(f"metadata {field}: {reference.get(field)!r} != {candidate.get(field)!r}")
 
-    ref = reference["logits"]
-    cand = candidate["logits"]
-    differences = sorted(abs(a - b) for a, b in zip(ref, cand))
-    sum_diff_sq = math.fsum((a - b) ** 2 for a, b in zip(ref, cand))
-    sum_ref_sq = math.fsum(a * a for a in ref)
-    ref_top20 = top_ids(ref, min(20, len(ref)))
-    cand_top20 = top_ids(cand, min(20, len(cand)))
+    ref_values = reference["logits"]
+    cand_values = candidate["logits"]
+    ref = np.asarray(ref_values, dtype=np.float64)
+    cand = np.asarray(cand_values, dtype=np.float64)
+    differences = np.abs(ref - cand)
+    sum_diff_sq = float(np.dot(differences, differences))
+    sum_ref_sq = float(np.dot(ref, ref))
+    ref_top20 = top_ids(ref_values, min(20, len(ref_values)))
+    cand_top20 = top_ids(cand_values, min(20, len(cand_values)))
     ref_margin = ref[ref_top20[0]] - ref[ref_top20[1]] if len(ref_top20) > 1 else math.inf
     cand_margin = cand[cand_top20[0]] - cand[cand_top20[1]] if len(cand_top20) > 1 else math.inf
     tvd, kl = probability_metrics(ref, cand)
@@ -118,21 +114,23 @@ def compare_pair(reference: dict, candidate: dict, thresholds: dict | None) -> d
         "argmax_equal": ref_top20[0] == cand_top20[0],
         "reference_margin": ref_margin,
         "candidate_margin": cand_margin,
-        "max_abs": differences[-1],
-        "p99_abs": percentile(differences, 0.99),
+        "max_abs": float(differences.max()),
+        "p99_abs": float(np.quantile(differences, 0.99, method="higher")),
         "nmse": sum_diff_sq / sum_ref_sq if sum_ref_sq else (0.0 if not sum_diff_sq else math.inf),
         "tvd": tvd,
         "kl": kl,
         "top5_overlap": len(set(ref_top20[:5]) & set(cand_top20[:5])),
         "top20_overlap": len(set(ref_top20) & set(cand_top20)),
+        "mean_signed_error": float(np.mean(cand - ref)),
+        "positive_error_fraction": float(np.mean(cand > ref)),
     }
     if thresholds is None:
         result["envelope_pass"] = None
         result["far_margin_inversion"] = None
     else:
-        result["far_margin_inversion"] = (
+        result["far_margin_inversion"] = bool(
             not result["argmax_equal"] and ref_margin > 2.0 * thresholds["e_bound"])
-        result["envelope_pass"] = (
+        result["envelope_pass"] = bool(
             not result["far_margin_inversion"] and
             result["max_abs"] <= thresholds["max_abs"] and
             result["p99_abs"] <= thresholds["p99_abs"] and
@@ -150,6 +148,8 @@ def main() -> int:
     parser.add_argument("candidate_dir", type=Path)
     parser.add_argument("--thresholds", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--steps-output", type=Path,
+                        help="write every per-position metric as JSON Lines")
     args = parser.parse_args()
     try:
         thresholds = load_thresholds(args.thresholds)
@@ -181,11 +181,25 @@ def main() -> int:
         "max_kl": max(item["kl"] for item in steps),
         "min_top5_overlap": min(item["top5_overlap"] for item in steps),
         "min_top20_overlap": min(item["top20_overlap"] for item in steps),
+        "max_abs_mean_signed_error": max(
+            abs(item["mean_signed_error"]) for item in steps),
+        "positive_error_fraction_range": [
+            min(item["positive_error_fraction"] for item in steps),
+            max(item["positive_error_fraction"] for item in steps),
+        ],
+        "worst_steps": {
+            key: max(steps, key=lambda item: item[key])
+            for key in ("max_abs", "p99_abs", "nmse", "tvd", "kl")
+        },
         "passed": not breaches if thresholds is not None else None,
     }
     encoded = json.dumps(summary, indent=2, sort_keys=True) + "\n"
     if args.output:
         args.output.write_text(encoded, encoding="utf-8")
+    if args.steps_output:
+        with args.steps_output.open("w", encoding="utf-8") as handle:
+            for item in steps:
+                handle.write(json.dumps(item, sort_keys=True) + "\n")
     sys.stdout.write(encoded)
     if thresholds is not None and breaches:
         print("teacher-logits: FAIL versioned lane-B envelope", file=sys.stderr)
