@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -54,6 +55,8 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *teacher_force_token_file;
+    const char *teacher_force_logits_dir;
     ds4_dist_options dist;
     ds4_tp_options tp;
     bool warm_weights;
@@ -361,6 +364,10 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--teacher-force-token-file")) {
+            c.teacher_force_token_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--teacher-force-logits-dir")) {
+            c.teacher_force_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -477,6 +484,24 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr,
                 "ds4-bench: --teacher-force-expect-fnv64 requires "
                 "--teacher-force-control\n");
+        exit(2);
+    }
+    if (!!c.teacher_force_token_file != !!c.teacher_force_logits_dir) {
+        fprintf(stderr,
+                "ds4-bench: --teacher-force-token-file and "
+                "--teacher-force-logits-dir must be used together\n");
+        exit(2);
+    }
+    if (c.teacher_force_token_file && c.teacher_force_control) {
+        fprintf(stderr,
+                "ds4-bench: frozen-token teacher forcing and the fixed "
+                "teacher control are separate diagnostic modes\n");
+        exit(2);
+    }
+    if (c.teacher_force_token_file && c.decode_self_check) {
+        fprintf(stderr,
+                "ds4-bench: frozen-token teacher forcing and decode self-check "
+                "are separate diagnostic modes\n");
         exit(2);
     }
     char tp_err[256];
@@ -939,6 +964,76 @@ static int run_teacher_force_control(ds4_engine *engine, ds4_session *session,
     return 0;
 }
 
+static int read_frozen_token_ids(const char *path, int vocab, ds4_tokens *out) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                path, strerror(errno));
+        return 1;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fprintf(stderr, "ds4-bench: failed to seek %s\n", path);
+        fclose(fp);
+        return 1;
+    }
+    const long size = ftell(fp);
+    if (size < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "ds4-bench: failed to size or rewind %s\n", path);
+        fclose(fp);
+        return 1;
+    }
+    char *text = malloc((size_t)size + 1u);
+    if (!text) {
+        fprintf(stderr, "ds4-bench: out of memory reading %s\n", path);
+        fclose(fp);
+        return 1;
+    }
+    if (fread(text, 1, (size_t)size, fp) != (size_t)size) {
+        fprintf(stderr, "ds4-bench: failed to read %s\n", path);
+        free(text);
+        fclose(fp);
+        return 1;
+    }
+    fclose(fp);
+    text[size] = '\0';
+    char *p = text;
+    while (*p) {
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (!*p) break;
+        if (*p == '#') {
+            while (*p && *p != '\n') p++;
+            continue;
+        }
+        errno = 0;
+        char *end = NULL;
+        long value = strtol(p, &end, 10);
+        if (errno != 0 || end == p || value < 0 || value >= vocab) {
+            fprintf(stderr,
+                    "ds4-bench: invalid frozen token near byte %td in %s\n",
+                    p - text, path);
+            free(text);
+            ds4_tokens_free(out);
+            return 1;
+        }
+        ds4_tokens_push(out, (int)value);
+        p = end;
+        if (*p && !isspace((unsigned char)*p) && *p != ',' && *p != '#') {
+            fprintf(stderr,
+                    "ds4-bench: invalid separator near byte %td in %s\n",
+                    p - text, path);
+            free(text);
+            ds4_tokens_free(out);
+            return 1;
+        }
+    }
+    free(text);
+    if (out->len == 0) {
+        fprintf(stderr, "ds4-bench: frozen token file is empty: %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
 static void json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
     if (s) {
@@ -980,7 +1075,6 @@ static int write_frontier_logits_json(
         free(logits);
         return 1;
     }
-
     char path[PATH_MAX];
     const int n = snprintf(path,
                            sizeof(path),
@@ -1032,6 +1126,151 @@ static int write_frontier_logits_json(
         return 1;
     }
     free(logits);
+    return 0;
+}
+
+static int write_teacher_logits_json(
+        const bench_config *cfg,
+        ds4_engine         *engine,
+        ds4_session        *session,
+        int                 prefix_tokens,
+        int                 step,
+        int                 teacher_token) {
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = malloc((size_t)vocab * sizeof(logits[0]));
+    if (!logits) {
+        fprintf(stderr, "ds4-bench: out of memory copying teacher logits\n");
+        return 1;
+    }
+    if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+        fprintf(stderr,
+                "ds4-bench: failed to copy teacher logits at step %d\n", step);
+        free(logits);
+        return 1;
+    }
+    for (int i = 0; i < vocab; i++) {
+        if (!isfinite(logits[i])) {
+            fprintf(stderr,
+                    "ds4-bench: non-finite teacher logit at step %d token %d\n",
+                    step, i);
+            free(logits);
+            return 1;
+        }
+    }
+
+    int top1 = -1;
+    int top2 = -1;
+    for (int i = 0; i < vocab; i++) {
+        if (top1 < 0 || logits[i] > logits[top1]) {
+            top2 = top1;
+            top1 = i;
+        } else if (top2 < 0 || logits[i] > logits[top2]) {
+            top2 = i;
+        }
+    }
+
+    char path[PATH_MAX];
+    const int n = snprintf(path, sizeof(path),
+                           "%s/decode_%06d.logits.json",
+                           cfg->teacher_force_logits_dir, step);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "ds4-bench: teacher logits path is too long\n");
+        free(logits);
+        return 1;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4-bench: failed to open %s: %s\n",
+                path, strerror(errno));
+        free(logits);
+        return 1;
+    }
+    fprintf(fp, "{\n  \"source\":\"ds4-bench-frozen-teacher\",\n  \"model\":");
+    json_write_string(fp, cfg->model_path);
+    fprintf(fp,
+            ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
+            "  \"dspark\":%s,\n  \"dspark_strict\":%s,\n"
+            "  \"quant_bits\":%d,\n"
+            "  \"prefix_tokens\":%d,\n  \"decode_step\":%d,\n"
+            "  \"position\":%d,\n  \"vocab\":%d,\n"
+            "  \"teacher_token\":%d,\n  \"teacher_logit\":%.9g,\n"
+            "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n"
+            "  \"runner_up_id\":%d,\n  \"runner_up_logit\":%.9g,\n"
+            "  \"top1_margin\":%.9g,\n  \"teacher_gap\":%.9g,\n"
+            "  \"logits\":[",
+            ds4_backend_name(cfg->backend),
+            cfg->quality ? "true" : "false",
+            cfg->dspark ? "true" : "false",
+            cfg->dspark_strict ? "true" : "false",
+            ds4_engine_routed_quant_bits(engine),
+            prefix_tokens, step, prefix_tokens + step, vocab,
+            teacher_token, logits[teacher_token],
+            top1, logits[top1], top2, logits[top2],
+            logits[top1] - logits[top2],
+            logits[top1] - logits[teacher_token]);
+    for (int i = 0; i < vocab; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 8) == 0) fputs("\n    ", fp);
+        fprintf(fp, "%.9g", logits[i]);
+    }
+    fputs("\n  ]\n}\n", fp);
+    const int close_rc = fclose(fp);
+    free(logits);
+    if (close_rc != 0) {
+        fprintf(stderr, "ds4-bench: failed to close %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
+static int run_frozen_teacher_logits(const bench_config *cfg,
+                                     ds4_engine *engine,
+                                     ds4_session *session,
+                                     const ds4_tokens *prompt) {
+    ds4_tokens reference = {0};
+    if (read_frozen_token_ids(cfg->teacher_force_token_file,
+                              ds4_engine_vocab_size(engine), &reference) != 0) {
+        return 1;
+    }
+    ds4_tokens prefix = {
+        .v = prompt->v,
+        .len = cfg->ctx_max,
+        .cap = cfg->ctx_max,
+    };
+    char err[256] = "";
+    if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4-bench: frozen teacher prefill failed: %s\n", err);
+        ds4_tokens_free(&reference);
+        return 1;
+    }
+
+    for (int step = 0; step < reference.len; step++) {
+        if (write_teacher_logits_json(cfg, engine, session, cfg->ctx_max,
+                                      step, reference.v[step]) != 0) {
+            ds4_tokens_free(&reference);
+            return 1;
+        }
+        if (step + 1 < reference.len &&
+            ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
+            fprintf(stderr,
+                    "ds4-bench: frozen teacher would exceed context before step %d\n",
+                    step + 1);
+            ds4_tokens_free(&reference);
+            return 1;
+        }
+        if (step + 1 < reference.len &&
+            ds4_session_eval(session, reference.v[step], err, sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: frozen teacher decode step %d failed: %s\n",
+                    step, err);
+            ds4_tokens_free(&reference);
+            return 1;
+        }
+    }
+    fprintf(stderr,
+            "ds4-bench: frozen teacher logits complete prefix=%d tokens=%d dir=%s\n",
+            cfg->ctx_max, reference.len, cfg->teacher_force_logits_dir);
+    ds4_tokens_free(&reference);
     return 0;
 }
 
@@ -1269,6 +1508,15 @@ int main(int argc, char **argv) {
         if (tp_leader) ds4_tp_send_stop(tp_leader);
         ds4_engine_close(engine);
         return self_check_rc;
+    }
+    if (cfg.teacher_force_token_file) {
+        const int teacher_rc = run_frozen_teacher_logits(
+            &cfg, engine, session, &prompt);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        if (tp_leader) ds4_tp_send_stop(tp_leader);
+        ds4_engine_close(engine);
+        return teacher_rc;
     }
     if (cfg.teacher_force_control) {
         const int teacher_rc = run_teacher_force_control(

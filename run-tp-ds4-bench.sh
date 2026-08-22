@@ -125,6 +125,8 @@ QUALITY=${DS4_BENCH_QUALITY:-0}
 ALLOW_NONSTANDARD_SPLIT=${DS4_BENCH_ALLOW_NONSTANDARD_SPLIT:-0}
 VALIDATE_CONFIG_ONLY=${DS4_BENCH_VALIDATE_CONFIG_ONLY:-0}
 DUMP_FRONTIER_LOGITS_DIR=${DS4_BENCH_DUMP_FRONTIER_LOGITS_DIR:-}
+FROZEN_TOKEN_FILE=${DS4_BENCH_FROZEN_TOKEN_FILE:-}
+FROZEN_LOGITS_DIR=${DS4_BENCH_FROZEN_LOGITS_DIR:-}
 EXPECT_GREEDY_TOP2=0
 CANDIDATE_ARGS=()
 CLEAN_ENV=(env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8)
@@ -249,6 +251,20 @@ if [[ $DECODE_SELF_CHECK == 1 && $TEACHER_FORCE_CONTROL == 1 ]]; then
   echo "error: choose only one TP decode diagnostic per run" >&2
   exit 2
 fi
+if [[ -n $FROZEN_TOKEN_FILE || -n $FROZEN_LOGITS_DIR ]]; then
+  [[ -n $FROZEN_TOKEN_FILE && -n $FROZEN_LOGITS_DIR ]] || {
+    echo "error: DS4_BENCH_FROZEN_TOKEN_FILE and DS4_BENCH_FROZEN_LOGITS_DIR must be used together" >&2
+    exit 2
+  }
+  [[ $CANDIDATE == 0 && $ROCPROF == 0 ]] || {
+    echo "error: frozen-token full-logit comparison is diagnostic, not benchmark evidence" >&2
+    exit 2
+  }
+  [[ $DECODE_SELF_CHECK == 0 && $TEACHER_FORCE_CONTROL == 0 ]] || {
+    echo "error: choose only one TP decode diagnostic per run" >&2
+    exit 2
+  }
+fi
 
 [[ -r $MODEL && -r $PROMPT_FILE ]] || { echo "error: missing local model or prompt" >&2; exit 1; }
 CURRENT_OPT_ENV=(
@@ -305,7 +321,8 @@ fi
 # Production greedy-top2 deliberately exposes only two global candidates and
 # therefore cannot serve as a full-logit oracle. This override is symmetric
 # across ranks and applies only to the pre-timing diagnostic modes.
-if [[ $DECODE_SELF_CHECK == 1 || $TEACHER_FORCE_CONTROL == 1 ]]; then
+if [[ $DECODE_SELF_CHECK == 1 || $TEACHER_FORCE_CONTROL == 1 ||
+      -n $FROZEN_TOKEN_FILE ]]; then
   CURRENT_OPT_ENV+=(DS4_TP_GREEDY_TOP2=0)
   EXPECT_GREEDY_TOP2=0
 fi
@@ -371,6 +388,33 @@ if [[ -n $DUMP_FRONTIER_LOGITS_DIR ]]; then
   esac
   mkdir -p "$DUMP_FRONTIER_LOGITS_DIR"
   COORD_ARGS+=(--dump-frontier-logits-dir "$DUMP_FRONTIER_LOGITS_DIR")
+fi
+if [[ -n $FROZEN_TOKEN_FILE ]]; then
+  [[ -r $FROZEN_TOKEN_FILE ]] || {
+    echo "error: missing frozen token file: $FROZEN_TOKEN_FILE" >&2
+    exit 1
+  }
+  case $FROZEN_TOKEN_FILE in
+    "$DS4_RESEARCH_ROOT"/*) ;;
+    *)
+      echo "error: frozen token file must be under $DS4_RESEARCH_ROOT" >&2
+      exit 2
+      ;;
+  esac
+  case $FROZEN_LOGITS_DIR/ in
+    "$DS4_RESEARCH_ROOT/"*) ;;
+    *)
+      echo "error: frozen logits directory must be under $DS4_RESEARCH_ROOT" >&2
+      exit 2
+      ;;
+  esac
+  mkdir -p "$FROZEN_LOGITS_DIR"
+  if find "$FROZEN_LOGITS_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    echo "error: frozen logits directory must be empty: $FROZEN_LOGITS_DIR" >&2
+    exit 2
+  fi
+  COORD_ARGS+=(--teacher-force-token-file "$FROZEN_TOKEN_FILE"
+               --teacher-force-logits-dir "$FROZEN_LOGITS_DIR")
 fi
 if [[ $DSPARK == 1 ]]; then
   DSPARK_ENV=(
@@ -439,6 +483,20 @@ remote_sample_fingerprint() {
   "${PEER_SSH[@]}" "p=$quoted; s=\$(stat -c %s \"\$p\"); h=\$((s / 2 > 4194304 ? s / 2 - 4194304 : 0)); t=\$((s > 8388608 ? s - 8388608 : 0)); { printf '%s\\n' \"\$s\"; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=0 count=8388608 status=none; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=\"\$h\" count=8388608 status=none; dd if=\"\$p\" iflag=skip_bytes,count_bytes skip=\"\$t\" count=8388608 status=none; } | sha256sum | awk '{print \$1}'"
 }
 
+runtime_inventory() {
+  local binary=$1
+  shift
+  env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 "$@" ldd "$binary" |
+    awk '/libamdhip64|libhsa-runtime64|libamd_comgr|libhipblas|librocblas/ {
+      if ($2 == "=>") print $1, $3; else print $1, $1
+    }' |
+    while read -r soname path; do
+      [[ -r $path ]] || { printf '%s\t%s\tMISSING\n' "$soname" "$path"; continue; }
+      path=$(readlink -f "$path")
+      printf '%s\t%s\t%s\n' "$soname" "$path" "$(sha256sum "$path" | awk '{print $1}')"
+    done | sort
+}
+
 if [[ $DSPARK == 1 && ( -z $MTP || ! -r $MTP ) ]]; then
   echo "error: missing local DSpark model: $MTP" >&2
   exit 1
@@ -491,8 +549,42 @@ PEER_DS4_HASH=$("${PEER_SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}'
   echo "error: worker binary hashes differ" >&2; exit 1;
 }
 LOCAL_BENCH_HASH=$(sha256sum "$REPO/ds4-bench-tp" | awk '{print $1}')
+PEER_BENCH_HASH=$("${PEER_SSH[@]}" "sha256sum '$PEER_REPO/ds4-bench-tp'" | awk '{print $1}')
+[[ $LOCAL_BENCH_HASH == "$PEER_BENCH_HASH" ]] || {
+  echo "error: benchmark binary hashes differ" >&2; exit 1;
+}
 PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
 PROMPT_SIZE=$(stat -c %s "$PROMPT_FILE")
+if [[ -n $FROZEN_TOKEN_FILE ]]; then
+  FROZEN_TOKEN_HASH=$(sha256sum "$FROZEN_TOKEN_FILE" | awk '{print $1}')
+else
+  FROZEN_TOKEN_HASH=
+fi
+LOCAL_RUNTIME_INVENTORY="$OUT/$TAG.runtime-local.tsv"
+PEER_RUNTIME_INVENTORY="$OUT/$TAG.runtime-peer.tsv"
+runtime_inventory "$REPO/ds4-bench-tp" "${COORD_ENV[@]}" > "$LOCAL_RUNTIME_INVENTORY"
+printf -v PEER_RUNTIME_ENV_Q '%q ' "${WORKER_ENV[@]}"
+printf -v PEER_REPO_Q '%q' "$PEER_REPO"
+"${PEER_SSH[@]}" "cd $PEER_REPO_Q || exit 1; env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 $PEER_RUNTIME_ENV_Q ldd ./ds4" |
+  awk '/libamdhip64|libhsa-runtime64|libamd_comgr|libhipblas|librocblas/ {
+    if ($2 == "=>") print $1, $3; else print $1, $1
+  }' |
+  while read -r soname path; do
+    [[ -n $path ]] || continue
+    printf -v soname_q '%q' "$soname"
+    printf -v path_q '%q' "$path"
+    "${PEER_SSH[@]}" "p=$path_q; n=$soname_q; test -r \"\$p\" || { printf '%s\\t%s\\tMISSING\\n' \"\$n\" \"\$p\"; exit 0; }; p=\$(readlink -f \"\$p\"); h=\$(sha256sum \"\$p\" | awk '{print \$1}'); printf '%s\\t%s\\t%s\\n' \"\$n\" \"\$p\" \"\$h\""
+  done | sort > "$PEER_RUNTIME_INVENTORY"
+LOCAL_RUNTIME_INVENTORY_HASH=$(sha256sum "$LOCAL_RUNTIME_INVENTORY" | awk '{print $1}')
+PEER_RUNTIME_INVENTORY_HASH=$(sha256sum "$PEER_RUNTIME_INVENTORY" | awk '{print $1}')
+[[ -s $LOCAL_RUNTIME_INVENTORY && -s $PEER_RUNTIME_INVENTORY ]] || {
+  echo "error: runtime library inventory is empty" >&2
+  exit 1
+}
+if grep -q $'\tMISSING$' "$LOCAL_RUNTIME_INVENTORY" "$PEER_RUNTIME_INVENTORY"; then
+  echo "error: runtime library inventory contains an unresolved library" >&2
+  exit 1
+fi
 
 # Preserve the complete non-secret control configuration beside every run.
 # Performance numbers without this record are not eligible for a baseline or
@@ -518,12 +610,20 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'ds4_sha256=%s\n' "$LOCAL_DS4_HASH"
   printf 'peer_ds4_sha256=%s\n' "$PEER_DS4_HASH"
   printf 'ds4_bench_tp_sha256=%s\n' "$LOCAL_BENCH_HASH"
+  printf 'peer_ds4_bench_tp_sha256=%s\n' "$PEER_BENCH_HASH"
+  printf 'runtime_inventory_local=%s\n' "$LOCAL_RUNTIME_INVENTORY"
+  printf 'runtime_inventory_local_sha256=%s\n' "$LOCAL_RUNTIME_INVENTORY_HASH"
+  printf 'runtime_inventory_peer=%s\n' "$PEER_RUNTIME_INVENTORY"
+  printf 'runtime_inventory_peer_sha256=%s\n' "$PEER_RUNTIME_INVENTORY_HASH"
   printf 'model=%s\n' "$MODEL"
   printf 'model_size=%s\n' "$LOCAL_MODEL_SIZE"
   printf 'model_sample_sha256=%s\n' "$LOCAL_MODEL_FINGERPRINT"
   printf 'prompt=%s\n' "$PROMPT_FILE"
   printf 'prompt_size=%s\n' "$PROMPT_SIZE"
   printf 'prompt_sha256=%s\n' "$PROMPT_HASH"
+  printf 'frozen_token_file=%s\n' "$FROZEN_TOKEN_FILE"
+  printf 'frozen_token_sha256=%s\n' "$FROZEN_TOKEN_HASH"
+  printf 'frozen_logits_dir=%s\n' "$FROZEN_LOGITS_DIR"
   printf 'frontier=%s\n' "$FRONTIER"
   printf 'generated_tokens=%s\n' "$TOKENS"
   printf 'context=%s\n' "$CONTEXT"
@@ -723,6 +823,16 @@ if [[ $TEACHER_FORCE_CONTROL == 1 ]]; then
       exit 1
     }
   echo "TP_TEACHER_FORCE_CONTROL_PASSED"
+  exit 0
+fi
+if [[ -n $FROZEN_TOKEN_FILE ]]; then
+  "$REPO/scripts/check-tp-rdma-logs.sh" \
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE"
+  grep -q 'ds4-bench: frozen teacher logits complete ' "$COORD_LOG" || {
+    echo "error: frozen teacher full-logit diagnostic did not complete" >&2
+    exit 1
+  }
+  echo "TP_FROZEN_TEACHER_LOGITS_RECORDED_NOT_BENCHMARKED"
   exit 0
 fi
 "$REPO/scripts/check-ds4-bench-result.sh" \
