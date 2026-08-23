@@ -128,7 +128,8 @@ VALIDATE_CONFIG_ONLY=${DS4_BENCH_VALIDATE_CONFIG_ONLY:-0}
 DUMP_FRONTIER_LOGITS_DIR=${DS4_BENCH_DUMP_FRONTIER_LOGITS_DIR:-}
 FROZEN_TOKEN_FILE=${DS4_BENCH_FROZEN_TOKEN_FILE:-}
 FROZEN_LOGITS_DIR=${DS4_BENCH_FROZEN_LOGITS_DIR:-}
-TOOLCHAIN_ID=${DS4_BENCH_TOOLCHAIN_ID:-}
+DECLARED_TOOLCHAIN_ID=${DS4_BENCH_TOOLCHAIN_ID:-}
+EXPECTED_TOOLCHAIN_SHA256=${DS4_BENCH_EXPECT_TOOLCHAIN_SHA256:-}
 EXPECT_GREEDY_TOP2=0
 CANDIDATE_ARGS=()
 CLEAN_ENV=(env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8)
@@ -534,6 +535,28 @@ PEER_DS4_HASH=$("${PEER_SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}'
 [[ $LOCAL_DS4_HASH == "$PEER_DS4_HASH" ]] || {
   echo "error: worker binary hashes differ" >&2; exit 1;
 }
+command -v readelf >/dev/null 2>&1 || {
+  echo "error: readelf is required to bind ROCm compiler provenance" >&2; exit 1;
+}
+BINARY_TOOLCHAIN_COMMENT=$(LC_ALL=C readelf -p .comment "$REPO/ds4" 2>/dev/null |
+  sed -n 's/^  \[[^]]*\]  //p' |
+  grep -E 'AMD clang version|Linker: AMD LLD' |
+  paste -sd ';' -)
+[[ -n $BINARY_TOOLCHAIN_COMMENT ]] || {
+  echo "error: ds4 binary has no AMD compiler/linker provenance" >&2; exit 1;
+}
+BINARY_TOOLCHAIN_SHA256=$(printf '%s\n' "$BINARY_TOOLCHAIN_COMMENT" |
+  sha256sum | awk '{print $1}')
+[[ -z $EXPECTED_TOOLCHAIN_SHA256 ||
+   $EXPECTED_TOOLCHAIN_SHA256 == "$BINARY_TOOLCHAIN_SHA256" ]] || {
+  echo "error: binary toolchain fingerprint mismatch: expected=$EXPECTED_TOOLCHAIN_SHA256 actual=$BINARY_TOOLCHAIN_SHA256" >&2
+  exit 1
+}
+BINARY_RUNPATH=$(LC_ALL=C readelf -d "$REPO/ds4" 2>/dev/null |
+  sed -n 's/.*\(RPATH\|RUNPATH\).*\[\(.*\)\]/\2/p' |
+  paste -sd ';' -)
+[[ -n $BINARY_RUNPATH ]] || BINARY_RUNPATH=none
+TOOLCHAIN_ID=${DECLARED_TOOLCHAIN_ID:-elf-comment-sha256:$BINARY_TOOLCHAIN_SHA256}
 LOCAL_BENCH_HASH=$(sha256sum "$REPO/ds4-bench-tp" | awk '{print $1}')
 PROMPT_HASH=$(sha256sum "$PROMPT_FILE" | awk '{print $1}')
 PROMPT_SIZE=$(stat -c %s "$PROMPT_FILE")
@@ -582,6 +605,10 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'frozen_token_sha256=%s\n' "$FROZEN_TOKEN_HASH"
   printf 'frozen_logits_dir=%s\n' "$FROZEN_LOGITS_DIR"
   printf 'toolchain_id=%s\n' "$TOOLCHAIN_ID"
+  printf 'binary_toolchain_sha256=%s\n' "$BINARY_TOOLCHAIN_SHA256"
+  printf 'binary_toolchain_comment=%s\n' "$BINARY_TOOLCHAIN_COMMENT"
+  printf 'binary_runpath=%s\n' "$BINARY_RUNPATH"
+  printf 'expected_binary_toolchain_sha256=%s\n' "$EXPECTED_TOOLCHAIN_SHA256"
   printf 'frontier=%s\n' "$FRONTIER"
   printf 'generated_tokens=%s\n' "$TOKENS"
   printf 'context=%s\n' "$CONTEXT"
