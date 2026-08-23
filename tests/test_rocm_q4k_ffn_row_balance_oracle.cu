@@ -1,13 +1,20 @@
-/* Mechanism I: FFN output-row balance oracle (Codex gpt-5.6-sol GATE-7).
+/* FFN row-balance and gate-free K-shard numerical oracle.
  *
- * Gold: shipped ds4_gpu_routed_moe_one_tensor (full mid 2048, out 4096).
- * Candidate: independently compute 1024-row mid halves, concatenate, then
- * full-K down on each 2048-row output half and concatenate. No K-shard.
+ * Exact Mechanism I: shipped ds4_gpu_routed_moe_one_tensor (full mid 2048,
+ * out 4096) versus independently computed 1024-row mid halves followed by
+ * full-K down on each 2048-row output half and concatenation.
+ *
+ * Lane-B precheck: incumbent expert-id TP ownership with full-K down versus
+ * all six routes on both ranks, each using one 1024-row gate/up and matching
+ * four-block down-K half. The existing final rank add is retained, but the
+ * FP32 reduction association intentionally changes and is measured rather
+ * than claimed bit-identical.
  */
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 
 #include <hip/hip_runtime.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -78,6 +85,22 @@ static void pack_row_span(unsigned char *dst, const unsigned char *src,
     }
 }
 
+static void pack_k_span(unsigned char *dst, const unsigned char *src,
+                        uint32_t experts, uint32_t rows,
+                        uint32_t full_blocks_per_row,
+                        uint32_t block0, uint32_t n_blocks) {
+    const uint32_t full_row_bytes = full_blocks_per_row * Q4_K_BLOCK_BYTES;
+    const uint32_t packed_row_bytes = n_blocks * Q4_K_BLOCK_BYTES;
+    for (uint32_t e = 0; e < experts; e++) {
+        for (uint32_t row = 0; row < rows; row++) {
+            memcpy(dst + ((uint64_t)e * rows + row) * packed_row_bytes,
+                   src + ((uint64_t)e * rows + row) * full_row_bytes +
+                       (uint64_t)block0 * Q4_K_BLOCK_BYTES,
+                   packed_row_bytes);
+        }
+    }
+}
+
 static int alloc_tensor(ds4_gpu_tensor *t, uint64_t bytes) {
     memset(t, 0, sizeof(*t));
     return ds4_gpu_tensor_alloc_on(t, 0, bytes) == 0;
@@ -85,6 +108,29 @@ static int alloc_tensor(ds4_gpu_tensor *t, uint64_t bytes) {
 
 static int upload(ds4_gpu_tensor *t, const void *src, uint64_t bytes) {
     return ds4_gpu_tensor_write(t, 0, src, bytes) != 0;
+}
+
+static int compare_float_ascending(const void *a, const void *b) {
+    const float av = *(const float *)a;
+    const float bv = *(const float *)b;
+    return av < bv ? -1 : av > bv ? 1 : 0;
+}
+
+static int add_outputs(float *host_out, const float *a, const float *b) {
+    ds4_gpu_tensor da = {}, db = {}, sum = {};
+    int ok = alloc_tensor(&da, OUT_DIM * sizeof(float)) &&
+             alloc_tensor(&db, OUT_DIM * sizeof(float)) &&
+             alloc_tensor(&sum, OUT_DIM * sizeof(float)) &&
+             upload(&da, a, OUT_DIM * sizeof(float)) &&
+             upload(&db, b, OUT_DIM * sizeof(float)) &&
+             ds4_gpu_add_tensor(&sum, &da, &db, OUT_DIM) != 0 &&
+             hipDeviceSynchronize() == hipSuccess &&
+             ds4_gpu_tensor_read(&sum, 0, host_out,
+                                 OUT_DIM * sizeof(float)) != 0;
+    ds4_gpu_tensor_free_in_place(&sum);
+    ds4_gpu_tensor_free_in_place(&db);
+    ds4_gpu_tensor_free_in_place(&da);
+    return ok;
 }
 
 static int run_moe(ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
@@ -124,7 +170,9 @@ static int run_case(const struct oracle_case *c,
                     ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
                     ds4_gpu_tensor *down, ds4_gpu_tensor *selected,
                     ds4_gpu_tensor *weights, ds4_gpu_tensor *x,
-                    ds4_gpu_tensor *add_in) {
+                    ds4_gpu_tensor *add_in,
+                    ds4_gpu_tensor *shared0,
+                    ds4_gpu_tensor *shared1) {
     const uint32_t n_total = c->n_total;
     const uint64_t full_gate_expert = MID_DIM * gate_row_bytes;
     const uint64_t full_down_expert = OUT_DIM * down_row_bytes;
@@ -270,6 +318,124 @@ static int run_case(const struct oracle_case *c,
           "concat out halves vs gold");
 
     printf("test_rocm_q4k_ffn_row_balance_oracle: %s PASS\n", c->name);
+
+    /* Lane-B precheck: keep the exact row-independent gate/up halves but
+     * partition the down K dimension instead of output rows. This removes
+     * the extra MOE_MID exchange required by the exact output-row design,
+     * at the cost of a different legal FP32 reduction association. Compare
+     * against the actual TP ownership association, including per-rank shared
+     * addends, before any production dispatcher or residency change. */
+    const uint32_t expert_split = n_total / 2u;
+    float rank0_weights[N_USED], rank1_weights[N_USED];
+    for (uint32_t slot = 0; slot < N_USED; slot++) {
+        const int32_t expert = c->route[slot];
+        const bool rank0 = expert >= 0 && (uint32_t)expert < expert_split;
+        rank0_weights[slot] = rank0 ? c->weights[slot] : 0.0f;
+        rank1_weights[slot] = rank0 ? 0.0f : c->weights[slot];
+    }
+
+    float current0[OUT_DIM], current1[OUT_DIM], current_tp[OUT_DIM];
+    CHECK(ds4_gpu_set_model_map(full_model, full_model_bytes),
+          "map K-shard current");
+    CHECK(upload(selected, c->route, sizeof(c->route)),
+          "K-shard current route");
+    CHECK(upload(weights, rank0_weights, sizeof(rank0_weights)),
+          "K-shard current rank0 weights");
+    CHECK(run_moe(out, gate, up, mid, down, selected, weights, x, shared0,
+                  full_model, full_model_bytes, full_gate_off, full_up_off,
+                  full_down_off, full_gate_expert, gate_row_bytes,
+                  full_down_expert, down_row_bytes, MID_DIM, OUT_DIM,
+                  n_total), "K-shard current rank0");
+    CHECK(hipDeviceSynchronize() == hipSuccess &&
+          ds4_gpu_tensor_read(out, 0, current0, sizeof(current0)),
+          "read K-shard current rank0");
+    CHECK(upload(weights, rank1_weights, sizeof(rank1_weights)),
+          "K-shard current rank1 weights");
+    CHECK(run_moe(out, gate, up, mid, down, selected, weights, x, shared1,
+                  full_model, full_model_bytes, full_gate_off, full_up_off,
+                  full_down_off, full_gate_expert, gate_row_bytes,
+                  full_down_expert, down_row_bytes, MID_DIM, OUT_DIM,
+                  n_total), "K-shard current rank1");
+    CHECK(hipDeviceSynchronize() == hipSuccess &&
+          ds4_gpu_tensor_read(out, 0, current1, sizeof(current1)),
+          "read K-shard current rank1");
+    CHECK(add_outputs(current_tp, current0, current1),
+          "combine K-shard current TP");
+
+    const uint32_t half_blocks = MID_HALF / QK_K;
+    const uint64_t k_down_row_bytes =
+        (uint64_t)half_blocks * Q4_K_BLOCK_BYTES;
+    const uint64_t k_down_expert_bytes = OUT_DIM * k_down_row_bytes;
+    const uint64_t k_map_bytes =
+        packed_gu_bytes * 2u + n_total * k_down_expert_bytes;
+    unsigned char *kmap0 = (unsigned char *)malloc((size_t)k_map_bytes);
+    unsigned char *kmap1 = (unsigned char *)malloc((size_t)k_map_bytes);
+    CHECK(kmap0 && kmap1, "K-shard maps");
+    memcpy(kmap0, gu0, (size_t)packed_gu_bytes);
+    memcpy(kmap0 + packed_gu_bytes, up0, (size_t)packed_gu_bytes);
+    memcpy(kmap1, gu1, (size_t)packed_gu_bytes);
+    memcpy(kmap1 + packed_gu_bytes, up1, (size_t)packed_gu_bytes);
+    pack_k_span(kmap0 + packed_gu_bytes * 2u,
+                full_model + full_down_off, n_total, OUT_DIM,
+                MID_DIM / QK_K, 0u, half_blocks);
+    pack_k_span(kmap1 + packed_gu_bytes * 2u,
+                full_model + full_down_off, n_total, OUT_DIM,
+                MID_DIM / QK_K, half_blocks, half_blocks);
+
+    float candidate0[OUT_DIM], candidate1[OUT_DIM], candidate_tp[OUT_DIM];
+    CHECK(upload(weights, c->weights, sizeof(c->weights)),
+          "K-shard candidate weights");
+    CHECK(ds4_gpu_set_model_map(kmap0, k_map_bytes),
+          "map K-shard candidate rank0");
+    CHECK(run_moe(out, gate, up, mid, down, selected, weights, x, shared0,
+                  kmap0, k_map_bytes, 0u, packed_gu_bytes,
+                  packed_gu_bytes * 2u, half_gate_expert, gate_row_bytes,
+                  k_down_expert_bytes, k_down_row_bytes, MID_HALF, OUT_DIM,
+                  n_total), "K-shard candidate rank0");
+    CHECK(hipDeviceSynchronize() == hipSuccess &&
+          ds4_gpu_tensor_read(out, 0, candidate0, sizeof(candidate0)),
+          "read K-shard candidate rank0");
+    CHECK(ds4_gpu_set_model_map(kmap1, k_map_bytes),
+          "map K-shard candidate rank1");
+    CHECK(run_moe(out, gate, up, mid, down, selected, weights, x, shared1,
+                  kmap1, k_map_bytes, 0u, packed_gu_bytes,
+                  packed_gu_bytes * 2u, half_gate_expert, gate_row_bytes,
+                  k_down_expert_bytes, k_down_row_bytes, MID_HALF, OUT_DIM,
+                  n_total), "K-shard candidate rank1");
+    CHECK(hipDeviceSynchronize() == hipSuccess &&
+          ds4_gpu_tensor_read(out, 0, candidate1, sizeof(candidate1)),
+          "read K-shard candidate rank1");
+    CHECK(add_outputs(candidate_tp, candidate0, candidate1),
+          "combine K-shard candidate TP");
+
+    float abs_errors[OUT_DIM];
+    double diff_sq = 0.0, ref_sq = 0.0;
+    float max_abs = 0.0f, max_rel = 0.0f;
+    uint32_t changed = 0u;
+    for (uint32_t row = 0; row < OUT_DIM; row++) {
+        const float error = fabsf(candidate_tp[row] - current_tp[row]);
+        const float rel = error / fmaxf(1.0f, fabsf(current_tp[row]));
+        abs_errors[row] = error;
+        if (error > max_abs) max_abs = error;
+        if (rel > max_rel) max_rel = rel;
+        if (memcmp(&candidate_tp[row], &current_tp[row], sizeof(float)) != 0)
+            changed++;
+        diff_sq += (double)error * error;
+        ref_sq += (double)current_tp[row] * current_tp[row];
+    }
+    qsort(abs_errors, OUT_DIM, sizeof(abs_errors[0]),
+          compare_float_ascending);
+    const float p99_abs = abs_errors[(OUT_DIM * 99u) / 100u];
+    const double nmse = diff_sq / fmax(1e-30, ref_sq);
+    printf("test_rocm_q4k_ffn_kshard_oracle: case=%s "
+           "changed=%u/%u max_abs=%.6e p99_abs=%.6e max_rel=%.6e "
+           "nmse=%.6e\n",
+           c->name, changed, OUT_DIM, max_abs, p99_abs, max_rel, nmse);
+    CHECK(max_rel <= 2e-5f && nmse <= 1e-10,
+          "K-shard numerical precheck envelope");
+
+    free(kmap1);
+    free(kmap0);
     free(gu0); free(gu1); free(up0); free(up1); free(dn0); free(dn1);
     free(map0); free(map1); free(dmap0); free(dmap1);
     return 0;
@@ -309,6 +475,7 @@ int main(void) {
 
     ds4_gpu_tensor out = {}, gate = {}, up = {}, mid = {}, down = {};
     ds4_gpu_tensor selected = {}, wts = {}, x = {}, add_in = {};
+    ds4_gpu_tensor shared0 = {}, shared1 = {};
     CHECK(alloc_tensor(&out, OUT_DIM * sizeof(float)), "out");
     CHECK(alloc_tensor(&gate, (uint64_t)N_USED * MID_DIM * sizeof(float)), "gate");
     CHECK(alloc_tensor(&up, (uint64_t)N_USED * MID_DIM * sizeof(float)), "up");
@@ -318,14 +485,22 @@ int main(void) {
     CHECK(alloc_tensor(&wts, N_USED * sizeof(float)), "weights");
     CHECK(alloc_tensor(&x, IN_DIM * sizeof(float)), "x");
     CHECK(alloc_tensor(&add_in, OUT_DIM * sizeof(float)), "add");
+    CHECK(alloc_tensor(&shared0, OUT_DIM * sizeof(float)), "shared0");
+    CHECK(alloc_tensor(&shared1, OUT_DIM * sizeof(float)), "shared1");
 
-    float hx[IN_DIM], hadd[OUT_DIM];
+    float hx[IN_DIM], hadd[OUT_DIM], hshared0[OUT_DIM], hshared1[OUT_DIM];
     for (uint32_t i = 0; i < IN_DIM; i++)
         hx[i] = (float)((int)(i % 31u) - 15) * 0.03125f;
     for (uint32_t i = 0; i < OUT_DIM; i++)
         hadd[i] = (float)((int)(i % 19u) - 9) * 0.00390625f;
+    for (uint32_t i = 0; i < OUT_DIM; i++) {
+        hshared0[i] = (float)((int)(i % 23u) - 11) * 0.0029296875f;
+        hshared1[i] = (float)((int)(i % 29u) - 14) * 0.001953125f;
+    }
     CHECK(upload(&x, hx, sizeof(hx)), "upload x");
     CHECK(upload(&add_in, hadd, sizeof(hadd)), "upload add");
+    CHECK(upload(&shared0, hshared0, sizeof(hshared0)), "upload shared0");
+    CHECK(upload(&shared1, hshared1, sizeof(hshared1)), "upload shared1");
 
     const struct oracle_case cases[] = {
         {"6/6", 8,
@@ -340,16 +515,25 @@ int main(void) {
         {"5/7", 12,
          {0, 1, 2, 5, 8, 11},
          {0.29f, 0.21f, 0.16f, 0.14f, 0.11f, 0.09f}, 0, 0},
+        {"6/0-ownership", 12,
+         {0, 1, 2, 3, 4, 5},
+         {0.27f, 0.22f, 0.18f, 0.14f, 0.11f, 0.08f}, 0, 0},
+        {"1/5-ownership", 12,
+         {0, 6, 7, 8, 9, 10},
+         {0.28f, 0.22f, 0.17f, 0.14f, 0.11f, 0.08f}, 0, 0},
     };
     for (uint32_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (run_case(&cases[i], full_model, full_gate_off, full_up_off,
                      full_down_off, full_model_bytes, gate_row_bytes,
                      down_row_bytes, &out, &gate, &up, &mid, &down,
-                     &selected, &wts, &x, &add_in) != 0) {
+                     &selected, &wts, &x, &add_in,
+                     &shared0, &shared1) != 0) {
             return 1;
         }
     }
 
+    ds4_gpu_tensor_free_in_place(&shared1);
+    ds4_gpu_tensor_free_in_place(&shared0);
     ds4_gpu_tensor_free_in_place(&add_in);
     ds4_gpu_tensor_free_in_place(&x);
     ds4_gpu_tensor_free_in_place(&wts);
