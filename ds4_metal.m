@@ -10210,6 +10210,24 @@ int ds4_gpu_q4k_packed_slice_load(
     return 0;
 }
 
+int ds4_gpu_q4k_packed_slice_resolve(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t n_expert, uint32_t source_rows,
+        uint64_t source_row_bytes, uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count,
+        ds4_gpu_q4k_packed_slice_kind kind,
+        const void **device_ptr, uint64_t *packed_bytes,
+        uint64_t *packed_expert_bytes, uint64_t *packed_row_bytes) {
+    (void)model_map; (void)tensor_offset; (void)n_expert; (void)source_rows;
+    (void)source_row_bytes; (void)row_base; (void)row_count;
+    (void)column_byte_base; (void)column_byte_count; (void)kind;
+    if (device_ptr) *device_ptr = NULL;
+    if (packed_bytes) *packed_bytes = 0;
+    if (packed_expert_bytes) *packed_expert_bytes = 0;
+    if (packed_row_bytes) *packed_row_bytes = 0;
+    return 0;
+}
+
 int ds4_gpu_q4k_packed_slice_readback(
         const void *model_map, uint64_t tensor_offset,
         uint32_t row_base, uint32_t row_count,

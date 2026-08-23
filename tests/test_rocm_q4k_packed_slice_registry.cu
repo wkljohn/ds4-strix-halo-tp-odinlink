@@ -168,6 +168,20 @@ int main(void) {
               DS4_GPU_Q4K_PACKED_K_RANGE),
           "partial K rows rejected");
 
+    const void *resolved = (const void *)(uintptr_t)1u;
+    uint64_t resolved_bytes = 1u;
+    uint64_t resolved_expert_bytes = 1u;
+    uint64_t resolved_row_bytes = 1u;
+    CHECK(!ds4_gpu_q4k_packed_slice_resolve(
+              model, down_offset, N_EXPERT, SOURCE_ROWS, down_row_bytes,
+              0u, SOURCE_ROWS, down_column_base, down_row_bytes / 2u,
+              DS4_GPU_Q4K_PACKED_K_RANGE, &resolved, &resolved_bytes,
+              &resolved_expert_bytes, &resolved_row_bytes),
+          "unloaded descriptor does not resolve");
+    CHECK(resolved == NULL && resolved_bytes == 0u &&
+              resolved_expert_bytes == 0u && resolved_row_bytes == 0u,
+          "failed resolver clears outputs");
+
     CHECK(ds4_gpu_q4k_packed_slice_load(
               model, gate_offset, gate_row_base, ROW_HALF,
               0u, gate_row_bytes),
@@ -184,6 +198,34 @@ int main(void) {
     unsigned char *expected = (unsigned char *)malloc((size_t)down_packed_bytes);
     unsigned char *got = (unsigned char *)malloc((size_t)down_packed_bytes);
     CHECK(expected && got, "readback buffers");
+
+    CHECK(ds4_gpu_q4k_packed_slice_resolve(
+              model, down_offset, N_EXPERT, SOURCE_ROWS, down_row_bytes,
+              0u, SOURCE_ROWS, down_column_base, down_row_bytes / 2u,
+              DS4_GPU_Q4K_PACKED_K_RANGE, &resolved, &resolved_bytes,
+              &resolved_expert_bytes, &resolved_row_bytes),
+          "resolve exact loaded K descriptor");
+    CHECK(resolved != NULL && resolved_bytes == down_packed_bytes &&
+              resolved_expert_bytes ==
+                  (uint64_t)SOURCE_ROWS * (down_row_bytes / 2u) &&
+              resolved_row_bytes == down_row_bytes / 2u,
+          "resolved K descriptor geometry");
+    CHECK(hipMemcpy(got, resolved, (size_t)down_packed_bytes,
+                    hipMemcpyDeviceToHost) == hipSuccess,
+          "resolved pointer copy");
+    pack_expected(expected, model, down_offset, down_row_bytes,
+                  0u, SOURCE_ROWS, down_column_base, down_row_bytes / 2u);
+    CHECK(memcmp(expected, got, (size_t)down_packed_bytes) == 0,
+          "resolved pointer bytes");
+    CHECK(!ds4_gpu_q4k_packed_slice_resolve(
+              model, down_offset, N_EXPERT, SOURCE_ROWS - 1u,
+              down_row_bytes, 0u, SOURCE_ROWS, down_column_base,
+              down_row_bytes / 2u, DS4_GPU_Q4K_PACKED_K_RANGE,
+              &resolved, &resolved_bytes, &resolved_expert_bytes,
+              &resolved_row_bytes),
+          "mismatched descriptor geometry rejected");
+    CHECK(resolved == NULL && resolved_bytes == 0u,
+          "mismatched resolver clears outputs");
 
     pack_expected(expected, model, gate_offset, gate_row_bytes,
                   gate_row_base, ROW_HALF, 0u, gate_row_bytes);
@@ -244,6 +286,20 @@ int main(void) {
 
     ds4_gpu_cleanup();
 
+    resolved = (const void *)(uintptr_t)1u;
+    resolved_bytes = 1u;
+    resolved_expert_bytes = 1u;
+    resolved_row_bytes = 1u;
+    CHECK(!ds4_gpu_q4k_packed_slice_resolve(
+              model, down_offset, N_EXPERT, SOURCE_ROWS, down_row_bytes,
+              0u, SOURCE_ROWS, down_column_base, down_row_bytes / 2u,
+              DS4_GPU_Q4K_PACKED_K_RANGE, &resolved, &resolved_bytes,
+              &resolved_expert_bytes, &resolved_row_bytes),
+          "cleanup invalidates descriptor resolver");
+    CHECK(resolved == NULL && resolved_bytes == 0u &&
+              resolved_expert_bytes == 0u && resolved_row_bytes == 0u,
+          "cleanup resolver clears outputs");
+
     CHECK(ds4_gpu_init(), "GPU reinit for no-fd path");
     CHECK(ds4_gpu_set_model_map(model, model_bytes),
           "set no-fd model map");
@@ -272,7 +328,8 @@ int main(void) {
     printf("packed_q4k_slice_registry row_fnv64=%016llx "
            "k_fnv64=%016llx bytes=%llu fd_staging=1 no_fd=1 "
            "ring_wrap=1 declare_after_cache=blocked "
-           "linear_fail_closed=1 disjoint_linear=1 lifetime=1\n",
+           "linear_fail_closed=1 disjoint_linear=1 lifetime=1 "
+           "exact_resolver=1\n",
            (unsigned long long)gate_hash,
            (unsigned long long)down_hash,
            (unsigned long long)(gate_packed_bytes + down_packed_bytes));

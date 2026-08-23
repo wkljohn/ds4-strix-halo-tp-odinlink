@@ -6438,6 +6438,33 @@ extern "C" int ds4_gpu_q4k_packed_slice_readback(
                    "packed Q4_K slice readback");
 }
 
+extern "C" int ds4_gpu_q4k_packed_slice_resolve(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t n_expert, uint32_t source_rows,
+        uint64_t source_row_bytes, uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count,
+        ds4_gpu_q4k_packed_slice_kind kind,
+        const void **device_ptr, uint64_t *packed_bytes,
+        uint64_t *packed_expert_bytes, uint64_t *packed_row_bytes) {
+    if (device_ptr) *device_ptr = NULL;
+    if (packed_bytes) *packed_bytes = 0u;
+    if (packed_expert_bytes) *packed_expert_bytes = 0u;
+    if (packed_row_bytes) *packed_row_bytes = 0u;
+    if (!device_ptr || !packed_bytes || !packed_expert_bytes ||
+        !packed_row_bytes) return 0;
+    cuda_q4k_packed_slice *p = cuda_q4k_packed_slice_find(
+        model_map, tensor_offset, row_base, row_count,
+        column_byte_base, column_byte_count);
+    if (!p || !p->device_ptr || p->n_expert != n_expert ||
+        p->source_rows != source_rows ||
+        p->source_row_bytes != source_row_bytes || p->kind != kind) return 0;
+    *device_ptr = p->device_ptr;
+    *packed_bytes = p->packed_bytes;
+    *packed_expert_bytes = p->packed_expert_bytes;
+    *packed_row_bytes = p->column_byte_count;
+    return 1;
+}
+
 extern "C" uint64_t ds4_gpu_q4k_packed_slice_bytes(void) {
     return g_q4k_packed_slice_bytes;
 }

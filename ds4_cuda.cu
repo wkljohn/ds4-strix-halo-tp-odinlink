@@ -3809,6 +3809,19 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
     return 0;
 }
 
+extern "C" int ds4_gpu_q4k_packed_slice_resolve(
+        const void *, uint64_t, uint32_t, uint32_t, uint64_t,
+        uint32_t, uint32_t, uint64_t, uint64_t,
+        ds4_gpu_q4k_packed_slice_kind, const void **device_ptr,
+        uint64_t *packed_bytes, uint64_t *packed_expert_bytes,
+        uint64_t *packed_row_bytes) {
+    if (device_ptr) *device_ptr = NULL;
+    if (packed_bytes) *packed_bytes = 0;
+    if (packed_expert_bytes) *packed_expert_bytes = 0;
+    if (packed_row_bytes) *packed_row_bytes = 0;
+    return 0;
+}
+
 extern "C" int ds4_gpu_q4k_packed_slice_readback(
         const void *, uint64_t, uint32_t, uint32_t, uint64_t, uint64_t,
         void *, uint64_t) {

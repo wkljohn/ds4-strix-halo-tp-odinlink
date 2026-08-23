@@ -17,7 +17,10 @@ force the four-buffer asynchronous fd staging ring to wrap. The oracle also
 checks the mmap/no-fd pack path, persistent-byte accounting, descriptor
 lifetime across a model-map transition, declaration-after-cache refusal,
 idempotent and conflicting declarations, geometry/alignment rejection,
-disjoint linear-range success, and fail-closed legacy range/span lookup.
+disjoint linear-range success, fail-closed legacy range/span lookup, and an
+exact loaded-descriptor resolver. The resolver requires the complete declared
+source and packed geometry, clears all outputs on failure, and never falls
+back to a linear model pointer.
 
 This test validates residency plumbing only. It does not enable full-model
 K-sharding, change ordinary inference, establish numerical equivalence, or
