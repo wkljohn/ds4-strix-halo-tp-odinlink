@@ -140,6 +140,8 @@ static int routed_moe_q4k_decode_halfk_down4_enabled(void) {
     return enabled;
 }
 
+static int g_routed_moe_q4k_halfk_down4_force;
+
 static int routed_moe_q4k_l2_pair_order_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -2602,7 +2604,8 @@ static int routed_moe_launch(
                         midq_blocks == 8u && out_dim == 4096u;
                     const uint32_t use_halfk_down4 =
                         midq_blocks == 4u && out_dim == 4096u &&
-                        routed_moe_q4k_decode_halfk_down4_enabled();
+                        (g_routed_moe_q4k_halfk_down4_force ||
+                         routed_moe_q4k_decode_halfk_down4_enabled());
                     if (use_halfk_down4) {
                         dim3 half_grid((out_dim + 63u) / 64u, 1, 1);
                         moe_down_q4K_sum6_halfk4_kernel<<<half_grid, 256>>>(
@@ -3953,6 +3956,112 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                 layer_index, v.active, n_total_expert, n_expert, gate_type, down_type,
                 expert_in_dim, expert_mid_dim, (unsigned long long)out_dim,
                 (unsigned long long)gate_offset, (unsigned long long)gate_expert_bytes);
+    }
+    return rc;
+}
+
+extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t n_total_expert,
+        uint64_t source_gate_row_bytes,
+        uint64_t source_down_row_bytes,
+        uint32_t row_base, uint32_t row_count,
+        uint64_t down_column_byte_base,
+        uint64_t down_column_byte_count,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *add_in,
+        uint32_t layer_index) {
+    const char *enabled = getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
+    if (!enabled || enabled[0] != '1' || enabled[1] != '\0' ||
+        !out || !gate || !up || !mid || !down || !model_map ||
+        model_size == 0u ||
+        !selected || !weights || !x || n_total_expert == 0u ||
+        n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
+        source_gate_row_bytes != 16u * sizeof(cuda_block_q4_K) ||
+        source_down_row_bytes != 8u * sizeof(cuda_block_q4_K) ||
+        row_count != 1024u || (row_base != 0u && row_base != 1024u) ||
+        down_column_byte_count != 4u * sizeof(cuda_block_q4_K) ||
+        down_column_byte_base !=
+            (uint64_t)(row_base / CUDA_QK_K) * sizeof(cuda_block_q4_K)) {
+        return 0;
+    }
+
+    const void *gate_w = NULL, *up_w = NULL, *down_w = NULL;
+    uint64_t gate_bytes = 0, up_bytes = 0, down_bytes = 0;
+    uint64_t gate_expert_bytes = 0, up_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    uint64_t gate_row_bytes = 0, up_row_bytes = 0, down_row_bytes = 0;
+    const int gate_ok = ds4_gpu_q4k_packed_slice_resolve(
+            model_map, gate_offset, n_total_expert, 2048u,
+            source_gate_row_bytes, row_base, row_count, 0u,
+            source_gate_row_bytes, DS4_GPU_Q4K_PACKED_ROW_RANGE,
+            &gate_w, &gate_bytes, &gate_expert_bytes, &gate_row_bytes);
+    const int up_ok = ds4_gpu_q4k_packed_slice_resolve(
+            model_map, up_offset, n_total_expert, 2048u,
+            source_gate_row_bytes, row_base, row_count, 0u,
+            source_gate_row_bytes, DS4_GPU_Q4K_PACKED_ROW_RANGE,
+            &up_w, &up_bytes, &up_expert_bytes, &up_row_bytes);
+    const int down_ok = ds4_gpu_q4k_packed_slice_resolve(
+            model_map, down_offset, n_total_expert, 4096u,
+            source_down_row_bytes, 0u, 4096u,
+            down_column_byte_base, down_column_byte_count,
+            DS4_GPU_Q4K_PACKED_K_RANGE,
+            &down_w, &down_bytes, &down_expert_bytes, &down_row_bytes);
+    if (!gate_ok || !up_ok || !down_ok ||
+        gate_expert_bytes != up_expert_bytes ||
+        gate_row_bytes != source_gate_row_bytes ||
+        up_row_bytes != source_gate_row_bytes ||
+        down_row_bytes != down_column_byte_count ||
+        gate_bytes != (uint64_t)n_total_expert * gate_expert_bytes ||
+        up_bytes != (uint64_t)n_total_expert * up_expert_bytes ||
+        down_bytes != (uint64_t)n_total_expert * down_expert_bytes) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K one-token descriptor mismatch: "
+                "resolved=%d/%d/%d bytes=%llu/%llu/%llu "
+                "expert=%llu/%llu/%llu row=%llu/%llu/%llu\n",
+                gate_ok, up_ok, down_ok,
+                (unsigned long long)gate_bytes,
+                (unsigned long long)up_bytes,
+                (unsigned long long)down_bytes,
+                (unsigned long long)gate_expert_bytes,
+                (unsigned long long)up_expert_bytes,
+                (unsigned long long)down_expert_bytes,
+                (unsigned long long)gate_row_bytes,
+                (unsigned long long)up_row_bytes,
+                (unsigned long long)down_row_bytes);
+        return 0;
+    }
+
+    g_slot_balance_gate_w = (const char *)gate_w;
+    g_slot_balance_up_w = (const char *)up_w;
+    g_slot_balance_down_w = (const char *)down_w;
+    g_routed_moe_q4k_halfk_down4_force = 1;
+    int add_fused = 0;
+    const int rc = routed_moe_launch(
+        out, gate, up, mid, down, model_map, model_size,
+        gate_offset, up_offset, down_offset, 12u, 12u,
+        gate_expert_bytes, gate_row_bytes,
+        down_expert_bytes, down_row_bytes,
+        4096u, row_count, 4096u,
+        selected, weights, n_total_expert, n_expert, clamp, x, add_in,
+        &add_fused, layer_index, 1u, false);
+    g_routed_moe_q4k_halfk_down4_force = 0;
+    g_slot_balance_gate_w = NULL;
+    g_slot_balance_up_w = NULL;
+    g_slot_balance_down_w = NULL;
+    if (rc && add_in && !add_fused &&
+        !ds4_gpu_add_tensor(out, out, add_in, 4096u)) return 0;
+    if (!rc) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K one-token launch failed: layer=%u rank-half=%u\n",
+                layer_index, row_base / row_count);
     }
     return rc;
 }

@@ -118,6 +118,16 @@ static int compare_float_ascending(const void *a, const void *b) {
     return av < bv ? -1 : av > bv ? 1 : 0;
 }
 
+static uint64_t fnv1a64(const void *data, uint64_t bytes) {
+    const unsigned char *p = (const unsigned char *)data;
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0; i < bytes; i++) {
+        h ^= p[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
 static int add_outputs(float *host_out, const float *a, const float *b) {
     ds4_gpu_tensor da = {}, db = {}, sum = {};
     int ok = alloc_tensor(&da, OUT_DIM * sizeof(float)) &&
@@ -701,6 +711,144 @@ static int run_case(const struct oracle_case *c,
     return 0;
 }
 
+static int run_registry_packed_one_oracle(
+        const unsigned char *full_model,
+        uint64_t full_gate_off, uint64_t full_up_off,
+        uint64_t full_down_off, uint64_t full_model_bytes,
+        uint64_t gate_row_bytes, uint64_t down_row_bytes,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down, ds4_gpu_tensor *selected,
+        ds4_gpu_tensor *weights, ds4_gpu_tensor *x) {
+    const uint64_t half_gate_expert = MID_HALF * gate_row_bytes;
+    const uint64_t half_down_row_bytes =
+        (uint64_t)(MID_HALF / QK_K) * Q4_K_BLOCK_BYTES;
+    const uint64_t half_down_expert = OUT_DIM * half_down_row_bytes;
+    const uint64_t gate_table_bytes = N_TOTAL_MAX * half_gate_expert;
+    const uint64_t down_table_bytes = N_TOTAL_MAX * half_down_expert;
+    const uint64_t packed_model_bytes = gate_table_bytes * 2u +
+                                        down_table_bytes;
+    unsigned char *gate_half =
+        (unsigned char *)malloc((size_t)gate_table_bytes);
+    unsigned char *up_half =
+        (unsigned char *)malloc((size_t)gate_table_bytes);
+    unsigned char *down_half =
+        (unsigned char *)malloc((size_t)down_table_bytes);
+    unsigned char *packed_model =
+        (unsigned char *)malloc((size_t)packed_model_bytes);
+    CHECK(gate_half && up_half && down_half && packed_model,
+          "packed one host maps");
+    pack_row_span(gate_half, full_model + full_gate_off, N_TOTAL_MAX,
+                  MID_DIM, 0u, MID_HALF, (uint32_t)gate_row_bytes);
+    pack_row_span(up_half, full_model + full_up_off, N_TOTAL_MAX,
+                  MID_DIM, 0u, MID_HALF, (uint32_t)gate_row_bytes);
+    pack_k_span(down_half, full_model + full_down_off, N_TOTAL_MAX,
+                OUT_DIM, MID_DIM / QK_K, 0u, MID_HALF / QK_K);
+    memcpy(packed_model, gate_half, (size_t)gate_table_bytes);
+    memcpy(packed_model + gate_table_bytes, up_half,
+           (size_t)gate_table_bytes);
+    memcpy(packed_model + gate_table_bytes * 2u, down_half,
+           (size_t)down_table_bytes);
+
+    const int32_t routes[N_USED] = {0, 1, 2, 6, 7, 8};
+    const float route_weights[N_USED] =
+        {0.31f, 0.23f, 0.17f, 0.13f, 0.09f, 0.07f};
+    CHECK(upload(selected, routes, sizeof(routes)), "packed one routes");
+    CHECK(upload(weights, route_weights, sizeof(route_weights)),
+          "packed one weights");
+    CHECK(unsetenv("DS4_ROCM_TP_SKIP_UNOWNED") == 0,
+          "packed one skip off");
+    CHECK(ds4_gpu_set_model_map(packed_model, packed_model_bytes),
+          "packed one direct map");
+    CHECK(run_moe(out, gate, up, mid, down, selected, weights, x, NULL,
+                  packed_model, packed_model_bytes,
+                  0u, gate_table_bytes, gate_table_bytes * 2u,
+                  half_gate_expert, gate_row_bytes,
+                  half_down_expert, half_down_row_bytes,
+                  MID_HALF, OUT_DIM, N_TOTAL_MAX),
+          "packed one direct reference");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "packed one direct sync");
+    float reference[OUT_DIM], candidate[OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(out, 0, reference, sizeof(reference)),
+          "packed one direct read");
+
+    unsigned char alternate_map[64] = {};
+    CHECK(ds4_gpu_set_model_map(alternate_map, sizeof(alternate_map)),
+          "packed one release direct map");
+    CHECK(ds4_gpu_set_model_map(full_model, full_model_bytes),
+          "packed one source map");
+    CHECK(ds4_gpu_set_model_fd_for_map(-1, full_model),
+          "packed one no-fd source");
+    CHECK(ds4_gpu_q4k_packed_slice_declare(
+              full_model, full_model_bytes, full_gate_off, N_TOTAL_MAX,
+              MID_DIM, gate_row_bytes, 0u, MID_HALF, 0u, gate_row_bytes,
+              DS4_GPU_Q4K_PACKED_ROW_RANGE),
+          "packed one gate declare");
+    CHECK(ds4_gpu_q4k_packed_slice_declare(
+              full_model, full_model_bytes, full_up_off, N_TOTAL_MAX,
+              MID_DIM, gate_row_bytes, 0u, MID_HALF, 0u, gate_row_bytes,
+              DS4_GPU_Q4K_PACKED_ROW_RANGE),
+          "packed one up declare");
+    CHECK(ds4_gpu_q4k_packed_slice_declare(
+              full_model, full_model_bytes, full_down_off, N_TOTAL_MAX,
+              OUT_DIM, down_row_bytes, 0u, OUT_DIM,
+              0u, half_down_row_bytes, DS4_GPU_Q4K_PACKED_K_RANGE),
+          "packed one down declare");
+    CHECK(ds4_gpu_q4k_packed_slice_load(
+              full_model, full_gate_off, 0u, MID_HALF,
+              0u, gate_row_bytes), "packed one gate load");
+    CHECK(ds4_gpu_q4k_packed_slice_load(
+              full_model, full_up_off, 0u, MID_HALF,
+              0u, gate_row_bytes), "packed one up load");
+    CHECK(ds4_gpu_q4k_packed_slice_load(
+              full_model, full_down_off, 0u, OUT_DIM,
+              0u, half_down_row_bytes), "packed one down load");
+
+    CHECK(!run_moe(out, gate, up, mid, down, selected, weights, x, NULL,
+                   full_model, full_model_bytes,
+                   full_gate_off, full_up_off, full_down_off,
+                   half_gate_expert, gate_row_bytes,
+                   half_down_expert, half_down_row_bytes,
+                   MID_HALF, OUT_DIM, N_TOTAL_MAX),
+          "ordinary linear primitive refuses declared slices");
+    CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0,
+          "packed one research off");
+    CHECK(!ds4_gpu_routed_moe_one_packed_q4k_tensor(
+              out, gate, up, mid, down, full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
+              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              x, NULL, 0u),
+          "packed one default-off refusal");
+    CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0,
+          "packed one research on");
+    CHECK(ds4_gpu_routed_moe_one_packed_q4k_tensor(
+              out, gate, up, mid, down, full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
+              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              x, NULL, 0u),
+          "packed one registry primitive");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "packed one registry sync");
+    CHECK(ds4_gpu_tensor_read(out, 0, candidate, sizeof(candidate)),
+          "packed one registry read");
+    CHECK(memcmp(reference, candidate, sizeof(reference)) == 0,
+          "packed one registry exact output");
+    printf("test_rocm_q4k_packed_one_oracle: output_fnv64=%016llx "
+           "linear_refusal=1 default_off=1 exact=1\n",
+           (unsigned long long)fnv1a64(candidate, sizeof(candidate)));
+    CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0,
+          "packed one research restore");
+
+    free(packed_model);
+    free(down_half);
+    free(up_half);
+    free(gate_half);
+    return 0;
+}
+
 int main(void) {
     int devices = 0;
     CHECK(hipGetDeviceCount(&devices) == hipSuccess && devices > 0,
@@ -797,6 +945,13 @@ int main(void) {
                      &shared0, &shared1) != 0) {
             return 1;
         }
+    }
+
+    if (run_registry_packed_one_oracle(
+            full_model, full_gate_off, full_up_off, full_down_off,
+            full_model_bytes, gate_row_bytes, down_row_bytes,
+            &out, &gate, &up, &mid, &down, &selected, &wts, &x) != 0) {
+        return 1;
     }
 
     ds4_gpu_tensor_free_in_place(&shared1);

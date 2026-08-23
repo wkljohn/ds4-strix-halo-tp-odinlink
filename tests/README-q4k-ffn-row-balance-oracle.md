@@ -33,6 +33,13 @@ Distinct shared-expert partials are folded on the corresponding ranks in both
 arms. Skew controls include 6/0 and 1/5 ownership. The predeclared isolated
 envelope is `max_rel <= 2e-5` and `NMSE <= 1e-10`.
 
+The final isolated case exercises the default-off registry-backed one-token
+primitive. It declares and loads exact gate/up row halves plus the matching
+down K half, proves the ordinary linear primitive refuses those source
+tensors, and compares the new primitive bit-for-bit with an independently
+packed direct-map reference. This still adds no production caller or TP
+feature negotiation.
+
 This is arithmetic only. It does not authorize the dispatcher, loader,
 negotiated feature, a new golden FNV, or `main` promotion.
 `DS4_ROCM_Q4K_DECODE_STAGE_MIDQ` stays off because that path assumes eight

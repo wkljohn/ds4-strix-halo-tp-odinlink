@@ -39674,3 +39674,25 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
     (void)enabled;
 }
+
+int ds4_gpu_routed_moe_one_packed_q4k_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t n_total_expert, uint64_t source_gate_row_bytes,
+        uint64_t source_down_row_bytes, uint32_t row_base,
+        uint32_t row_count, uint64_t down_column_byte_base,
+        uint64_t down_column_byte_count,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *add_in, uint32_t layer_index) {
+    (void)out; (void)gate; (void)up; (void)mid; (void)experts;
+    (void)model_map; (void)model_size; (void)gate_offset; (void)up_offset;
+    (void)down_offset; (void)n_total_expert; (void)source_gate_row_bytes;
+    (void)source_down_row_bytes; (void)row_base; (void)row_count;
+    (void)down_column_byte_base; (void)down_column_byte_count;
+    (void)selected; (void)weights; (void)n_expert; (void)clamp;
+    (void)x; (void)add_in; (void)layer_index;
+    return 0;
+}
