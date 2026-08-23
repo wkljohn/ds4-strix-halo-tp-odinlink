@@ -6,6 +6,20 @@ See `$DS4_RESEARCH_ROOT/decode-25tps-2026-08-20/CODEX-GATE-7.md`.
 make test-rocm-q4k-ffn-row-balance-oracle
 ```
 
+Before the numerical cases, the test runs a warm, device-resident,
+kernel-only shape-cost gate. It alternates 33 `hipEvent` samples of the current
+three-full-expert TP rank against both six-expert packed K-halves. Both arms
+execute 40.5 MiB of unique Q4_K weight bytes through the shipped one-token
+primitive. The test prints the worse-half ratio and a conservative whole-token
+model bound to the frozen route-stage profile; host packing, uploads, pointer
+selection, and readback are outside the timed interval.
+
+The research gate is `ratio <= 1.10` and `modeled_save_ms >= 2.0`. A
+1.8--2.0 ms result is conditional on an independent paired-lever model that
+covers the full residual to 21 t/s. `ratio >= 1.25`, saving below 1.5 ms, or a
+nonpositive saving stops K-shard integration. The timing result is a geometry
+falsifier, not a full-model performance claim.
+
 Drives shipped `ds4_gpu_routed_moe_one_tensor`. Candidate concatenates two
 independently computed 1,024-row mid halves, then runs full-K (8 Q8_K block)
 down on each 2,048-row output half and concatenates. `memcmp` vs the full

@@ -41,6 +41,8 @@ enum {
     OUT_DIM = 4096,
     OUT_HALF = 2048,
     N_TOTAL_MAX = 12,
+    TIMING_WARMUP = 8,
+    TIMING_SAMPLES = 33,
 };
 
 static void pack_q4k_block(unsigned char *dst, uint32_t seed) {
@@ -150,6 +152,258 @@ static int run_moe(ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
         down_expert_bytes, down_row_bytes,
         IN_DIM, mid_dim, out_dim, selected, weights,
         n_total, N_USED, 0.0f, x, add_in, 0, true);
+}
+
+struct timing_arm {
+    const char *name;
+    const void *model_map;
+    uint64_t model_bytes;
+    uint64_t gate_off;
+    uint64_t up_off;
+    uint64_t down_off;
+    uint64_t gate_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t down_row_bytes;
+    uint32_t mid_dim;
+    const ds4_gpu_tensor *weights;
+};
+
+static int time_arm_once(
+        const struct timing_arm *arm,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down, ds4_gpu_tensor *selected,
+        ds4_gpu_tensor *x, hipEvent_t start, hipEvent_t stop,
+        float *elapsed_ms) {
+    CHECK(ds4_gpu_set_model_map(arm->model_map, arm->model_bytes),
+          "install resident timing map");
+    CHECK(hipEventRecord(start) == hipSuccess, "timing start");
+    CHECK(run_moe(out, gate, up, mid, down, selected,
+                  (ds4_gpu_tensor *)arm->weights, x, NULL,
+                  arm->model_map, arm->model_bytes,
+                  arm->gate_off, arm->up_off, arm->down_off,
+                  arm->gate_expert_bytes, arm->gate_row_bytes,
+                  arm->down_expert_bytes, arm->down_row_bytes,
+                  arm->mid_dim, OUT_DIM, N_TOTAL_MAX),
+          arm->name);
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess, "timing stop");
+    CHECK(hipEventElapsedTime(elapsed_ms, start, stop) == hipSuccess,
+          "timing elapsed");
+    return 0;
+}
+
+static int run_kshard_shape_cost_gate(
+        const unsigned char *full_model,
+        uint64_t full_gate_off, uint64_t full_up_off,
+        uint64_t full_down_off, uint64_t full_model_bytes,
+        uint64_t gate_row_bytes, uint64_t down_row_bytes,
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down, ds4_gpu_tensor *selected,
+        ds4_gpu_tensor *x) {
+    const uint64_t full_gate_expert = MID_DIM * gate_row_bytes;
+    const uint64_t full_down_expert = OUT_DIM * down_row_bytes;
+    const uint64_t half_gate_expert = MID_HALF * gate_row_bytes;
+    const uint32_t half_blocks = MID_HALF / QK_K;
+    const uint64_t half_down_row_bytes =
+        (uint64_t)half_blocks * Q4_K_BLOCK_BYTES;
+    const uint64_t half_down_expert = OUT_DIM * half_down_row_bytes;
+    const uint64_t packed_gu_bytes = N_TOTAL_MAX * half_gate_expert;
+    const uint64_t packed_down_bytes = N_TOTAL_MAX * half_down_expert;
+    const uint64_t packed_map_bytes = packed_gu_bytes * 2u + packed_down_bytes;
+
+    unsigned char *gu0 = (unsigned char *)malloc((size_t)packed_gu_bytes);
+    unsigned char *gu1 = (unsigned char *)malloc((size_t)packed_gu_bytes);
+    unsigned char *up0 = (unsigned char *)malloc((size_t)packed_gu_bytes);
+    unsigned char *up1 = (unsigned char *)malloc((size_t)packed_gu_bytes);
+    unsigned char *map0 = (unsigned char *)malloc((size_t)packed_map_bytes);
+    unsigned char *map1 = (unsigned char *)malloc((size_t)packed_map_bytes);
+    CHECK(gu0 && gu1 && up0 && up1 && map0 && map1,
+          "timing host maps");
+
+    pack_row_span(gu0, full_model + full_gate_off, N_TOTAL_MAX, MID_DIM,
+                  0u, MID_HALF, (uint32_t)gate_row_bytes);
+    pack_row_span(gu1, full_model + full_gate_off, N_TOTAL_MAX, MID_DIM,
+                  MID_HALF, MID_HALF, (uint32_t)gate_row_bytes);
+    pack_row_span(up0, full_model + full_up_off, N_TOTAL_MAX, MID_DIM,
+                  0u, MID_HALF, (uint32_t)gate_row_bytes);
+    pack_row_span(up1, full_model + full_up_off, N_TOTAL_MAX, MID_DIM,
+                  MID_HALF, MID_HALF, (uint32_t)gate_row_bytes);
+    memcpy(map0, gu0, (size_t)packed_gu_bytes);
+    memcpy(map0 + packed_gu_bytes, up0, (size_t)packed_gu_bytes);
+    memcpy(map1, gu1, (size_t)packed_gu_bytes);
+    memcpy(map1 + packed_gu_bytes, up1, (size_t)packed_gu_bytes);
+    pack_k_span(map0 + packed_gu_bytes * 2u,
+                full_model + full_down_off, N_TOTAL_MAX, OUT_DIM,
+                MID_DIM / QK_K, 0u, half_blocks);
+    pack_k_span(map1 + packed_gu_bytes * 2u,
+                full_model + full_down_off, N_TOTAL_MAX, OUT_DIM,
+                MID_DIM / QK_K, half_blocks, half_blocks);
+
+    const uint64_t full_base = 0u;
+    const uint64_t packed0_base = full_model_bytes;
+    const uint64_t packed1_base = packed0_base + packed_map_bytes;
+    const uint64_t resident_model_bytes = packed1_base + packed_map_bytes;
+    unsigned char *resident_model =
+        (unsigned char *)malloc((size_t)resident_model_bytes);
+    CHECK(resident_model, "timing resident source image");
+    memcpy(resident_model + full_base, full_model, (size_t)full_model_bytes);
+    memcpy(resident_model + packed0_base, map0, (size_t)packed_map_bytes);
+    memcpy(resident_model + packed1_base, map1, (size_t)packed_map_bytes);
+    FILE *resident_file = tmpfile();
+    CHECK(resident_file, "timing resident backing file");
+    CHECK(fwrite(resident_model, 1, (size_t)resident_model_bytes,
+                 resident_file) == resident_model_bytes,
+          "write timing resident backing file");
+    CHECK(fflush(resident_file) == 0, "flush timing resident backing file");
+    CHECK(ds4_gpu_set_model_map(resident_model, resident_model_bytes),
+          "install timing source map");
+    CHECK(ds4_gpu_set_model_fd(fileno(resident_file)),
+          "install timing source fd");
+    const uint64_t resident_offsets[3] = {
+        full_base, packed0_base, packed1_base,
+    };
+    const uint64_t resident_sizes[3] = {
+        full_model_bytes, packed_map_bytes, packed_map_bytes,
+    };
+    CHECK(ds4_gpu_set_model_map_spans(
+              resident_model, resident_model_bytes,
+              resident_offsets, resident_sizes, 3u, full_model_bytes),
+          "install device-resident timing spans");
+
+    ds4_gpu_tensor weights_full = {}, weights_packed = {};
+    CHECK(alloc_tensor(&weights_full, N_USED * sizeof(float)),
+          "timing full weights");
+    CHECK(alloc_tensor(&weights_packed, N_USED * sizeof(float)),
+          "timing packed weights");
+    const int32_t routes[N_USED] = {0, 1, 2, 6, 7, 8};
+    const float packed_weights[N_USED] =
+        {0.31f, 0.23f, 0.17f, 0.13f, 0.09f, 0.07f};
+    const float full_weights[N_USED] =
+        {0.31f, 0.23f, 0.17f, 0.0f, 0.0f, 0.0f};
+    CHECK(upload(selected, routes, sizeof(routes)), "timing routes");
+    CHECK(upload(&weights_full, full_weights, sizeof(full_weights)),
+          "timing full weights upload");
+    CHECK(upload(&weights_packed, packed_weights, sizeof(packed_weights)),
+          "timing packed weights upload");
+
+    struct timing_arm arms[3] = {};
+    arms[0].name = "full3";
+    arms[0].model_map = resident_model;
+    arms[0].model_bytes = resident_model_bytes;
+    arms[0].gate_off = full_base + full_gate_off;
+    arms[0].up_off = full_base + full_up_off;
+    arms[0].down_off = full_base + full_down_off;
+    arms[0].gate_expert_bytes = full_gate_expert;
+    arms[0].gate_row_bytes = gate_row_bytes;
+    arms[0].down_expert_bytes = full_down_expert;
+    arms[0].down_row_bytes = down_row_bytes;
+    arms[0].mid_dim = MID_DIM;
+    arms[0].weights = &weights_full;
+    arms[1] = arms[0];
+    arms[1].name = "packed6-half0";
+    arms[1].gate_off = packed0_base;
+    arms[1].up_off = packed0_base + packed_gu_bytes;
+    arms[1].down_off = packed0_base + packed_gu_bytes * 2u;
+    arms[1].gate_expert_bytes = half_gate_expert;
+    arms[1].down_expert_bytes = half_down_expert;
+    arms[1].down_row_bytes = half_down_row_bytes;
+    arms[1].mid_dim = MID_HALF;
+    arms[1].weights = &weights_packed;
+    arms[2] = arms[1];
+    arms[2].name = "packed6-half1";
+    arms[2].gate_off = packed1_base;
+    arms[2].up_off = packed1_base + packed_gu_bytes;
+    arms[2].down_off = packed1_base + packed_gu_bytes * 2u;
+
+    CHECK(setenv("DS4_ROCM_TP_SKIP_UNOWNED", "1", 1) == 0,
+          "timing skip unowned");
+    CHECK(unsetenv("DS4_ROCM_Q4K_DECODE_STAGE_MIDQ") == 0,
+          "timing midq off");
+    hipEvent_t start = nullptr, stop = nullptr;
+    CHECK(hipEventCreate(&start) == hipSuccess &&
+          hipEventCreate(&stop) == hipSuccess, "timing events");
+    float ignored = 0.0f;
+    for (uint32_t i = 0; i < TIMING_WARMUP; i++) {
+        const uint32_t order[3] = {
+            (i & 1u) ? 2u : 0u,
+            1u,
+            (i & 1u) ? 0u : 2u,
+        };
+        for (uint32_t j = 0; j < 3u; j++) {
+            CHECK(time_arm_once(&arms[order[j]], out, gate, up, mid, down,
+                                selected, x, start, stop, &ignored) == 0,
+                  "timing warmup arm");
+        }
+    }
+
+    float samples[3][TIMING_SAMPLES];
+    for (uint32_t i = 0; i < TIMING_SAMPLES; i++) {
+        const uint32_t order[3] = {
+            (i & 1u) ? 2u : 0u,
+            1u,
+            (i & 1u) ? 0u : 2u,
+        };
+        for (uint32_t j = 0; j < 3u; j++) {
+            const uint32_t arm = order[j];
+            CHECK(time_arm_once(&arms[arm], out, gate, up, mid, down,
+                                selected, x, start, stop,
+                                &samples[arm][i]) == 0,
+                  "timing sample arm");
+        }
+    }
+    float med[3];
+    for (uint32_t arm = 0; arm < 3u; arm++) {
+        qsort(samples[arm], TIMING_SAMPLES, sizeof(float),
+              compare_float_ascending);
+        med[arm] = samples[arm][TIMING_SAMPLES / 2u];
+    }
+
+    const float packed_worst = fmaxf(med[1], med[2]);
+    const float ratio = packed_worst / med[0];
+    const float graph_full3_ms = 0.249f;
+    const float critical_full3_ms = 0.358f;
+    const float wait33_ms = 0.044f;
+    const uint32_t layers = 43u;
+    const float graph_delta = fmaxf(0.0f, graph_full3_ms - med[0]);
+    const float graph_packed_ms = packed_worst + graph_delta;
+    const float critical_packed_ms = graph_packed_ms + wait33_ms;
+    const float save_ms =
+        (float)layers * (critical_full3_ms - critical_packed_ms);
+    const char *decision =
+        (ratio <= 1.10f && save_ms >= 2.0f) ? "PASS" :
+        (ratio <= 1.10f && save_ms >= 1.8f) ? "CONDITIONAL" :
+        (ratio >= 1.25f || save_ms < 1.5f || save_ms <= 0.0f) ? "STOP" :
+        "DIAGNOSE";
+    const double unique_mib =
+        3.0 * (double)(full_gate_expert * 2u + full_down_expert) /
+        1048576.0;
+    printf("test_rocm_q4k_kshard_shape_cost: full3_ms=%.6f "
+           "half0_ms=%.6f half1_ms=%.6f packed_worst_ms=%.6f "
+           "ratio=%.6f graph_delta_ms=%.6f graph_packed_ms=%.6f "
+           "critical_packed_ms=%.6f layers=%u modeled_save_ms=%.6f "
+           "decision=%s samples=%u warmup=%u unique_mib=%.2f "
+           "full_mid=%u packed_mid=%u full_down_blocks=%u "
+           "packed_down_blocks=%u gate_grid_full=16x6 "
+           "gate_grid_packed=8x6 down_grid=128x1\n",
+           med[0], med[1], med[2], packed_worst, ratio, graph_delta,
+           graph_packed_ms, critical_packed_ms, layers, save_ms, decision,
+           TIMING_SAMPLES, TIMING_WARMUP, unique_mib, MID_DIM, MID_HALF,
+           MID_DIM / QK_K, MID_HALF / QK_K);
+
+    CHECK(hipEventDestroy(stop) == hipSuccess, "destroy timing stop");
+    CHECK(hipEventDestroy(start) == hipSuccess, "destroy timing start");
+    ds4_gpu_tensor_free_in_place(&weights_packed);
+    ds4_gpu_tensor_free_in_place(&weights_full);
+    CHECK(ds4_gpu_set_model_fd(-1), "clear timing source fd");
+    CHECK(fclose(resident_file) == 0, "close timing resident backing file");
+    free(resident_model);
+    free(map1); free(map0); free(up1); free(up0); free(gu1); free(gu0);
+    CHECK(ds4_gpu_set_model_map(full_model, full_model_bytes),
+          "restore oracle model map");
+    return 0;
 }
 
 struct oracle_case {
@@ -501,6 +755,13 @@ int main(void) {
     CHECK(upload(&add_in, hadd, sizeof(hadd)), "upload add");
     CHECK(upload(&shared0, hshared0, sizeof(hshared0)), "upload shared0");
     CHECK(upload(&shared1, hshared1, sizeof(hshared1)), "upload shared1");
+
+    if (run_kshard_shape_cost_gate(
+            full_model, full_gate_off, full_up_off, full_down_off,
+            full_model_bytes, gate_row_bytes, down_row_bytes,
+            &out, &gate, &up, &mid, &down, &selected, &x) != 0) {
+        return 1;
+    }
 
     const struct oracle_case cases[] = {
         {"6/6", 8,
