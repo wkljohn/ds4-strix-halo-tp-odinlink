@@ -106,6 +106,146 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
 
+#if defined(DS4_ENABLE_TEST_HOOKS) && DS4_ENABLE_TEST_HOOKS
+/* Exact-kernel test hook for measuring multi-stream overlap.  Production
+ * builds do not contain this symbol.  The caller owns all stream dependencies
+ * and must use disjoint output tensors. */
+extern "C" int ds4_gpu_test_shared_gate_up_swiglu_q8_0_stream_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp,
+        void                   *stream_handle) {
+    if (!gate || !up || !mid || !model_map || !x || !stream_handle ||
+        in_dim != 4096u || out_dim != 1024u) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    const uint64_t out_bytes = out_dim * sizeof(float);
+    if (!cuda_model_range_fits(model_size, gate_offset, weight_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, weight_bytes) ||
+        !cuda_tensor_has_f32(x, in_dim) ||
+        !cuda_tensor_has_bytes(gate, out_bytes) ||
+        !cuda_tensor_has_bytes(up, out_bytes) ||
+        !cuda_tensor_has_bytes(mid, out_bytes)) {
+        return 0;
+    }
+    const char *wg = cuda_model_range_ptr(
+        model_map, gate_offset, weight_bytes, "test_shared_gate_q8_stream");
+    const char *wu = cuda_model_range_ptr(
+        model_map, up_offset, weight_bytes, "test_shared_up_q8_stream");
+    if (!wg || !wu) return 0;
+    cudaStream_t stream = (cudaStream_t)stream_handle;
+    const unsigned rows_per_block = 32u;
+    const unsigned threads = rows_per_block * 32u;
+    if (shared_gate_up_swiglu_sharedx_enabled()) {
+        const int store_gate_up =
+            (g_quality_mode || cuda_runtime_config()->graph_dump) ? 1 : 0;
+        shared_gate_up_swiglu_q8_0_sharedx_rows_w32_kernel<<<
+                (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+                threads,
+                (size_t)in_dim * sizeof(float),
+                stream>>>(
+                (float *)gate->ptr,
+                (float *)up->ptr,
+                (float *)mid->ptr,
+                reinterpret_cast<const unsigned char *>(wg),
+                reinterpret_cast<const unsigned char *>(wu),
+                (const float *)x->ptr,
+                (uint32_t)blocks,
+                out_dim,
+                row_bytes,
+                store_gate_up,
+                clamp);
+        return cuda_ok(cudaGetLastError(),
+                       "test shared fused gate/up/SwiGLU stream launch");
+    }
+    if (q8_decode_pair_dp4a_enabled()) return 0;
+    matmul_q8_0_pair_f32_sharedx_warp_rows_w32_kernel<<<
+            (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+            threads,
+            (size_t)in_dim * sizeof(float),
+            stream>>>(
+            (float *)gate->ptr,
+            (float *)up->ptr,
+            reinterpret_cast<const unsigned char *>(wg),
+            reinterpret_cast<const unsigned char *>(wu),
+            (const float *)x->ptr,
+            (uint32_t)blocks,
+            out_dim,
+            out_dim,
+            row_bytes);
+    if (!cuda_ok(cudaGetLastError(),
+                 "test shared gate/up exact q8 pair stream launch")) {
+        return 0;
+    }
+    swiglu_kernel<<<
+            (unsigned)((out_dim + 255u) / 256u),
+            256u,
+            0,
+            stream>>>(
+            (float *)mid->ptr,
+            (const float *)gate->ptr,
+            (const float *)up->ptr,
+            (uint32_t)out_dim,
+            clamp,
+            1.0f);
+    return cuda_ok(cudaGetLastError(),
+                   "test shared SwiGLU exact stream launch");
+}
+
+extern "C" int ds4_gpu_test_shared_down_q8_0_stream_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        void                   *stream_handle) {
+    if (!out || !model_map || !x || !stream_handle ||
+        in_dim != 1024u || out_dim != 4096u) {
+        return 0;
+    }
+    const uint64_t blocks = in_dim / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = out_dim * row_bytes;
+    if (!cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_f32(x, in_dim) ||
+        !cuda_tensor_has_f32(out, out_dim)) {
+        return 0;
+    }
+    const char *weights = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "test_shared_down_q8_stream");
+    if (!weights) return 0;
+    cudaStream_t stream = (cudaStream_t)stream_handle;
+    const unsigned rows_per_block = 32u;
+    const unsigned threads = rows_per_block * 32u;
+    matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
+            (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
+            threads,
+            (size_t)in_dim * sizeof(float),
+            stream>>>(
+            (float *)out->ptr,
+            reinterpret_cast<const unsigned char *>(weights),
+            (const float *)x->ptr,
+            (uint32_t)blocks,
+            out_dim,
+            row_bytes);
+    return cuda_ok(cudaGetLastError(),
+                   "test shared down exact q8 stream launch");
+}
+#endif
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
