@@ -106,6 +106,14 @@ typedef enum {
     DS4_GPU_DECODE_ATTN_EVENT_KV_PATH,
     DS4_GPU_DECODE_ATTN_EVENT_COMPRESSOR_PROJ,
     DS4_GPU_DECODE_ATTN_EVENT_COMPRESSOR_UPDATE,
+    DS4_GPU_DECODE_ATTN_EVENT_COMPRESSOR_QUANTIZE,
+    DS4_GPU_DECODE_ATTN_EVENT_COMPRESSOR_COMMIT,
+    DS4_GPU_DECODE_ATTN_EVENT_INDEXER_COMPRESSOR_PROJ,
+    DS4_GPU_DECODE_ATTN_EVENT_INDEXER_COMPRESSOR_UPDATE,
+    DS4_GPU_DECODE_ATTN_EVENT_INDEXER_COMPRESSOR_QAT,
+    DS4_GPU_DECODE_ATTN_EVENT_INDEXER_QUERY_PROJ,
+    DS4_GPU_DECODE_ATTN_EVENT_INDEXER_SCORE,
+    DS4_GPU_DECODE_ATTN_EVENT_INDEXER_TOPK,
     DS4_GPU_DECODE_ATTN_EVENT_COMPRESSOR_INDEXER,
     DS4_GPU_DECODE_ATTN_EVENT_ATTN_INV_ROPE,
     DS4_GPU_DECODE_ATTN_EVENT_ATTN_OUTPUT_LOW,
@@ -124,9 +132,34 @@ typedef enum {
     DS4_GPU_DECODE_ATTN_EVENT_COUNT
 } ds4_gpu_decode_attn_event_stage;
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
 int ds4_gpu_decode_attn_event_profile_enabled(void);
+void ds4_gpu_decode_attn_event_profile_begin(uint32_t rank,
+                                             uint32_t layer,
+                                             uint32_t pos,
+                                             uint32_t compress_ratio,
+                                             int compress_emit);
 void ds4_gpu_decode_attn_event_profile_record(ds4_gpu_decode_attn_event_stage stage,
                                               uint32_t rank);
+#else
+static inline int ds4_gpu_decode_attn_event_profile_enabled(void) {
+    return 0;
+}
+static inline void ds4_gpu_decode_attn_event_profile_begin(
+        uint32_t rank, uint32_t layer, uint32_t pos,
+        uint32_t compress_ratio, int compress_emit) {
+    (void)rank;
+    (void)layer;
+    (void)pos;
+    (void)compress_ratio;
+    (void)compress_emit;
+}
+static inline void ds4_gpu_decode_attn_event_profile_record(
+        ds4_gpu_decode_attn_event_stage stage, uint32_t rank) {
+    (void)stage;
+    (void)rank;
+}
+#endif
 
 /* Default-off, ROCm verifier-only stage events.  Markers are recorded on the
  * existing compute stream; harvesting is explicitly non-blocking. */

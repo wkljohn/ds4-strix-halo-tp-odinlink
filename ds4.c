@@ -22298,15 +22298,24 @@ static bool metal_graph_encode_decode_layer_phase(
     bool ok = true;
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const bool decode_attn_event_profile =
         ds4_gpu_decode_attn_event_profile_enabled() != 0;
+#define DS4_ROCM_DECODE_ATTN_EVENT_BEGIN() do { \
+        if (ok && decode_attn_event_profile) { \
+            const uint32_t profile_ratio = compressed ? ds4_layer_compress_ratio(il) : 0u; \
+            const int profile_emit = profile_ratio != 0u && ((pos + 1u) % profile_ratio) == 0u; \
+            ds4_gpu_decode_attn_event_profile_begin( \
+                    g->tp_rank, il, pos, profile_ratio, profile_emit); \
+        } \
+    } while (0)
 #define DS4_ROCM_DECODE_ATTN_EVENT(stage) do { \
         if (ok && decode_attn_event_profile) { \
             ds4_gpu_decode_attn_event_profile_record((stage), g->tp_rank); \
         } \
     } while (0)
 #else
+#define DS4_ROCM_DECODE_ATTN_EVENT_BEGIN() do { } while (0)
 #define DS4_ROCM_DECODE_ATTN_EVENT(stage) do { } while (0)
 #endif
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
@@ -22438,7 +22447,7 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     if (!resume_after_attn) {
     if (!resume_after_qkv) {
-    DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_START);
+    DS4_ROCM_DECODE_ATTN_EVENT_BEGIN();
     bool qkv_pair_projected = resume_after_qa_kv_raw;
     if (!resume_after_qa_kv_raw && ok && qkv_rms_fused &&
         g->cuda_qkv_pair && !metal_graph_use_reference_qkv_pair_proj()) {
@@ -22803,8 +22812,10 @@ static bool metal_graph_encode_decode_layer_phase(
             }
             ds4_gpu_tensor_free(comp_row_view);
             DS4_METAL_PROFILE_DECODE_STAGE("compressor_quantize");
+            DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_COMPRESSOR_QUANTIZE);
             if (ok) ok = metal_graph_commit_attn_comp_stage(g, il, comp_row, 1);
             DS4_METAL_PROFILE_DECODE_STAGE("compressor_commit");
+            DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_COMPRESSOR_COMMIT);
         }
         if (ok && emit) g->layer_n_comp[il]++;
 
@@ -22888,6 +22899,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                          metal_graph_attn_norm(g), 1) != 0;
             }
             DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_proj");
+            DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_INDEXER_COMPRESSOR_PROJ);
             const uint32_t index_row = g->layer_n_index_comp[il];
             if (ok && !temporal) ok = ds4_gpu_compressor_update_tensor(metal_graph_comp_kv_cur(g),
                                                             metal_graph_comp_sc_cur(g),
@@ -22915,6 +22927,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                             DS4_RMS_EPS,
                                                             index_state_already_stored) != 0;
             DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_update");
+            DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_INDEXER_COMPRESSOR_UPDATE);
             if (ok && emit) {
 #if defined(__APPLE__)
                 ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
@@ -22945,6 +22958,7 @@ static bool metal_graph_encode_decode_layer_phase(
 #endif
                 DS4_METAL_PROFILE_DECODE_STAGE("indexer_compressor_qat");
             }
+            DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_INDEXER_COMPRESSOR_QAT);
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_sparse_threshold =
                 metal_graph_decode_indexer_sparse_threshold(g);
@@ -22993,6 +23007,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                          layer->indexer_proj->abs_offset,
                                                          DS4_N_EMBD, DS4_N_INDEXER_HEAD,
                                                          metal_graph_attn_norm(g), 1) != 0;
+                DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_INDEXER_QUERY_PROJ);
                 const float index_scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary(NULL,
@@ -23010,6 +23025,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                 DS4_N_INDEXER_HEAD,
                                                                 DS4_N_INDEXER_HEAD_DIM,
                                                                 index_scale) != 0;
+                DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_INDEXER_SCORE);
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_score",
                                                                     il,
@@ -23023,6 +23039,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                            g->layer_n_index_comp[il],
                                                            1,
                                                            DS4_N_INDEXER_TOP_K) != 0;
+                DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_INDEXER_TOPK);
                 if (ok && decode_index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("decode_topk",
                                                                     il,
@@ -24987,6 +25004,7 @@ static bool metal_graph_encode_decode_layer_phase(
     DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_FFN_HC_POST);
 #undef DS4_METAL_PROFILE_DECODE_STAGE
 #undef DS4_ROCM_DECODE_ATTN_EVENT
+#undef DS4_ROCM_DECODE_ATTN_EVENT_BEGIN
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_after_ffn_hc(g), hc_dim, il, pos);
     }

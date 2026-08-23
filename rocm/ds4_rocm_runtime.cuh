@@ -6697,9 +6697,11 @@ extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const 
                    label ? label : "selected readback wait");
 }
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
 enum {
-    DS4_ROCM_DECODE_ATTN_EVENT_POOL_SIZE = 16,
-    DS4_ROCM_DECODE_ATTN_EVENT_REPORT_SAMPLES = 500
+    DS4_ROCM_DECODE_ATTN_EVENT_POOL_SIZE = 64,
+    DS4_ROCM_DECODE_ATTN_EVENT_REPORT_SAMPLES = 500,
+    DS4_ROCM_DECODE_ATTN_EVENT_SAMPLE_MAX = 16384
 };
 
 typedef struct {
@@ -6712,8 +6714,23 @@ typedef struct {
 typedef struct {
     hipEvent_t events[DS4_GPU_DECODE_ATTN_EVENT_COUNT];
     uint32_t valid_mask;
+    uint32_t rank;
+    uint32_t layer;
+    uint32_t pos;
+    uint32_t compress_ratio;
+    uint32_t compress_emit;
     int complete;
 } ds4_rocm_decode_attn_event_slot;
+
+typedef struct {
+    float elapsed_ms[DS4_GPU_DECODE_ATTN_EVENT_COUNT];
+    uint32_t valid_mask;
+    uint32_t rank;
+    uint32_t layer;
+    uint32_t pos;
+    uint32_t compress_ratio;
+    uint32_t compress_emit;
+} ds4_rocm_decode_attn_event_sample;
 
 static ds4_rocm_decode_attn_event_slot
     g_decode_attn_event_slots[DS4_ROCM_DECODE_ATTN_EVENT_POOL_SIZE];
@@ -6727,16 +6744,25 @@ static uint32_t g_decode_attn_event_next_slot;
 static uint32_t g_decode_attn_event_rank;
 static uint64_t g_decode_attn_event_samples;
 static uint64_t g_decode_attn_event_dropped;
+static int g_decode_attn_event_samples_enabled;
+static ds4_rocm_decode_attn_event_sample
+    g_decode_attn_event_sample_archive[DS4_ROCM_DECODE_ATTN_EVENT_SAMPLE_MAX];
+static uint32_t g_decode_attn_event_sample_count;
+static uint64_t g_decode_attn_event_sample_dropped;
 
 static const char *const g_decode_attn_event_names[DS4_GPU_DECODE_ATTN_EVENT_COUNT] = {
     "start", "qkv_proj", "qkv_norm_rope", "q_b_proj", "q_norm_rope",
-    "kv_path", "compressor_proj", "compressor_update", "compressor_indexer",
+    "kv_path", "compressor_proj", "compressor_update",
+    "compressor_quantize", "compressor_commit",
+    "indexer_compressor_proj", "indexer_compressor_update",
+    "indexer_compressor_qat", "indexer_query_proj", "indexer_score",
+    "indexer_topk", "compressor_indexer",
     "attn_inv_rope", "attn_output_low", "attn_output_expand", "attn_gate",
     "attn_output", "attn_hc_post", "ffn_hc_pre", "ffn_norm", "router",
     "shared_gate_up", "shared_down", "routed_moe", "ffn_gate", "ffn_hc_post"
 };
 
-static void ds4_rocm_decode_attn_event_print(void) {
+static void ds4_rocm_decode_attn_event_print_summary(void) {
     if (g_decode_attn_event_samples == 0u) return;
     fprintf(stderr, DS4_GPU_LOG_PREFIX
             "decode attention event profile rank=%u samples=%llu dropped=%llu",
@@ -6753,6 +6779,41 @@ static void ds4_rocm_decode_attn_event_print(void) {
                 (double)s->min_ms, (double)s->max_ms);
     }
     fputc('\n', stderr);
+}
+
+static void ds4_rocm_decode_attn_event_print(void) {
+    ds4_rocm_decode_attn_event_print_summary();
+    if (!g_decode_attn_event_samples_enabled) return;
+    for (uint32_t sample_index = 0;
+         sample_index < g_decode_attn_event_sample_count;
+         sample_index++) {
+        const ds4_rocm_decode_attn_event_sample *sample =
+            &g_decode_attn_event_sample_archive[sample_index];
+        fprintf(stderr,
+                "{\"ds4_decode_stage_sample\":true,\"rank\":%u,"
+                "\"layer\":%u,\"pos\":%u,\"ratio\":%u,\"emit\":%u,"
+                "\"stages_ms\":{",
+                sample->rank, sample->layer, sample->pos,
+                sample->compress_ratio, sample->compress_emit);
+        int separator = 0;
+        for (uint32_t stage = 1;
+             stage < DS4_GPU_DECODE_ATTN_EVENT_COUNT;
+             stage++) {
+            if ((sample->valid_mask & (1u << stage)) == 0u) continue;
+            fprintf(stderr, "%s\"%s\":%.6f",
+                    separator ? "," : "", g_decode_attn_event_names[stage],
+                    (double)sample->elapsed_ms[stage]);
+            separator = 1;
+        }
+        fputs("}}\n", stderr);
+    }
+    if (g_decode_attn_event_sample_dropped != 0u) {
+        fprintf(stderr,
+                "{\"ds4_decode_stage_samples_dropped\":true,"
+                "\"rank\":%u,\"count\":%llu}\n",
+                g_decode_attn_event_rank,
+                (unsigned long long)g_decode_attn_event_sample_dropped);
+    }
 }
 
 static int ds4_rocm_decode_attn_event_ensure_events(void) {
@@ -6774,20 +6835,22 @@ static int ds4_rocm_decode_attn_event_ensure_events(void) {
 }
 
 extern "C" int ds4_gpu_decode_attn_event_profile_enabled(void) {
-#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_decode_attn_event_enabled < 0) {
         const char *env = getenv("DS4_ROCM_DECODE_ATTN_EVENT_PROFILE");
+        const char *samples_env =
+            getenv("DS4_ROCM_DECODE_ATTN_EVENT_SAMPLES");
+        g_decode_attn_event_samples_enabled =
+            samples_env != NULL && samples_env[0] != '\0' &&
+            strcmp(samples_env, "0") != 0;
         g_decode_attn_event_enabled =
-            env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+            (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ||
+            g_decode_attn_event_samples_enabled;
         if (g_decode_attn_event_enabled && !g_decode_attn_event_atexit_registered) {
             atexit(ds4_rocm_decode_attn_event_print);
             g_decode_attn_event_atexit_registered = 1;
         }
     }
     return g_decode_attn_event_enabled;
-#else
-    return 0;
-#endif
 }
 
 static int ds4_rocm_decode_attn_event_harvest(
@@ -6819,6 +6882,13 @@ static int ds4_rocm_decode_attn_event_harvest(
         return 0;
     }
     uint32_t previous = DS4_GPU_DECODE_ATTN_EVENT_START;
+    ds4_rocm_decode_attn_event_sample sample = {};
+    sample.valid_mask = slot->valid_mask;
+    sample.rank = slot->rank;
+    sample.layer = slot->layer;
+    sample.pos = slot->pos;
+    sample.compress_ratio = slot->compress_ratio;
+    sample.compress_emit = slot->compress_emit;
     for (uint32_t stage = 1; stage < DS4_GPU_DECODE_ATTN_EVENT_COUNT; stage++) {
         const uint32_t bit = 1u << stage;
         if ((slot->valid_mask & bit) == 0u) continue;
@@ -6838,13 +6908,23 @@ static int ds4_rocm_decode_attn_event_harvest(
         if (stat->count == 0u || elapsed_ms > stat->max_ms) stat->max_ms = elapsed_ms;
         stat->count++;
         stat->sum_ms += elapsed_ms;
+        sample.elapsed_ms[stage] = elapsed_ms;
         previous = stage;
+    }
+    if (g_decode_attn_event_samples_enabled) {
+        if (g_decode_attn_event_sample_count <
+            DS4_ROCM_DECODE_ATTN_EVENT_SAMPLE_MAX) {
+            g_decode_attn_event_sample_archive[g_decode_attn_event_sample_count++] =
+                sample;
+        } else {
+            g_decode_attn_event_sample_dropped++;
+        }
     }
     slot->complete = 0;
     slot->valid_mask = 0u;
     g_decode_attn_event_samples++;
     if (g_decode_attn_event_samples % DS4_ROCM_DECODE_ATTN_EVENT_REPORT_SAMPLES == 0u) {
-        ds4_rocm_decode_attn_event_print();
+        ds4_rocm_decode_attn_event_print_summary();
     }
     return 1;
 }
@@ -6893,6 +6973,22 @@ extern "C" void ds4_gpu_decode_attn_event_profile_record(
         g_decode_attn_event_active_slot = -1;
     }
 }
+
+extern "C" void ds4_gpu_decode_attn_event_profile_begin(
+        uint32_t rank, uint32_t layer, uint32_t pos,
+        uint32_t compress_ratio, int compress_emit) {
+    ds4_gpu_decode_attn_event_profile_record(
+            DS4_GPU_DECODE_ATTN_EVENT_START, rank);
+    if (g_decode_attn_event_active_slot < 0) return;
+    ds4_rocm_decode_attn_event_slot *slot =
+        &g_decode_attn_event_slots[g_decode_attn_event_active_slot];
+    slot->rank = rank;
+    slot->layer = layer;
+    slot->pos = pos;
+    slot->compress_ratio = compress_ratio;
+    slot->compress_emit = compress_emit != 0;
+}
+#endif
 
 /* Verifier stage timing deliberately uses enough slots for one complete
  * DS4-Flash verifier graph.  The graph queues every layer before its normal
