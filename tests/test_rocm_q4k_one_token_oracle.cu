@@ -205,6 +205,32 @@ __device__ static int32_t dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int
     return sum;
 }
 
+__device__ __forceinline__ static float dev_dot_q4k_q8k_block(
+        const block_q4_K &x, const block_q8_K &y) {
+    const float xd = __half2float(*reinterpret_cast<const __half *>(&x.d));
+    const float xmin = __half2float(*reinterpret_cast<const __half *>(&x.dmin));
+    int isum = 0;
+    int summs = 0;
+    #pragma unroll
+    for (uint32_t j = 0; j < 8u; ++j) {
+        uint8_t sc, m;
+        dev_q4k_scale_min(j, x.scales, &sc, &m);
+        summs += (int)m * (int)(y.bsums[2u * j] + y.bsums[2u * j + 1u]);
+        const uint32_t byte_off = (j >> 1u) * 32u;
+        const int shift = (j & 1u) ? 4 : 0;
+        isum += (int)sc *
+            dev_dot_q4_32(x.qs + byte_off, y.qs + j * 32u, shift);
+    }
+    return y.d * xd * (float)isum - y.d * xmin * (float)summs;
+}
+
+__device__ __forceinline__ static float subgroup8_sum(float v) {
+    v += __shfl_down(v, 4, 8);
+    v += __shfl_down(v, 2, 8);
+    v += __shfl_down(v, 1, 8);
+    return v;
+}
+
 /* One-wave packed Q4_K×Q8_K down: 8 lanes cover 8 superblock groups. */
 __global__ void k_q4k_q8k_down_wave32(const block_q4_K *weights,
                                       const block_q8_K *xq,
@@ -219,20 +245,7 @@ __global__ void k_q4k_q8k_down_wave32(const block_q4_K *weights,
     for (uint32_t b = lane; b < n_blocks; b += 32u) {
         const block_q4_K x = wr[b];
         const block_q8_K y = xq[b];
-        const float xd = __half2float(*reinterpret_cast<const __half *>(&x.d));
-        const float xmin = __half2float(*reinterpret_cast<const __half *>(&x.dmin));
-        int isum = 0;
-        int summs = 0;
-        #pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) {
-            uint8_t sc, m;
-            dev_q4k_scale_min(j, x.scales, &sc, &m);
-            summs += (int)m * (int)(y.bsums[2u * j] + y.bsums[2u * j + 1u]);
-            const uint32_t byte_off = (j >> 1u) * 32u;
-            const int shift = (j & 1u) ? 4 : 0;
-            isum += (int)sc * dev_dot_q4_32(x.qs + byte_off, y.qs + j * 32u, shift);
-        }
-        acc += y.d * xd * (float)isum - y.d * xmin * (float)summs;
+        acc += dev_dot_q4k_q8k_block(x, y);
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -280,6 +293,74 @@ __global__ void k_q4k_mmvdq_down_wave32(const block_q4_K *weights,
     for (int off = 16; off > 0; off >>= 1)
         acc += __shfl_down(acc, off, 32);
     if (lane == 0) out[row] = acc;
+}
+
+/* Production-shaped split gate/up projection used by the row-shard oracle.
+ * Full-expert mode launches 3 experts × 2048 rows. Row-shard mode launches
+ * 6 experts × 1024 rows with the same total Q4_K bytes and active CTAs. */
+__global__ void k_q4k_projection_row_shard(
+        const block_q4_K *weights,
+        const block_q8_K *xq,
+        float *out,
+        uint32_t experts,
+        uint32_t stored_rows,
+        uint32_t row_begin,
+        uint32_t rows,
+        uint32_t blocks_per_row) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t expert = blockIdx.y;
+    for (uint32_t rr = 0; rr < 8u; ++rr) {
+        const uint32_t local_row =
+            blockIdx.x * 128u + row_lane + rr * 16u;
+        if (local_row >= rows) continue;
+        if (expert >= experts) {
+            if (lane == 0u)
+                out[(uint64_t)expert * rows + local_row] = 0.0f;
+            continue;
+        }
+        const uint32_t stored_row = row_begin + local_row;
+        const block_q4_K *wr = weights +
+            ((uint64_t)expert * stored_rows + stored_row) * blocks_per_row;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < blocks_per_row; b += 8u)
+            acc += dev_dot_q4k_q8k_block(wr[b], xq[b]);
+        acc = subgroup8_sum(acc);
+        if (lane == 0u)
+            out[(uint64_t)expert * rows + local_row] = acc;
+    }
+}
+
+/* Production-shaped direct down projection. Full-expert mode evaluates
+ * 3 experts × 8 K-blocks; a row-sharded rank evaluates 6 experts × 4
+ * matching K-blocks. Both consume the same Q4_K bytes. */
+__global__ void k_q4k_down_row_shard(
+        const block_q4_K *weights,
+        const block_q8_K *midq,
+        float *out,
+        uint32_t experts,
+        uint32_t rows,
+        uint32_t stored_blocks_per_row,
+        uint32_t block_begin,
+        uint32_t blocks_per_rank) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= rows) return;
+    float total = 0.0f;
+    for (uint32_t expert = 0; expert < N_USED; ++expert) {
+        if (expert >= experts) continue;
+        const block_q4_K *wr = weights +
+            ((uint64_t)expert * rows + row) * stored_blocks_per_row +
+            block_begin;
+        const block_q8_K *xq = midq +
+            (uint64_t)expert * stored_blocks_per_row + block_begin;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < blocks_per_rank; b += 8u)
+            acc += dev_dot_q4k_q8k_block(wr[b], xq[b]);
+        acc = subgroup8_sum(acc);
+        if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) out[row] = total;
 }
 
 __device__ __forceinline__ static uint4 load_q4k_block_144(
@@ -426,15 +507,79 @@ static int run_shipped(ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
         N_TOTAL_EXPERT, N_USED, 0.0f, x, add_in, 0, true);
 }
 
+static int compare_float_ascending(const void *a, const void *b) {
+    const float av = *(const float *)a;
+    const float bv = *(const float *)b;
+    return av < bv ? -1 : av > bv ? 1 : 0;
+}
+
+static float median_float(const float *values, uint32_t count) {
+    float sorted[64];
+    if (count == 0u || count > 64u) return NAN;
+    memcpy(sorted, values, count * sizeof(float));
+    qsort(sorted, count, sizeof(float), compare_float_ascending);
+    return sorted[count / 2u];
+}
+
+static int time_row_shard_workload(
+        float *elapsed_ms,
+        hipEvent_t start,
+        hipEvent_t stop,
+        block_q4_K *const *gate,
+        block_q4_K *const *up,
+        block_q4_K *const *down,
+        const block_q8_K *xq,
+        const block_q8_K *midq,
+        float *gate_out,
+        float *up_out,
+        float *down_out,
+        uint32_t experts,
+        uint32_t gate_row_begin,
+        uint32_t gate_rows,
+        uint32_t down_block_begin,
+        uint32_t down_blocks_per_rank) {
+    const dim3 projection_grid((gate_rows + 127u) / 128u, N_USED, 1u);
+    const dim3 down_grid((OUT_DIM + 31u) / 32u, 1u, 1u);
+    if (hipEventRecord(start) != hipSuccess) return 0;
+    for (uint32_t i = 0; i < ITERS; ++i) {
+        const uint32_t copy = 1u + i % COLD_COPIES;
+        k_q4k_projection_row_shard<<<projection_grid, 128>>>(
+            gate[copy], xq, gate_out, experts, MID_DIM, gate_row_begin,
+            gate_rows, IN_DIM / QK_K);
+        k_q4k_projection_row_shard<<<projection_grid, 128>>>(
+            up[copy], xq, up_out, experts, MID_DIM, gate_row_begin,
+            gate_rows, IN_DIM / QK_K);
+        k_q4k_down_row_shard<<<down_grid, 256>>>(
+            down[copy], midq, down_out, experts, OUT_DIM, MID_DIM / QK_K,
+            down_block_begin, down_blocks_per_rank);
+    }
+    if (hipGetLastError() != hipSuccess ||
+        hipEventRecord(stop) != hipSuccess ||
+        hipEventSynchronize(stop) != hipSuccess) {
+        return 0;
+    }
+    float total_ms = 0.0f;
+    if (hipEventElapsedTime(&total_ms, start, stop) != hipSuccess) return 0;
+    *elapsed_ms = total_ms / (float)ITERS;
+    return 1;
+}
+
 int main(int argc, char **argv) {
     uint32_t owned = 6u;
+    int row_shard_oracle = 0;
     if (argc > 2) {
-        fprintf(stderr, "usage: %s [owned-routes:1|3|6]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s [owned-routes:1|3|6|row-shard]\n", argv[0]);
         return 2;
     }
-    if (argc == 2) owned = (uint32_t)strtoul(argv[1], NULL, 10);
+    if (argc == 2 && strcmp(argv[1], "row-shard") == 0) {
+        row_shard_oracle = 1;
+    } else if (argc == 2) {
+        owned = (uint32_t)strtoul(argv[1], NULL, 10);
+    }
     if (owned != 1u && owned != 3u && owned != 6u) {
-        fprintf(stderr, "usage: %s [owned-routes:1|3|6]\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s [owned-routes:1|3|6|row-shard]\n", argv[0]);
         return 2;
     }
     CHECK(setenv("DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP", "1", 1) == 0,
@@ -780,6 +925,274 @@ int main(int argc, char **argv) {
            fused_gate_load_cold_ms, split_gate_load_cold_ms,
            down_load_cold_ms, fused_cold_gbps, split_cold_gbps,
            observed_load_sink);
+
+    /* STREAM is no longer needed; release it before the optional row-shard
+     * oracle allocates its independent cold-copy address sets. */
+    (void)hipFree(stream_sink);
+    (void)hipFree(stream_src);
+    stream_sink = nullptr;
+    stream_src = nullptr;
+
+    if (row_shard_oracle) {
+        block_q4_K *shard_gate[MODEL_COPIES] = {};
+        block_q4_K *shard_up[MODEL_COPIES] = {};
+        block_q4_K *shard_down[MODEL_COPIES] = {};
+        for (uint32_t c = 0; c < MODEL_COPIES; ++c) {
+            CHECK(hipMalloc(&shard_gate[c], (size_t)load_gate_bytes) ==
+                      hipSuccess,
+                  "allocate row-shard gate");
+            CHECK(hipMalloc(&shard_up[c], (size_t)load_gate_bytes) ==
+                      hipSuccess,
+                  "allocate row-shard up");
+            CHECK(hipMalloc(&shard_down[c], (size_t)load_down_bytes) ==
+                      hipSuccess,
+                  "allocate row-shard down");
+            CHECK(hipMemcpy(shard_gate[c], copies[c] + gate_off,
+                            (size_t)load_gate_bytes,
+                            hipMemcpyHostToDevice) == hipSuccess,
+                  "copy row-shard gate");
+            CHECK(hipMemcpy(shard_up[c], copies[c] + up_off,
+                            (size_t)load_gate_bytes,
+                            hipMemcpyHostToDevice) == hipSuccess,
+                  "copy row-shard up");
+            CHECK(hipMemcpy(shard_down[c], copies[c] + down_off,
+                            (size_t)load_down_bytes,
+                            hipMemcpyHostToDevice) == hipSuccess,
+                  "copy row-shard down");
+        }
+
+        block_q8_K h_row_xq[IN_DIM / QK_K];
+        block_q8_K h_row_midq[N_USED * (MID_DIM / QK_K)];
+        float row_input[IN_DIM];
+        float row_mid[MID_DIM];
+        for (uint32_t i = 0; i < IN_DIM; ++i)
+            row_input[i] = (float)((int)(i % 37u) - 18) * 0.0234375f;
+        quant_q8_K(row_input, h_row_xq, IN_DIM);
+        for (uint32_t expert = 0; expert < N_USED; ++expert) {
+            for (uint32_t i = 0; i < MID_DIM; ++i) {
+                row_mid[i] =
+                    (float)((int)((i + 11u * expert) % 41u) - 20) *
+                    0.01953125f;
+            }
+            quant_q8_K(row_mid,
+                       h_row_midq + expert * (MID_DIM / QK_K), MID_DIM);
+        }
+
+        block_q8_K *d_row_xq = nullptr, *d_row_midq = nullptr;
+        float *d_row_gate = nullptr, *d_row_up = nullptr;
+        float *d_row_down0 = nullptr, *d_row_down1 = nullptr;
+        const uint64_t projection_values = (uint64_t)N_USED * MID_DIM;
+        CHECK(hipMalloc(&d_row_xq, sizeof(h_row_xq)) == hipSuccess,
+              "allocate row-shard xq");
+        CHECK(hipMalloc(&d_row_midq, sizeof(h_row_midq)) == hipSuccess,
+              "allocate row-shard midq");
+        CHECK(hipMalloc(&d_row_gate,
+                        projection_values * sizeof(float)) == hipSuccess,
+              "allocate row-shard gate output");
+        CHECK(hipMalloc(&d_row_up,
+                        projection_values * sizeof(float)) == hipSuccess,
+              "allocate row-shard up output");
+        CHECK(hipMalloc(&d_row_down0, OUT_DIM * sizeof(float)) == hipSuccess,
+              "allocate row-shard down0 output");
+        CHECK(hipMalloc(&d_row_down1, OUT_DIM * sizeof(float)) == hipSuccess,
+              "allocate row-shard down1 output");
+        CHECK(hipMemcpy(d_row_xq, h_row_xq, sizeof(h_row_xq),
+                        hipMemcpyHostToDevice) == hipSuccess,
+              "copy row-shard xq");
+        CHECK(hipMemcpy(d_row_midq, h_row_midq, sizeof(h_row_midq),
+                        hipMemcpyHostToDevice) == hipSuccess,
+              "copy row-shard midq");
+
+        const dim3 full_projection_grid((MID_DIM + 127u) / 128u,
+                                        N_USED, 1u);
+        const dim3 half_projection_grid((MID_DIM / 2u + 127u) / 128u,
+                                        N_USED, 1u);
+        const dim3 row_down_grid((OUT_DIM + 31u) / 32u, 1u, 1u);
+
+        /* Correctness: both legacy 3×full and each 6×half rank are checked
+         * against the scalar Q4_K×Q8_K formula. The two down halves are then
+         * reconstructed into the full six-expert partial sum. */
+        k_q4k_projection_row_shard<<<full_projection_grid, 128>>>(
+            load_gate[0], d_row_xq, d_row_gate, 3u, MID_DIM, 0u, MID_DIM,
+            IN_DIM / QK_K);
+        k_q4k_down_row_shard<<<row_down_grid, 256>>>(
+            load_down[0], d_row_midq, d_row_down0, 3u, OUT_DIM,
+            MID_DIM / QK_K, 0u, MID_DIM / QK_K);
+        CHECK(hipGetLastError() == hipSuccess &&
+              hipDeviceSynchronize() == hipSuccess,
+              "legacy row-shard oracle launch");
+
+        float *h_projection =
+            (float *)malloc((size_t)projection_values * sizeof(float));
+        float *h_down0 = (float *)malloc(OUT_DIM * sizeof(float));
+        float *h_down1 = (float *)malloc(OUT_DIM * sizeof(float));
+        CHECK(h_projection && h_down0 && h_down1,
+              "allocate row-shard host outputs");
+        CHECK(hipMemcpy(h_projection, d_row_gate,
+                        (size_t)projection_values * sizeof(float),
+                        hipMemcpyDeviceToHost) == hipSuccess,
+              "read legacy row-shard projection");
+        CHECK(hipMemcpy(h_down0, d_row_down0, OUT_DIM * sizeof(float),
+                        hipMemcpyDeviceToHost) == hipSuccess,
+              "read legacy row-shard down");
+
+        double full_max_rel = 0.0;
+        const block_q4_K *h_gate6 =
+            (const block_q4_K *)(copies[0] + gate_off);
+        const block_q4_K *h_down6 =
+            (const block_q4_K *)(copies[0] + down_off);
+        for (uint32_t expert = 0; expert < 3u; ++expert) {
+            for (uint32_t row = 0; row < MID_DIM; ++row) {
+                float ref = 0.0f;
+                const block_q4_K *wr = h_gate6 +
+                    ((uint64_t)expert * MID_DIM + row) * (IN_DIM / QK_K);
+                for (uint32_t b = 0; b < IN_DIM / QK_K; ++b)
+                    ref += cpu_dot_q4k_q8k(wr + b, h_row_xq + b);
+                const float got = h_projection[(uint64_t)expert * MID_DIM + row];
+                const double rel = fabs((double)got - ref) /
+                                   fmax(1.0, fabs((double)ref));
+                if (rel > full_max_rel) full_max_rel = rel;
+            }
+        }
+        for (uint32_t row = 0; row < OUT_DIM; ++row) {
+            float ref = 0.0f;
+            for (uint32_t expert = 0; expert < 3u; ++expert) {
+                const block_q4_K *wr = h_down6 +
+                    ((uint64_t)expert * OUT_DIM + row) * (MID_DIM / QK_K);
+                const block_q8_K *xq = h_row_midq +
+                    expert * (MID_DIM / QK_K);
+                for (uint32_t b = 0; b < MID_DIM / QK_K; ++b)
+                    ref += cpu_dot_q4k_q8k(wr + b, xq + b);
+            }
+            const double rel = fabs((double)h_down0[row] - ref) /
+                               fmax(1.0, fabs((double)ref));
+            if (rel > full_max_rel) full_max_rel = rel;
+        }
+        CHECK(full_max_rel < 1e-5,
+              "legacy 3xfull row-shard scalar oracle");
+
+        double shard_max_rel = 0.0;
+        for (uint32_t half = 0; half < 2u; ++half) {
+            const uint32_t row_begin = half * (MID_DIM / 2u);
+            const uint32_t block_begin = half * (MID_DIM / QK_K / 2u);
+            k_q4k_projection_row_shard<<<half_projection_grid, 128>>>(
+                shard_gate[0], d_row_xq, d_row_gate, N_USED, MID_DIM,
+                row_begin, MID_DIM / 2u, IN_DIM / QK_K);
+            k_q4k_down_row_shard<<<row_down_grid, 256>>>(
+                shard_down[0], d_row_midq,
+                half == 0u ? d_row_down0 : d_row_down1,
+                N_USED, OUT_DIM, MID_DIM / QK_K, block_begin,
+                MID_DIM / QK_K / 2u);
+            CHECK(hipGetLastError() == hipSuccess &&
+                  hipDeviceSynchronize() == hipSuccess,
+                  "6xhalf row-shard oracle launch");
+            CHECK(hipMemcpy(h_projection, d_row_gate,
+                            (size_t)projection_values * sizeof(float),
+                            hipMemcpyDeviceToHost) == hipSuccess,
+                  "read 6xhalf row-shard projection");
+            for (uint32_t expert = 0; expert < N_USED; ++expert) {
+                for (uint32_t local_row = 0; local_row < MID_DIM / 2u;
+                     ++local_row) {
+                    const uint32_t row = row_begin + local_row;
+                    float ref = 0.0f;
+                    const block_q4_K *wr = h_gate6 +
+                        ((uint64_t)expert * MID_DIM + row) *
+                        (IN_DIM / QK_K);
+                    for (uint32_t b = 0; b < IN_DIM / QK_K; ++b)
+                        ref += cpu_dot_q4k_q8k(wr + b, h_row_xq + b);
+                    const float got =
+                        h_projection[(uint64_t)expert * (MID_DIM / 2u) +
+                                     local_row];
+                    const double rel = fabs((double)got - ref) /
+                                       fmax(1.0, fabs((double)ref));
+                    if (rel > shard_max_rel) shard_max_rel = rel;
+                }
+            }
+        }
+        CHECK(hipMemcpy(h_down0, d_row_down0, OUT_DIM * sizeof(float),
+                        hipMemcpyDeviceToHost) == hipSuccess &&
+              hipMemcpy(h_down1, d_row_down1, OUT_DIM * sizeof(float),
+                        hipMemcpyDeviceToHost) == hipSuccess,
+              "read 6xhalf row-shard down");
+        for (uint32_t row = 0; row < OUT_DIM; ++row) {
+            float ref = 0.0f;
+            for (uint32_t expert = 0; expert < N_USED; ++expert) {
+                const block_q4_K *wr = h_down6 +
+                    ((uint64_t)expert * OUT_DIM + row) * (MID_DIM / QK_K);
+                const block_q8_K *xq = h_row_midq +
+                    expert * (MID_DIM / QK_K);
+                for (uint32_t b = 0; b < MID_DIM / QK_K; ++b)
+                    ref += cpu_dot_q4k_q8k(wr + b, xq + b);
+            }
+            const float got = h_down0[row] + h_down1[row];
+            const double rel = fabs((double)got - ref) /
+                               fmax(1.0, fabs((double)ref));
+            if (rel > shard_max_rel) shard_max_rel = rel;
+        }
+        CHECK(shard_max_rel < 1e-5,
+              "6xhalf reconstructed row-shard scalar oracle");
+
+        enum { ROW_SHARD_SAMPLES = 31 };
+        float full_samples[ROW_SHARD_SAMPLES] = {};
+        float shard0_samples[ROW_SHARD_SAMPLES] = {};
+        float shard1_samples[ROW_SHARD_SAMPLES] = {};
+        for (uint32_t sample = 0; sample < ROW_SHARD_SAMPLES; ++sample) {
+            const uint32_t order = sample % 3u;
+            for (uint32_t step = 0; step < 3u; ++step) {
+                const uint32_t which = (order + step) % 3u;
+                if (which == 0u) {
+                    CHECK(time_row_shard_workload(
+                              &full_samples[sample], start, stop,
+                              load_gate, load_up, load_down, d_row_xq,
+                              d_row_midq, d_row_gate, d_row_up, d_row_down0,
+                              3u, 0u, MID_DIM, 0u, MID_DIM / QK_K),
+                          "time 3xfull row-shard control");
+                } else {
+                    const uint32_t half = which - 1u;
+                    CHECK(time_row_shard_workload(
+                              half == 0u ? &shard0_samples[sample]
+                                         : &shard1_samples[sample],
+                              start, stop, shard_gate, shard_up, shard_down,
+                              d_row_xq, d_row_midq, d_row_gate, d_row_up,
+                              half == 0u ? d_row_down0 : d_row_down1,
+                              N_USED, half * (MID_DIM / 2u), MID_DIM / 2u,
+                              half * (MID_DIM / QK_K / 2u),
+                              MID_DIM / QK_K / 2u),
+                          "time 6xhalf row-shard candidate");
+                }
+            }
+        }
+        const float full_median =
+            median_float(full_samples, ROW_SHARD_SAMPLES);
+        const float shard0_median =
+            median_float(shard0_samples, ROW_SHARD_SAMPLES);
+        const float shard1_median =
+            median_float(shard1_samples, ROW_SHARD_SAMPLES);
+        const float shard_worst = fmaxf(shard0_median, shard1_median);
+        const float shard_ratio = shard_worst / full_median;
+        printf("q4k_row_shard_oracle bytes_each_mib=40.500 "
+               "full3_median_ms=%.6f shard6_half0_median_ms=%.6f "
+               "shard6_half1_median_ms=%.6f worst_ratio=%.6f "
+               "full_max_rel=%.3e shard_max_rel=%.3e decision=%s\n",
+               full_median, shard0_median, shard1_median, shard_ratio,
+               full_max_rel, shard_max_rel,
+               shard_ratio <= 1.10f ? "GO" : "NO_GO");
+
+        free(h_down1);
+        free(h_down0);
+        free(h_projection);
+        (void)hipFree(d_row_down1);
+        (void)hipFree(d_row_down0);
+        (void)hipFree(d_row_up);
+        (void)hipFree(d_row_gate);
+        (void)hipFree(d_row_midq);
+        (void)hipFree(d_row_xq);
+        for (uint32_t c = 0; c < MODEL_COPIES; ++c) {
+            (void)hipFree(shard_down[c]);
+            (void)hipFree(shard_up[c]);
+            (void)hipFree(shard_gate[c]);
+        }
+    }
 
     /* Independent one-wave down oracle vs CPU of the same Q4_K×Q8_K formula. */
     const uint32_t n_blocks = (uint32_t)mid_blocks;
