@@ -540,6 +540,15 @@ tests/test_rocm_q4k_kshard_install: tests/test_rocm_q4k_kshard_install.o ds4_roc
 test-rocm-q4k-kshard-install: tests/test_rocm_q4k_kshard_install
 	./tests/test_rocm_q4k_kshard_install
 
+tests/test_rocm_q4k_kshard_compose.o: tests/test_rocm_q4k_kshard_compose.cu ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_q4k_kshard_compose: tests/test_rocm_q4k_kshard_compose.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-q4k-kshard-compose: tests/test_rocm_q4k_kshard_compose
+	./tests/test_rocm_q4k_kshard_compose
+
 tests/test_rocm_q4k_slot_balance_oracle.o: tests/test_rocm_q4k_slot_balance_oracle.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
