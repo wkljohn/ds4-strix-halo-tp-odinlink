@@ -821,6 +821,14 @@ static int run_registry_packed_one_oracle(
               0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
               x, NULL, 0u),
           "packed one default-off refusal");
+    bool batch_mid_is_f16 = true;
+    CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+              out, gate, up, mid, down, full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
+              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              x, 0u, 1u, &batch_mid_is_f16),
+          "packed batch default-off refusal");
     CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0,
           "packed one research on");
     CHECK(ds4_gpu_routed_moe_one_packed_q4k_tensor(
@@ -839,6 +847,49 @@ static int run_registry_packed_one_oracle(
     printf("test_rocm_q4k_packed_one_oracle: output_fnv64=%016llx "
            "linear_refusal=1 default_off=1 exact=1\n",
            (unsigned long long)fnv1a64(candidate, sizeof(candidate)));
+
+    CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+              out, gate, up, mid, down, full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
+              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              x, 0u, 0u, &batch_mid_is_f16),
+          "packed batch zero-token refusal");
+    CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+              out, gate, up, mid, down, full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
+              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              x, 0u, 2u, &batch_mid_is_f16),
+          "packed batch two-token refusal");
+    CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+              out, gate, up, mid, down, full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
+              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              x, 0u, 32u, &batch_mid_is_f16),
+          "packed batch prefill refusal");
+    batch_mid_is_f16 = true;
+    CHECK(ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+              out, gate, up, mid, down, full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
+              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              x, 0u, 1u, &batch_mid_is_f16),
+          "packed batch decode primitive");
+    CHECK(!batch_mid_is_f16, "packed batch FP32 mid");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "packed batch registry sync");
+    float batch_candidate[OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(out, 0, batch_candidate,
+                              sizeof(batch_candidate)),
+          "packed batch registry read");
+    CHECK(memcmp(candidate, batch_candidate, sizeof(candidate)) == 0,
+          "packed batch matches one-token primitive");
+    printf("test_rocm_q4k_packed_batch_oracle: output_fnv64=%016llx "
+           "tokens=1 fp32_mid=1 reject=0,2,32 exact=1\n",
+           (unsigned long long)fnv1a64(batch_candidate,
+                                      sizeof(batch_candidate)));
     CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0,
           "packed one research restore");
 

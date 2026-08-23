@@ -27793,4 +27793,14 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t) {
     return 0;
 }
+
+extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
+        ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t,
+        uint64_t, uint64_t, uint64_t, uint32_t, uint64_t, uint64_t,
+        uint32_t, uint32_t, uint64_t, uint64_t,
+        const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, float,
+        const ds4_gpu_tensor *, uint32_t, uint32_t, bool *) {
+    return 0;
+}
 #pragma GCC diagnostic pop

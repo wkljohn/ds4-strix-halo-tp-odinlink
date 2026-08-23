@@ -2648,6 +2648,33 @@ int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         const ds4_gpu_tensor *add_in,
         uint32_t              layer_index);
 
+int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              n_total_expert,
+        uint64_t              source_gate_row_bytes,
+        uint64_t              source_down_row_bytes,
+        uint32_t              row_base,
+        uint32_t              row_count,
+        uint64_t              down_column_byte_base,
+        uint64_t              down_column_byte_count,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t              n_expert,
+        float                 clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t              layer_index,
+        uint32_t              n_tokens,
+        bool                 *mid_is_f16);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,

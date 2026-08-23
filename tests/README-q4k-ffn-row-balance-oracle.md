@@ -40,6 +40,11 @@ tensors, and compares the new primitive bit-for-bit with an independently
 packed direct-map reference. This still adds no production caller or TP
 feature negotiation.
 
+The batch-shaped packed entry remains decode-only: it wraps the same isolated
+primitive for exactly one token, reports FP32 mid storage, and rejects 0, 2,
+and 32 tokens. The existing batch/prefill API and all production callers are
+unchanged; multi-token packed K-shard is not authorized by this oracle.
+
 This is arithmetic only. It does not authorize the dispatcher, loader,
 negotiated feature, a new golden FNV, or `main` promotion.
 `DS4_ROCM_Q4K_DECODE_STAGE_MIDQ` stays off because that path assumes eight
