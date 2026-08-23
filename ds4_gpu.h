@@ -338,6 +338,14 @@ void ds4_gpu_tp_set_expert_split(uint32_t first_rank1);
  * split across both ranks. */
 void ds4_gpu_tp_suspend_expert_sharding(int suspend);
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
+#ifdef DS4_ROCM_BUILD
+/* PROFILE=1-only route-skew recorder. Production call sites are compiled out;
+ * the ROCm implementation is inert unless DS4_TP_ROUTE_SAMPLES=1. */
+void ds4_gpu_tp_route_profile(const ds4_gpu_tensor *selected,
+                              uint32_t n_selected,
+                              uint32_t layer,
+                              uint32_t pos);
+#endif
 /* Diagnostic-only FFN partial-sum range profiler.  A no-op unless
  * DS4_TP_FFN_RANGE_PROFILE is exactly "1". */
 void ds4_gpu_tp_ffn_range_profile(const ds4_gpu_tensor *tensor,

@@ -310,6 +310,93 @@ static ds4_tp_ffn_range_record *g_tp_ffn_range_host[2] = {};
 static ds4_tp_ffn_range_record *g_tp_ffn_range_device[2] = {};
 static ds4_tp_ffn_range_total g_tp_ffn_range_total[2] = {};
 
+/* PROFILE-only route records share the row-gate ordering contract.  A tiny
+ * kernel writes the six selected IDs' ownership count into mapped memory
+ * before the FFN producer kernels.  The gate callback consumes it only after
+ * the producer event/arrival word proves all preceding default-stream work is
+ * complete, so no per-layer D2H synchronization is added. */
+struct ds4_tp_route_record {
+    uint64_t seq;
+    uint32_t layer;
+    uint32_t pos;
+    uint32_t rank0_owned;
+    uint32_t selected;
+};
+
+#define DS4_TP_ROUTE_SAMPLE_MAX 32768u
+static int g_tp_route_profile = -1;
+static ds4_tp_route_record *g_tp_route_host = NULL;
+static ds4_tp_route_record *g_tp_route_device = NULL;
+static ds4_tp_route_record g_tp_route_samples[DS4_TP_ROUTE_SAMPLE_MAX];
+static uint32_t g_tp_route_sample_count = 0;
+static uint64_t g_tp_route_sample_dropped = 0;
+
+static inline int ds4_tp_route_profile_enabled(void) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    if (g_tp_route_profile < 0) {
+        const char *s = getenv("DS4_TP_ROUTE_SAMPLES");
+        g_tp_route_profile = s && strcmp(s, "1") == 0 ? 1 : 0;
+    }
+    return g_tp_route_profile;
+#else
+    return 0;
+#endif
+}
+
+__global__ static void ds4_tp_route_profile_kernel(
+        const int32_t *selected, uint32_t n_selected, uint32_t split,
+        uint64_t seq, uint32_t layer, uint32_t pos,
+        ds4_tp_route_record *out) {
+    if (blockIdx.x || threadIdx.x) return;
+    uint32_t rank0_owned = 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const int32_t expert = selected[i];
+        if (expert >= 0 && (uint32_t)expert < split) rank0_owned++;
+    }
+    ds4_tp_route_record record = {};
+    record.seq = seq;
+    record.layer = layer;
+    record.pos = pos;
+    record.rank0_owned = rank0_owned;
+    record.selected = n_selected;
+    *out = record;
+}
+
+static void ds4_tp_route_profile_consume(int ch, uint64_t seq,
+                                         const ds4_tp_req *req) {
+    if (ch != 0 || !g_tp_route_host || !req ||
+        req->kind != DS4_TP_ROW || req->gate != 1u) return;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    const ds4_tp_route_record *r = &g_tp_route_host[seq % DS4_TP_RING];
+    if (r->seq != seq || r->layer != req->layer) return;
+    if (g_tp_route_sample_count < DS4_TP_ROUTE_SAMPLE_MAX) {
+        g_tp_route_samples[g_tp_route_sample_count++] = *r;
+    } else {
+        g_tp_route_sample_dropped++;
+    }
+}
+
+static void ds4_tp_route_profile_print(void) {
+    if (!ds4_tp_route_profile_enabled()) return;
+    for (uint32_t i = 0; i < g_tp_route_sample_count; i++) {
+        const ds4_tp_route_record *r = &g_tp_route_samples[i];
+        fprintf(stderr,
+                "{\"ds4_tp_route_sample\":true,\"rank\":%u,"
+                "\"seq\":%llu,\"layer\":%u,\"pos\":%u,"
+                "\"rank0_owned\":%u,\"rank1_owned\":%u}\n",
+                g_tp_split_rank, (unsigned long long)r->seq,
+                r->layer, r->pos, r->rank0_owned,
+                r->selected - r->rank0_owned);
+    }
+    if (g_tp_route_sample_dropped) {
+        fprintf(stderr,
+                "{\"ds4_tp_route_samples_dropped\":true,"
+                "\"rank\":%u,\"count\":%llu}\n",
+                g_tp_split_rank,
+                (unsigned long long)g_tp_route_sample_dropped);
+    }
+}
+
 static inline int ds4_tp_ffn_range_enabled(void) {
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_tp_ffn_range_profile < 0) {
@@ -738,6 +825,7 @@ static int ds4_tp_pump_ffn_range(int ch, uint64_t *next) {
     if (arrived < *next) return 0;
     const struct ds4_tp_req *r = &c->ring[*next % DS4_TP_RING];
     ds4_tp_ffn_range_consume(ch, *next, r);
+    ds4_tp_route_profile_consume(ch, *next, r);
     int ok = 0;
     switch (r->kind) {
     case DS4_TP_ROW:
@@ -792,6 +880,7 @@ static int ds4_tp_pump_profile(int ch, uint64_t *next,
         p->last_miss_ns[ch] = 0;
     }
     ds4_tp_ffn_range_consume(ch, *next, r);
+    ds4_tp_route_profile_consume(ch, *next, r);
     if (p->last_release_ns[ch]) {
         uint64_t dt = noticed_ns - p->last_release_ns[ch];
         ds4_tp_interval_add(&p->release_to_arrival[ch], dt);
@@ -869,9 +958,10 @@ static void *ds4_tp_service_thread(void *arg) {
 #else
     const int profile_enabled = 0;
 #endif
-    const int ffn_range_enabled = ds4_tp_ffn_range_enabled() &&
-                                  g_tp_ffn_range_host[0] &&
-                                  g_tp_ffn_range_host[1];
+    const int aux_profile_enabled =
+        (ds4_tp_ffn_range_enabled() &&
+         g_tp_ffn_range_host[0] && g_tp_ffn_range_host[1]) ||
+        (ds4_tp_route_profile_enabled() && g_tp_route_host);
     struct ds4_tp_interval_profile profile = {};
     profile.next_report = 500;
     while (g_tp_run) {
@@ -883,7 +973,7 @@ static void *ds4_tp_service_thread(void *arg) {
                 ds4_tp_interval_print(&profile);
                 profile.next_report += 500;
             }
-        } else if (__builtin_expect(ffn_range_enabled, 0)) {
+        } else if (__builtin_expect(aux_profile_enabled, 0)) {
             did = ds4_tp_pump_ffn_range(0, &next[0]) |
                   ds4_tp_pump_ffn_range(1, &next[1]);
         } else {
@@ -949,6 +1039,8 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
     g_tp_split_rank = rank;
     g_tp_split_world = 2;   /* ds4 TP is always a two-way split */
     memset(g_tp_ffn_range_total, 0, sizeof(g_tp_ffn_range_total));
+    g_tp_route_sample_count = 0;
+    g_tp_route_sample_dropped = 0;
     {
         const char *timeout = getenv("DS4_TP_TIMEOUT_SEC");
         char *end = NULL;
@@ -1089,6 +1181,23 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
             g_tp_ffn_range_device[ch] = (ds4_tp_ffn_range_record *)device;
         }
     }
+    if (ds4_tp_route_profile_enabled()) {
+        void *host = NULL;
+        void *device = NULL;
+        const size_t bytes = DS4_TP_RING * sizeof(ds4_tp_route_record);
+        if (hipHostMalloc(&host, bytes, hipHostMallocMapped) != hipSuccess ||
+            !host || hipHostGetDevicePointer(&device, host, 0) != hipSuccess ||
+            !device) {
+            (void)hipGetLastError();
+            if (host) (void)hipHostFree(host);
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "TP route profiler disabled: mapped record allocation failed\n");
+        } else {
+            memset(host, 0, bytes);
+            g_tp_route_host = (ds4_tp_route_record *)host;
+            g_tp_route_device = (ds4_tp_route_record *)device;
+        }
+    }
     g_tp_run = 1;
     g_tp_thread_started = 0;
     if (!g_tp_host_sync &&
@@ -1102,6 +1211,9 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
             g_tp_ffn_range_host[ch] = NULL;
             g_tp_ffn_range_device[ch] = NULL;
         }
+        if (g_tp_route_host) (void)hipHostFree(g_tp_route_host);
+        g_tp_route_host = NULL;
+        g_tp_route_device = NULL;
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tp_init: service thread failed\n");
         return 0;
     }
@@ -1146,6 +1258,7 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
         ds4_tp_ffn_range_print("decode-row", -1, &g_tp_ffn_range_total[0]);
         ds4_tp_ffn_range_print("prefill-big", -1, &g_tp_ffn_range_total[1]);
     }
+    ds4_tp_route_profile_print();
     g_tp_thread_live = 0;
     ds4_tp_set_devcopy(NULL);
     if (g_tp_copy_stream) { (void)hipStreamDestroy(g_tp_copy_stream); g_tp_copy_stream = NULL; }
@@ -1172,6 +1285,9 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
         g_tp_ffn_range_host[ch] = NULL;
         g_tp_ffn_range_device[ch] = NULL;
     }
+    if (g_tp_route_host) (void)hipHostFree(g_tp_route_host);
+    g_tp_route_host = NULL;
+    g_tp_route_device = NULL;
     g_tp_fn = NULL; g_tp_ud = NULL;
     g_tp_host_sync = 0;
     g_tp_host_callback = 0;
@@ -1215,6 +1331,7 @@ static void ds4_tp_host_callback_run(void *opaque) {
     if (ds4_tp_fail_get()) return;
     __atomic_store_n(c->gpu_flag, req->seq, __ATOMIC_RELEASE);
     ds4_tp_ffn_range_consume((int)req->ch, req->seq, req);
+    ds4_tp_route_profile_consume((int)req->ch, req->seq, req);
     const int ok = g_tp_fn ?
         g_tp_fn(g_tp_ud, req->layer, req->gate, req->seq) : 0;
     if (!ok) {
@@ -1463,6 +1580,7 @@ static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
                     ch, (unsigned long long)seq, (int)req->kind, req->layer);
         }
         ds4_tp_ffn_range_consume(ch, seq, req);
+        ds4_tp_route_profile_consume(ch, seq, req);
         int ok = 0;
         switch (req->kind) {
         case DS4_TP_ROW:
@@ -1530,6 +1648,25 @@ static int ds4_tp_encode(int ch, const struct ds4_tp_req *req) {
 extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     struct ds4_tp_req r = {}; r.kind = DS4_TP_ROW; r.layer = layer; r.gate = gate;
     return ds4_tp_encode(0, &r);
+}
+
+extern "C" void ds4_gpu_tp_route_profile(
+        const ds4_gpu_tensor *selected, uint32_t n_selected,
+        uint32_t layer, uint32_t pos) {
+    if (__builtin_expect(!ds4_tp_route_profile_enabled(), 1)) return;
+    if (!selected || !selected->ptr || !n_selected || !g_tp_route_device) return;
+    const uint64_t seq = g_tp_chan[0].seq + 1u;
+    ds4_tp_route_record *record =
+        &g_tp_route_device[seq % DS4_TP_RING];
+    ds4_tp_route_profile_kernel<<<1, 1>>>(
+        (const int32_t *)selected->ptr, n_selected, g_tp_expert_split,
+        seq, layer, pos, record);
+    const hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "TP route profile kernel launch failed (layer %u pos %u): %s\n",
+                layer, pos, hipGetErrorString(err));
+    }
 }
 
 extern "C" void ds4_gpu_tp_ffn_range_profile(const ds4_gpu_tensor *tensor,

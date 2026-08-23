@@ -23796,6 +23796,12 @@ static bool metal_graph_encode_decode_layer_phase(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_ROUTER);
+#if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    if (ok && g->tp_world == 2) {
+        ds4_gpu_tp_route_profile(metal_graph_router_selected(g),
+                                 DS4_N_EXPERT_USED, il, pos);
+    }
+#endif
     if (ok) ok = metal_graph_profile_router_selection(g, layer, il, pos);
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", metal_graph_router_logits(g), DS4_N_EXPERT, il, pos);
