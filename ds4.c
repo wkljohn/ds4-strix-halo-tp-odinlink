@@ -52005,11 +52005,22 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     uint32_t iq2_features = DS4_TP_FEATURE_IQ2_I8_WMMA;
     bool saw_q4k_layer = false;
     bool saw_iq2_layer = false;
+    bool all_routed_q4k_kshard_layout = true;
+    bool saw_routed_layer = false;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_tensor *gate = e->weights.layer[il].ffn_gate_exps;
         const ds4_tensor *up = e->weights.layer[il].ffn_up_exps;
         const ds4_tensor *down = e->weights.layer[il].ffn_down_exps;
         if (!gate || !up || !down) continue;
+        saw_routed_layer = true;
+        if (gate->type != DS4_TENSOR_Q4_K ||
+            up->type != DS4_TENSOR_Q4_K ||
+            down->type != DS4_TENSOR_Q4_K ||
+            gate->dim[0] != 4096u || gate->dim[1] != 2048u ||
+            up->dim[0] != 4096u || up->dim[1] != 2048u ||
+            down->dim[0] != 2048u || down->dim[1] != 4096u) {
+            all_routed_q4k_kshard_layout = false;
+        }
         /* This is a whole-run TP capability bit, not the quantization of the
          * first routed layer.  Mixed GGUFs may place fully Q4_K layers after
          * IQ2/Q2 layers.  Require every fully-Q4_K candidate to satisfy the
@@ -52039,6 +52050,10 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         const uint64_t down_row_bytes =
             (down->dim[0] / gguf_types[down->type].block_elems) *
             gguf_types[down->type].block_bytes;
+        if (row_bytes != 16u * gguf_types[gate->type].block_bytes ||
+            down_row_bytes != 8u * gguf_types[down->type].block_bytes) {
+            all_routed_q4k_kshard_layout = false;
+        }
         q4k_features &=
             ds4_gpu_q4k_wmma_runtime_features(
                 1,
@@ -52051,9 +52066,17 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
                 down->dim[1] * down_row_bytes, down_row_bytes,
                 (const uint8_t *)e->model.map + down->abs_offset);
     }
+    const bool mtp_or_dspark = e->mtp_ready ||
+        (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+    const uint32_t q4k_kshard_feature = ds4_tp_q4k_kshard_feature(
+        getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH"), 1, mtp_or_dspark,
+        saw_routed_layer && all_routed_q4k_kshard_layout,
+        saw_q4k_layer &&
+            (q4k_features & DS4_TP_FEATURE_Q4K_WMMA) != 0u);
     return (saw_q4k_layer ? q4k_features : 0u) |
            (saw_iq2_layer ? iq2_features : 0u) |
-           hc_features | indexer_features | placement_features;
+           hc_features | indexer_features | q4k_kshard_feature |
+           placement_features;
 #endif
 }
 

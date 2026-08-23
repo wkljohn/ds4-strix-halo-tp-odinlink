@@ -84,7 +84,23 @@ enum {
      * bitonic chunk tree with an exact packed-key radix tree.  Negotiate it
      * because independently launched ranks must select identical index rows. */
     DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE = UINT32_C(1) << 18,
+    /* The research Q4_K K-shard maps one K-half of every routed expert and
+     * disables ordinary expert-id remapping. Independently launched ranks
+     * must agree before that incompatible residency layout is created. */
+    DS4_TP_FEATURE_Q4K_KSHARD = UINT32_C(1) << 19,
 };
+
+static inline uint32_t ds4_tp_q4k_kshard_feature(
+        const char *env,
+        int rocm_ready,
+        int mtp_or_dspark,
+        int all_routed_q4k_kshard_layout,
+        int q4k_wmma_ok) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           rocm_ready && !mtp_or_dspark &&
+           all_routed_q4k_kshard_layout && q4k_wmma_ok
+        ? DS4_TP_FEATURE_Q4K_KSHARD : 0u;
+}
 
 static inline uint32_t ds4_tp_feature_expert_split(uint32_t first_rank1) {
     return (first_rank1 & UINT32_C(0xff)) <<

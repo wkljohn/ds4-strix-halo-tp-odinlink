@@ -114,6 +114,16 @@ int main(void) {
     ok &= check("hello mismatched-indexer-topk-radix-tree",
                 DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00040000 peer=0x00000000)");
+    ok &= check("hello equal-q4k-kshard",
+                DS4_TP_FEATURE_Q4K_KSHARD,
+                DS4_TP_FEATURE_Q4K_KSHARD, 1, NULL);
+    ok &= check("hello mismatched-q4k-kshard",
+                DS4_TP_FEATURE_Q4K_KSHARD, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00080000 peer=0x00000000)");
+    ok &= check("hello q4k-wmma-kshard mismatch",
+                DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD,
+                DS4_TP_FEATURE_Q4K_WMMA, 0,
+                "tp hello: runtime feature mismatch (local=0x00080001 peer=0x00000001)");
     ok &= check("hello equal-batch-attn-head-split",
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);
@@ -140,6 +150,28 @@ int main(void) {
         ok = 0;
     } else {
         fprintf(stderr, "PASS expert split feature round trip\n");
+    }
+    const char *invalid_kshard_env[] = {
+        NULL, "", "0", "true", "10", "1 ", "1\n"
+    };
+    for (size_t i = 0;
+         i < sizeof(invalid_kshard_env) / sizeof(invalid_kshard_env[0]);
+         ++i) {
+        if (ds4_tp_q4k_kshard_feature(invalid_kshard_env[i], 1, 0, 1, 1) != 0u) {
+            fprintf(stderr, "FAIL q4k-kshard malformed env case %zu\n", i);
+            ok = 0;
+        }
+    }
+    if (ds4_tp_q4k_kshard_feature("1", 1, 0, 1, 1) !=
+            DS4_TP_FEATURE_Q4K_KSHARD ||
+        ds4_tp_q4k_kshard_feature("1", 0, 0, 1, 1) != 0u ||
+        ds4_tp_q4k_kshard_feature("1", 1, 1, 1, 1) != 0u ||
+        ds4_tp_q4k_kshard_feature("1", 1, 0, 0, 1) != 0u ||
+        ds4_tp_q4k_kshard_feature("1", 1, 0, 1, 0) != 0u) {
+        fprintf(stderr, "FAIL q4k-kshard advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS q4k-kshard advertisement predicate\n");
     }
     if (ds4_tp_test_rdma_provider_decode_max_msg("odl_tb5_0") != 131072) {
         fprintf(stderr, "FAIL OdinLink decode message policy\n");
