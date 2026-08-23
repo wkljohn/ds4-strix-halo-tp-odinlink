@@ -3832,6 +3832,21 @@ extern "C" uint64_t ds4_gpu_q4k_packed_slice_bytes(void) {
     return 0;
 }
 
+extern "C" int ds4_gpu_q4k_kshard_install(
+        const void *, uint64_t, int, uint32_t, const uint64_t *,
+        const uint64_t *, uint32_t, uint64_t,
+        const ds4_gpu_q4k_kshard_layer *, uint32_t) {
+    return 0;
+}
+
+extern "C" int ds4_gpu_q4k_kshard_windows_get(
+        ds4_gpu_q4k_kshard_windows *windows) {
+    if (windows) memset(windows, 0, sizeof(*windows));
+    return 0;
+}
+
+extern "C" void ds4_gpu_q4k_kshard_release(void) {}
+
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
@@ -27753,6 +27768,10 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
 
 extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     (void)suspend;
+}
+
+extern "C" int ds4_gpu_tp_expert_shard_active(void) {
+    return 0;
 }
 
 extern "C" void ds4_gpu_tp_set_expert_split(uint32_t first_rank1) {

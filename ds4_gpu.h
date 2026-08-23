@@ -256,6 +256,51 @@ int ds4_gpu_q4k_packed_slice_readback(
         void       *dst,
         uint64_t    bytes);
 uint64_t ds4_gpu_q4k_packed_slice_bytes(void);
+
+typedef struct ds4_gpu_q4k_kshard_layer {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint32_t n_expert;
+    uint32_t expert_in_dim;
+    uint32_t expert_mid_dim;
+    uint32_t out_dim;
+    uint64_t gate_row_bytes;
+    uint64_t up_row_bytes;
+    uint64_t down_row_bytes;
+} ds4_gpu_q4k_kshard_layer;
+
+typedef struct ds4_gpu_q4k_kshard_windows {
+    uint32_t rank;
+    uint32_t n_layers;
+    uint32_t n_expert;
+    uint32_t expert_in_dim;
+    uint32_t expert_mid_dim;
+    uint32_t out_dim;
+    uint32_t row_base;
+    uint32_t row_count;
+    uint64_t source_gate_row_bytes;
+    uint64_t source_down_row_bytes;
+    uint64_t down_column_byte_base;
+    uint64_t down_column_byte_count;
+    uint64_t packed_gate_expert_bytes;
+    uint64_t packed_down_expert_bytes;
+} ds4_gpu_q4k_kshard_windows;
+
+int ds4_gpu_q4k_kshard_install(
+        const void                     *model_map,
+        uint64_t                        model_size,
+        int                             model_fd,
+        uint32_t                        rank,
+        const uint64_t                 *dense_offsets,
+        const uint64_t                 *dense_sizes,
+        uint32_t                        dense_count,
+        uint64_t                        dense_max_tensor_bytes,
+        const ds4_gpu_q4k_kshard_layer *layers,
+        uint32_t                        n_layers);
+int ds4_gpu_q4k_kshard_windows_get(
+        ds4_gpu_q4k_kshard_windows *windows);
+void ds4_gpu_q4k_kshard_release(void);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
@@ -425,6 +470,7 @@ void ds4_gpu_tp_set_expert_split(uint32_t first_rank1);
  * Suspend ownership only while encoding it; base-model verification remains
  * split across both ranks. */
 void ds4_gpu_tp_suspend_expert_sharding(int suspend);
+int ds4_gpu_tp_expert_shard_active(void);
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
 #if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
 /* PROFILE=1-only route-skew recorder. Production call sites are compiled out;
