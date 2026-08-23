@@ -380,6 +380,11 @@ static int run_kshard_shape_cost_gate(
     const double unique_mib =
         3.0 * (double)(full_gate_expert * 2u + full_down_expert) /
         1048576.0;
+    const char *halfk_down4_env =
+        getenv("DS4_ROCM_Q4K_DECODE_HALFK_DOWN4");
+    const uint32_t packed_down_grid =
+        halfk_down4_env && halfk_down4_env[0] == '1' &&
+        halfk_down4_env[1] == '\0' ? 64u : 128u;
     printf("test_rocm_q4k_kshard_shape_cost: full3_ms=%.6f "
            "half0_ms=%.6f half1_ms=%.6f packed_worst_ms=%.6f "
            "ratio=%.6f graph_delta_ms=%.6f graph_packed_ms=%.6f "
@@ -387,11 +392,12 @@ static int run_kshard_shape_cost_gate(
            "decision=%s samples=%u warmup=%u unique_mib=%.2f "
            "full_mid=%u packed_mid=%u full_down_blocks=%u "
            "packed_down_blocks=%u gate_grid_full=16x6 "
-           "gate_grid_packed=8x6 down_grid=128x1\n",
+           "gate_grid_packed=8x6 down_grid_full=128x1 "
+           "down_grid_packed=%ux1\n",
            med[0], med[1], med[2], packed_worst, ratio, graph_delta,
            graph_packed_ms, critical_packed_ms, layers, save_ms, decision,
            TIMING_SAMPLES, TIMING_WARMUP, unique_mib, MID_DIM, MID_HALF,
-           MID_DIM / QK_K, MID_HALF / QK_K);
+           MID_DIM / QK_K, MID_HALF / QK_K, packed_down_grid);
 
     CHECK(hipEventDestroy(stop) == hipSuccess, "destroy timing stop");
     CHECK(hipEventDestroy(start) == hipSuccess, "destroy timing start");

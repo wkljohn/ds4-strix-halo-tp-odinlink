@@ -2477,6 +2477,45 @@ __global__ static void moe_down_q4K_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = add_in ? total + add_in[row] : total;
 }
 
+/* Half-K TP research path: four Q8_K blocks need four lanes, while the
+ * ordinary eight-lane subgroup leaves lanes 4..7 idle.  Four-lane subgroups
+ * double rows per workgroup without changing the reduction association:
+ * the removed offset-4 step only added zero-valued inactive lanes. */
+__global__ static void moe_down_q4K_sum6_halfk4_kernel(
+        float *out,
+        const float *add_in,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t skip_zero_weight) {
+    const uint32_t lane = threadIdx.x & 3u;
+    const uint32_t row = blockIdx.x * 64u + (threadIdx.x >> 2u);
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; slot++) {
+        if (slot >= n_expert) continue;
+        if (skip_zero_weight && weights[slot] == 0.0f) continue;
+        const int32_t expert_i = selected[slot];
+        if (expert_i < 0) continue;
+        const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+            down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+            (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + (uint64_t)slot * 4u;
+        float acc = dev_dot_q4_K_q8_K_block(wr + lane, xq + lane);
+        const uint32_t mask = 0xfu << (threadIdx.x & 28u);
+        acc += __shfl_down_sync(static_cast<MASK_T>(mask), acc, 2, 4);
+        acc += __shfl_down_sync(static_cast<MASK_T>(mask), acc, 1, 4);
+        if (lane == 0u) total += acc;
+    }
+    if (lane == 0u) out[row] = add_in ? total + add_in[row] : total;
+}
+
 /* One-token Q4_K down with the six mid-Q8_K slots staged in LDS.  Default-off
  * via DS4_ROCM_Q4K_DECODE_STAGE_MIDQ.  6 slots × 8 cuda_block_q8_K × 292 B =
  * 14,016 B.  The cooperative copy of all 48 blocks runs before any row,

@@ -131,6 +131,15 @@ static int routed_moe_q4k_decode_stage_midq_enabled(void) {
     return enabled;
 }
 
+static int routed_moe_q4k_decode_halfk_down4_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_ROCM_Q4K_DECODE_HALFK_DOWN4");
+        enabled = env && env[0] == '1' && env[1] == '\0';
+    }
+    return enabled;
+}
+
 static int routed_moe_q4k_l2_pair_order_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -2591,7 +2600,24 @@ static int routed_moe_launch(
                         routed_moe_q4k_decode_stage_midq_enabled() &&
                         n_tokens == 1u && n_expert == 6u &&
                         midq_blocks == 8u && out_dim == 4096u;
-                    if (stage_midq) {
+                    const uint32_t use_halfk_down4 =
+                        midq_blocks == 4u && out_dim == 4096u &&
+                        routed_moe_q4k_decode_halfk_down4_enabled();
+                    if (use_halfk_down4) {
+                        dim3 half_grid((out_dim + 63u) / 64u, 1, 1);
+                        moe_down_q4K_sum6_halfk4_kernel<<<half_grid, 256>>>(
+                            (float *)out->ptr,
+                            fuse_add ? (const float *)add_in->ptr : NULL,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            out_dim,
+                            n_expert,
+                            tp_skip_unowned && n_tokens == 1u);
+                    } else if (stage_midq) {
                         static int logged_stage_midq = 0;
                         if (!logged_stage_midq) {
                             logged_stage_midq = 1;
