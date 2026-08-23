@@ -1,9 +1,10 @@
 /* Isolated one-token Q4_K oracle (Codex gpt-5.6-sol 2026-08-20 option A).
  *
  * Drives the shipped ds4_gpu_routed_moe_one_tensor for bitwise self-check and
- * cold-weight timing. Test-local kernels compare a one-wave Q4_K×Q8_K DP4A
- * candidate (bitwise vs CPU scalar of the same association) and an MMVDQ
- * F32-dequant control that is allowed to lose. No production dispatcher.
+ * device-resident timing. Test-local kernels compare a one-wave Q4_K×Q8_K
+ * DP4A candidate (bitwise vs CPU scalar of the same association), an MMVDQ
+ * F32-dequant control that is allowed to lose, and an optimistic unique-byte
+ * load floor. No production dispatcher is changed.
  */
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -36,9 +37,13 @@ enum {
     MID_DIM = 2048,
     OUT_DIM = 4096,
     COLD_COPIES = 4,
+    MODEL_COPIES = COLD_COPIES + 1,
     WARMUP = 4,
     ITERS = 32,
+    STREAM_ITERS = 8,
 };
+
+static constexpr uint64_t STREAM_BYTES = UINT64_C(256) * 1024u * 1024u;
 
 struct block_q4_K {
     uint16_t d;
@@ -277,6 +282,132 @@ __global__ void k_q4k_mmvdq_down_wave32(const block_q4_K *weights,
     if (lane == 0) out[row] = acc;
 }
 
+__device__ __forceinline__ static uint4 load_q4k_block_144(
+        const block_q4_K *block, uint4 acc) {
+    const uint4 *words = reinterpret_cast<const uint4 *>(block);
+    #pragma unroll
+    for (uint32_t i = 0; i < 9u; ++i) {
+        const uint4 v = words[i];
+        /* Four independent chains keep every loaded word observable without
+         * turning the optimistic bandwidth floor into a serial ALU test. */
+        acc.x ^= v.x;
+        acc.y ^= v.y;
+        acc.z ^= v.z;
+        acc.w ^= v.w;
+    }
+    return acc;
+}
+
+/* Optimistic unique-byte floor for the production split gate/up geometry.
+ * The grid keeps all six route slots so zero-owned slots retain launch/return
+ * overhead, while active threads consume every byte of both Q4_K tables once.
+ */
+__global__ void k_q4k_gate_up_load_only(
+        const block_q4_K *gate,
+        const block_q4_K *up,
+        uint32_t owned,
+        uint32_t rows,
+        uint32_t blocks_per_row,
+        uint32_t *sink) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t slot = blockIdx.y;
+    const uint32_t seed = 0x9e3779b9u ^ threadIdx.x ^ (slot << 16u);
+    uint4 acc = make_uint4(seed, seed ^ 0x85ebca6bu,
+                           seed ^ 0xc2b2ae35u, seed ^ 0x27d4eb2fu);
+    if (slot < owned) {
+        for (uint32_t rr = 0; rr < 8u; ++rr) {
+            const uint32_t row = blockIdx.x * 128u + row_lane + rr * 16u;
+            if (row >= rows) continue;
+            const uint64_t row_base =
+                ((uint64_t)slot * rows + row) * blocks_per_row;
+            for (uint32_t b = lane; b < blocks_per_row; b += 8u) {
+                acc = load_q4k_block_144(gate + row_base + b, acc);
+                acc = load_q4k_block_144(up + row_base + b, acc);
+            }
+        }
+    }
+    const uint64_t out =
+        ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    sink[out] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+}
+
+/* One-projection form matching each of the two production gate/up launches. */
+__global__ void k_q4k_projection_load_only(
+        const block_q4_K *weight,
+        uint32_t owned,
+        uint32_t rows,
+        uint32_t blocks_per_row,
+        uint32_t *sink) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t slot = blockIdx.y;
+    const uint32_t seed = 0x165667b1u ^ threadIdx.x ^ (slot << 16u);
+    uint4 acc = make_uint4(seed, seed ^ 0x9e3779b9u,
+                           seed ^ 0x85ebca6bu, seed ^ 0xc2b2ae35u);
+    if (slot < owned) {
+        for (uint32_t rr = 0; rr < 8u; ++rr) {
+            const uint32_t row = blockIdx.x * 128u + row_lane + rr * 16u;
+            if (row >= rows) continue;
+            const uint64_t row_base =
+                ((uint64_t)slot * rows + row) * blocks_per_row;
+            for (uint32_t b = lane; b < blocks_per_row; b += 8u)
+                acc = load_q4k_block_144(weight + row_base + b, acc);
+        }
+    }
+    const uint64_t out =
+        ((uint64_t)blockIdx.y * gridDim.x + blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    sink[out] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+}
+
+/* Optimistic unique-byte floor for the production direct sum6 down geometry.
+ * Each lane consumes its one 144-byte block from every active expert/row.
+ */
+__global__ void k_q4k_down_load_only(
+        const block_q4_K *down,
+        uint32_t owned,
+        uint32_t rows,
+        uint32_t blocks_per_row,
+        uint32_t *sink) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t seed = 0x85ebca6bu ^ threadIdx.x;
+    uint4 acc = make_uint4(seed, seed ^ 0x9e3779b9u,
+                           seed ^ 0xc2b2ae35u, seed ^ 0x27d4eb2fu);
+    if (row < rows) {
+        for (uint32_t slot = 0; slot < owned; ++slot) {
+            const uint64_t block =
+                ((uint64_t)slot * rows + row) * blocks_per_row + lane;
+            if (lane < blocks_per_row)
+                acc = load_q4k_block_144(down + block, acc);
+        }
+    }
+    sink[(uint64_t)blockIdx.x * blockDim.x + threadIdx.x] =
+        acc.x ^ acc.y ^ acc.z ^ acc.w;
+}
+
+/* Read-only device-memory calibration with the same observable XOR shape as
+ * the Q4_K floor.  The 256 MiB source is larger than gfx1151's last-level
+ * cache, so repeated iterations remain a DRAM-bandwidth reference. */
+__global__ void k_stream_read_uint4(
+        const uint4 *src, uint64_t words, uint4 *sink) {
+    const uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    const uint32_t seed = 0x27d4eb2fu ^ (uint32_t)tid;
+    uint4 acc = make_uint4(seed, seed ^ 0x9e3779b9u,
+                           seed ^ 0x85ebca6bu, seed ^ 0xc2b2ae35u);
+    for (uint64_t i = tid; i < words; i += stride) {
+        const uint4 v = src[i];
+        acc.x ^= v.x;
+        acc.y ^= v.y;
+        acc.z ^= v.z;
+        acc.w ^= v.w;
+    }
+    sink[tid] = acc;
+}
+
 static int run_shipped(ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
                        ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
                        ds4_gpu_tensor *down, ds4_gpu_tensor *selected,
@@ -295,7 +426,25 @@ static int run_shipped(ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
         N_TOTAL_EXPERT, N_USED, 0.0f, x, add_in, 0, true);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    uint32_t owned = 6u;
+    if (argc > 2) {
+        fprintf(stderr, "usage: %s [owned-routes:1|3|6]\n", argv[0]);
+        return 2;
+    }
+    if (argc == 2) owned = (uint32_t)strtoul(argv[1], NULL, 10);
+    if (owned != 1u && owned != 3u && owned != 6u) {
+        fprintf(stderr, "usage: %s [owned-routes:1|3|6]\n", argv[0]);
+        return 2;
+    }
+    CHECK(setenv("DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP", "1", 1) == 0,
+          "select benchmark split gate/up");
+    CHECK(setenv("DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP", "1", 1) == 0,
+          "select benchmark Q4 WMMA policy");
+    CHECK(setenv("DS4_ROCM_Q4K_WMMA_FUSE_MID", "1", 1) == 0,
+          "select benchmark fused-mid policy");
+    CHECK(setenv("DS4_ROCM_TP_SKIP_UNOWNED", "1", 1) == 0,
+          "select benchmark zero-route skip");
     int devices = 0;
     CHECK(hipGetDeviceCount(&devices) == hipSuccess && devices > 0,
           "ROCm device required");
@@ -315,8 +464,8 @@ int main(void) {
     const uint64_t down_off = up_off + N_TOTAL_EXPERT * gate_expert_bytes;
     const uint64_t model_bytes = down_off + N_TOTAL_EXPERT * down_expert_bytes;
 
-    unsigned char *copies[COLD_COPIES];
-    for (int c = 0; c < COLD_COPIES; c++) {
+    unsigned char *copies[MODEL_COPIES];
+    for (int c = 0; c < MODEL_COPIES; c++) {
         copies[c] = (unsigned char *)malloc((size_t)model_bytes);
         CHECK(copies[c], "allocate cold model copy");
         pack_q4k_table(copies[c] + gate_off, N_TOTAL_EXPERT, MID_DIM,
@@ -342,8 +491,14 @@ int main(void) {
     CHECK(alloc_tensor(&x, IN_DIM * sizeof(float)), "allocate input");
     CHECK(alloc_tensor(&add_in, OUT_DIM * sizeof(float)), "allocate addend");
 
-    const int32_t route[N_USED] = {0, 1, 2, 3, 4, 5};
-    const float route_weights[N_USED] = {0.31f, 0.23f, 0.17f, 0.13f, 0.09f, 0.07f};
+    int32_t route[N_USED] = {};
+    float route_weights[N_USED] = {};
+    const float base_weights[N_USED] =
+        {0.31f, 0.23f, 0.17f, 0.13f, 0.09f, 0.07f};
+    for (uint32_t i = 0; i < N_USED; ++i) {
+        route[i] = i < owned ? (int32_t)i : 0;
+        route_weights[i] = i < owned ? base_weights[i] : 0.0f;
+    }
     float hx[IN_DIM], hadd[OUT_DIM];
     for (uint32_t i = 0; i < IN_DIM; i++)
         hx[i] = (float)((int)(i % 31u) - 15) * 0.03125f;
@@ -381,19 +536,250 @@ int main(void) {
     hipEvent_t start = nullptr, stop = nullptr;
     CHECK(hipEventCreate(&start) == hipSuccess &&
           hipEventCreate(&stop) == hipSuccess, "events");
-    CHECK(hipEventRecord(start) == hipSuccess, "start");
-    for (uint32_t i = 0; i < ITERS; i++) {
-        unsigned char *model = copies[i % COLD_COPIES];
-        CHECK(ds4_gpu_set_model_map(model, model_bytes), "rotate cold map");
+    CHECK(ds4_gpu_set_model_map(copies[0], model_bytes), "restore warm map");
+    for (uint32_t i = 0; i < WARMUP; ++i) {
         CHECK(run_shipped(&out, &gate, &up, &mid, &down, &selected, &weights,
-                          &x, &add_in, model, model_bytes, gate_off, up_off,
+                          &x, &add_in, copies[0], model_bytes, gate_off, up_off,
                           down_off, gate_expert_bytes, gate_row_bytes,
-                          down_expert_bytes, down_row_bytes), "cold shipped");
+                          down_expert_bytes, down_row_bytes), "warm shipped");
+    }
+    CHECK(hipDeviceSynchronize() == hipSuccess, "sync warm shipped");
+    CHECK(hipEventRecord(start) == hipSuccess, "warm start");
+    for (uint32_t i = 0; i < ITERS; ++i) {
+        CHECK(run_shipped(&out, &gate, &up, &mid, &down, &selected, &weights,
+                          &x, &add_in, copies[0], model_bytes, gate_off, up_off,
+                          down_off, gate_expert_bytes, gate_row_bytes,
+                          down_expert_bytes, down_row_bytes), "timed warm shipped");
     }
     CHECK(hipEventRecord(stop) == hipSuccess &&
-          hipEventSynchronize(stop) == hipSuccess, "stop");
-    float shipped_ms = 0.0f;
-    CHECK(hipEventElapsedTime(&shipped_ms, start, stop) == hipSuccess, "elapsed");
+          hipEventSynchronize(stop) == hipSuccess, "warm stop");
+    float shipped_warm_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&shipped_warm_ms, start, stop) == hipSuccess,
+          "warm elapsed");
+
+    /* Unique-byte floors use device-resident copies and the production grids.
+     * Copy zero is warm-only. Four other rotating copies exceed gfx1151's
+     * cache capacity and never reuse the just-warmed allocation. */
+    block_q4_K *load_gate[MODEL_COPIES] = {};
+    block_q4_K *load_up[MODEL_COPIES] = {};
+    block_q4_K *load_down[MODEL_COPIES] = {};
+    const uint64_t load_gate_bytes = (uint64_t)N_USED * gate_expert_bytes;
+    const uint64_t load_down_bytes = (uint64_t)N_USED * down_expert_bytes;
+    for (uint32_t c = 0; c < MODEL_COPIES; ++c) {
+        CHECK(hipMalloc(&load_gate[c], (size_t)load_gate_bytes) == hipSuccess,
+              "allocate load-only gate");
+        CHECK(hipMalloc(&load_up[c], (size_t)load_gate_bytes) == hipSuccess,
+              "allocate load-only up");
+        CHECK(hipMalloc(&load_down[c], (size_t)load_down_bytes) == hipSuccess,
+              "allocate load-only down");
+        CHECK(hipMemcpy(load_gate[c], copies[c] + gate_off,
+                        (size_t)load_gate_bytes, hipMemcpyHostToDevice) ==
+                  hipSuccess,
+              "copy load-only gate");
+        CHECK(hipMemcpy(load_up[c], copies[c] + up_off,
+                        (size_t)load_gate_bytes, hipMemcpyHostToDevice) ==
+                  hipSuccess,
+              "copy load-only up");
+        CHECK(hipMemcpy(load_down[c], copies[c] + down_off,
+                        (size_t)load_down_bytes, hipMemcpyHostToDevice) ==
+                  hipSuccess,
+              "copy load-only down");
+    }
+    uint32_t *load_sink = nullptr;
+    const uint64_t sink_words =
+        (uint64_t)((OUT_DIM + 31u) / 32u) * 256u;
+    CHECK(hipMalloc(&load_sink, sink_words * sizeof(uint32_t)) == hipSuccess,
+          "allocate load-only sink");
+    const dim3 gate_load_grid((MID_DIM + 127u) / 128u, N_USED, 1u);
+    const dim3 down_load_grid((OUT_DIM + 31u) / 32u, 1u, 1u);
+    for (uint32_t i = 0; i < WARMUP; ++i) {
+        k_q4k_gate_up_load_only<<<gate_load_grid, 128>>>(
+            load_gate[0], load_up[0], owned, MID_DIM, (uint32_t)in_blocks,
+            load_sink);
+        k_q4k_projection_load_only<<<gate_load_grid, 128>>>(
+            load_gate[0], owned, MID_DIM, (uint32_t)in_blocks, load_sink);
+        k_q4k_projection_load_only<<<gate_load_grid, 128>>>(
+            load_up[0], owned, MID_DIM, (uint32_t)in_blocks, load_sink);
+        k_q4k_down_load_only<<<down_load_grid, 256>>>(
+            load_down[0], owned, OUT_DIM, (uint32_t)mid_blocks, load_sink);
+    }
+    CHECK(hipGetLastError() == hipSuccess, "load-only warmup launch");
+    CHECK(hipDeviceSynchronize() == hipSuccess, "load-only warmup");
+
+    CHECK(hipEventRecord(start) == hipSuccess, "warm fused gate-load start");
+    for (uint32_t i = 0; i < ITERS; ++i)
+        k_q4k_gate_up_load_only<<<gate_load_grid, 128>>>(
+            load_gate[0], load_up[0], owned, MID_DIM, (uint32_t)in_blocks,
+            load_sink);
+    CHECK(hipGetLastError() == hipSuccess, "warm fused gate-load launch");
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess,
+          "warm fused gate-load stop");
+    float fused_gate_load_warm_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&fused_gate_load_warm_ms, start, stop) ==
+              hipSuccess,
+          "warm fused gate-load elapsed");
+
+    CHECK(hipEventRecord(start) == hipSuccess, "warm split gate-load start");
+    for (uint32_t i = 0; i < ITERS; ++i) {
+        k_q4k_projection_load_only<<<gate_load_grid, 128>>>(
+            load_gate[0], owned, MID_DIM, (uint32_t)in_blocks, load_sink);
+        k_q4k_projection_load_only<<<gate_load_grid, 128>>>(
+            load_up[0], owned, MID_DIM, (uint32_t)in_blocks, load_sink);
+    }
+    CHECK(hipGetLastError() == hipSuccess, "warm split gate-load launch");
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess,
+          "warm split gate-load stop");
+    float split_gate_load_warm_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&split_gate_load_warm_ms, start, stop) ==
+              hipSuccess,
+          "warm split gate-load elapsed");
+
+    CHECK(hipEventRecord(start) == hipSuccess, "warm down-load start");
+    for (uint32_t i = 0; i < ITERS; ++i)
+        k_q4k_down_load_only<<<down_load_grid, 256>>>(
+            load_down[0], owned, OUT_DIM, (uint32_t)mid_blocks, load_sink);
+    CHECK(hipGetLastError() == hipSuccess, "warm down-load launch");
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess, "warm down-load stop");
+    float down_load_warm_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&down_load_warm_ms, start, stop) == hipSuccess,
+          "warm down-load elapsed");
+
+    CHECK(hipEventRecord(start) == hipSuccess, "cold fused gate-load start");
+    for (uint32_t i = 0; i < ITERS; ++i) {
+        const uint32_t c = 1u + i % COLD_COPIES;
+        k_q4k_gate_up_load_only<<<gate_load_grid, 128>>>(
+            load_gate[c], load_up[c], owned, MID_DIM, (uint32_t)in_blocks,
+            load_sink);
+    }
+    CHECK(hipGetLastError() == hipSuccess, "cold fused gate-load launch");
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess,
+          "cold fused gate-load stop");
+    float fused_gate_load_cold_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&fused_gate_load_cold_ms, start, stop) ==
+              hipSuccess,
+          "cold fused gate-load elapsed");
+
+    CHECK(hipEventRecord(start) == hipSuccess, "cold split gate-load start");
+    for (uint32_t i = 0; i < ITERS; ++i) {
+        const uint32_t c = 1u + i % COLD_COPIES;
+        k_q4k_projection_load_only<<<gate_load_grid, 128>>>(
+            load_gate[c], owned, MID_DIM, (uint32_t)in_blocks, load_sink);
+        k_q4k_projection_load_only<<<gate_load_grid, 128>>>(
+            load_up[c], owned, MID_DIM, (uint32_t)in_blocks, load_sink);
+    }
+    CHECK(hipGetLastError() == hipSuccess, "cold split gate-load launch");
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess,
+          "cold split gate-load stop");
+    float split_gate_load_cold_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&split_gate_load_cold_ms, start, stop) ==
+              hipSuccess,
+          "cold split gate-load elapsed");
+
+    CHECK(hipEventRecord(start) == hipSuccess, "cold down-load start");
+    for (uint32_t i = 0; i < ITERS; ++i) {
+        const uint32_t c = 1u + i % COLD_COPIES;
+        k_q4k_down_load_only<<<down_load_grid, 256>>>(
+            load_down[c], owned, OUT_DIM, (uint32_t)mid_blocks, load_sink);
+    }
+    CHECK(hipGetLastError() == hipSuccess, "cold down-load launch");
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess, "cold down-load stop");
+    float down_load_cold_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&down_load_cold_ms, start, stop) == hipSuccess,
+          "cold down-load elapsed");
+
+    fused_gate_load_warm_ms /= (float)ITERS;
+    split_gate_load_warm_ms /= (float)ITERS;
+    down_load_warm_ms /= (float)ITERS;
+    fused_gate_load_cold_ms /= (float)ITERS;
+    split_gate_load_cold_ms /= (float)ITERS;
+    down_load_cold_ms /= (float)ITERS;
+
+    uint32_t observed_load_sink = 0;
+    CHECK(hipMemcpy(&observed_load_sink, load_sink, sizeof(observed_load_sink),
+                    hipMemcpyDeviceToHost) == hipSuccess,
+          "observe load-only sink");
+
+    uint4 *stream_src = nullptr, *stream_sink = nullptr;
+    const uint32_t stream_blocks = 1024u;
+    const uint32_t stream_threads = 256u;
+    const uint64_t stream_sink_words =
+        (uint64_t)stream_blocks * stream_threads;
+    CHECK(hipMalloc(&stream_src, (size_t)STREAM_BYTES) == hipSuccess,
+          "allocate STREAM source");
+    CHECK(hipMalloc(&stream_sink,
+                    (size_t)stream_sink_words * sizeof(uint4)) == hipSuccess,
+          "allocate STREAM sink");
+    CHECK(hipMemset(stream_src, 0x5a, (size_t)STREAM_BYTES) == hipSuccess,
+          "initialize STREAM source");
+    k_stream_read_uint4<<<stream_blocks, stream_threads>>>(
+        stream_src, STREAM_BYTES / sizeof(uint4), stream_sink);
+    CHECK(hipGetLastError() == hipSuccess, "STREAM warmup launch");
+    CHECK(hipDeviceSynchronize() == hipSuccess, "STREAM warmup");
+    CHECK(hipEventRecord(start) == hipSuccess, "STREAM start");
+    for (uint32_t i = 0; i < STREAM_ITERS; ++i)
+        k_stream_read_uint4<<<stream_blocks, stream_threads>>>(
+            stream_src, STREAM_BYTES / sizeof(uint4), stream_sink);
+    CHECK(hipGetLastError() == hipSuccess, "STREAM timed launch");
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess, "STREAM stop");
+    float stream_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&stream_ms, start, stop) == hipSuccess,
+          "STREAM elapsed");
+    stream_ms /= (float)STREAM_ITERS;
+    uint4 observed_stream_sink = {};
+    CHECK(hipMemcpy(&observed_stream_sink, stream_sink,
+                    sizeof(observed_stream_sink), hipMemcpyDeviceToHost) ==
+              hipSuccess,
+          "observe STREAM sink");
+    const double stream_gbps =
+        (double)STREAM_BYTES / ((double)stream_ms * 1.0e6);
+
+    const uint64_t unique_gate_up_bytes =
+        2u * (uint64_t)owned * MID_DIM * in_blocks * Q4_K_BLOCK_BYTES;
+    const uint64_t unique_down_bytes =
+        (uint64_t)owned * OUT_DIM * mid_blocks * Q4_K_BLOCK_BYTES;
+    const uint64_t q4_blocks =
+        2u * (uint64_t)owned * MID_DIM * in_blocks +
+        (uint64_t)owned * OUT_DIM * mid_blocks;
+    const uint64_t per_block_line_ceiling_bytes = q4_blocks * 192u;
+    const double fused_warm_gbps =
+        (double)(unique_gate_up_bytes + unique_down_bytes) /
+        ((double)(fused_gate_load_warm_ms + down_load_warm_ms) * 1.0e6);
+    const double split_warm_gbps =
+        (double)(unique_gate_up_bytes + unique_down_bytes) /
+        ((double)(split_gate_load_warm_ms + down_load_warm_ms) * 1.0e6);
+    const double fused_cold_gbps =
+        (double)(unique_gate_up_bytes + unique_down_bytes) /
+        ((double)(fused_gate_load_cold_ms + down_load_cold_ms) * 1.0e6);
+    const double split_cold_gbps =
+        (double)(unique_gate_up_bytes + unique_down_bytes) /
+        ((double)(split_gate_load_cold_ms + down_load_cold_ms) * 1.0e6);
+    printf("q4k_stream_read bytes=%llu avg_ms=%.6f gbps=%.2f "
+           "sink=%08x\n",
+           (unsigned long long)STREAM_BYTES, stream_ms, stream_gbps,
+           observed_stream_sink.x ^ observed_stream_sink.y ^
+               observed_stream_sink.z ^ observed_stream_sink.w);
+    printf("q4k_load_floor owned=%u unique_mib=%.3f "
+           "per_block_line_ceiling_mib=%.3f "
+           "warm_fused_gate_up_ms=%.6f warm_split_gate_up_ms=%.6f "
+           "warm_down_ms=%.6f warm_fused_gbps=%.2f warm_split_gbps=%.2f "
+           "cold_fused_gate_up_ms=%.6f cold_split_gate_up_ms=%.6f "
+           "cold_down_ms=%.6f cold_fused_gbps=%.2f cold_split_gbps=%.2f "
+           "sink=%08x\n",
+           owned,
+           (double)(unique_gate_up_bytes + unique_down_bytes) / 1048576.0,
+           (double)per_block_line_ceiling_bytes / 1048576.0,
+           fused_gate_load_warm_ms, split_gate_load_warm_ms,
+           down_load_warm_ms, fused_warm_gbps, split_warm_gbps,
+           fused_gate_load_cold_ms, split_gate_load_cold_ms,
+           down_load_cold_ms, fused_cold_gbps, split_cold_gbps,
+           observed_load_sink);
 
     /* Independent one-wave down oracle vs CPU of the same Q4_K×Q8_K formula. */
     const uint32_t n_blocks = (uint32_t)mid_blocks;
@@ -485,17 +871,26 @@ int main(void) {
     float mmvdq_ms = 0.0f;
     CHECK(hipEventElapsedTime(&mmvdq_ms, start, stop) == hipSuccess, "mmvdq elapsed");
 
-    const float shipped_avg = shipped_ms / (float)ITERS;
+    const float shipped_warm_avg = shipped_warm_ms / (float)ITERS;
     const float packed_avg = packed_ms / (float)ITERS;
     const float mmvdq_avg = mmvdq_ms / (float)ITERS;
-    printf("test_rocm_q4k_one_token_oracle: shipped_avg_ms=%.6f "
+    printf("test_rocm_q4k_one_token_oracle: owned=%u "
+           "shipped_device_resident_avg_ms=%.6f "
            "packed_down_1024_avg_ms=%.6f mmvdq_down_1024_avg_ms=%.6f "
            "mmvdq_nrmse=%.3e shipped_fnv64=%016llx waves=1 "
            "kill_note=10pct_isolated_not_25tps\n",
-           shipped_avg, packed_avg, mmvdq_avg, nrmse,
+           owned, shipped_warm_avg, packed_avg, mmvdq_avg, nrmse,
            (unsigned long long)fnv1a64(hout_a, sizeof(hout_a)));
 
     (void)hipFree(d_w); (void)hipFree(d_q8); (void)hipFree(d_x); (void)hipFree(d_out);
+    (void)hipFree(stream_sink);
+    (void)hipFree(stream_src);
+    (void)hipFree(load_sink);
+    for (uint32_t c = 0; c < MODEL_COPIES; ++c) {
+        (void)hipFree(load_down[c]);
+        (void)hipFree(load_up[c]);
+        (void)hipFree(load_gate[c]);
+    }
     (void)hipEventDestroy(start); (void)hipEventDestroy(stop);
     ds4_gpu_tensor_free_in_place(&add_in);
     ds4_gpu_tensor_free_in_place(&x);
@@ -506,7 +901,7 @@ int main(void) {
     ds4_gpu_tensor_free_in_place(&up);
     ds4_gpu_tensor_free_in_place(&gate);
     ds4_gpu_tensor_free_in_place(&out);
-    for (int c = 0; c < COLD_COPIES; c++) free(copies[c]);
+    for (int c = 0; c < MODEL_COPIES; c++) free(copies[c]);
     free(cpu_pack); free(cpu_mmvdq); free(gpu_pack); free(gpu_mmvdq);
     ds4_gpu_cleanup();
     return 0;
