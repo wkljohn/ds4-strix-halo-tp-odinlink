@@ -36,7 +36,8 @@ static constexpr uint32_t kThreads = 256u;
 static void usage(const char *argv0) {
     std::fprintf(stderr,
         "usage: %s leader|worker ADDRESS PORT RDMA_DEVICE GID_INDEX_OR_-1 "
-        "[ITERATIONS=4000] [ARRIVAL_TIMEOUT_MS=250] [device|mapped]\n",
+        "[ITERATIONS=4000] [ARRIVAL_TIMEOUT_MS=250] [device|mapped] "
+        "[legacy|host-sync]\n",
         argv0);
 }
 
@@ -109,7 +110,7 @@ static void exchange_service(service_state *state) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 6 || argc > 9 ||
+    if (argc < 6 || argc > 10 ||
         (std::strcmp(argv[1], "leader") != 0 &&
          std::strcmp(argv[1], "worker") != 0)) {
         usage(argv[0]);
@@ -126,8 +127,11 @@ int main(int argc, char **argv) {
                                           : UINT64_C(250);
     const char *flag_allocator = argc >= 9 ? argv[8] : "device";
     const bool mapped_flag = std::strcmp(flag_allocator, "mapped") == 0;
+    const char *protocol = argc >= 10 ? argv[9] : "legacy";
+    const bool host_sync = std::strcmp(protocol, "host-sync") == 0;
     if (port <= 0 || port > 65535 || iterations < 1307u || timeout_ms == 0u ||
-        (!mapped_flag && std::strcmp(flag_allocator, "device") != 0)) {
+        (!mapped_flag && std::strcmp(flag_allocator, "device") != 0) ||
+        (!host_sync && std::strcmp(protocol, "legacy") != 0)) {
         usage(argv[0]);
         return 2;
     }
@@ -195,24 +199,26 @@ int main(int argc, char **argv) {
 
     void *arrival_host = nullptr;
     void *arrival_device = nullptr;
-    if (mapped_flag) {
-        hip_check(hipHostMalloc(&arrival_host, 64u, hipHostMallocMapped),
-                  "arrival mapped alloc");
-        hip_check(hipHostGetDevicePointer(&arrival_device, arrival_host, 0),
-                  "arrival mapped device pointer");
-        std::memset(arrival_host, 0, 64u);
-    } else {
-        hip_check(hipMalloc(&arrival_device, 64u), "arrival device alloc");
-        arrival_host = arrival_device; /* gfx1151 UMA CPU-visible device VA */
-        hip_check(hipMemset(arrival_device, 0, 64u), "clear arrival");
-    }
     void *release_host = nullptr;
     void *release_device = nullptr;
-    hip_check(hipHostMalloc(&release_host, 64u, hipHostMallocMapped),
-              "release mapped alloc");
-    hip_check(hipHostGetDevicePointer(&release_device, release_host, 0),
-              "release mapped device pointer");
-    std::memset(release_host, 0, 64u);
+    if (!host_sync) {
+        if (mapped_flag) {
+            hip_check(hipHostMalloc(&arrival_host, 64u, hipHostMallocMapped),
+                      "arrival mapped alloc");
+            hip_check(hipHostGetDevicePointer(&arrival_device, arrival_host, 0),
+                      "arrival mapped device pointer");
+            std::memset(arrival_host, 0, 64u);
+        } else {
+            hip_check(hipMalloc(&arrival_device, 64u), "arrival device alloc");
+            arrival_host = arrival_device; /* gfx1151 UMA CPU-visible device VA */
+            hip_check(hipMemset(arrival_device, 0, 64u), "clear arrival");
+        }
+        hip_check(hipHostMalloc(&release_host, 64u, hipHostMallocMapped),
+                  "release mapped alloc");
+        hip_check(hipHostGetDevicePointer(&release_device, release_host, 0),
+                  "release mapped device pointer");
+        std::memset(release_host, 0, 64u);
+    }
 
     float *shared_src = nullptr, *shared_dst = nullptr;
     float *routed_src = nullptr, *routed_dst = nullptr;
@@ -231,12 +237,17 @@ int main(int argc, char **argv) {
     hip_check(hipDeviceSynchronize(), "initialize work buffers");
 
     hipStream_t gate_stream = nullptr, shared_stream = nullptr;
-    hipEvent_t input_ready = nullptr;
-    hip_check(hipStreamCreate(&gate_stream), "blocking gate stream");
+    hipEvent_t input_ready = nullptr, producer_ready = nullptr;
+    if (!host_sync)
+        hip_check(hipStreamCreate(&gate_stream), "blocking gate stream");
     hip_check(hipStreamCreateWithFlags(&shared_stream, hipStreamNonBlocking),
               "nonblocking shared stream");
     hip_check(hipEventCreateWithFlags(&input_ready, hipEventDisableTiming),
               "input event");
+    if (host_sync)
+        hip_check(hipEventCreateWithFlags(&producer_ready,
+                                          hipEventDisableTiming),
+                  "producer event");
 
     service_state state;
     state.tp = tp;
@@ -244,11 +255,16 @@ int main(int argc, char **argv) {
     state.release = (volatile uint64_t *)release_host;
     state.iterations = iterations;
     state.timeout_ns = timeout_ms * UINT64_C(1000000);
-    std::thread service(exchange_service, &state);
+    std::thread service;
+    if (!host_sync) service = std::thread(exchange_service, &state);
 
     const uint32_t rank = leader ? 0u : 1u;
     const auto begin = std::chrono::steady_clock::now();
     bool enqueue_ok = true;
+    uint64_t producer_timeouts = 0;
+    uint64_t first_producer_timeout = 0;
+    uint64_t payload_mismatches = 0;
+    uint64_t first_payload_mismatch = 0;
     for (uint64_t seq = 1; seq <= iterations && enqueue_ok; ++seq) {
         const uint32_t gate = (uint32_t)((seq - 1u) & 1u);
         float *out = (float *)((char *)slab_device +
@@ -275,13 +291,56 @@ int main(int argc, char **argv) {
         }
         /* This host join is the exact old async-shared call shape. */
         if (err == hipSuccess) err = hipStreamSynchronize(shared_stream);
-        if (err == hipSuccess)
+        if (host_sync && err == hipSuccess) {
+            err = hipEventRecord(producer_ready, nullptr);
+            const uint64_t deadline = monotonic_ns() + state.timeout_ns;
+            while (err == hipSuccess) {
+                err = hipEventQuery(producer_ready);
+                if (err == hipSuccess) break;
+                if (err != hipErrorNotReady) break;
+                if (monotonic_ns() >= deadline) {
+                    producer_timeouts++;
+                    if (first_producer_timeout == 0)
+                        first_producer_timeout = seq;
+                    err = hipEventSynchronize(producer_ready);
+                    break;
+                }
+                err = hipSuccess;
+                for (int i = 0; i < 64; ++i) __builtin_ia32_pause();
+                std::this_thread::yield();
+            }
+            if (err == hipSuccess &&
+                !ds4_tp_gate_exchange(tp, 0u, gate, seq)) {
+                state.transport_errors.fetch_add(1,
+                                                 std::memory_order_relaxed);
+                err = hipErrorUnknown;
+            }
+            if (err == hipSuccess) {
+                const float *in = (const float *)((const char *)slab_host +
+                    ds4_tp_slab_in_offset(tp, 0u, gate));
+                const uint32_t peer_rank = 1u - rank;
+                for (uint32_t i = 0; i < kEmbd; ++i) {
+                    const float expected =
+                        (float)(peer_rank * 100000u + (uint32_t)seq) +
+                        (float)(i & 63u);
+                    if (in[i] != expected) {
+                        payload_mismatches++;
+                        if (first_payload_mismatch == 0)
+                            first_payload_mismatch = seq;
+                        break;
+                    }
+                }
+                state.completed.store(seq, std::memory_order_release);
+            }
+        } else if (err == hipSuccess) {
             err = hipStreamWriteValue64(gate_stream, arrival_device,
                                         (int64_t)seq, 0);
-        if (err == hipSuccess)
-            err = hipStreamWaitValue64(gate_stream, release_device,
-                                       (int64_t)seq,
-                                       hipStreamWaitValueGte, ~UINT64_C(0));
+            if (err == hipSuccess)
+                err = hipStreamWaitValue64(gate_stream, release_device,
+                                           (int64_t)seq,
+                                           hipStreamWaitValueGte,
+                                           ~UINT64_C(0));
+        }
         if (err != hipSuccess) {
             std::fprintf(stderr, "FAIL enqueue seq=%llu: %s\n",
                          (unsigned long long)seq, hipGetErrorString(err));
@@ -289,7 +348,7 @@ int main(int argc, char **argv) {
         }
     }
     hipError_t finish_err = hipDeviceSynchronize();
-    service.join();
+    if (service.joinable()) service.join();
     const double elapsed_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - begin).count();
 
@@ -301,33 +360,46 @@ int main(int argc, char **argv) {
         state.transport_errors.load(std::memory_order_relaxed);
     const uint64_t completed = state.completed.load(std::memory_order_relaxed);
     std::printf(
-        "TP_DUAL_STREAM_PROGRESS rank=%u provider=%s flag_allocator=%s "
+        "TP_DUAL_STREAM_PROGRESS rank=%u provider=%s protocol=%s "
+        "flag_allocator=%s "
         "iterations=%llu completed=%llu arrival_timeouts=%llu "
         "first_timeout_seq=%llu transport_errors=%llu finish=%s "
+        "producer_timeouts=%llu first_producer_timeout_seq=%llu "
+        "payload_mismatches=%llu first_payload_mismatch_seq=%llu "
         "elapsed_s=%.3f verdict=%s\n",
-        rank, device, flag_allocator,
+        rank, device, protocol, flag_allocator,
         (unsigned long long)iterations, (unsigned long long)completed,
         (unsigned long long)arrival_timeouts,
         (unsigned long long)first_timeout,
         (unsigned long long)transport_errors,
-        hipGetErrorString(finish_err), elapsed_s,
+        hipGetErrorString(finish_err),
+        (unsigned long long)producer_timeouts,
+        (unsigned long long)first_producer_timeout,
+        (unsigned long long)payload_mismatches,
+        (unsigned long long)first_payload_mismatch,
+        elapsed_s,
         enqueue_ok && finish_err == hipSuccess && !transport_errors &&
-                completed == iterations && arrival_timeouts == 0u
+                completed == iterations && arrival_timeouts == 0u &&
+                producer_timeouts == 0u && payload_mismatches == 0u
             ? "PROGRESS_PASS" :
-        enqueue_ok && finish_err == hipSuccess && !transport_errors &&
+        !host_sync && enqueue_ok && finish_err == hipSuccess &&
+                !transport_errors &&
                 completed == iterations && arrival_timeouts != 0u
             ? "LEGACY_FAILURE_REPRODUCED" : "HARNESS_FAIL");
 
+    if (producer_ready) (void)hipEventDestroy(producer_ready);
     (void)hipEventDestroy(input_ready);
     (void)hipStreamDestroy(shared_stream);
-    (void)hipStreamDestroy(gate_stream);
+    if (gate_stream) (void)hipStreamDestroy(gate_stream);
     (void)hipFree(routed_dst);
     (void)hipFree(routed_src);
     (void)hipFree(shared_dst);
     (void)hipFree(shared_src);
-    (void)hipHostFree(release_host);
-    if (mapped_flag) (void)hipHostFree(arrival_host);
-    else (void)hipFree(arrival_device);
+    if (release_host) (void)hipHostFree(release_host);
+    if (arrival_host) {
+        if (mapped_flag) (void)hipHostFree(arrival_host);
+        else (void)hipFree(arrival_device);
+    }
     ds4_tp_free(tp);
     if (host_slab) (void)hipHostFree(slab_host);
     else (void)hipFree(slab_device);
@@ -335,5 +407,6 @@ int main(int argc, char **argv) {
     /* Both clean progress and a safely released legacy failure are useful
      * diagnostic outcomes. Transport errors or incomplete cleanup are not. */
     return enqueue_ok && finish_err == hipSuccess && !transport_errors &&
-                   completed == iterations ? 0 : 1;
+                   completed == iterations && payload_mismatches == 0u &&
+                   producer_timeouts == 0u ? 0 : 1;
 }

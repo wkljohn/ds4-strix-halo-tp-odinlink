@@ -117,7 +117,8 @@ test-tp-dual-stream-progress: tests/test_tp_dual_stream_progress
 	timeout "$${PROCESS_TIMEOUT:-120}" ./tests/test_tp_dual_stream_progress \
 		"$(ROLE)" "$(ADDRESS)" "$${PORT:-5597}" "$(RDMA_DEVICE)" \
 		"$${GID_INDEX:--1}" "$${ITERATIONS:-4000}" \
-		"$${ARRIVAL_TIMEOUT_MS:-250}" "$${FLAG_ALLOCATOR:-device}"
+		"$${ARRIVAL_TIMEOUT_MS:-250}" "$${FLAG_ALLOCATOR:-device}" \
+		"$${PROTOCOL:-legacy}"
 
 tests/ds4_tp_big_gate_overlap.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1 \
