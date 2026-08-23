@@ -3797,6 +3797,28 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
     return cuda_model_range_is_cached(model_map, offset, bytes);
 }
 
+extern "C" int ds4_gpu_q4k_packed_slice_declare(
+        const void *, uint64_t, uint64_t, uint32_t, uint32_t, uint64_t,
+        uint32_t, uint32_t, uint64_t, uint64_t,
+        ds4_gpu_q4k_packed_slice_kind) {
+    return 0;
+}
+
+extern "C" int ds4_gpu_q4k_packed_slice_load(
+        const void *, uint64_t, uint32_t, uint32_t, uint64_t, uint64_t) {
+    return 0;
+}
+
+extern "C" int ds4_gpu_q4k_packed_slice_readback(
+        const void *, uint64_t, uint32_t, uint32_t, uint64_t, uint64_t,
+        void *, uint64_t) {
+    return 0;
+}
+
+extern "C" uint64_t ds4_gpu_q4k_packed_slice_bytes(void) {
+    return 0;
+}
+
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;

@@ -10188,6 +10188,42 @@ int ds4_gpu_set_model_map_spans(
     }
 }
 
+int ds4_gpu_q4k_packed_slice_declare(
+        const void *model_map, uint64_t model_size, uint64_t tensor_offset,
+        uint32_t n_expert, uint32_t source_rows,
+        uint64_t source_row_bytes, uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count,
+        ds4_gpu_q4k_packed_slice_kind kind) {
+    (void)model_map; (void)model_size; (void)tensor_offset;
+    (void)n_expert; (void)source_rows; (void)source_row_bytes;
+    (void)row_base; (void)row_count;
+    (void)column_byte_base; (void)column_byte_count; (void)kind;
+    return 0;
+}
+
+int ds4_gpu_q4k_packed_slice_load(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count) {
+    (void)model_map; (void)tensor_offset; (void)row_base; (void)row_count;
+    (void)column_byte_base; (void)column_byte_count;
+    return 0;
+}
+
+int ds4_gpu_q4k_packed_slice_readback(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count,
+        void *dst, uint64_t bytes) {
+    (void)model_map; (void)tensor_offset; (void)row_base; (void)row_count;
+    (void)column_byte_base; (void)column_byte_count; (void)dst; (void)bytes;
+    return 0;
+}
+
+uint64_t ds4_gpu_q4k_packed_slice_bytes(void) {
+    return 0;
+}
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }

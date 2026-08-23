@@ -74,6 +74,26 @@ struct cuda_model_image {
     uint64_t device_offset;
 };
 
+struct cuda_q4k_packed_slice {
+    const void *host_base;
+    uint64_t model_size;
+    uint64_t tensor_offset;
+    uint64_t source_tensor_bytes;
+    uint64_t source_expert_bytes;
+    uint64_t source_row_bytes;
+    uint64_t packed_expert_bytes;
+    uint64_t packed_bytes;
+    uint64_t column_byte_base;
+    uint64_t column_byte_count;
+    uint32_t n_expert;
+    uint32_t source_rows;
+    uint32_t row_base;
+    uint32_t row_count;
+    ds4_gpu_q4k_packed_slice_kind kind;
+    char *device_ptr;
+    int blocked_logged;
+};
+
 struct cuda_q8_f16_range {
     const void *host_base;
     uint64_t offset;
@@ -276,12 +296,15 @@ struct cuda_stream_cache_layer_stats {
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::vector<cuda_model_image> g_model_images;
+static std::vector<cuda_q4k_packed_slice> g_q4k_packed_slices;
+static std::unordered_multimap<uint64_t, size_t> g_q4k_packed_by_offset;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f16_transpose_range> g_q8_f16_transpose_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_transpose_by_offset;
 static uint64_t g_model_range_bytes;
+static uint64_t g_q4k_packed_slice_bytes;
 static uint64_t g_q8_f16_bytes;
 static int g_q8_f16_disabled_after_oom;
 static int g_q8_f16_disabled_for_multi_model;
@@ -646,7 +669,94 @@ static uint64_t cuda_model_image_bytes(void) {
     return bytes;
 }
 
+static cuda_q4k_packed_slice *cuda_q4k_packed_slice_find(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count) {
+    const auto range = g_q4k_packed_by_offset.equal_range(tensor_offset);
+    for (auto it = range.first; it != range.second; ++it) {
+        cuda_q4k_packed_slice &p = g_q4k_packed_slices[it->second];
+        if (p.host_base == model_map && p.row_base == row_base &&
+            p.row_count == row_count &&
+            p.column_byte_base == column_byte_base &&
+            p.column_byte_count == column_byte_count) return &p;
+    }
+    return NULL;
+}
+
+static cuda_q4k_packed_slice *cuda_q4k_packed_slice_intersection(
+        const void *model_map, uint64_t offset, uint64_t bytes) {
+    if (!model_map || bytes == 0u || offset > UINT64_MAX - bytes) return NULL;
+    const uint64_t end = offset + bytes;
+    for (cuda_q4k_packed_slice &p : g_q4k_packed_slices) {
+        if (p.host_base != model_map ||
+            p.tensor_offset > UINT64_MAX - p.source_tensor_bytes) continue;
+        const uint64_t p_end = p.tensor_offset + p.source_tensor_bytes;
+        if (offset < p_end && p.tensor_offset < end) return &p;
+    }
+    return NULL;
+}
+
+static int cuda_u64_ranges_overlap(
+        uint64_t a_offset, uint64_t a_bytes,
+        uint64_t b_offset, uint64_t b_bytes) {
+    if (a_bytes == 0u || b_bytes == 0u ||
+        a_offset > UINT64_MAX - a_bytes ||
+        b_offset > UINT64_MAX - b_bytes) return 0;
+    return a_offset < b_offset + b_bytes && b_offset < a_offset + a_bytes;
+}
+
+static int cuda_q4k_linear_residency_intersection(
+        const void *model_map, uint64_t offset, uint64_t bytes);
+
+static int cuda_q4k_packed_slice_refuse_linear(
+        const void *model_map, uint64_t offset, uint64_t bytes,
+        const char *what) {
+    cuda_q4k_packed_slice *p =
+        cuda_q4k_packed_slice_intersection(model_map, offset, bytes);
+    if (!p) return 0;
+    if (!p->blocked_logged) {
+        p->blocked_logged = 1;
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "refusing linear model resolution for packed Q4_K routed "
+                "tensor at offset %.2f GiB (%s); packed descriptor required\n",
+                (double)p->tensor_offset / 1073741824.0,
+                what ? what : "weights");
+    }
+    return 1;
+}
+
+static int cuda_q4k_packed_slice_refuse_routed_tables(
+        const void *model_map, uint32_t n_total_expert,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        const char *what) {
+    uint64_t gate_bytes = 0;
+    uint64_t down_bytes = 0;
+    if (!cuda_u64_mul_checked(n_total_expert, gate_expert_bytes,
+                              &gate_bytes) ||
+        !cuda_u64_mul_checked(n_total_expert, down_expert_bytes,
+                              &down_bytes)) return 1;
+    return cuda_q4k_packed_slice_refuse_linear(
+               model_map, gate_offset, gate_bytes, what) ||
+           cuda_q4k_packed_slice_refuse_linear(
+               model_map, up_offset, gate_bytes, what) ||
+           cuda_q4k_packed_slice_refuse_linear(
+               model_map, down_offset, down_bytes, what);
+}
+
+static void cuda_q4k_packed_slice_release_all(void) {
+    for (cuda_q4k_packed_slice &p : g_q4k_packed_slices) {
+        if (p.device_ptr) (void)cudaFree(p.device_ptr);
+        p.device_ptr = NULL;
+    }
+    g_q4k_packed_slices.clear();
+    g_q4k_packed_by_offset.clear();
+    g_q4k_packed_slice_bytes = 0;
+}
+
 static void cuda_model_image_release_all(void) {
+    cuda_q4k_packed_slice_release_all();
     for (const cuda_model_image &img : g_model_images) {
         if (img.device_ptr) (void)cudaFree(img.device_ptr);
     }
@@ -1904,6 +2014,42 @@ struct cuda_stream_selected_pending {
 
 static cuda_stream_selected_pending g_stream_selected_pending;
 
+static int cuda_q4k_linear_residency_intersection(
+        const void *model_map, uint64_t offset, uint64_t bytes) {
+    if (!model_map || bytes == 0u || offset > UINT64_MAX - bytes) return 1;
+    for (const cuda_model_image &img : g_model_images) {
+        if (img.host_base == model_map &&
+            cuda_u64_ranges_overlap(offset, bytes,
+                                    img.device_offset, img.size)) return 1;
+    }
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map &&
+            cuda_u64_ranges_overlap(offset, bytes, r.offset, r.bytes)) {
+            return 1;
+        }
+    }
+    /* Stream caches contain routed-table fragments outside g_model_ranges.
+     * Descriptor declaration is a startup operation, so any live cache for
+     * this model makes the transition ambiguous and must be rejected. */
+    if ((g_stream_selected_cache.loaded &&
+         g_stream_selected_cache.model_map == model_map) ||
+        (g_stream_batch_selected_cache.loaded &&
+         g_stream_batch_selected_cache.model_map == model_map) ||
+        (g_stream_selected_pending.active &&
+         g_stream_selected_pending.model_map == model_map) ||
+        (g_stream_batch_selected_pending.active &&
+         g_stream_batch_selected_pending.model_map == model_map)) return 1;
+    for (const cuda_stream_layer_expert_cache &c :
+         g_stream_layer_expert_cache) {
+        if (c.active && c.model_map == model_map) return 1;
+    }
+    for (const cuda_stream_resident_expert &e :
+         g_stream_resident_experts) {
+        if (e.model_map == model_map) return 1;
+    }
+    return 0;
+}
+
 typedef struct cuda_stream_read_profile_span {
     uint64_t offset;
     uint64_t end;
@@ -2660,6 +2806,10 @@ static int cuda_stream_layer_expert_cache_apply(
         const char **up_w,
         const char **down_w) {
     if (!g_ssd_streaming_mode || !gate_w || !up_w || !down_w) return 0;
+    if (cuda_q4k_packed_slice_refuse_routed_tables(
+            model_map, n_total_expert, gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            "streaming full-layer expert cache apply")) return 0;
     for (uint32_t i = 0; i < 2u; i++) {
         const cuda_stream_layer_expert_cache &c = g_stream_layer_expert_cache[i];
         if (c.active &&
@@ -2714,6 +2864,10 @@ static int cuda_stream_layer_expert_cache_load(
         return 0;
     }
     total_bytes = gate_pair_bytes + down_bytes;
+    if (cuda_q4k_packed_slice_refuse_routed_tables(
+            model_map, n_total_expert, gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            "streaming full-layer expert cache load")) return 0;
     if (cuda_stream_cache_stats_on()) {
         g_stream_cache_stats.layer_loads++;
         g_stream_cache_stats.layer_load_bytes += total_bytes;
@@ -2849,6 +3003,10 @@ static int cuda_stream_resident_seed_experts(
                 DS4_GPU_LOG_PREFIX "streaming hotlist seed expert range outside model map\n");
         return 0;
     }
+    if (cuda_q4k_packed_slice_refuse_routed_tables(
+            model_map, n_total_expert, gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            "streaming resident expert seed")) return 0;
 
     uint32_t seed_cap = n_experts < g_stream_expert_cache_budget ?
         n_experts : g_stream_expert_cache_budget;
@@ -3284,6 +3442,10 @@ static int cuda_stream_batch_selected_prepare_from_host(
         cuda_stream_selected_abort_pending();
     }
     g_stream_batch_selected_cache.loaded = 0;
+    if (cuda_q4k_packed_slice_refuse_routed_tables(
+            model_map, n_total_expert, gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            "streaming batch selected experts")) return 0;
 
     uint64_t n_ids64 = 0;
     if (!cuda_u64_mul_checked(n_tokens, n_selected, &n_ids64) ||
@@ -4202,6 +4364,10 @@ static int cuda_stream_selected_load(
         down_expert_bytes == 0) {
         return 0;
     }
+    if (cuda_q4k_packed_slice_refuse_routed_tables(
+            model_map, n_total_expert, gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            "streaming selected experts")) return 0;
     uint64_t gate_bytes = 0;
     uint64_t down_bytes = 0;
     if (!cuda_u64_mul_checked(n_selected, gate_expert_bytes, &gate_bytes) ||
@@ -5086,6 +5252,9 @@ static int cuda_dspark_prepare_selected_experts(
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
+    if (cuda_q4k_packed_slice_refuse_linear(model_map, offset, bytes, what)) {
+        return NULL;
+    }
     const char *image_ptr =
         cuda_model_image_range_ptr(model_map, offset, bytes);
     if (image_ptr) return image_ptr;
@@ -6007,6 +6176,272 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
+extern "C" int ds4_gpu_q4k_packed_slice_declare(
+        const void *model_map, uint64_t model_size, uint64_t tensor_offset,
+        uint32_t n_expert, uint32_t source_rows,
+        uint64_t source_row_bytes, uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count,
+        ds4_gpu_q4k_packed_slice_kind kind) {
+    if (!model_map || model_size == 0u || n_expert == 0u ||
+        n_expert > DS4_ROCM_MAX_N_EXPERT || source_rows == 0u ||
+        source_row_bytes == 0u ||
+        (source_row_bytes % sizeof(cuda_block_q4_K)) != 0u ||
+        row_count == 0u || row_base > source_rows ||
+        row_count > source_rows - row_base ||
+        column_byte_count == 0u ||
+        (column_byte_base % sizeof(cuda_block_q4_K)) != 0u ||
+        (column_byte_count % sizeof(cuda_block_q4_K)) != 0u ||
+        column_byte_base > source_row_bytes ||
+        column_byte_count > source_row_bytes - column_byte_base ||
+        (kind != DS4_GPU_Q4K_PACKED_ROW_RANGE &&
+         kind != DS4_GPU_Q4K_PACKED_K_RANGE)) return 0;
+    if (kind == DS4_GPU_Q4K_PACKED_ROW_RANGE &&
+        (column_byte_base != 0u ||
+         column_byte_count != source_row_bytes ||
+         (row_base % CUDA_QK_K) != 0u ||
+         (row_count % CUDA_QK_K) != 0u)) return 0;
+    if (kind == DS4_GPU_Q4K_PACKED_K_RANGE &&
+        (row_base != 0u || row_count != source_rows)) return 0;
+
+    uint64_t source_expert_bytes = 0, source_tensor_bytes = 0;
+    uint64_t packed_expert_bytes = 0, packed_bytes = 0;
+    if (!cuda_u64_mul_checked(source_rows, source_row_bytes,
+                              &source_expert_bytes) ||
+        !cuda_u64_mul_checked(n_expert, source_expert_bytes,
+                              &source_tensor_bytes) ||
+        !cuda_u64_mul_checked(row_count, column_byte_count,
+                              &packed_expert_bytes) ||
+        !cuda_u64_mul_checked(n_expert, packed_expert_bytes,
+                              &packed_bytes) ||
+        packed_bytes > (uint64_t)SIZE_MAX ||
+        tensor_offset > model_size ||
+        source_tensor_bytes > model_size - tensor_offset) return 0;
+
+    if (cuda_q4k_linear_residency_intersection(
+            model_map, tensor_offset, source_tensor_bytes)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K declaration refused because the source tensor "
+                "already has linear device residency\n");
+        return 0;
+    }
+
+    cuda_q4k_packed_slice *existing = cuda_q4k_packed_slice_find(
+        model_map, tensor_offset, row_base, row_count,
+        column_byte_base, column_byte_count);
+    if (existing) {
+        return existing->model_size == model_size &&
+               existing->n_expert == n_expert &&
+               existing->source_rows == source_rows &&
+               existing->source_row_bytes == source_row_bytes &&
+               existing->kind == kind;
+    }
+    const size_t index = g_q4k_packed_slices.size();
+    g_q4k_packed_slices.push_back({
+        model_map, model_size, tensor_offset, source_tensor_bytes,
+        source_expert_bytes, source_row_bytes, packed_expert_bytes,
+        packed_bytes, column_byte_base, column_byte_count, n_expert,
+        source_rows, row_base, row_count, kind, NULL, 0});
+    g_q4k_packed_by_offset.emplace(tensor_offset, index);
+    return 1;
+}
+
+extern "C" int ds4_gpu_q4k_packed_slice_load(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count) {
+    cuda_q4k_packed_slice *p = cuda_q4k_packed_slice_find(
+        model_map, tensor_offset, row_base, row_count,
+        column_byte_base, column_byte_count);
+    if (!p) return 0;
+    if (p->device_ptr) return 1;
+    if (g_model_fd >= 0 && g_model_fd_host_base != model_map) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K loader model-fd/map mismatch\n");
+        return 0;
+    }
+
+    void *dev = NULL;
+    cudaError_t err = cudaMalloc(&dev, (size_t)p->packed_bytes);
+    if (err != cudaSuccess || !dev) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K slice allocation failed (%.2f MiB): %s\n",
+                (double)p->packed_bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    const int use_fd_staging = g_model_fd >= 0;
+    const int strided = p->column_byte_base != 0u ||
+                        p->column_byte_count != p->source_row_bytes;
+    uint64_t source_window_bytes = 0;
+    if (!cuda_u64_mul_checked(p->row_count, p->source_row_bytes,
+                              &source_window_bytes)) {
+        (void)cudaFree(dev);
+        return 0;
+    }
+    void *packed_raw[4] = {};
+    char *packed_stage[4] = {};
+    std::vector<char> host_pack;
+    int ok = 1;
+
+    if (use_fd_staging) {
+        uint64_t stage_need = strided ? source_window_bytes :
+                                        p->packed_expert_bytes;
+        if (!cuda_u64_add_checked(
+                stage_need,
+                g_model_direct_align > 1u ? g_model_direct_align : 1u,
+                &stage_need) ||
+            !cuda_model_stage_pool_alloc(stage_need)) ok = 0;
+        if (ok && strided) {
+            uint64_t alloc_bytes = p->packed_expert_bytes;
+            const uint64_t pad = g_model_direct_align > 1u ?
+                                 g_model_direct_align - 1u : 0u;
+            if (!cuda_u64_add_checked(alloc_bytes, pad, &alloc_bytes) ||
+                alloc_bytes > (uint64_t)SIZE_MAX) ok = 0;
+            for (uint32_t i = 0; ok && i < 4u; i++) {
+                err = cudaMallocHost(&packed_raw[i], (size_t)alloc_bytes);
+                if (err != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    ok = 0;
+                } else {
+                    packed_stage[i] = (char *)cuda_align_ptr(
+                        packed_raw[i], g_model_direct_align);
+                }
+            }
+        }
+    } else if (strided) {
+        try {
+            host_pack.resize((size_t)p->packed_expert_bytes);
+        } catch (...) {
+            ok = 0;
+        }
+    }
+
+    for (uint32_t expert = 0; ok && expert < p->n_expert; expert++) {
+        const uint64_t src_offset = p->tensor_offset +
+            (uint64_t)expert * p->source_expert_bytes +
+            (uint64_t)p->row_base * p->source_row_bytes;
+        char *dst = (char *)dev +
+                    (uint64_t)expert * p->packed_expert_bytes;
+        if (use_fd_staging) {
+            const uint32_t bi = expert % 4u;
+            if (expert >= 4u &&
+                (err = cudaEventSynchronize(g_model_stage_event[bi])) !=
+                    cudaSuccess) {
+                ok = 0;
+                break;
+            }
+            const char *payload = NULL;
+            const uint64_t read_bytes = strided ? source_window_bytes :
+                                                  p->packed_expert_bytes;
+            if (!cuda_model_stage_read(g_model_stage[bi],
+                                       g_model_stage_bytes, src_offset,
+                                       read_bytes, &payload)) {
+                ok = 0;
+                break;
+            }
+            const char *upload = payload;
+            if (strided) {
+                for (uint32_t row = 0; row < p->row_count; row++) {
+                    memcpy(packed_stage[bi] +
+                               (uint64_t)row * p->column_byte_count,
+                           payload + (uint64_t)row * p->source_row_bytes +
+                               p->column_byte_base,
+                           (size_t)p->column_byte_count);
+                }
+                upload = packed_stage[bi];
+            }
+            err = cudaMemcpyAsync(dst, upload,
+                                  (size_t)p->packed_expert_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+            if (err != cudaSuccess ||
+                (err = cudaEventRecord(g_model_stage_event[bi],
+                                       g_model_upload_stream)) !=
+                    cudaSuccess) {
+                ok = 0;
+                break;
+            }
+            cuda_model_drop_file_pages(src_offset, read_bytes);
+            cuda_model_discard_source_pages(
+                model_map, p->model_size, src_offset, read_bytes);
+        } else if (!strided) {
+            err = cudaMemcpy(dst, (const char *)model_map + src_offset,
+                             (size_t)p->packed_expert_bytes,
+                             cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) ok = 0;
+        } else {
+            const char *src = (const char *)model_map + src_offset;
+            for (uint32_t row = 0; row < p->row_count; row++) {
+                memcpy(host_pack.data() +
+                           (uint64_t)row * p->column_byte_count,
+                       src + (uint64_t)row * p->source_row_bytes +
+                           p->column_byte_base,
+                       (size_t)p->column_byte_count);
+            }
+            err = cudaMemcpy(dst, host_pack.data(),
+                             (size_t)p->packed_expert_bytes,
+                             cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) ok = 0;
+        }
+    }
+    if (use_fd_staging) {
+        const cudaError_t sync_err = cudaStreamSynchronize(g_model_upload_stream);
+        if (sync_err != cudaSuccess) {
+            err = sync_err;
+            ok = 0;
+        }
+    }
+    for (uint32_t i = 0; i < 4u; i++) {
+        if (packed_raw[i]) (void)cudaFreeHost(packed_raw[i]);
+    }
+    if (!ok) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K slice load failed at offset %.2f GiB: %s\n",
+                (double)p->tensor_offset / 1073741824.0,
+                err == cudaSuccess ? strerror(errno) : cudaGetErrorString(err));
+        (void)cudaFree(dev);
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    p->device_ptr = (char *)dev;
+    g_q4k_packed_slice_bytes += p->packed_bytes;
+    cuda_model_load_progress_note(g_model_range_bytes +
+                                  g_q4k_packed_slice_bytes);
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+            "loaded packed Q4_K routed slice offset=%.2f GiB "
+            "rows=%u:%u columns=%llu:%llu experts=%u bytes=%.2f MiB "
+            "kind=%s\n",
+            (double)p->tensor_offset / 1073741824.0,
+            p->row_base, p->row_base + p->row_count,
+            (unsigned long long)p->column_byte_base,
+            (unsigned long long)(p->column_byte_base +
+                                 p->column_byte_count),
+            p->n_expert, (double)p->packed_bytes / 1048576.0,
+            p->kind == DS4_GPU_Q4K_PACKED_ROW_RANGE ? "row" : "K");
+    return 1;
+}
+
+extern "C" int ds4_gpu_q4k_packed_slice_readback(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count,
+        void *dst, uint64_t bytes) {
+    cuda_q4k_packed_slice *p = cuda_q4k_packed_slice_find(
+        model_map, tensor_offset, row_base, row_count,
+        column_byte_base, column_byte_count);
+    if (!p || !p->device_ptr || !dst || bytes != p->packed_bytes) return 0;
+    return cuda_ok(cudaMemcpy(dst, p->device_ptr, (size_t)bytes,
+                              cudaMemcpyDeviceToHost),
+                   "packed Q4_K slice readback");
+}
+
+extern "C" uint64_t ds4_gpu_q4k_packed_slice_bytes(void) {
+    return g_q4k_packed_slice_bytes;
+}
+
 static uint64_t cuda_model_cache_limit_bytes(void) {
     if (!g_ssd_streaming_mode) return UINT64_MAX;
     const char *env = getenv("DS4_ROCM_STREAM_MODEL_CACHE_GB");
@@ -6144,6 +6579,9 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t bytes,
         const char *what) {
     if (g_model_fd < 0 || bytes == 0) return NULL;
+    if (cuda_q4k_packed_slice_refuse_linear(model_map, offset, bytes, what)) {
+        return NULL;
+    }
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
@@ -6241,6 +6679,8 @@ static const char *cuda_model_range_ptr_from_fd(
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!model_map || model_size == 0 || map_offset > model_size || map_size > model_size - map_offset) return 0;
     if (map_size == 0) return 0;
+    if (cuda_q4k_packed_slice_refuse_linear(
+            model_map, map_offset, map_size, "chunked model image")) return 0;
     if (cuda_model_image_range_ptr(model_map, map_offset, map_size)) return 1;
 
     void *dev = NULL;
@@ -7470,6 +7910,12 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
         map_size > model_size - map_offset) {
         return 0;
     }
+    if (cuda_q4k_packed_slice_intersection(model_map, map_offset, map_size)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "model range intersects a declared packed Q4_K routed "
+                "tensor; refusing linear residency\n");
+        return 0;
+    }
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
     if (g_ssd_streaming_mode) {
         const uint64_t limit = cuda_model_cache_limit_bytes();
@@ -7519,6 +7965,13 @@ extern "C" int ds4_gpu_set_model_map_spans(
         if (offsets[i] > model_size ||
             sizes[i] == 0 ||
             sizes[i] > model_size - offsets[i]) {
+            return 0;
+        }
+        if (cuda_q4k_packed_slice_intersection(
+                model_map, offsets[i], sizes[i])) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "model span %u intersects a declared packed Q4_K "
+                    "routed tensor; refusing linear residency\n", i);
             return 0;
         }
     }
