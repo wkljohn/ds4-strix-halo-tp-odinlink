@@ -310,6 +310,7 @@ static ds4_tp_ffn_range_record *g_tp_ffn_range_host[2] = {};
 static ds4_tp_ffn_range_record *g_tp_ffn_range_device[2] = {};
 static ds4_tp_ffn_range_total g_tp_ffn_range_total[2] = {};
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
 /* PROFILE-only route records share the row-gate ordering contract.  A tiny
  * kernel writes the six selected IDs' ownership count into mapped memory
  * before the FFN producer kernels.  The gate callback consumes it only after
@@ -396,6 +397,21 @@ static void ds4_tp_route_profile_print(void) {
                 (unsigned long long)g_tp_route_sample_dropped);
     }
 }
+#else
+static inline int ds4_tp_route_profile_enabled(void) {
+    return 0;
+}
+
+static inline void ds4_tp_route_profile_consume(
+        int ch, uint64_t seq, const ds4_tp_req *req) {
+    (void)ch;
+    (void)seq;
+    (void)req;
+}
+
+static inline void ds4_tp_route_profile_print(void) {
+}
+#endif
 
 static inline int ds4_tp_ffn_range_enabled(void) {
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
@@ -960,8 +976,11 @@ static void *ds4_tp_service_thread(void *arg) {
 #endif
     const int aux_profile_enabled =
         (ds4_tp_ffn_range_enabled() &&
-         g_tp_ffn_range_host[0] && g_tp_ffn_range_host[1]) ||
-        (ds4_tp_route_profile_enabled() && g_tp_route_host);
+         g_tp_ffn_range_host[0] && g_tp_ffn_range_host[1])
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+        || (ds4_tp_route_profile_enabled() && g_tp_route_host)
+#endif
+        ;
     struct ds4_tp_interval_profile profile = {};
     profile.next_report = 500;
     while (g_tp_run) {
@@ -1039,8 +1058,10 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
     g_tp_split_rank = rank;
     g_tp_split_world = 2;   /* ds4 TP is always a two-way split */
     memset(g_tp_ffn_range_total, 0, sizeof(g_tp_ffn_range_total));
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     g_tp_route_sample_count = 0;
     g_tp_route_sample_dropped = 0;
+#endif
     {
         const char *timeout = getenv("DS4_TP_TIMEOUT_SEC");
         char *end = NULL;
@@ -1181,6 +1202,7 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
             g_tp_ffn_range_device[ch] = (ds4_tp_ffn_range_record *)device;
         }
     }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (ds4_tp_route_profile_enabled()) {
         void *host = NULL;
         void *device = NULL;
@@ -1198,6 +1220,7 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
             g_tp_route_device = (ds4_tp_route_record *)device;
         }
     }
+#endif
     g_tp_run = 1;
     g_tp_thread_started = 0;
     if (!g_tp_host_sync &&
@@ -1211,9 +1234,11 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank,
             g_tp_ffn_range_host[ch] = NULL;
             g_tp_ffn_range_device[ch] = NULL;
         }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
         if (g_tp_route_host) (void)hipHostFree(g_tp_route_host);
         g_tp_route_host = NULL;
         g_tp_route_device = NULL;
+#endif
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tp_init: service thread failed\n");
         return 0;
     }
@@ -1285,9 +1310,11 @@ extern "C" void ds4_gpu_tp_shutdown(void) {
         g_tp_ffn_range_host[ch] = NULL;
         g_tp_ffn_range_device[ch] = NULL;
     }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     if (g_tp_route_host) (void)hipHostFree(g_tp_route_host);
     g_tp_route_host = NULL;
     g_tp_route_device = NULL;
+#endif
     g_tp_fn = NULL; g_tp_ud = NULL;
     g_tp_host_sync = 0;
     g_tp_host_callback = 0;
@@ -1650,6 +1677,7 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     return ds4_tp_encode(0, &r);
 }
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
 extern "C" void ds4_gpu_tp_route_profile(
         const ds4_gpu_tensor *selected, uint32_t n_selected,
         uint32_t layer, uint32_t pos) {
@@ -1668,6 +1696,7 @@ extern "C" void ds4_gpu_tp_route_profile(
                 layer, pos, hipGetErrorString(err));
     }
 }
+#endif
 
 extern "C" void ds4_gpu_tp_ffn_range_profile(const ds4_gpu_tensor *tensor,
                                                 uint64_t elements,
