@@ -43,6 +43,11 @@ by default. Set `Q4K_KSHARD_RESEARCH=0` or
 `ATTN_DECODE_SEQTILE_RESEARCH=0` in the deployment config for a symmetric
 rollback on both ranks.
 
+The deployment profile enables the long-context ratio-4 sequence tile after
+the 1,024 compressed-row handoff. Set
+`ATTN_DECODE_INDEXED_SEQTILE_RESEARCH=0` for a symmetric rollback to indexed
+old-HIP attention on both ranks.
+
 On the 96 GiB reference nodes the optional resident DSpark profile settles near
 97--98% reported VRAM use and leaves little safety margin. Ordinary production
 decode has more headroom. Do not add resident sessions or enable the
