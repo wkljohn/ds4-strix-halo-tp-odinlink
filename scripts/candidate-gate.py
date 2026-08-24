@@ -311,6 +311,274 @@ def load_baseline(root: Path, baseline_id: str) -> tuple[Path, dict]:
     return path, value
 
 
+def verify_review_evidence(root: Path, evidence: object,
+                           label: str) -> list[dict]:
+    if not isinstance(evidence, list):
+        raise GateError(f"{label} requires review evidence")
+    review_kinds = set()
+    for item in evidence:
+        if (not isinstance(item, dict) or item.get("kind") not in
+                {"fable-review", "grok-review"} or
+                not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))):
+            raise GateError(f"{label} has invalid review evidence")
+        path = Path(str(item.get("path", ""))).resolve()
+        if path != root and root not in path.parents:
+            raise GateError(f"{label} review escapes canonical research root")
+        if not path.is_file() or sha256(path) != item["sha256"]:
+            raise GateError(f"{label} review hash mismatch")
+        review_kinds.add(item["kind"])
+    if review_kinds != {"fable-review", "grok-review"}:
+        raise GateError(f"{label} requires both Fable and Grok reviews")
+    return evidence
+
+
+def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
+    """Create the first immutable numerical baseline from recomputable evidence."""
+    genesis_path = genesis_path.resolve()
+    if genesis_path != root and root not in genesis_path.parents:
+        raise GateError("baseline genesis must live in the canonical research root")
+    try:
+        genesis = json.loads(genesis_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise GateError(f"invalid baseline genesis: {error}") from error
+    if (genesis.get("schema_version") != 1 or
+            genesis.get("kind") != "ds4-baseline-genesis" or
+            not ID_RE.fullmatch(str(genesis.get("genesis_id", ""))) or
+            not isinstance(genesis.get("rationale"), str) or
+            not genesis["rationale"].strip()):
+        raise GateError("invalid baseline genesis identity or rationale")
+    reviews = verify_review_evidence(root, genesis.get("evidence"),
+                                     "baseline genesis")
+    record = genesis.get("record")
+    artifacts = genesis.get("artifacts")
+    if not isinstance(record, dict) or not isinstance(artifacts, dict):
+        raise GateError("baseline genesis requires record and artifacts objects")
+    record = json.loads(json.dumps(record))
+    if (record.get("schema_version") != 1 or
+            record.get("kind") != "ds4-numerical-baseline"):
+        raise GateError("baseline genesis record has an unsupported schema")
+    for section in ("key", "reference", "thresholds"):
+        if not isinstance(record.get(section), dict):
+            raise GateError(f"baseline genesis record is missing {section}")
+
+    key = record["key"]
+    reference = record["reference"]
+    if ("oracle_numerical" in reference or
+            "oracle_numerical" in record["thresholds"] or
+            record.get("oracle_generators") not in (None, [])):
+        raise GateError(
+            "baseline genesis cannot preapprove canonical oracles or generators")
+    workload = key.get("workload")
+    if (not isinstance(workload, dict) or key.get("architecture") != "gfx1151" or
+            key.get("tp_degree") != 2 or key.get("expert_split") != "128/128" or
+            key.get("decode_mode") != "ordinary-greedy"):
+        raise GateError("baseline genesis is not balanced ordinary gfx1151 TP=2")
+    if (not re.fullmatch(r"[0-9a-f]{40}", str(key.get("source_commit", ""))) or
+            not isinstance(key.get("toolchain_id"), str) or
+            not key["toolchain_id"]):
+        raise GateError("baseline genesis requires source and toolchain identity")
+    fnv = str(reference.get("fnv64", "")).lower()
+    if not re.fullmatch(r"[0-9a-f]{16}", fnv):
+        raise GateError("baseline genesis has an invalid reference fingerprint")
+    providers = key.get("rdma_providers")
+    if (not isinstance(providers, list) or
+            set(providers) != {"odinlink", "roce-v2"}):
+        raise GateError("baseline genesis requires OdinLink and RoCE v2")
+
+    model_path = Path(str(artifacts.get("model_path", "")))
+    if not model_path.is_absolute() or not model_path.is_file():
+        raise GateError("baseline genesis model path is invalid")
+    model_size, model_sample = sampled_model_sha256(model_path)
+    if (model_size != key.get("model_size") or
+            model_sample != key.get("model_sample_sha256") or
+            sha256(model_path) != key.get("model_sha256")):
+        raise GateError("baseline genesis model identity mismatch")
+
+    benchmark_items = artifacts.get("benchmarks")
+    if not isinstance(benchmark_items, list):
+        raise GateError("baseline genesis requires benchmark artifacts")
+    provider_counts = {provider: 0 for provider in providers}
+    run_ids = set()
+    binary_hashes = set()
+    for item in benchmark_items:
+        if (not isinstance(item, dict) or
+                not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", ""))) or
+                not re.fullmatch(r"[0-9a-f]{64}",
+                                 str(item.get("manifest_sha256", "")))):
+            raise GateError("baseline genesis has invalid benchmark binding")
+        csv_path = Path(str(item.get("path", ""))).resolve()
+        if csv_path != root and root not in csv_path.parents:
+            raise GateError("baseline genesis benchmark escapes canonical root")
+        if not csv_path.is_file() or sha256(csv_path) != item["sha256"]:
+            raise GateError("baseline genesis benchmark hash mismatch")
+        row, manifest, manifest_path = read_benchmark(csv_path)
+        if sha256(manifest_path) != item["manifest_sha256"]:
+            raise GateError("baseline genesis benchmark manifest hash mismatch")
+        provider = manifest.get("rdma_profile")
+        if provider not in provider_counts:
+            raise GateError("baseline genesis benchmark used an undeclared provider")
+        provider_counts[provider] += 1
+        run_id = manifest.get("run_id")
+        if not run_id or run_id in run_ids:
+            raise GateError("baseline genesis benchmark run IDs are not distinct")
+        run_ids.add(run_id)
+        if (row["gen_token_fnv64"].lower() != fnv or
+                manifest.get("source_dirty") != "0" or
+                manifest.get("source_commit") != key.get("source_commit") or
+                manifest.get("model_size") != str(model_size) or
+                manifest.get("model_sample_sha256") != model_sample or
+                manifest.get("toolchain_id") != key.get("toolchain_id") or
+                manifest.get("dspark") != "0"):
+            raise GateError("baseline genesis benchmark identity mismatch")
+        for field in ("prompt_sha256", "frontier", "generated_tokens",
+                      "context", "prefill_chunk", "dspark"):
+            if manifest.get(field) != str(workload.get(field, "")):
+                raise GateError(f"baseline genesis benchmark differs in {field}")
+        local_binary = str(manifest.get("ds4_sha256", ""))
+        peer_binary = str(manifest.get("peer_ds4_sha256", ""))
+        if (not re.fullmatch(r"[0-9a-f]{64}", local_binary) or
+                not re.fullmatch(r"[0-9a-f]{64}", peer_binary) or
+                local_binary != peer_binary):
+            raise GateError("baseline genesis binaries differed across ranks")
+        binary_hashes.add(local_binary)
+    if any(count < 3 for count in provider_counts.values()):
+        raise GateError("baseline genesis requires three runs per RDMA provider")
+    if len(binary_hashes) != 1:
+        raise GateError("baseline genesis benchmarks used different binaries")
+
+    token_path = Path(str(artifacts.get("frozen_token_file", ""))).resolve()
+    if token_path != root and root not in token_path.parents:
+        raise GateError("baseline genesis frozen-token file escapes canonical root")
+    if (not token_path.is_file() or
+            sha256(token_path) != workload.get("frozen_token_sha256")):
+        raise GateError("baseline genesis frozen-token identity mismatch")
+
+    numerical_dir = Path(str(artifacts.get("numerical_dir", ""))).resolve()
+    if numerical_dir != root and root not in numerical_dir.parents:
+        raise GateError("baseline genesis numerical directory escapes canonical root")
+    numerical = reference.get("numerical")
+    if not isinstance(numerical, dict) or not isinstance(numerical.get("files"), list):
+        raise GateError("baseline genesis numerical reference is missing")
+    numerical_manifest = numerical_dir / "manifest"
+    if (not numerical_manifest.is_file() or
+            sha256(numerical_manifest) != numerical.get("manifest_sha256")):
+        raise GateError("baseline genesis numerical manifest mismatch")
+    numerical_values = read_manifest(numerical_manifest)
+    if (numerical_values.get("model_size") != str(model_size) or
+            numerical_values.get("model_sample_sha256") != model_sample or
+            numerical_values.get("source_commit") != key.get("source_commit") or
+            numerical_values.get("source_dirty") != "0" or
+            numerical_values.get("toolchain_id") != key.get("toolchain_id") or
+            numerical_values.get("prefix_tokens") != str(workload.get("frontier")) or
+            numerical_values.get("frozen_token_sha256") !=
+            workload.get("frozen_token_sha256") or
+            numerical_values.get("dspark") != "0"):
+        raise GateError("baseline genesis numerical manifest identity mismatch")
+    bound_names = set()
+    for item in numerical["files"]:
+        if (not isinstance(item, dict) or not isinstance(item.get("name"), str) or
+                Path(item["name"]).name != item["name"] or
+                not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))):
+            raise GateError("baseline genesis has invalid numerical file binding")
+        path = (numerical_dir / item["name"]).resolve()
+        if (path != root and root not in path.parents) or not path.is_file():
+            raise GateError("baseline genesis numerical file escapes canonical root")
+        if sha256(path) != item["sha256"]:
+            raise GateError("baseline genesis numerical file hash mismatch")
+        bound_names.add(item["name"])
+    if (len(bound_names) != len(numerical["files"]) or
+            numerical_values.get("file_count") != str(len(bound_names))):
+        raise GateError("baseline genesis numerical file count mismatch")
+
+    quality_path = Path(str(artifacts.get("quality_tsv", ""))).resolve()
+    quality_manifest = Path(str(artifacts.get("quality_manifest", ""))).resolve()
+    for path in (quality_path, quality_manifest):
+        if path != root and root not in path.parents:
+            raise GateError("baseline genesis quality artifact escapes canonical root")
+    quality = reference.get("quality")
+    if (not isinstance(quality, dict) or not quality_path.is_file() or
+            not quality_manifest.is_file() or sha256(quality_path) != quality.get("sha256") or
+            sha256(quality_manifest) != quality.get("manifest_sha256")):
+        raise GateError("baseline genesis quality binding mismatch")
+    quality_values = read_manifest(quality_manifest)
+    if (quality_values.get("model_size") != str(model_size) or
+            quality_values.get("model_sample_sha256") != model_sample or
+            quality_values.get("source_commit") != key.get("source_commit") or
+            quality_values.get("source_dirty") != "0" or
+            quality_values.get("dspark") != "0"):
+        raise GateError("baseline genesis quality manifest identity mismatch")
+    try:
+        with quality_path.open(newline="", encoding="utf-8") as stream:
+            quality_rows = list(csv.DictReader(stream, delimiter="\t"))
+        target_tokens = sum(int(row["target_tokens"]) for row in quality_rows)
+    except (OSError, KeyError, ValueError) as error:
+        raise GateError(f"baseline genesis quality table is invalid: {error}") from error
+
+    numerical_thresholds = validate_numerical_thresholds(
+        record["thresholds"].get("numerical"), "numerical")
+    quality_thresholds = validate_quality_thresholds(
+        record["thresholds"].get("quality"), "quality")
+    if len(bound_names) < numerical_thresholds["min_teacher_steps"]:
+        raise GateError("baseline genesis numerical coverage is too small")
+    if (len(quality_rows) < quality_thresholds["min_cases"] or
+            target_tokens < quality_thresholds["min_target_tokens"]):
+        raise GateError("baseline genesis quality coverage is too small")
+    # Reopen the raw numerical and quality artifacts with the same independent
+    # comparators used by candidate promotion.  A list of valid hashes is not
+    # enough: malformed or incomplete self-authored payloads must not become
+    # the immutable truth anchor merely because their bytes were bound.
+    with tempfile.TemporaryDirectory(prefix="baseline-genesis-", dir=root) as temporary:
+        temporary_path = Path(temporary)
+        numerical_threshold_path = temporary_path / "numerical-thresholds.json"
+        quality_threshold_path = temporary_path / "quality-thresholds.json"
+        atomic_json(numerical_threshold_path,
+                    {"baseline_id": "GENESIS", **numerical_thresholds})
+        atomic_json(quality_threshold_path,
+                    {"baseline_id": "GENESIS", **quality_thresholds})
+        numerical_result = rerun_json_tool(
+            [sys.executable, str(Path(__file__).with_name("compare-teacher-logits.py")),
+             str(numerical_dir), str(numerical_dir),
+             "--thresholds", str(numerical_threshold_path)],
+            "baseline genesis numerical self-check")
+        quality_result = rerun_json_tool(
+            [sys.executable, str(Path(__file__).with_name("compare-quality-scores.py")),
+             str(quality_path), str(quality_path),
+             "--thresholds", str(quality_threshold_path)],
+            "baseline genesis quality self-check")
+    if (numerical_result.get("passed") is not True or
+            numerical_result.get("steps") != len(bound_names)):
+        raise GateError("baseline genesis numerical self-check did not pass")
+    quality_metrics = quality_result.get("metrics", {})
+    if (quality_result.get("passed") is not True or
+            quality_metrics.get("cases") != len(quality_rows) or
+            quality_metrics.get("target_tokens") != target_tokens):
+        raise GateError("baseline genesis quality self-check did not pass")
+    if "quality_anchor" not in reference:
+        reference["quality_anchor"] = quality
+    if reference["quality_anchor"] != quality:
+        raise GateError("baseline genesis quality anchor must be its own reference")
+    record["oracle_generators"] = []
+    record["provenance"] = {
+        "genesis_id": genesis["genesis_id"],
+        "lane_origin": "bootstrap",
+        "rationale": genesis["rationale"],
+        "genesis_json_sha256": sha256(genesis_path),
+        "evidence": reviews,
+        "benchmarks": benchmark_items,
+    }
+    digest = canonical_sha256(record)
+    baseline_path = root / "baselines" / "sha256" / f"{digest}.json"
+    if baseline_path.exists():
+        raise GateError(f"refusing to overwrite existing baseline: {baseline_path}")
+    atomic_json(baseline_path, record)
+    try:
+        load_baseline(root, f"sha256:{digest}")
+    except Exception:
+        baseline_path.unlink(missing_ok=True)
+        raise
+    print(f"sha256:{digest}")
+
+
 def init_candidate(repo: Path, root: Path, candidate_id: str, lane: str) -> None:
     lane = lane.upper()
     if lane not in LANES:
@@ -945,23 +1213,8 @@ def amend_baseline(repo: Path, root: Path, amendment_path: Path) -> None:
             not amendment["rationale"].strip()):
         raise GateError("invalid baseline amendment identity or rationale")
     _, predecessor = load_baseline(root, str(amendment.get("baseline_id", "")))
-    reviews = amendment.get("evidence")
-    if not isinstance(reviews, list):
-        raise GateError("baseline amendment requires review evidence")
-    review_kinds = set()
-    for item in reviews:
-        if (not isinstance(item, dict) or item.get("kind") not in
-                {"fable-review", "grok-review"} or
-                not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", "")))):
-            raise GateError("baseline amendment has invalid review evidence")
-        path = Path(str(item.get("path", ""))).resolve()
-        if path != root and root not in path.parents:
-            raise GateError("baseline amendment review escapes canonical research root")
-        if not path.is_file() or sha256(path) != item["sha256"]:
-            raise GateError("baseline amendment review hash mismatch")
-        review_kinds.add(item["kind"])
-    if review_kinds != {"fable-review", "grok-review"}:
-        raise GateError("baseline amendment requires both Fable and Grok reviews")
+    reviews = verify_review_evidence(root, amendment.get("evidence"),
+                                     "baseline amendment")
 
     record = json.loads(json.dumps(predecessor))
     generator = amendment.get("add_oracle_generator")
@@ -1048,6 +1301,8 @@ def main() -> int:
         child.add_argument("candidate_id")
     amend = sub.add_parser("amend-baseline")
     amend.add_argument("amendment", type=Path)
+    genesis = sub.add_parser("bootstrap-baseline")
+    genesis.add_argument("genesis", type=Path)
     args = parser.parse_args()
     try:
         repo, root = roots()
@@ -1057,8 +1312,10 @@ def main() -> int:
             check_candidate(repo, root, args.candidate_id)
         elif args.command == "promote":
             promote_candidate(repo, root, args.candidate_id)
-        else:
+        elif args.command == "amend-baseline":
             amend_baseline(repo, root, args.amendment)
+        else:
+            bootstrap_baseline(repo, root, args.genesis)
     except (GateError, subprocess.CalledProcessError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
