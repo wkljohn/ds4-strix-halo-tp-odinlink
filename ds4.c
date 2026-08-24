@@ -52454,8 +52454,17 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     }
     const bool mtp_or_dspark = e->mtp_ready ||
         (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+    const char *q4k_kshard_legacy =
+        getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
+    const char *q4k_kshard_disable =
+        getenv("DS4_ROCM_DISABLE_Q4K_KSHARD");
+    const bool q4k_kshard_enabled =
+        !(q4k_kshard_disable && q4k_kshard_disable[0] == '1' &&
+          q4k_kshard_disable[1] == '\0') &&
+        (!q4k_kshard_legacy ||
+         (q4k_kshard_legacy[0] == '1' && q4k_kshard_legacy[1] == '\0'));
     const uint32_t q4k_kshard_feature = ds4_tp_q4k_kshard_feature(
-        getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH"), 1, mtp_or_dspark,
+        q4k_kshard_enabled ? "1" : "0", 1, mtp_or_dspark,
         saw_routed_layer && all_routed_q4k_kshard_layout,
         saw_q4k_layer &&
             (q4k_features & DS4_TP_FEATURE_Q4K_WMMA) != 0u);
@@ -59867,7 +59876,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 #endif
 }
 
-/* H8 research representation: both ranks keep all routed experts but only
+/* H8 Q4_K representation: both ranks keep all routed experts but only
  * their Q4_K K-half. Decode and prefill therefore share one resident layout;
  * TP reduction composes the two output partials. */
 static bool ds4_engine_activate_q4k_kshard(ds4_engine *e,
@@ -59994,7 +60003,7 @@ static bool ds4_engine_activate_q4k_kshard(ds4_engine *e,
     }
     e->q4k_kshard_active = true;
     fprintf(stderr,
-            "ds4: Q4_K K-shard research decode active: rank=%d "
+            "ds4: Q4_K K-shard decode active: rank=%d "
             "layers=%u rows=%u:%u down-bytes=%llu:%llu\n",
             e->tp.rank, windows.n_layers,
             windows.row_base, windows.row_base + windows.row_count,

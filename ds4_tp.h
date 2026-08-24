@@ -84,7 +84,7 @@ enum {
      * bitonic chunk tree with an exact packed-key radix tree.  Negotiate it
      * because independently launched ranks must select identical index rows. */
     DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE = UINT32_C(1) << 18,
-    /* The research Q4_K K-shard maps one K-half of every routed expert and
+    /* The Q4_K K-shard maps one K-half of every routed expert and
      * disables ordinary expert-id remapping. Independently launched ranks
      * must agree before that incompatible residency layout is created. */
     DS4_TP_FEATURE_Q4K_KSHARD = UINT32_C(1) << 19,

@@ -241,23 +241,29 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
-    static int seqtile_research = -1;
-    if (seqtile_research < 0) {
-        const char *env = getenv("DS4_ROCM_ATTN_DECODE_SEQTILE_RESEARCH");
-        seqtile_research = env && env[0] ? atoi(env) : 0;
-        if (seqtile_research != 8) seqtile_research = 0;
-        if (seqtile_research) {
+    static int seqtile_enabled = -1;
+    if (seqtile_enabled < 0) {
+        const char *legacy =
+            getenv("DS4_ROCM_ATTN_DECODE_SEQTILE_RESEARCH");
+        const char *disable =
+            getenv("DS4_ROCM_DISABLE_ATTN_DECODE_SEQTILE");
+        seqtile_enabled = legacy && legacy[0] ? atoi(legacy) : 8;
+        if (disable && disable[0] == '1' && disable[1] == '\0') {
+            seqtile_enabled = 0;
+        }
+        if (seqtile_enabled != 8) seqtile_enabled = 0;
+        if (seqtile_enabled) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
-                    "contiguous sequence-tiled attention research armed: tiles=8\n");
+                    "contiguous sequence-tiled attention armed: tiles=8\n");
         }
     }
-    const int seqtile_research_shape =
-        seqtile_research && !g_quality_mode && !use_mask &&
+    const int seqtile_shape =
+        seqtile_enabled && !g_quality_mode && !use_mask &&
         cfg->oldhip_attention_decode && n_raw <= 128u &&
         n_comp >= 256u && n_comp <= 1024u &&
         n_head == 32u && head_dim == 512u;
-    if (seqtile_research && !g_quality_mode &&
-        !seqtile_research_shape && n_comp >= 256u) {
+    if (seqtile_enabled && !g_quality_mode &&
+        !seqtile_shape && n_comp >= 256u) {
         static uint32_t seqtile_miss_logs;
         if (seqtile_miss_logs < 4u) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -269,8 +275,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             seqtile_miss_logs++;
         }
     }
-    if (seqtile_research_shape) {
-        const uint32_t n_tiles = (uint32_t)seqtile_research;
+    if (seqtile_shape) {
+        const uint32_t n_tiles = (uint32_t)seqtile_enabled;
         const uint32_t n_score = n_raw + n_comp;
         const uint64_t score_floats = (uint64_t)n_head * n_score;
         const uint64_t scratch_bytes =
@@ -310,7 +316,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         if (!seqtile_logged) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX
-                    "contiguous sequence-tiled attention research active: "
+                    "contiguous sequence-tiled attention active: "
                     "tiles=%u output_rows=%u global_order=1 scratch=%.2f MiB "
                     "raw=%u comp=%u heads=%u\n",
                     n_tiles, DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS,

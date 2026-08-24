@@ -38,9 +38,10 @@ off for OdinLink, and the radix tree engages only after 8,192 compressed rows.
 Set `PREFILL_FFN_WAVEFRONT=0`, `Q8_M256_K128=0`,
 `HC_STAGE_EXACT_COOP=0`, or `INDEXER_TOPK_RADIX_TREE=0` in the deployment
 config for a symmetric rollback; no extra shell environment is required.
-Research branches can also forward the symmetric
-`Q4K_KSHARD_RESEARCH` and `ATTN_DECODE_SEQTILE_RESEARCH` switches. They remain
-off by default and must not be enabled without their matching gate dossier.
+The validated Q4_K K-shard and contiguous attention sequence tile are enabled
+by default. Set `Q4K_KSHARD_RESEARCH=0` or
+`ATTN_DECODE_SEQTILE_RESEARCH=0` in the deployment config for a symmetric
+rollback on both ranks.
 
 On the 96 GiB reference nodes the optional resident DSpark profile settles near
 97--98% reported VRAM use and leaves little safety margin. Ordinary production
