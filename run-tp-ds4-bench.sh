@@ -285,7 +285,7 @@ if [[ -n $FROZEN_TOKEN_FILE || -n $FROZEN_LOGITS_DIR ]]; then
     echo "error: DS4_BENCH_FROZEN_TOKEN_FILE and DS4_BENCH_FROZEN_LOGITS_DIR must be used together" >&2
     exit 2
   }
-  [[ -n $TOOLCHAIN_ID ]] || {
+  [[ -n $DECLARED_TOOLCHAIN_ID ]] || {
     echo "error: frozen-token evidence requires DS4_BENCH_TOOLCHAIN_ID" >&2
     exit 2
   }
