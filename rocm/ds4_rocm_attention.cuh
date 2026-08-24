@@ -1610,3 +1610,300 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         out4[lane + 96u] = o3;
     }
 }
+
+enum { DS4_ATTN_SEQ_RECORD_FLOATS = 516u };
+
+/* Research path for the contiguous one-token ratio-4 decode shape used by
+ * the fixed 2K reporting workload.  Each block shares four KV rows across
+ * eight heads and emits one stable partial-softmax record per head/tile. */
+__global__ static void attention_decode_mixed_heads8_seqtile_kernel(
+        float *partials,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_tiles) {
+    const uint32_t tile = blockIdx.x;
+    const uint32_t head_group = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = head_group * 8u + warp;
+    const bool valid_head = head < n_head;
+    if (head_dim != 512u || tile >= n_tiles) return;
+
+    const uint32_t n_score = n_raw + n_comp;
+    const uint32_t rows_per_tile = (n_score + n_tiles - 1u) / n_tiles;
+    const uint32_t row_begin = tile * rows_per_tile;
+    const uint32_t row_end = row_begin + rows_per_tile < n_score
+                           ? row_begin + rows_per_tile : n_score;
+    __shared__ float4 kv_shared[4u * 128u];
+
+    const float scale = rsqrtf((float)head_dim);
+    const float4 *q4 = valid_head
+        ? (const float4 *)(q + (uint64_t)head * head_dim) : NULL;
+    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 q1 = q0, q2 = q0, q3 = q0;
+    if (valid_head) {
+        q0 = q4[lane + 0u]; q1 = q4[lane + 32u];
+        q2 = q4[lane + 64u]; q3 = q4[lane + 96u];
+    }
+
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+    for (uint32_t row0 = row_begin; row0 < row_end; row0 += 4u) {
+        const uint32_t nr = row_end - row0 < 4u ? row_end - row0 : 4u;
+        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t sr = row0 + rr;
+            const float4 *src;
+            if (sr < n_raw) {
+                const uint32_t raw_row = raw_cap
+                    ? (raw_start + sr) % raw_cap : sr;
+                src = (const float4 *)(raw_kv +
+                                       (uint64_t)raw_row * head_dim);
+            } else {
+                src = (const float4 *)(comp_kv +
+                                       (uint64_t)(sr - n_raw) * head_dim);
+            }
+            kv_shared[off] = src[c4];
+        }
+        __syncthreads();
+        if (valid_head) {
+            for (uint32_t rr = 0u; rr < nr; rr++) {
+                const float4 *kv4 = kv_shared + rr * 128u;
+                const float4 k0 = kv4[lane + 0u];
+                const float4 k1 = kv4[lane + 32u];
+                const float4 k2 = kv4[lane + 64u];
+                const float4 k3 = kv4[lane + 96u];
+                float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
+                              dot4_f32(q2, k2) + dot4_f32(q3, k3);
+                score = warp_sum_f32(score) * scale;
+                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                const float new_max = fmaxf(max_s, score);
+                const float old_scale = isinf(max_s) ? 0.0f
+                                                     : expf(max_s - new_max);
+                const float row_scale = expf(score - new_max);
+                sum_s = sum_s * old_scale + row_scale;
+#define DS4_CONTIG_SEQ_ACCUM4(o, k) do { \
+                    (o).x = (o).x * old_scale + (k).x * row_scale; \
+                    (o).y = (o).y * old_scale + (k).y * row_scale; \
+                    (o).z = (o).z * old_scale + (k).z * row_scale; \
+                    (o).w = (o).w * old_scale + (k).w * row_scale; \
+                } while (0)
+                DS4_CONTIG_SEQ_ACCUM4(o0, k0);
+                DS4_CONTIG_SEQ_ACCUM4(o1, k1);
+                DS4_CONTIG_SEQ_ACCUM4(o2, k2);
+                DS4_CONTIG_SEQ_ACCUM4(o3, k3);
+#undef DS4_CONTIG_SEQ_ACCUM4
+                max_s = new_max;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_head) {
+        float *record = partials +
+            ((uint64_t)head * n_tiles + tile) * DS4_ATTN_SEQ_RECORD_FLOATS;
+        if (lane == 0u) {
+            record[0] = max_s;
+            record[1] = sum_s;
+        }
+        float4 *out4 = (float4 *)(record + 4u);
+        out4[lane + 0u] = o0; out4[lane + 32u] = o1;
+        out4[lane + 64u] = o2; out4[lane + 96u] = o3;
+    }
+}
+
+/* Research path for the production one-token indexed decode shape.  Preserve
+ * the incumbent's per-occurrence top-k semantics and raw-ring traversal, but
+ * share each staged KV row across eight heads and partition the logical
+ * raw+selected sequence across blocks.  Sinks are deliberately excluded from
+ * these partials and folded exactly once by the merge kernel below. */
+__global__ static void attention_decode_indexed_mixed_heads8_seqtile_kernel(
+        float *partials,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const int32_t *topk,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t pos0,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_tiles) {
+    const uint32_t tile = blockIdx.x;
+    const uint32_t head_group = blockIdx.y;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = head_group * 8u + warp;
+    const bool valid_head = head < n_head;
+    if (head_dim != 512u || tile >= n_tiles) return;
+
+    __shared__ uint32_t comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
+    __shared__ uint32_t comp_count_s;
+    __shared__ float4 kv_shared[4u * 128u];
+
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0u) {
+        visible_comp = (pos0 + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+    if (threadIdx.x == 0u) {
+        comp_count_s = 0u;
+        for (uint32_t i = 0u;
+             i < top_k && comp_count_s < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
+             i++) {
+            const int32_t ci = topk[i];
+            if (ci < 0) continue;
+            const uint32_t c = (uint32_t)ci;
+            /* Do not deduplicate: the incumbent weights each valid top-k
+             * occurrence independently. */
+            if (c < n_comp && c < visible_comp) {
+                comp_rows[comp_count_s++] = c;
+            }
+        }
+    }
+    __syncthreads();
+
+    const uint32_t comp_count = comp_count_s;
+    const uint32_t n_score = n_raw + comp_count;
+    const uint32_t rows_per_tile = (n_score + n_tiles - 1u) / n_tiles;
+    const uint32_t row_begin = tile * rows_per_tile;
+    const uint32_t row_end = row_begin + rows_per_tile < n_score
+                           ? row_begin + rows_per_tile : n_score;
+    const float scale = rsqrtf((float)head_dim);
+    const float4 *q4 = valid_head
+        ? (const float4 *)(q + (uint64_t)head * head_dim) : NULL;
+    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 q1 = q0, q2 = q0, q3 = q0;
+    if (valid_head) {
+        q0 = q4[lane + 0u]; q1 = q4[lane + 32u];
+        q2 = q4[lane + 64u]; q3 = q4[lane + 96u];
+    }
+
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+
+    for (uint32_t row0 = row_begin; row0 < row_end; row0 += 4u) {
+        const uint32_t nr = row_end - row0 < 4u ? row_end - row0 : 4u;
+        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t sr = row0 + rr;
+            const float4 *src;
+            if (sr < n_raw) {
+                const uint32_t raw_row = raw_cap
+                    ? (raw_start + sr) % raw_cap : sr;
+                src = (const float4 *)(raw_kv +
+                                       (uint64_t)raw_row * head_dim);
+            } else {
+                const uint32_t comp_row = comp_rows[sr - n_raw];
+                src = (const float4 *)(comp_kv +
+                                       (uint64_t)comp_row * head_dim);
+            }
+            kv_shared[off] = src[c4];
+        }
+        __syncthreads();
+        if (valid_head) {
+            for (uint32_t rr = 0u; rr < nr; rr++) {
+                const float4 *kv4 = kv_shared + rr * 128u;
+                const float4 k0 = kv4[lane + 0u];
+                const float4 k1 = kv4[lane + 32u];
+                const float4 k2 = kv4[lane + 64u];
+                const float4 k3 = kv4[lane + 96u];
+                float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
+                              dot4_f32(q2, k2) + dot4_f32(q3, k3);
+                score = warp_sum_f32(score) * scale;
+                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+                const float new_max = fmaxf(max_s, score);
+                const float old_scale = isinf(max_s) ? 0.0f
+                                                     : expf(max_s - new_max);
+                const float row_scale = expf(score - new_max);
+                sum_s = sum_s * old_scale + row_scale;
+#define DS4_INDEXED_SEQ_ACCUM4(o, k) do { \
+                    (o).x = (o).x * old_scale + (k).x * row_scale; \
+                    (o).y = (o).y * old_scale + (k).y * row_scale; \
+                    (o).z = (o).z * old_scale + (k).z * row_scale; \
+                    (o).w = (o).w * old_scale + (k).w * row_scale; \
+                } while (0)
+                DS4_INDEXED_SEQ_ACCUM4(o0, k0);
+                DS4_INDEXED_SEQ_ACCUM4(o1, k1);
+                DS4_INDEXED_SEQ_ACCUM4(o2, k2);
+                DS4_INDEXED_SEQ_ACCUM4(o3, k3);
+#undef DS4_INDEXED_SEQ_ACCUM4
+                max_s = new_max;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_head) {
+        float *record = partials +
+            ((uint64_t)head * n_tiles + tile) * DS4_ATTN_SEQ_RECORD_FLOATS;
+        if (lane == 0u) {
+            record[0] = max_s;
+            record[1] = sum_s;
+        }
+        float4 *out4 = (float4 *)(record + 4u);
+        out4[lane + 0u] = o0; out4[lane + 32u] = o1;
+        out4[lane + 64u] = o2; out4[lane + 96u] = o3;
+    }
+}
+
+__global__ static void attention_decode_mixed_seqtile_merge_kernel(
+        float *heads,
+        const float *sinks,
+        const float *partials,
+        uint32_t n_tiles,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t head = blockIdx.x;
+    if (head >= n_head || head_dim != 512u || n_tiles > 16u) return;
+    __shared__ float scales[16];
+    if (threadIdx.x == 0u) {
+        float max_s = sinks[head];
+        for (uint32_t tile = 0; tile < n_tiles; tile++) {
+            const float *record = partials +
+                ((uint64_t)head * n_tiles + tile) * DS4_ATTN_SEQ_RECORD_FLOATS;
+            max_s = fmaxf(max_s, record[0]);
+        }
+        float denom = expf(sinks[head] - max_s);
+        for (uint32_t tile = 0; tile < n_tiles; tile++) {
+            const float *record = partials +
+                ((uint64_t)head * n_tiles + tile) * DS4_ATTN_SEQ_RECORD_FLOATS;
+            const float scale = isinf(record[0]) ? 0.0f
+                                                  : expf(record[0] - max_s);
+            scales[tile] = scale;
+            denom += record[1] * scale;
+        }
+        const float inv_denom = denom == 0.0f ? 0.0f : 1.0f / denom;
+        for (uint32_t tile = 0; tile < n_tiles; tile++) {
+            scales[tile] *= inv_denom;
+        }
+    }
+    __syncthreads();
+    float *out = heads + (uint64_t)head * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t tile = 0; tile < n_tiles; tile++) {
+            const float *record = partials +
+                ((uint64_t)head * n_tiles + tile) * DS4_ATTN_SEQ_RECORD_FLOATS;
+            acc += record[4u + d] * scales[tile];
+        }
+        out[d] = acc;
+    }
+}

@@ -190,6 +190,190 @@ static double max_scaled_error(const std::vector<float> &a,
     return max_diff / fmax(max_ref, 1.0e-30);
 }
 
+static int time_heads8_decode_path(float *usec_per_call,
+                                   ds4_gpu_tensor *heads,
+                                   const std::vector<float> &sinks,
+                                   const ds4_gpu_tensor *q,
+                                   const std::vector<ds4_gpu_tensor> &raw_ring,
+                                   const std::vector<ds4_gpu_tensor> &comp_ring,
+                                   uint32_t raw_start) {
+    constexpr int warmup = 20;
+    constexpr int iterations = 400;
+    constexpr uint32_t n_raw = 128u, raw_cap = 160u, n_comp = 523u;
+    constexpr uint32_t n_head = 32u, head_dim = 512u;
+    hipEvent_t start = NULL, stop = NULL;
+    CHECK(!raw_ring.empty() && raw_ring.size() == comp_ring.size(),
+          "valid cold-KV timing ring");
+    ds4_gpu_set_quality(false);
+    for (int i = 0; i < warmup; i++) {
+        const size_t slot = (size_t)i % raw_ring.size();
+        CHECK(ds4_gpu_attention_decode_heads_tensor(
+                  heads, sinks.data(), sinks.size() * sizeof(float), 0,
+                  q, &raw_ring[slot], n_raw, raw_cap, raw_start,
+                  &comp_ring[slot], 0, n_comp, NULL, 0, n_head, head_dim),
+              "warm up heads8 timing path");
+    }
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "synchronize heads8 timing warmup");
+    CHECK(hipEventCreate(&start) == hipSuccess &&
+          hipEventCreate(&stop) == hipSuccess,
+          "create heads8 timing events");
+    CHECK(hipEventRecord(start, NULL) == hipSuccess,
+          "record heads8 timing start");
+    for (int i = 0; i < iterations; i++) {
+        const size_t slot = (size_t)i % raw_ring.size();
+        CHECK(ds4_gpu_attention_decode_heads_tensor(
+                  heads, sinks.data(), sinks.size() * sizeof(float), 0,
+                  q, &raw_ring[slot], n_raw, raw_cap, raw_start,
+                  &comp_ring[slot], 0, n_comp, NULL, 0, n_head, head_dim),
+              "run heads8 timing path");
+    }
+    CHECK(hipEventRecord(stop, NULL) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess,
+          "finish heads8 timing events");
+    float elapsed_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&elapsed_ms, start, stop) == hipSuccess,
+          "read heads8 timing events");
+    CHECK(hipEventDestroy(start) == hipSuccess &&
+          hipEventDestroy(stop) == hipSuccess,
+          "destroy heads8 timing events");
+    *usec_per_call = elapsed_ms * 1000.0f / (float)iterations;
+    return 0;
+}
+
+static int run_heads8_decode_shape_oracle(void) {
+    constexpr uint32_t head_dim = 512u, n_head = 32u;
+    constexpr uint32_t raw_cap = 160u, n_raw = 128u, comp_cap = 1024u;
+    const uint32_t raw_starts[] = {0u, 1u, 80u, 159u};
+    const uint32_t comp_counts[] = {256u, 511u, 512u, 523u, 587u, 1024u};
+
+    std::vector<float> sinks(n_head);
+    std::vector<float> q((size_t)n_head * head_dim);
+    std::vector<float> raw((size_t)raw_cap * head_dim);
+    std::vector<float> comp((size_t)comp_cap * head_dim);
+    std::vector<float> mask(comp_cap, 0.0f);
+    for (uint32_t h = 0; h < n_head; h++) {
+        sinks[h] = -0.41f + 0.027f * (float)h;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            q[(size_t)h * head_dim + d] =
+                0.031f * sinf((float)(d * 11u + h * 47u + 5u) * 0.0091f) +
+                0.017f * cosf((float)(d * 3u + h * 13u + 7u) * 0.021f);
+        }
+    }
+    for (uint32_t r = 0; r < raw_cap; r++) {
+        float *row = raw.data() + (size_t)r * head_dim;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            row[d] = 0.23f * sinf((float)(d * 5u + r * 97u + 3u) * 0.007f) +
+                     0.014f * cosf((float)(d + r * 19u) * 0.031f);
+        }
+        mixed_cache_round(row, head_dim, 64u);
+    }
+    for (uint32_t c = 0; c < comp_cap; c++) {
+        float *row = comp.data() + (size_t)c * head_dim;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            row[d] = 0.19f * cosf((float)(d * 7u + c * 71u + 11u) * 0.0083f) -
+                     0.011f * sinf((float)(d * 2u + c * 29u) * 0.019f);
+        }
+        mixed_cache_round(row, head_dim, 64u);
+    }
+
+    CHECK(ds4_gpu_set_model_map(sinks.data(), sinks.size() * sizeof(float)),
+          "install heads8 attention sinks");
+    ds4_gpu_tensor q_dev = {}, raw_dev = {}, comp_dev = {}, heads_dev = {};
+    CHECK(ds4_gpu_tensor_alloc_on(&q_dev, 0, q.size() * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&raw_dev, 0, raw.size() * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&comp_dev, 0, comp.size() * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&heads_dev, 0, q.size() * sizeof(float)) == 0,
+          "allocate heads8 oracle tensors");
+    CHECK(ds4_gpu_tensor_write(&q_dev, 0, q.data(), q.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(&raw_dev, 0, raw.data(), raw.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(&comp_dev, 0, comp.data(), comp.size() * sizeof(float)),
+          "upload heads8 oracle tensors");
+
+    std::vector<float> candidate(q.size()), dense(q.size()), ref(q.size());
+    for (uint32_t raw_start : raw_starts) {
+        for (uint32_t n_comp : comp_counts) {
+            ds4_gpu_set_quality(false);
+            CHECK(ds4_gpu_attention_decode_heads_tensor(
+                      &heads_dev, sinks.data(), sinks.size() * sizeof(float), 0,
+                      &q_dev, &raw_dev, n_raw, raw_cap, raw_start,
+                      &comp_dev, 0, n_comp, NULL, 0, n_head, head_dim) &&
+                  ds4_gpu_tensor_read(&heads_dev, 0, candidate.data(),
+                                      candidate.size() * sizeof(float)),
+                  "run and read heads8 candidate");
+            ds4_gpu_set_quality(true);
+            CHECK(ds4_gpu_attention_decode_heads_tensor(
+                      &heads_dev, sinks.data(), sinks.size() * sizeof(float), 0,
+                      &q_dev, &raw_dev, n_raw, raw_cap, raw_start,
+                      &comp_dev, 0, n_comp, NULL, 0, n_head, head_dim) &&
+                  ds4_gpu_tensor_read(&heads_dev, 0, dense.data(),
+                                      dense.size() * sizeof(float)),
+                  "run and read dense decode reference kernel");
+            attention_reference(ref, q, raw, comp, mask, sinks,
+                                n_raw, raw_cap, raw_start, n_comp,
+                                n_head, head_dim);
+            const double candidate_rel = rel_rms(candidate, ref);
+            const double candidate_max = max_scaled_error(candidate, ref);
+            const double dense_rel = rel_rms(dense, ref);
+            const double candidate_dense = rel_rms(candidate, dense);
+            fprintf(stderr,
+                    "heads8_oracle raw_start=%u n_comp=%u candidate_rel=%g "
+                    "candidate_max=%g dense_rel=%g candidate_dense=%g\n",
+                    raw_start, n_comp, candidate_rel, candidate_max,
+                    dense_rel, candidate_dense);
+            CHECK(candidate_rel <= 2.0e-5 && candidate_max <= 3.0e-4,
+                  "heads8 candidate must stay inside Lane-B oracle envelope");
+            CHECK(dense_rel <= 1.0e-5,
+                  "dense decode kernel must match large-shape oracle");
+            CHECK(candidate_dense <= 2.0e-5,
+                  "heads8 and dense decode kernels must remain numerically close");
+        }
+    }
+
+    constexpr size_t timing_ring_size = 21u;
+    std::vector<ds4_gpu_tensor> raw_ring(timing_ring_size);
+    std::vector<ds4_gpu_tensor> comp_ring(timing_ring_size);
+    for (size_t i = 0; i < timing_ring_size; i++) {
+        CHECK(ds4_gpu_tensor_alloc_on(&raw_ring[i], 0,
+                                      raw.size() * sizeof(float)) == 0 &&
+              ds4_gpu_tensor_alloc_on(&comp_ring[i], 0,
+                                      comp.size() * sizeof(float)) == 0,
+              "allocate cold-KV timing ring");
+        CHECK(ds4_gpu_tensor_write(&raw_ring[i], 0, raw.data(),
+                                   raw.size() * sizeof(float)) &&
+              ds4_gpu_tensor_write(&comp_ring[i], 0, comp.data(),
+                                   comp.size() * sizeof(float)),
+              "upload cold-KV timing ring");
+    }
+
+    float active_a = 0.0f, active_b = 0.0f;
+    CHECK(time_heads8_decode_path(&active_a, &heads_dev, sinks,
+                                  &q_dev, raw_ring, comp_ring, 159u) == 0 &&
+          time_heads8_decode_path(&active_b, &heads_dev, sinks,
+                                  &q_dev, raw_ring, comp_ring, 159u) == 0,
+          "time active contiguous decode path");
+    const float active_mid = 0.5f * (active_a + active_b);
+    const char *mode = getenv("DS4_ROCM_ATTN_DECODE_SEQTILE_RESEARCH")
+        ? "candidate" : "incumbent";
+    fprintf(stderr,
+            "contiguous_seqtile_timing mode=%s n_raw=128 n_comp=523 "
+            "heads=32 raw_start=159 active_a_us=%.3f active_b_us=%.3f "
+            "active_mid_us=%.3f\n",
+            mode, active_a, active_b, active_mid);
+
+    for (size_t i = 0; i < timing_ring_size; i++) {
+        ds4_gpu_tensor_free_in_place(&raw_ring[i]);
+        ds4_gpu_tensor_free_in_place(&comp_ring[i]);
+    }
+
+    ds4_gpu_set_quality(false);
+    ds4_gpu_tensor_free_in_place(&q_dev);
+    ds4_gpu_tensor_free_in_place(&raw_dev);
+    ds4_gpu_tensor_free_in_place(&comp_dev);
+    ds4_gpu_tensor_free_in_place(&heads_dev);
+    return 0;
+}
+
 int main(void) {
     constexpr uint32_t head_dim = 512, n_rot = 64, n_head = 4;
     constexpr uint32_t raw_cap = 7, n_raw = 5, raw_start = 5, n_comp = 3;
@@ -318,6 +502,8 @@ int main(void) {
     ds4_gpu_tensor_free_in_place(&comp_dev);
     ds4_gpu_tensor_free_in_place(&mask_dev);
     ds4_gpu_tensor_free_in_place(&heads_dev);
+    CHECK(run_heads8_decode_shape_oracle() == 0,
+          "large decode-shape heads8 oracle");
     ds4_gpu_cleanup();
     fprintf(stderr, "test_rocm_attention_decode_mixed: PASS\n");
     return 0;

@@ -241,6 +241,70 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
+    static int seqtile_research = -1;
+    if (seqtile_research < 0) {
+        const char *env = getenv("DS4_ROCM_ATTN_DECODE_SEQTILE_RESEARCH");
+        seqtile_research = env && env[0] ? atoi(env) : 0;
+        if (seqtile_research != 8) seqtile_research = 0;
+        if (seqtile_research) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "contiguous sequence-tiled attention research armed: tiles=8\n");
+        }
+    }
+    const int seqtile_research_shape =
+        seqtile_research && !g_quality_mode && !use_mask &&
+        cfg->oldhip_attention_decode && n_raw <= 128u &&
+        n_comp >= 256u && n_comp <= 1024u &&
+        n_head == 32u && head_dim == 512u;
+    if (seqtile_research && !g_quality_mode &&
+        !seqtile_research_shape && n_comp >= 256u) {
+        static uint32_t seqtile_miss_logs;
+        if (seqtile_miss_logs < 4u) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "contiguous sequence-tiled attention dispatch miss: "
+                    "quality=%d oldhip=%d mask=%u raw=%u comp=%u "
+                    "heads=%u dim=%u\n",
+                    g_quality_mode, cfg->oldhip_attention_decode, use_mask,
+                    n_raw, n_comp, n_head, head_dim);
+            seqtile_miss_logs++;
+        }
+    }
+    if (seqtile_research_shape) {
+        const uint32_t n_tiles = (uint32_t)seqtile_research;
+        const uint64_t scratch_bytes =
+            (uint64_t)n_head * n_tiles * DS4_ATTN_SEQ_RECORD_FLOATS *
+            sizeof(float);
+        float *partials =
+            (float *)cuda_attention_seq_scratch_alloc(scratch_bytes);
+        if (!partials) return 0;
+        dim3 tile_grid(n_tiles, (n_head + 7u) / 8u, 1u);
+        attention_decode_mixed_heads8_seqtile_kernel<<<tile_grid, 256>>>(
+                partials,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr,
+                n_raw, raw_cap, raw_start, n_comp,
+                n_head, head_dim, n_tiles);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention contiguous sequence-tiled stage-1 launch")) {
+            return 0;
+        }
+        attention_decode_mixed_seqtile_merge_kernel<<<n_head, 256>>>(
+                (float *)heads->ptr, sinks, partials,
+                n_tiles, n_head, head_dim);
+        static int seqtile_logged;
+        if (!seqtile_logged) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "contiguous sequence-tiled attention research active: "
+                    "tiles=%u scratch=%.2f MiB raw=%u comp=%u heads=%u\n",
+                    n_tiles, (double)scratch_bytes / 1048576.0,
+                    n_raw, n_comp, n_head);
+            seqtile_logged = 1;
+        }
+        return cuda_ok(cudaGetLastError(),
+                       "attention contiguous sequence-tiled merge launch");
+    }
     if (cfg->oldhip_attention_decode) {
         const uint32_t rows = n_raw + n_comp;
         const size_t shmem = (size_t)(rows ? rows : 1u) * sizeof(float);
@@ -603,6 +667,80 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
     const ds4_rocm_runtime_config *cfg = cuda_runtime_config();
+    static int indexed_seqtile_research = -1;
+    if (indexed_seqtile_research < 0) {
+        const char *env =
+            getenv("DS4_ROCM_ATTN_DECODE_INDEXED_SEQTILE_RESEARCH");
+        indexed_seqtile_research = env && env[0] ? atoi(env) : 0;
+        if (indexed_seqtile_research != 8) {
+            indexed_seqtile_research = 0;
+        }
+    }
+    const int indexed_seqtile_shape =
+        indexed_seqtile_research && !g_quality_mode &&
+        cfg->oldhip_attention_decode && n_tokens == 1u &&
+        n_raw <= 128u && top_k > 0u && top_k <= 512u && ratio == 4u &&
+        n_head == 32u && head_dim == 512u;
+    if (indexed_seqtile_research && n_tokens == 1u && ratio == 4u &&
+        !indexed_seqtile_shape) {
+        static uint32_t indexed_seqtile_miss_logs;
+        if (indexed_seqtile_miss_logs < 4u) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "indexed sequence-tiled attention dispatch miss: "
+                    "quality=%d oldhip=%d raw=%u topk=%u ratio=%u "
+                    "heads=%u dim=%u ncomp=%u pos=%u\n",
+                    g_quality_mode, cfg->oldhip_attention_decode,
+                    n_raw, top_k, ratio, n_head, head_dim, n_comp, pos0);
+            indexed_seqtile_miss_logs++;
+        }
+    }
+    if (indexed_seqtile_shape) {
+        const uint32_t n_tiles = (uint32_t)indexed_seqtile_research;
+        const uint64_t scratch_bytes =
+            (uint64_t)n_head * n_tiles * DS4_ATTN_SEQ_RECORD_FLOATS *
+            sizeof(float);
+        float *partials =
+            (float *)cuda_attention_seq_scratch_alloc(scratch_bytes);
+        if (!partials) return 0;
+        dim3 tile_grid(n_tiles, (n_head + 7u) / 8u, 1u);
+        attention_decode_indexed_mixed_heads8_seqtile_kernel
+            <<<tile_grid, 256>>>(
+                partials,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr,
+                topk_ptr,
+                n_raw,
+                raw_cap,
+                raw_start,
+                n_comp,
+                top_k,
+                pos0,
+                ratio,
+                n_head,
+                head_dim,
+                n_tiles);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention indexed sequence-tiled stage-1 launch")) {
+            return 0;
+        }
+        attention_decode_mixed_seqtile_merge_kernel<<<n_head, 256>>>(
+                (float *)heads->ptr, sinks, partials,
+                n_tiles, n_head, head_dim);
+        static int indexed_seqtile_logged;
+        if (!indexed_seqtile_logged) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "indexed sequence-tiled attention research active: "
+                    "tiles=%u scratch=%.2f MiB ratio=%u raw=%u topk=%u heads=%u\n",
+                    n_tiles, (double)scratch_bytes / 1048576.0,
+                    ratio, n_raw, top_k, n_head);
+            indexed_seqtile_logged = 1;
+        }
+        return cuda_ok(cudaGetLastError(),
+                       "attention indexed sequence-tiled merge launch");
+    }
     if (n_tokens == 1u && cfg->oldhip_attention_decode) {
         const uint32_t rows = n_raw + (top_k < n_comp ? top_k : n_comp);
         const size_t shmem = (size_t)(rows ? rows : 1u) * sizeof(float);

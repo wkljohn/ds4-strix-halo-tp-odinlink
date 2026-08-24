@@ -441,6 +441,15 @@ tests/test_rocm_attention_decode_mixed: tests/test_rocm_attention_decode_mixed.o
 test-rocm-attention-decode-mixed: tests/test_rocm_attention_decode_mixed
 	./tests/test_rocm_attention_decode_mixed
 
+tests/test_rocm_attention_decode_indexed_seqtile.o: tests/test_rocm_attention_decode_indexed_seqtile.cu ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_attention_decode_indexed_seqtile: tests/test_rocm_attention_decode_indexed_seqtile.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-attention-decode-indexed-seqtile: tests/test_rocm_attention_decode_indexed_seqtile
+	./tests/test_rocm_attention_decode_indexed_seqtile
+
 tests/test_rocm_attention_prefill_static_flash.o: tests/test_rocm_attention_prefill_static_flash.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
