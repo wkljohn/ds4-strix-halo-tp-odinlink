@@ -311,9 +311,10 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX
                     "contiguous sequence-tiled attention research active: "
-                    "tiles=%u global_order=1 scratch=%.2f MiB "
+                    "tiles=%u output_rows=%u global_order=1 scratch=%.2f MiB "
                     "raw=%u comp=%u heads=%u\n",
-                    n_tiles, (double)scratch_bytes / 1048576.0,
+                    n_tiles, DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS,
+                    (double)scratch_bytes / 1048576.0,
                     n_raw, n_comp, n_head);
             seqtile_logged = 1;
         }

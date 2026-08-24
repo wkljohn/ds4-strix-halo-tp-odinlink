@@ -1614,6 +1614,7 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
 enum {
     DS4_ATTN_SEQ_RECORD_FLOATS = 516u,
     DS4_ATTN_SEQ_MAX_ROWS_PER_TILE = 144u,
+    DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS = 32u,
 };
 
 /* Research path for the contiguous one-token decode shape.  Stage 1 retains
@@ -1722,11 +1723,14 @@ __global__ static void attention_decode_mixed_heads8_seqtile_output_kernel(
     const float *weight_row = valid_head
         ? weights + (uint64_t)head * n_score : NULL;
     const float inv_denom = valid_head ? inv_denoms[head] : 0.0f;
-    __shared__ float4 kv_shared[4u * 128u];
+    __shared__ float4 kv_shared[DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS * 128u];
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
-    for (uint32_t row0 = 0u; row0 < n_score; row0 += 4u) {
-        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+    for (uint32_t row0 = 0u; row0 < n_score;
+         row0 += DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS) {
+        const uint32_t nr = n_score - row0 < DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS
+                          ? n_score - row0
+                          : DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS;
         for (uint32_t off = threadIdx.x; off < nr * 128u;
              off += blockDim.x) {
             const uint32_t rr = off >> 7u;
