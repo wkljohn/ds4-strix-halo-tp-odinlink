@@ -48,6 +48,8 @@ PREFILL_FFN_WAVEFRONT=${PREFILL_FFN_WAVEFRONT:-1}
 Q8_M256_K128=${Q8_M256_K128:-1}
 HC_STAGE_EXACT_COOP=${HC_STAGE_EXACT_COOP:-1}
 INDEXER_TOPK_RADIX_TREE=${INDEXER_TOPK_RADIX_TREE:-1}
+Q4K_KSHARD_RESEARCH=${Q4K_KSHARD_RESEARCH:-0}
+ATTN_DECODE_SEQTILE_RESEARCH=${ATTN_DECODE_SEQTILE_RESEARCH:-0}
 if [[ -z ${EXPERT_SPLIT:-} ]]; then
   if [[ $DSPARK == 1 ]]; then EXPERT_SPLIT=118; else EXPERT_SPLIT=128; fi
 fi
@@ -88,6 +90,12 @@ is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$EXPERT_SPLIT" &&
 }
 [[ $INDEXER_TOPK_RADIX_TREE == 0 || $INDEXER_TOPK_RADIX_TREE == 1 ]] || {
   echo "error: INDEXER_TOPK_RADIX_TREE must be 0 or 1" >&2; exit 2;
+}
+[[ $Q4K_KSHARD_RESEARCH == 0 || $Q4K_KSHARD_RESEARCH == 1 ]] || {
+  echo "error: Q4K_KSHARD_RESEARCH must be 0 or 1" >&2; exit 2;
+}
+[[ $ATTN_DECODE_SEQTILE_RESEARCH =~ ^[0-9]+$ ]] || {
+  echo "error: ATTN_DECODE_SEQTILE_RESEARCH must be a non-negative integer" >&2; exit 2;
 }
 if [[ $DSPARK == 1 ]]; then : "${MTP:?MTP is required when DSPARK=1}"; fi
 (( CONTEXT == 262144 )) || echo "warning: deployment context is $CONTEXT, not 262144" >&2
@@ -286,7 +294,9 @@ start() {
       DS4_ROCM_TP_PREFILL_SKIP_UNOWNED="$tp_prefill_skip_unowned"
       DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1
       DS4_ROCM_HC_STAGE_EXACT_COOP="$HC_STAGE_EXACT_COOP"
-      DS4_ROCM_INDEXER_TOPK_RADIX_TREE="$INDEXER_TOPK_RADIX_TREE")
+      DS4_ROCM_INDEXER_TOPK_RADIX_TREE="$INDEXER_TOPK_RADIX_TREE"
+      DS4_ROCM_Q4K_KSHARD_RESEARCH="$Q4K_KSHARD_RESEARCH"
+      DS4_ROCM_ATTN_DECODE_SEQTILE_RESEARCH="$ATTN_DECODE_SEQTILE_RESEARCH")
     support_args=()
   fi
   common+=("${decode_env[@]}")
