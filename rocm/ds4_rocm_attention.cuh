@@ -1716,8 +1716,8 @@ __global__ static void attention_decode_mixed_heads8_seqtile_output_kernel(
         uint32_t head_dim) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t warp = threadIdx.x >> 5u;
-    const uint32_t head_warp = warp >> 1u;
-    const uint32_t dim_half = warp & 1u;
+    const uint32_t head_warp = warp >> 2u;
+    const uint32_t dim_quarter = warp & 3u;
     const uint32_t head = blockIdx.x * 8u + head_warp;
     const bool valid_head = head < n_head;
     if (head_dim != 512u) return;
@@ -1727,7 +1727,6 @@ __global__ static void attention_decode_mixed_heads8_seqtile_output_kernel(
     const float inv_denom = valid_head ? inv_denoms[head] : 0.0f;
     __shared__ float4 kv_shared[DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS * 128u];
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 o1 = o0;
     for (uint32_t row0 = 0u; row0 < n_score;
          row0 += DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS) {
         const uint32_t nr = n_score - row0 < DS4_ATTN_SEQ_OUTPUT_STAGE_ROWS
@@ -1755,9 +1754,8 @@ __global__ static void attention_decode_mixed_heads8_seqtile_output_kernel(
             for (uint32_t rr = 0u; rr < nr; rr++) {
                 const float weight = weight_row[row0 + rr];
                 const float4 *kv4 = kv_shared + rr * 128u;
-                const uint32_t dim_base4 = dim_half * 64u;
+                const uint32_t dim_base4 = dim_quarter * 32u;
                 const float4 k0 = kv4[dim_base4 + lane];
-                const float4 k1 = kv4[dim_base4 + lane + 32u];
 #define DS4_CONTIG_SEQ_WEIGHTED_ACCUM4(o, k) do { \
                     (o).x += (k).x * weight; \
                     (o).y += (k).y * weight; \
@@ -1765,7 +1763,6 @@ __global__ static void attention_decode_mixed_heads8_seqtile_output_kernel(
                     (o).w += (k).w * weight; \
                 } while (0)
                 DS4_CONTIG_SEQ_WEIGHTED_ACCUM4(o0, k0);
-                DS4_CONTIG_SEQ_WEIGHTED_ACCUM4(o1, k1);
 #undef DS4_CONTIG_SEQ_WEIGHTED_ACCUM4
             }
         }
@@ -1774,12 +1771,9 @@ __global__ static void attention_decode_mixed_heads8_seqtile_output_kernel(
     if (valid_head) {
         o0.x *= inv_denom; o0.y *= inv_denom;
         o0.z *= inv_denom; o0.w *= inv_denom;
-        o1.x *= inv_denom; o1.y *= inv_denom;
-        o1.z *= inv_denom; o1.w *= inv_denom;
         float4 *out4 = (float4 *)(heads + (uint64_t)head * head_dim);
-        const uint32_t dim_base4 = dim_half * 64u;
+        const uint32_t dim_base4 = dim_quarter * 32u;
         out4[dim_base4 + lane] = o0;
-        out4[dim_base4 + lane + 32u] = o1;
     }
 }
 

@@ -298,7 +298,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
             return 0;
         }
         attention_decode_mixed_heads8_seqtile_output_kernel
-            <<<(n_head + 7u) / 8u, 512>>>(
+            <<<(n_head + 7u) / 8u, 1024>>>(
                 (float *)heads->ptr,
                 weights,
                 inv_denoms,
