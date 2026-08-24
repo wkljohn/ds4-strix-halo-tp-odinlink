@@ -29,6 +29,13 @@
 
 typedef int (*ds4_tp_devcopy_fn)(void *, const void *, uint64_t);
 extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
+extern "C" int ds4_gpu_routed_moe_batch_q4k_control(
+        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
+        ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t,
+        uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+        uint64_t, uint64_t, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
+        uint32_t, uint32_t, float, const ds4_gpu_tensor *, uint32_t,
+        uint32_t, uint32_t, bool);
 
 enum {
     Q4_K_TYPE = 12,
@@ -719,11 +726,17 @@ static int run_registry_packed_one_oracle(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
         ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
         ds4_gpu_tensor *down, ds4_gpu_tensor *selected,
-        ds4_gpu_tensor *weights, ds4_gpu_tensor *x) {
+        ds4_gpu_tensor *weights, ds4_gpu_tensor *x,
+        uint32_t row_base, float *returned_scalar,
+        float *returned_wmma) {
+    CHECK(row_base == 0u || row_base == MID_HALF,
+          "packed registry rank-half row base");
     const uint64_t half_gate_expert = MID_HALF * gate_row_bytes;
     const uint64_t half_down_row_bytes =
         (uint64_t)(MID_HALF / QK_K) * Q4_K_BLOCK_BYTES;
     const uint64_t half_down_expert = OUT_DIM * half_down_row_bytes;
+    const uint64_t down_column_byte_base =
+        (uint64_t)(row_base / QK_K) * Q4_K_BLOCK_BYTES;
     const uint64_t gate_table_bytes = N_TOTAL_MAX * half_gate_expert;
     const uint64_t down_table_bytes = N_TOTAL_MAX * half_down_expert;
     const uint64_t packed_model_bytes = gate_table_bytes * 2u +
@@ -739,11 +752,12 @@ static int run_registry_packed_one_oracle(
     CHECK(gate_half && up_half && down_half && packed_model,
           "packed one host maps");
     pack_row_span(gate_half, full_model + full_gate_off, N_TOTAL_MAX,
-                  MID_DIM, 0u, MID_HALF, (uint32_t)gate_row_bytes);
+                  MID_DIM, row_base, MID_HALF, (uint32_t)gate_row_bytes);
     pack_row_span(up_half, full_model + full_up_off, N_TOTAL_MAX,
-                  MID_DIM, 0u, MID_HALF, (uint32_t)gate_row_bytes);
+                  MID_DIM, row_base, MID_HALF, (uint32_t)gate_row_bytes);
     pack_k_span(down_half, full_model + full_down_off, N_TOTAL_MAX,
-                OUT_DIM, MID_DIM / QK_K, 0u, MID_HALF / QK_K);
+                OUT_DIM, MID_DIM / QK_K, row_base / QK_K,
+                MID_HALF / QK_K);
     memcpy(packed_model, gate_half, (size_t)gate_table_bytes);
     memcpy(packed_model + gate_table_bytes, up_half,
            (size_t)gate_table_bytes);
@@ -773,6 +787,132 @@ static int run_registry_packed_one_oracle(
     CHECK(ds4_gpu_tensor_read(out, 0, reference, sizeof(reference)),
           "packed one direct read");
 
+    enum { PACKED_BATCH_TOKENS = 8 };
+    ds4_gpu_tensor batch_out = {}, batch_gate = {}, batch_up = {};
+    ds4_gpu_tensor batch_mid = {}, batch_down = {}, batch_selected = {};
+    ds4_gpu_tensor batch_weights = {}, batch_x = {};
+    CHECK(alloc_tensor(&batch_out,
+                       (uint64_t)PACKED_BATCH_TOKENS * OUT_DIM * sizeof(float)),
+          "packed batch out");
+    CHECK(alloc_tensor(&batch_gate,
+                       (uint64_t)PACKED_BATCH_TOKENS * N_USED * MID_HALF *
+                           sizeof(float)),
+          "packed batch gate");
+    CHECK(alloc_tensor(&batch_up,
+                       (uint64_t)PACKED_BATCH_TOKENS * N_USED * MID_HALF *
+                           sizeof(float)),
+          "packed batch up");
+    CHECK(alloc_tensor(&batch_mid,
+                       (uint64_t)PACKED_BATCH_TOKENS * N_USED * MID_HALF *
+                           sizeof(float)),
+          "packed batch mid");
+    CHECK(alloc_tensor(&batch_down,
+                       (uint64_t)PACKED_BATCH_TOKENS * N_USED * OUT_DIM *
+                           sizeof(float)),
+          "packed batch down");
+    CHECK(alloc_tensor(&batch_selected,
+                       (uint64_t)PACKED_BATCH_TOKENS * N_USED *
+                           sizeof(int32_t)),
+          "packed batch selected");
+    CHECK(alloc_tensor(&batch_weights,
+                       (uint64_t)PACKED_BATCH_TOKENS * N_USED * sizeof(float)),
+          "packed batch weights");
+    CHECK(alloc_tensor(&batch_x,
+                       (uint64_t)PACKED_BATCH_TOKENS * IN_DIM * sizeof(float)),
+          "packed batch x");
+    int32_t batch_routes[PACKED_BATCH_TOKENS * N_USED];
+    float batch_route_weights[PACKED_BATCH_TOKENS * N_USED];
+    float batch_x_host[PACKED_BATCH_TOKENS * IN_DIM];
+    float x_one[IN_DIM];
+    CHECK(ds4_gpu_tensor_read(x, 0, x_one, sizeof(x_one)),
+          "packed batch read source x");
+    for (uint32_t t = 0; t < PACKED_BATCH_TOKENS; ++t) {
+        for (uint32_t j = 0; j < N_USED; ++j) {
+            batch_routes[t * N_USED + j] = routes[(j + t) % N_USED];
+            batch_route_weights[t * N_USED + j] =
+                route_weights[(j + t) % N_USED];
+        }
+        for (uint32_t j = 0; j < IN_DIM; ++j) {
+            batch_x_host[t * IN_DIM + j] =
+                x_one[j] + (float)((int)(t % 3u) - 1) * 0.0009765625f;
+        }
+    }
+    CHECK(upload(&batch_selected, batch_routes, sizeof(batch_routes)),
+          "packed batch routes");
+    CHECK(upload(&batch_weights, batch_route_weights,
+                 sizeof(batch_route_weights)), "packed batch weights");
+    CHECK(upload(&batch_x, batch_x_host, sizeof(batch_x_host)),
+          "packed batch x");
+    bool reference_mid_is_f16 = true;
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              &batch_out, &batch_gate, &batch_up, &batch_mid, &batch_down,
+              packed_model, packed_model_bytes,
+              0u, gate_table_bytes, gate_table_bytes * 2u, Q4_K_TYPE,
+              Q4_K_TYPE, half_gate_expert, gate_row_bytes,
+              half_down_expert, half_down_row_bytes, IN_DIM, MID_HALF,
+              OUT_DIM, &batch_selected, &batch_weights, N_TOTAL_MAX,
+              N_USED, 0.0f, &batch_x, 0u, PACKED_BATCH_TOKENS,
+              &reference_mid_is_f16, false),
+          "packed batch direct reference");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "packed batch direct sync");
+    float batch_reference[PACKED_BATCH_TOKENS * OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(&batch_out, 0, batch_reference,
+                              sizeof(batch_reference)),
+          "packed batch direct read");
+    CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0,
+          "compact WMMA control research on");
+    CHECK(ds4_gpu_routed_moe_batch_q4k_control(
+              &batch_out, &batch_gate, &batch_up, &batch_mid, &batch_down,
+              packed_model, packed_model_bytes,
+              0u, gate_table_bytes, gate_table_bytes * 2u,
+              half_gate_expert, gate_row_bytes,
+              half_down_expert, half_down_row_bytes,
+              &batch_selected, &batch_weights, N_TOTAL_MAX, N_USED, 0.0f,
+              &batch_x, 0u, PACKED_BATCH_TOKENS, MID_HALF, true),
+          "compact half-shape WMMA control A");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "compact half-shape WMMA control A sync");
+    float batch_compact_wmma_a[PACKED_BATCH_TOKENS * OUT_DIM];
+    float batch_compact_wmma_b[PACKED_BATCH_TOKENS * OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(&batch_out, 0, batch_compact_wmma_a,
+                              sizeof(batch_compact_wmma_a)),
+          "compact half-shape WMMA control A read");
+    CHECK(ds4_gpu_routed_moe_batch_q4k_control(
+              &batch_out, &batch_gate, &batch_up, &batch_mid, &batch_down,
+              packed_model, packed_model_bytes,
+              0u, gate_table_bytes, gate_table_bytes * 2u,
+              half_gate_expert, gate_row_bytes,
+              half_down_expert, half_down_row_bytes,
+              &batch_selected, &batch_weights, N_TOTAL_MAX, N_USED, 0.0f,
+              &batch_x, 0u, PACKED_BATCH_TOKENS, MID_HALF, true),
+          "compact half-shape WMMA control B");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "compact half-shape WMMA control B sync");
+    CHECK(ds4_gpu_tensor_read(&batch_out, 0, batch_compact_wmma_b,
+                              sizeof(batch_compact_wmma_b)),
+          "compact half-shape WMMA control B read");
+    CHECK(memcmp(batch_compact_wmma_a, batch_compact_wmma_b,
+                 sizeof(batch_compact_wmma_a)) == 0,
+          "compact half-shape WMMA deterministic");
+    CHECK(ds4_gpu_routed_moe_batch_q4k_control(
+              &batch_out, &batch_gate, &batch_up, &batch_mid, &batch_down,
+              packed_model, packed_model_bytes,
+              0u, gate_table_bytes, gate_table_bytes * 2u,
+              half_gate_expert, gate_row_bytes,
+              half_down_expert, half_down_row_bytes,
+              &batch_selected, &batch_weights, N_TOTAL_MAX, N_USED, 0.0f,
+              &batch_x, 0u, 2u, MID_HALF, true),
+          "compact half-shape two-token fallback control");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "compact half-shape two-token fallback sync");
+    float batch_compact_two[2u * OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(&batch_out, 0, batch_compact_two,
+                              sizeof(batch_compact_two)),
+          "compact half-shape two-token fallback read");
+    CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0,
+          "compact WMMA control research restore");
+
     unsigned char alternate_map[64] = {};
     CHECK(ds4_gpu_set_model_map(alternate_map, sizeof(alternate_map)),
           "packed one release direct map");
@@ -782,28 +922,30 @@ static int run_registry_packed_one_oracle(
           "packed one no-fd source");
     CHECK(ds4_gpu_q4k_packed_slice_declare(
               full_model, full_model_bytes, full_gate_off, N_TOTAL_MAX,
-              MID_DIM, gate_row_bytes, 0u, MID_HALF, 0u, gate_row_bytes,
+              MID_DIM, gate_row_bytes, row_base, MID_HALF, 0u, gate_row_bytes,
               DS4_GPU_Q4K_PACKED_ROW_RANGE),
           "packed one gate declare");
     CHECK(ds4_gpu_q4k_packed_slice_declare(
               full_model, full_model_bytes, full_up_off, N_TOTAL_MAX,
-              MID_DIM, gate_row_bytes, 0u, MID_HALF, 0u, gate_row_bytes,
+              MID_DIM, gate_row_bytes, row_base, MID_HALF, 0u, gate_row_bytes,
               DS4_GPU_Q4K_PACKED_ROW_RANGE),
           "packed one up declare");
     CHECK(ds4_gpu_q4k_packed_slice_declare(
               full_model, full_model_bytes, full_down_off, N_TOTAL_MAX,
               OUT_DIM, down_row_bytes, 0u, OUT_DIM,
-              0u, half_down_row_bytes, DS4_GPU_Q4K_PACKED_K_RANGE),
+              down_column_byte_base, half_down_row_bytes,
+              DS4_GPU_Q4K_PACKED_K_RANGE),
           "packed one down declare");
     CHECK(ds4_gpu_q4k_packed_slice_load(
-              full_model, full_gate_off, 0u, MID_HALF,
+              full_model, full_gate_off, row_base, MID_HALF,
               0u, gate_row_bytes), "packed one gate load");
     CHECK(ds4_gpu_q4k_packed_slice_load(
-              full_model, full_up_off, 0u, MID_HALF,
+              full_model, full_up_off, row_base, MID_HALF,
               0u, gate_row_bytes), "packed one up load");
     CHECK(ds4_gpu_q4k_packed_slice_load(
               full_model, full_down_off, 0u, OUT_DIM,
-              0u, half_down_row_bytes), "packed one down load");
+              down_column_byte_base, half_down_row_bytes),
+          "packed one down load");
 
     CHECK(!run_moe(out, gate, up, mid, down, selected, weights, x, NULL,
                    full_model, full_model_bytes,
@@ -817,16 +959,18 @@ static int run_registry_packed_one_oracle(
     CHECK(!ds4_gpu_routed_moe_one_packed_q4k_tensor(
               out, gate, up, mid, down, full_model, full_model_bytes,
               full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
-              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
-              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              gate_row_bytes, down_row_bytes, row_base, MID_HALF,
+              down_column_byte_base, half_down_row_bytes,
+              selected, weights, N_USED, 0.0f,
               x, NULL, 0u),
           "packed one default-off refusal");
     bool batch_mid_is_f16 = true;
     CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
               out, gate, up, mid, down, full_model, full_model_bytes,
               full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
-              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
-              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              gate_row_bytes, down_row_bytes, row_base, MID_HALF,
+              down_column_byte_base, half_down_row_bytes,
+              selected, weights, N_USED, 0.0f,
               x, 0u, 1u, &batch_mid_is_f16),
           "packed batch default-off refusal");
     CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0,
@@ -834,8 +978,9 @@ static int run_registry_packed_one_oracle(
     CHECK(ds4_gpu_routed_moe_one_packed_q4k_tensor(
               out, gate, up, mid, down, full_model, full_model_bytes,
               full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
-              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
-              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              gate_row_bytes, down_row_bytes, row_base, MID_HALF,
+              down_column_byte_base, half_down_row_bytes,
+              selected, weights, N_USED, 0.0f,
               x, NULL, 0u),
           "packed one registry primitive");
     CHECK(hipDeviceSynchronize() == hipSuccess,
@@ -844,37 +989,26 @@ static int run_registry_packed_one_oracle(
           "packed one registry read");
     CHECK(memcmp(reference, candidate, sizeof(reference)) == 0,
           "packed one registry exact output");
-    printf("test_rocm_q4k_packed_one_oracle: output_fnv64=%016llx "
+    printf("test_rocm_q4k_packed_one_oracle: rank_half=%u output_fnv64=%016llx "
            "linear_refusal=1 default_off=1 exact=1\n",
+           row_base / MID_HALF,
            (unsigned long long)fnv1a64(candidate, sizeof(candidate)));
 
     CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
               out, gate, up, mid, down, full_model, full_model_bytes,
               full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
-              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
-              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              gate_row_bytes, down_row_bytes, row_base, MID_HALF,
+              down_column_byte_base, half_down_row_bytes,
+              selected, weights, N_USED, 0.0f,
               x, 0u, 0u, &batch_mid_is_f16),
           "packed batch zero-token refusal");
-    CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
-              out, gate, up, mid, down, full_model, full_model_bytes,
-              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
-              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
-              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
-              x, 0u, 2u, &batch_mid_is_f16),
-          "packed batch two-token refusal");
-    CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
-              out, gate, up, mid, down, full_model, full_model_bytes,
-              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
-              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
-              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
-              x, 0u, 32u, &batch_mid_is_f16),
-          "packed batch prefill refusal");
     batch_mid_is_f16 = true;
     CHECK(ds4_gpu_routed_moe_batch_packed_q4k_tensor(
               out, gate, up, mid, down, full_model, full_model_bytes,
               full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
-              gate_row_bytes, down_row_bytes, 0u, MID_HALF,
-              0u, half_down_row_bytes, selected, weights, N_USED, 0.0f,
+              gate_row_bytes, down_row_bytes, row_base, MID_HALF,
+              down_column_byte_base, half_down_row_bytes,
+              selected, weights, N_USED, 0.0f,
               x, 0u, 1u, &batch_mid_is_f16),
           "packed batch decode primitive");
     CHECK(!batch_mid_is_f16, "packed batch FP32 mid");
@@ -886,17 +1020,278 @@ static int run_registry_packed_one_oracle(
           "packed batch registry read");
     CHECK(memcmp(candidate, batch_candidate, sizeof(candidate)) == 0,
           "packed batch matches one-token primitive");
-    printf("test_rocm_q4k_packed_batch_oracle: output_fnv64=%016llx "
-           "tokens=1 fp32_mid=1 reject=0,2,32 exact=1\n",
+    batch_mid_is_f16 = true;
+    CHECK(ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+              &batch_out, &batch_gate, &batch_up, &batch_mid, &batch_down,
+              full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, row_base, MID_HALF,
+              down_column_byte_base, half_down_row_bytes,
+              &batch_selected, &batch_weights,
+              N_USED, 0.0f, &batch_x, 0u, PACKED_BATCH_TOKENS,
+              &batch_mid_is_f16),
+          "packed batch eight-token primitive");
+    CHECK(!batch_mid_is_f16, "packed batch eight-token FP32 mid");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "packed batch eight-token sync");
+    float batch_eight_candidate[PACKED_BATCH_TOKENS * OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(&batch_out, 0, batch_eight_candidate,
+                              sizeof(batch_eight_candidate)),
+          "packed batch eight-token read");
+    CHECK(memcmp(batch_eight_candidate, batch_compact_wmma_a,
+                 sizeof(batch_eight_candidate)) == 0,
+          "packed and compact half-shape WMMA bit-exact");
+    if (returned_scalar) {
+        memcpy(returned_scalar, batch_reference, sizeof(batch_reference));
+    }
+    if (returned_wmma) {
+        memcpy(returned_wmma, batch_eight_candidate,
+               sizeof(batch_eight_candidate));
+    }
+    batch_mid_is_f16 = true;
+    CHECK(ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+              &batch_out, &batch_gate, &batch_up, &batch_mid, &batch_down,
+              full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, row_base, MID_HALF,
+              down_column_byte_base, half_down_row_bytes,
+              &batch_selected, &batch_weights, N_USED, 0.0f,
+              &batch_x, 0u, 2u, &batch_mid_is_f16),
+          "packed batch two-token fallback primitive");
+    CHECK(!batch_mid_is_f16, "packed batch two-token FP32 mid");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "packed batch two-token fallback sync");
+    float batch_packed_two[2u * OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(&batch_out, 0, batch_packed_two,
+                              sizeof(batch_packed_two)),
+          "packed batch two-token fallback read");
+    CHECK(memcmp(batch_packed_two, batch_compact_two,
+                 sizeof(batch_packed_two)) == 0,
+          "packed and compact two-token fallback bit-exact");
+    uint32_t batch_changed = 0;
+    float batch_max_abs = 0.0f, batch_max_rel = 0.0f;
+    double batch_diff_sq = 0.0, batch_ref_sq = 0.0;
+    for (uint32_t i = 0; i < PACKED_BATCH_TOKENS * OUT_DIM; ++i) {
+        const float error = fabsf(batch_eight_candidate[i] -
+                                  batch_reference[i]);
+        const float rel = error / fmaxf(1e-12f, fabsf(batch_reference[i]));
+        if (error > batch_max_abs) batch_max_abs = error;
+        if (rel > batch_max_rel) batch_max_rel = rel;
+        if (memcmp(&batch_eight_candidate[i], &batch_reference[i],
+                   sizeof(float)) != 0) ++batch_changed;
+        batch_diff_sq += (double)error * error;
+        batch_ref_sq += (double)batch_reference[i] * batch_reference[i];
+    }
+    const double batch_nmse = batch_diff_sq / fmax(1e-30, batch_ref_sq);
+    printf("test_rocm_q4k_packed_batch_oracle: rank_half=%u output_fnv64=%016llx "
+           "tokens=1,2,8 fp32_mid=1 reject=0 batch2_fnv64=%016llx "
+           "batch8_fnv64=%016llx "
+           "changed=%u/%u max_abs=%.6e max_rel=%.6e nmse=%.6e\n",
+           row_base / MID_HALF,
            (unsigned long long)fnv1a64(batch_candidate,
-                                      sizeof(batch_candidate)));
+                                      sizeof(batch_candidate)),
+           (unsigned long long)fnv1a64(batch_packed_two,
+                                      sizeof(batch_packed_two)),
+           (unsigned long long)fnv1a64(batch_eight_candidate,
+                                      sizeof(batch_eight_candidate)),
+           batch_changed, PACKED_BATCH_TOKENS * OUT_DIM,
+           batch_max_abs, batch_max_rel, batch_nmse);
+    CHECK(isfinite(batch_max_rel) && isfinite(batch_nmse),
+          "packed batch eight-token finite WMMA delta");
     CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0,
           "packed one research restore");
+
+    ds4_gpu_tensor_free_in_place(&batch_x);
+    ds4_gpu_tensor_free_in_place(&batch_weights);
+    ds4_gpu_tensor_free_in_place(&batch_selected);
+    ds4_gpu_tensor_free_in_place(&batch_down);
+    ds4_gpu_tensor_free_in_place(&batch_mid);
+    ds4_gpu_tensor_free_in_place(&batch_up);
+    ds4_gpu_tensor_free_in_place(&batch_gate);
+    ds4_gpu_tensor_free_in_place(&batch_out);
 
     free(packed_model);
     free(down_half);
     free(up_half);
     free(gate_half);
+    return 0;
+}
+
+static int run_full_shape_wmma_control(
+        const unsigned char *full_model,
+        uint64_t full_gate_off, uint64_t full_up_off,
+        uint64_t full_down_off, uint64_t full_model_bytes,
+        uint64_t gate_row_bytes, uint64_t down_row_bytes,
+        ds4_gpu_tensor *source_x,
+        float *returned_scalar, float *returned_wmma) {
+    enum { TOKENS = 8 };
+    const uint64_t full_gate_expert = MID_DIM * gate_row_bytes;
+    const uint64_t full_down_expert = OUT_DIM * down_row_bytes;
+    ds4_gpu_tensor out = {}, gate = {}, up = {}, mid = {}, down = {};
+    ds4_gpu_tensor selected = {}, weights = {}, x = {};
+    CHECK(alloc_tensor(&out, (uint64_t)TOKENS * OUT_DIM * sizeof(float)),
+          "full control out");
+    CHECK(alloc_tensor(&gate,
+                       (uint64_t)TOKENS * N_USED * MID_DIM * sizeof(float)),
+          "full control gate");
+    CHECK(alloc_tensor(&up,
+                       (uint64_t)TOKENS * N_USED * MID_DIM * sizeof(float)),
+          "full control up");
+    CHECK(alloc_tensor(&mid,
+                       (uint64_t)TOKENS * N_USED * MID_DIM * sizeof(float)),
+          "full control mid");
+    CHECK(alloc_tensor(&down,
+                       (uint64_t)TOKENS * N_USED * OUT_DIM * sizeof(float)),
+          "full control down");
+    CHECK(alloc_tensor(&selected,
+                       (uint64_t)TOKENS * N_USED * sizeof(int32_t)),
+          "full control selected");
+    CHECK(alloc_tensor(&weights,
+                       (uint64_t)TOKENS * N_USED * sizeof(float)),
+          "full control weights");
+    CHECK(alloc_tensor(&x, (uint64_t)TOKENS * IN_DIM * sizeof(float)),
+          "full control x");
+
+    const int32_t routes[N_USED] = {0, 1, 2, 6, 7, 8};
+    const float route_weights[N_USED] =
+        {0.31f, 0.23f, 0.17f, 0.13f, 0.09f, 0.07f};
+    int32_t batch_routes[TOKENS * N_USED];
+    float batch_route_weights[TOKENS * N_USED];
+    float batch_x_host[TOKENS * IN_DIM];
+    float x_one[IN_DIM];
+    CHECK(ds4_gpu_tensor_read(source_x, 0, x_one, sizeof(x_one)),
+          "full control source x read");
+    for (uint32_t t = 0; t < TOKENS; ++t) {
+        for (uint32_t j = 0; j < N_USED; ++j) {
+            batch_routes[t * N_USED + j] = routes[(j + t) % N_USED];
+            batch_route_weights[t * N_USED + j] =
+                route_weights[(j + t) % N_USED];
+        }
+        for (uint32_t j = 0; j < IN_DIM; ++j) {
+            batch_x_host[t * IN_DIM + j] =
+                x_one[j] + (float)((int)(t % 3u) - 1) * 0.0009765625f;
+        }
+    }
+    CHECK(upload(&selected, batch_routes, sizeof(batch_routes)),
+          "full control routes");
+    CHECK(upload(&weights, batch_route_weights, sizeof(batch_route_weights)),
+          "full control weights");
+    CHECK(upload(&x, batch_x_host, sizeof(batch_x_host)), "full control x");
+
+    unsigned char release_map[64] = {};
+    CHECK(ds4_gpu_set_model_map(release_map, sizeof(release_map)),
+          "full control release packed map");
+    CHECK(ds4_gpu_set_model_map(full_model, full_model_bytes),
+          "full control model map");
+    CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0,
+          "full control research on");
+
+    CHECK(ds4_gpu_routed_moe_batch_q4k_control(
+              &out, &gate, &up, &mid, &down,
+              full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off,
+              full_gate_expert, gate_row_bytes,
+              full_down_expert, down_row_bytes,
+              &selected, &weights, N_TOTAL_MAX, N_USED, 0.0f, &x,
+              0u, TOKENS, MID_DIM, false),
+          "full-shape scalar control");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "full-shape scalar control sync");
+    float scalar[TOKENS * OUT_DIM];
+    float wmma_a[TOKENS * OUT_DIM];
+    float wmma_b[TOKENS * OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(&out, 0, scalar, sizeof(scalar)),
+          "full-shape scalar read");
+
+    CHECK(ds4_gpu_routed_moe_batch_q4k_control(
+              &out, &gate, &up, &mid, &down,
+              full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off,
+              full_gate_expert, gate_row_bytes,
+              full_down_expert, down_row_bytes,
+              &selected, &weights, N_TOTAL_MAX, N_USED, 0.0f, &x,
+              0u, TOKENS, MID_DIM, true),
+          "full-shape WMMA control A");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "full-shape WMMA control A sync");
+    CHECK(ds4_gpu_tensor_read(&out, 0, wmma_a, sizeof(wmma_a)),
+          "full-shape WMMA control A read");
+    CHECK(ds4_gpu_routed_moe_batch_q4k_control(
+              &out, &gate, &up, &mid, &down,
+              full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off,
+              full_gate_expert, gate_row_bytes,
+              full_down_expert, down_row_bytes,
+              &selected, &weights, N_TOTAL_MAX, N_USED, 0.0f, &x,
+              0u, TOKENS, MID_DIM, true),
+          "full-shape WMMA control B");
+    CHECK(hipDeviceSynchronize() == hipSuccess,
+          "full-shape WMMA control B sync");
+    CHECK(ds4_gpu_tensor_read(&out, 0, wmma_b, sizeof(wmma_b)),
+          "full-shape WMMA control B read");
+    CHECK(memcmp(wmma_a, wmma_b, sizeof(wmma_a)) == 0,
+          "full-shape WMMA deterministic");
+    memcpy(returned_scalar, scalar, sizeof(scalar));
+    memcpy(returned_wmma, wmma_a, sizeof(wmma_a));
+    CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0,
+          "full control research restore");
+
+    ds4_gpu_tensor_free_in_place(&x);
+    ds4_gpu_tensor_free_in_place(&weights);
+    ds4_gpu_tensor_free_in_place(&selected);
+    ds4_gpu_tensor_free_in_place(&down);
+    ds4_gpu_tensor_free_in_place(&mid);
+    ds4_gpu_tensor_free_in_place(&up);
+    ds4_gpu_tensor_free_in_place(&gate);
+    ds4_gpu_tensor_free_in_place(&out);
+    return 0;
+}
+
+static int check_half_shape_wmma_b2(
+        const float *full_scalar, const float *full_wmma,
+        const float *half0_scalar, const float *half0_wmma,
+        const float *half1_scalar, const float *half1_wmma) {
+    enum { TOKENS = 8 };
+    double full_diff_sq = 0.0, split_diff_sq = 0.0;
+    double split_scalar_diff_sq = 0.0, ref_sq = 0.0;
+    float full_max_rel = 0.0f, split_max_rel = 0.0f;
+    float split_scalar_max_rel = 0.0f;
+    uint32_t nonfinite = 0u;
+    for (uint32_t i = 0; i < TOKENS * OUT_DIM; ++i) {
+        const float split_scalar = half0_scalar[i] + half1_scalar[i];
+        const float split_wmma = half0_wmma[i] + half1_wmma[i];
+        const float denom = fmaxf(1.0f, fabsf(full_scalar[i]));
+        const float full_error = fabsf(full_wmma[i] - full_scalar[i]);
+        const float split_error = fabsf(split_wmma - full_scalar[i]);
+        const float split_scalar_error = fabsf(split_scalar - full_scalar[i]);
+        if (!isfinite(full_scalar[i]) || !isfinite(full_wmma[i]) ||
+            !isfinite(split_wmma) || !isfinite(split_scalar)) ++nonfinite;
+        full_max_rel = fmaxf(full_max_rel, full_error / denom);
+        split_max_rel = fmaxf(split_max_rel, split_error / denom);
+        split_scalar_max_rel =
+            fmaxf(split_scalar_max_rel, split_scalar_error / denom);
+        full_diff_sq += (double)full_error * full_error;
+        split_diff_sq += (double)split_error * split_error;
+        split_scalar_diff_sq +=
+            (double)split_scalar_error * split_scalar_error;
+        ref_sq += (double)full_scalar[i] * full_scalar[i];
+    }
+    const double full_nmse = full_diff_sq / fmax(1e-30, ref_sq);
+    const double split_nmse = split_diff_sq / fmax(1e-30, ref_sq);
+    const double split_scalar_nmse =
+        split_scalar_diff_sq / fmax(1e-30, ref_sq);
+    printf("test_rocm_q4k_half_wmma_b2: tokens=%u "
+           "full_max_rel=%.6e full_nmse=%.6e split_max_rel=%.6e "
+           "split_nmse=%.6e scalar_split_max_rel=%.6e "
+           "scalar_split_nmse=%.6e nonfinite=%u factor_limit=2\n",
+           TOKENS, full_max_rel, full_nmse, split_max_rel, split_nmse,
+           split_scalar_max_rel, split_scalar_nmse, nonfinite);
+    CHECK(nonfinite == 0u, "half-shape WMMA B2 finite outputs");
+    CHECK(split_scalar_max_rel <= 2e-5f && split_scalar_nmse <= 1e-10,
+          "half-shape scalar split coherence");
+    CHECK(split_max_rel <= fmaxf(1e-7f, 2.0f * full_max_rel) &&
+              split_nmse <= fmax(1e-20, 2.0 * full_nmse),
+          "half-shape WMMA B2 production-relative envelope");
     return 0;
 }
 
@@ -909,6 +1304,10 @@ int main(void) {
     config.device_indices[0] = 0;
     CHECK(ds4_gpu_init_multi(&config), "initialize ROCm");
     CHECK(setenv("DS4_ROCM_Q4K_DECODE_STAGE_XQ", "1", 1) == 0, "stage XQ");
+    CHECK(setenv("DS4_ROCM_Q4K_SORTED_MIN_TOKENS", "8", 1) == 0,
+          "packed batch WMMA threshold");
+    CHECK(setenv("DS4_ROCM_Q4K_WMMA_LAYER_LOG", "1", 1) == 0,
+          "packed batch WMMA proof log");
     CHECK(unsetenv("DS4_ROCM_Q4K_DECODE_STAGE_MIDQ") == 0, "midq off");
 
     const uint64_t in_blocks = IN_DIM / QK_K;
@@ -998,10 +1397,32 @@ int main(void) {
         }
     }
 
+    float full_scalar[8u * OUT_DIM], full_wmma[8u * OUT_DIM];
+    float half0_scalar[8u * OUT_DIM], half0_wmma[8u * OUT_DIM];
+    float half1_scalar[8u * OUT_DIM], half1_wmma[8u * OUT_DIM];
+    if (run_full_shape_wmma_control(
+            full_model, full_gate_off, full_up_off, full_down_off,
+            full_model_bytes, gate_row_bytes, down_row_bytes, &x,
+            full_scalar, full_wmma) != 0) {
+        return 1;
+    }
     if (run_registry_packed_one_oracle(
             full_model, full_gate_off, full_up_off, full_down_off,
             full_model_bytes, gate_row_bytes, down_row_bytes,
-            &out, &gate, &up, &mid, &down, &selected, &wts, &x) != 0) {
+            &out, &gate, &up, &mid, &down, &selected, &wts, &x, 0u,
+            half0_scalar, half0_wmma) != 0) {
+        return 1;
+    }
+    if (run_registry_packed_one_oracle(
+            full_model, full_gate_off, full_up_off, full_down_off,
+            full_model_bytes, gate_row_bytes, down_row_bytes,
+            &out, &gate, &up, &mid, &down, &selected, &wts, &x,
+            MID_HALF, half1_scalar, half1_wmma) != 0) {
+        return 1;
+    }
+    if (check_half_shape_wmma_b2(
+            full_scalar, full_wmma, half0_scalar, half0_wmma,
+            half1_scalar, half1_wmma) != 0) {
         return 1;
     }
 

@@ -32,6 +32,7 @@
 /tests/test_rocm_q4k_fused_mid
 /tests/test_rocm_attention_prefill_static_flash
 /tests/test_rocm_attention_decode_mixed
+/tests/test_rocm_attention_decode_indexed_seqtile
 /tests/test_rocm_attention_output_tp
 /tests/test_rocm_attention_q_b_fused
 /tests/test_rocm_moe_wave_plan
@@ -39,6 +40,12 @@
 /tests/test_rocm_q4k_one_token_oracle
 /tests/test_rocm_q4k_staged_midq_oracle
 /tests/test_rocm_q4k_ffn_row_balance_oracle
+/tests/test_rocm_q4k_kshard_compose
+/tests/test_rocm_q4k_kshard_install
+/tests/test_rocm_q4k_kshard_prefill_realweight
+/tests/test_rocm_q4k_kshard_prefill_timing
+/tests/test_rocm_q4k_packed_slice_registry
+/tests/test_rocm_shared_routed_overlap
 /tests/test_rocm_q4k_slot_balance_oracle
 /tests/test_rocm_compressor_row_shard_oracle
 /tests/test_rocm_prefill_wavefront_projections
@@ -48,6 +55,7 @@
 /tests/test_rocm_tp_split_gate
 /tests/rocm_long_context_smoke
 /tests/test_tp_big_gate_overlap
+/tests/test_tp_dual_stream_progress
 /tests/roce_v2_mr_probe
 *.o
 *.dSYM/

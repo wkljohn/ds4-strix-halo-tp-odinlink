@@ -72,7 +72,7 @@ int main(void) {
         (uint64_t)DOWN_ROWS * DOWN_ROW_BYTES;
     const uint64_t tensor_gate_bytes = N_EXPERT * gate_expert_bytes;
     const uint64_t tensor_down_bytes = N_EXPERT * down_expert_bytes;
-    const uint64_t gate_offset = 4096u;
+    const uint64_t gate_offset = 128u * 1024u;
     const uint64_t up_offset =
         align_up(gate_offset + tensor_gate_bytes, 4096u);
     const uint64_t down_offset =
@@ -103,7 +103,7 @@ int main(void) {
         4096u, 2048u, 4096u,
         GATE_ROW_BYTES, GATE_ROW_BYTES, DOWN_ROW_BYTES
     };
-    const uint64_t dense_offset = 0u, dense_size = 4096u;
+    const uint64_t dense_offset = 0u, dense_size = 2048u;
     ds4_gpu_q4k_kshard_windows windows;
 
     CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0, "research unset");
@@ -220,9 +220,55 @@ int main(void) {
     ds4_gpu_tp_shutdown();
     ds4_gpu_tensor_free(slab);
 
+    /* Production starts with rank-owned routed images.  The K-shard
+     * transition evacuates those allocations and replaces them with fresh
+     * packed slices without increasing persistent routed-weight residency.
+     * Release is deliberately fail-closed until engine cleanup: the old
+     * allocation addresses must never be re-published. */
+    CHECK(ds4_gpu_init(), "borrowed GPU re-init");
+    slab = ds4_gpu_tensor_alloc_rdma_host(4096u);
+    CHECK(slab, "borrowed TP slab");
+    CHECK(ds4_gpu_tp_init(0u, slab, 0u, exchange_stub, NULL),
+          "borrowed TP init");
+    const uint64_t half_gate = tensor_gate_bytes / 2u;
+    const uint64_t half_down = tensor_down_bytes / 2u;
+    const uint64_t resident_offsets[] = {
+        dense_offset, gate_offset, up_offset, down_offset,
+    };
+    const uint64_t resident_sizes[] = {
+        dense_size, half_gate, half_gate, half_down,
+    };
+    CHECK(ds4_gpu_set_model_fd_for_map(fd, model), "borrowed model fd");
+    CHECK(ds4_gpu_set_model_map_spans(
+              model, model_bytes, resident_offsets, resident_sizes, 4u,
+              half_gate), "rank-owned resident images");
+    size_t free_before = 0, total_before = 0;
+    size_t free_after = 0, total_after = 0;
+    CHECK(hipMemGetInfo(&free_before, &total_before) == hipSuccess,
+          "borrowed memory before");
+    CHECK(ds4_gpu_q4k_kshard_install(
+              model, model_bytes, fd, 0u, &dense_offset, &dense_size, 1u,
+              dense_size, &layer, 1u), "borrowed rank0 install");
+    CHECK(hipMemGetInfo(&free_after, &total_after) == hipSuccess,
+          "borrowed memory after");
+    CHECK(free_after + 1048576u >= free_before,
+          "borrowed transition adds no routed allocation");
+    CHECK(resolve_one(model, gate_offset, GATE_ROWS, GATE_ROW_BYTES,
+                      0u, 1024u, 0u, GATE_ROW_BYTES,
+                      DS4_GPU_Q4K_PACKED_ROW_RANGE, packed_gate_expert),
+          "borrowed packed addressability");
+    ds4_gpu_q4k_kshard_release();
+    CHECK(!ds4_gpu_cache_model_range(model, model_bytes, gate_offset,
+                                     half_gate, "evacuated-release-linear"),
+          "evacuated release remains fail closed");
+    ds4_gpu_cleanup();
+    ds4_gpu_tp_shutdown();
+    ds4_gpu_tensor_free(slab);
+
     printf("q4k_kshard_install experts=%u packed_bytes=%llu "
            "rank0=pass rank1=pass remap_restore=pass failure_atomic=pass "
-           "release_atomic=pass linear_fail_closed=pass idempotent=pass\n",
+           "release_atomic=pass linear_fail_closed=pass idempotent=pass "
+           "zero_net_evacuation=pass cleanup_required=pass\n",
            N_EXPERT, (unsigned long long)packed_total);
     close(bad_fd);
     close(fd);

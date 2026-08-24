@@ -90,6 +90,9 @@ case $RDMA_PROFILE in
 esac
 PROMPT_FILE=${DS4_BENCH_PROMPT_FILE:-$REPO/bench-prompts/codex-attn-rowsplit-implement-brief.md}
 FRONTIER=${DS4_BENCH_FRONTIER:-2048}
+FRONTIER_MAX=${DS4_BENCH_FRONTIER_MAX:-$FRONTIER}
+STEP_INCR=${DS4_BENCH_STEP_INCR:-2048}
+STEP_MUL=${DS4_BENCH_STEP_MUL:-1}
 TOKENS=${DS4_BENCH_TOKENS:-300}
 CONTEXT=${DS4_BENCH_CONTEXT:-4096}
 PREFILL_CHUNK=${DS4_BENCH_PREFILL_CHUNK:-4096}
@@ -139,8 +142,12 @@ PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes
           -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS")
 
 [[ $FRONTIER =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid frontier" >&2; exit 2; }
+[[ $FRONTIER_MAX =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid frontier max" >&2; exit 2; }
+(( FRONTIER_MAX >= FRONTIER )) || { echo "error: frontier max must be >= frontier" >&2; exit 2; }
+[[ $STEP_INCR =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid frontier step increment" >&2; exit 2; }
+[[ $STEP_MUL =~ ^[1-9][0-9]*(\.[0-9]+)?$ ]] || { echo "error: invalid frontier step multiplier" >&2; exit 2; }
 [[ $TOKENS =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid generated-token count" >&2; exit 2; }
-(( CONTEXT > FRONTIER + TOKENS )) || { echo "error: context must exceed frontier + tokens" >&2; exit 2; }
+(( CONTEXT > FRONTIER_MAX + TOKENS )) || { echo "error: context must exceed frontier max + tokens" >&2; exit 2; }
 [[ $TP_TIMEOUT_SEC =~ ^[1-9][0-9]*$ ]] || { echo "error: invalid TP timeout" >&2; exit 2; }
 if [[ $ROCPROF == 1 && -z $TP_TIMEOUT_EXPLICIT ]]; then
   # Coordinator-only tracing can delay one rank substantially. This affects
@@ -164,6 +171,10 @@ if [[ -n ${DS4_TP_EXPERT_SPLIT+x} ]]; then
   exit 2
 fi
 if [[ $CANDIDATE == 1 ]]; then
+  [[ $FRONTIER == "$FRONTIER_MAX" ]] || {
+    echo "error: candidate timing requires one fixed frontier; multi-frontier sweeps are diagnostic only" >&2
+    exit 2
+  }
   [[ $CANDIDATE_LANE == A || $CANDIDATE_LANE == B || $CANDIDATE_LANE == C ]] || {
     echo "error: DS4_BENCH_LANE must be A, B, or C" >&2; exit 2;
   }
@@ -610,6 +621,9 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'binary_runpath=%s\n' "$BINARY_RUNPATH"
   printf 'expected_binary_toolchain_sha256=%s\n' "$EXPECTED_TOOLCHAIN_SHA256"
   printf 'frontier=%s\n' "$FRONTIER"
+  printf 'frontier_max=%s\n' "$FRONTIER_MAX"
+  printf 'step_incr=%s\n' "$STEP_INCR"
+  printf 'step_mul=%s\n' "$STEP_MUL"
   printf 'generated_tokens=%s\n' "$TOKENS"
   printf 'context=%s\n' "$CONTEXT"
   printf 'prefill_chunk=%s\n' "$PREFILL_CHUNK"
@@ -704,7 +718,7 @@ done
 
 echo "=== ds4-bench $TAG ==="
 echo "model: $MODEL"
-echo "workload: frontier=$FRONTIER generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK"
+echo "workload: frontier=$FRONTIER frontier_max=$FRONTIER_MAX step_incr=$STEP_INCR step_mul=$STEP_MUL generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK"
 echo "rdma_profile: $RDMA_PROFILE coordinator_device=$LOCAL_RDMA_DEVICE worker_device=$PEER_RDMA_DEVICE"
 if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
 if [[ $DSPARK == 0 ]]; then echo "routed_expert_family: $ROUTED_FAMILY"; fi
@@ -759,7 +773,9 @@ fi
   --role coordinator --tensor-parallel --listen 0.0.0.0 9000 \
   --transport rdma --rocm -m "$MODEL" --prompt-file "$PROMPT_FILE" \
   "${RDMA_ARGS[@]}" \
-  --ctx-start "$FRONTIER" --ctx-max "$FRONTIER" --ctx-alloc "$CONTEXT" \
+  --ctx-start "$FRONTIER" --ctx-max "$FRONTIER_MAX" \
+  --step-incr "$STEP_INCR" --step-mul "$STEP_MUL" \
+  --ctx-alloc "$CONTEXT" \
   --prefill-chunk "$PREFILL_CHUNK" --gen-tokens "$TOKENS" --csv "$CSV" \
   "${CANDIDATE_ARGS[@]}" \
   "${COORD_ARGS[@]}" \

@@ -29,6 +29,25 @@ static cudaStream_t g_stream_selected_upload_stream;
 static cudaStream_t g_selected_readback_stream;
 static cudaEvent_t g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
+static cudaEvent_t g_token_span_start;
+static cudaEvent_t g_token_span_head;
+static cudaEvent_t g_token_span_head_stage[DS4_GPU_TOKEN_HEAD_STAGE_COUNT];
+static cudaEvent_t g_token_span_stop;
+static int g_token_span_active;
+static int g_token_span_head_valid;
+static uint32_t g_token_span_head_stage_mask;
+static cudaEvent_t g_token_attn_span_start;
+static cudaEvent_t g_token_attn_span_stop;
+static int g_token_attn_span_active;
+static int g_token_attn_span_valid;
+
+static int token_span_head_stage_profile_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_TP_TOKEN_HEAD_STAGE_PROFILE") != NULL;
+    }
+    return enabled;
+}
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
@@ -72,6 +91,7 @@ struct cuda_model_image {
     uint64_t size;
     char *device_ptr;
     uint64_t device_offset;
+    int owns_device_ptr = 1;
 };
 
 struct cuda_q4k_packed_slice {
@@ -91,6 +111,8 @@ struct cuda_q4k_packed_slice {
     uint32_t row_count;
     ds4_gpu_q4k_packed_slice_kind kind;
     char *device_ptr;
+    int owns_device_ptr;
+    int loaded;
     int blocked_logged;
 };
 
@@ -296,6 +318,8 @@ struct cuda_stream_cache_layer_stats {
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::vector<cuda_model_image> g_model_images;
+static std::vector<cuda_model_image> g_q4k_kshard_pre_images;
+static std::vector<cuda_model_image> g_q4k_kshard_borrowed_images;
 static std::vector<cuda_q4k_packed_slice> g_q4k_packed_slices;
 static std::unordered_multimap<uint64_t, size_t> g_q4k_packed_by_offset;
 struct cuda_q4k_kshard_blocked_range {
@@ -317,6 +341,7 @@ static struct {
     int installed;
     int owns_shard_suspend;
     int snapshot_valid;
+    int evacuated;
     const void *model_map;
     uint64_t model_size;
     uint64_t key_hash;
@@ -335,16 +360,58 @@ static struct {
     uint64_t pre_model_file_size;
 } g_q4k_kshard;
 
+static int cuda_q4k_kshard_restore_borrowed(void);
+static int g_q4k_kshard_cleanup_in_progress;
+
 static void cuda_q4k_kshard_state_clear(void) {
+    const int was_evacuated = g_q4k_kshard.evacuated;
     if (g_q4k_kshard.owns_shard_suspend) {
         ds4_gpu_tp_suspend_expert_sharding(0);
     }
     if (g_q4k_kshard.snapshot_valid) {
-        while (g_model_images.size() >
-               g_q4k_kshard.pre_model_image_count) {
-            cuda_model_image &img = g_model_images.back();
-            if (img.device_ptr) (void)cudaFree(img.device_ptr);
-            g_model_images.pop_back();
+        if (g_q4k_kshard.evacuated) {
+            for (const cuda_model_image &img : g_model_images) {
+                if (img.device_ptr && img.owns_device_ptr) {
+                    (void)cudaFree(img.device_ptr);
+                }
+            }
+            g_model_images.clear();
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "Q4_K K-shard evacuated residency released; this "
+                    "engine requires cleanup rather than in-place rollback\n");
+        }
+        const int had_borrowed = !g_q4k_kshard_borrowed_images.empty();
+        const int restored = g_q4k_kshard.evacuated ? 0 :
+            (g_q4k_kshard_cleanup_in_progress ||
+             cuda_q4k_kshard_restore_borrowed());
+        for (const cuda_model_image &img : g_model_images) {
+            int existed = 0;
+            for (const cuda_model_image &old : g_q4k_kshard_pre_images) {
+                if (img.device_ptr == old.device_ptr) {
+                    existed = 1;
+                    break;
+                }
+            }
+            if (!existed && img.device_ptr && img.owns_device_ptr) {
+                (void)cudaFree(img.device_ptr);
+            }
+        }
+        if (g_q4k_kshard.evacuated) {
+            /* The snapshot's pointers named allocations freed before the
+             * packed reload.  Never re-publish those stale addresses. */
+        } else if (restored) {
+            g_model_images = g_q4k_kshard_pre_images;
+            if (had_borrowed && !g_q4k_kshard_cleanup_in_progress) {
+                g_q4k_kshard_blocked_ranges.clear();
+            }
+        } else {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "Q4_K K-shard rollback reload failed; routed weights "
+                    "remain fail-closed until model cleanup\n");
+            for (const cuda_model_image &img :
+                 g_q4k_kshard_borrowed_images) {
+                if (img.device_ptr) (void)cudaFree(img.device_ptr);
+            }
         }
         if (g_model_direct_fd >= 0) (void)close(g_model_direct_fd);
         g_model_host_base = g_q4k_kshard.pre_model_host_base;
@@ -363,7 +430,14 @@ static void cuda_q4k_kshard_state_clear(void) {
         g_model_direct_align =
             g_q4k_kshard.pre_model_direct_align;
         g_model_file_size = g_q4k_kshard.pre_model_file_size;
+        if (was_evacuated) {
+            g_model_device_base = NULL;
+            g_model_device_owned = 0;
+            g_model_cache_full = 0;
+        }
     }
+    g_q4k_kshard_pre_images.clear();
+    g_q4k_kshard_borrowed_images.clear();
     memset(&g_q4k_kshard, 0, sizeof(g_q4k_kshard));
     g_q4k_kshard.pre_model_direct_fd = -1;
 }
@@ -377,6 +451,8 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+static void *g_attention_seq_scratch[DS4_MAX_GPUS];
+static uint64_t g_attention_seq_scratch_bytes[DS4_MAX_GPUS];
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -661,6 +737,12 @@ __global__ static void dequant_q8_0_to_f16_transpose_kernel(
         uint64_t out_dim,
         uint64_t blocks);
 
+__global__ static void cuda_copy_bytes_kernel(
+        char *dst, const char *src, uint64_t bytes) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < bytes) dst[i] = src[i];
+}
+
 static void cuda_shared_gate_up_async_cleanup(void);
 
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
@@ -682,6 +764,39 @@ static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     g_cuda_tmp = ptr;
     g_cuda_tmp_bytes = bytes;
     return g_cuda_tmp;
+}
+
+static void *cuda_attention_seq_scratch_alloc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        device < 0 || device >= DS4_MAX_GPUS) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "sequence-tiled attention cannot resolve current device\n");
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    if (g_attention_seq_scratch_bytes[device] >= bytes) {
+        return g_attention_seq_scratch[device];
+    }
+    if (g_attention_seq_scratch[device]) {
+        (void)cudaFree(g_attention_seq_scratch[device]);
+        g_attention_seq_scratch[device] = NULL;
+        g_attention_seq_scratch_bytes[device] = 0;
+    }
+    void *ptr = NULL;
+    const cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "sequence-tiled attention scratch alloc failed (%.2f MiB): %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_attention_seq_scratch[device] = ptr;
+    g_attention_seq_scratch_bytes[device] = bytes;
+    return ptr;
 }
 
 static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
@@ -827,7 +942,7 @@ static int cuda_q4k_packed_slice_refuse_routed_tables(
 
 static void cuda_q4k_packed_slice_release_all(void) {
     for (cuda_q4k_packed_slice &p : g_q4k_packed_slices) {
-        if (p.device_ptr) (void)cudaFree(p.device_ptr);
+        if (p.device_ptr && p.owns_device_ptr) (void)cudaFree(p.device_ptr);
         p.device_ptr = NULL;
     }
     g_q4k_packed_slices.clear();
@@ -837,9 +952,13 @@ static void cuda_q4k_packed_slice_release_all(void) {
 }
 
 static void cuda_model_image_release_all(void) {
+    g_q4k_kshard_cleanup_in_progress = 1;
     cuda_q4k_packed_slice_release_all();
+    g_q4k_kshard_cleanup_in_progress = 0;
     for (const cuda_model_image &img : g_model_images) {
-        if (img.device_ptr) (void)cudaFree(img.device_ptr);
+        if (img.device_ptr && img.owns_device_ptr) {
+            (void)cudaFree(img.device_ptr);
+        }
     }
     g_model_images.clear();
     g_q4k_kshard_blocked_ranges.clear();
@@ -4939,6 +5058,13 @@ static int cuda_stream_selected_apply(
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     const char *owned = cuda_model_image_ptr(model_map, offset);
     if (owned) return owned;
+    if (g_q4k_kshard.snapshot_valid && model_map == g_model_host_base) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "Q4_K K-shard refusing uncovered start-only model pointer "
+                "at offset %.6f GiB\n",
+                (double)offset / 1073741824.0);
+        return NULL;
+    }
     if (model_map == g_model_host_base && g_model_device_base) return g_model_device_base + offset;
     return (const char *)model_map + offset;
 }
@@ -5333,10 +5459,10 @@ static int cuda_dspark_prepare_selected_experts(
 }
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
-    if (bytes == 0) return cuda_model_ptr(model_map, offset);
     if (cuda_q4k_packed_slice_refuse_linear(model_map, offset, bytes, what)) {
         return NULL;
     }
+    if (bytes == 0) return cuda_model_ptr(model_map, offset);
     const char *image_ptr =
         cuda_model_image_range_ptr(model_map, offset, bytes);
     if (image_ptr) return image_ptr;
@@ -5360,6 +5486,15 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
+    if (g_q4k_kshard.snapshot_valid && model_map == g_model_host_base) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "Q4_K K-shard refusing uncovered model range %s at "
+                "offset %.6f GiB bytes=%llu\n",
+                what ? what : "weights",
+                (double)offset / 1073741824.0,
+                (unsigned long long)bytes);
+        return NULL;
+    }
     const char *fd_ptr = cuda_model_range_ptr_from_fd(model_map, offset, bytes, what);
     if (fd_ptr) return fd_ptr;
     if (g_ssd_streaming_mode && model_map == g_model_host_base) {
@@ -6258,6 +6393,48 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
     return cuda_pread_full(g_model_fd, stage, bytes, offset);
 }
 
+static int cuda_q4k_kshard_restore_borrowed(void) {
+    if (g_q4k_kshard_borrowed_images.empty()) return 1;
+    if (g_model_fd < 0 ||
+        g_model_fd_host_base != g_q4k_kshard.model_map) return 0;
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    uint64_t stage_bytes = chunk;
+    if (!cuda_u64_add_checked(
+            stage_bytes,
+            g_model_direct_align > 1u ? g_model_direct_align : 1u,
+            &stage_bytes) || !cuda_model_stage_pool_alloc(stage_bytes)) {
+        return 0;
+    }
+    uint64_t chunk_index = 0;
+    for (const cuda_model_image &img : g_q4k_kshard_borrowed_images) {
+        uint64_t copied = 0;
+        while (copied < img.size) {
+            const uint64_t n = std::min(chunk, img.size - copied);
+            const uint32_t bi = (uint32_t)(chunk_index % 4u);
+            cudaError_t err = cudaSuccess;
+            if (chunk_index >= 4u &&
+                (err = cudaEventSynchronize(g_model_stage_event[bi])) !=
+                    cudaSuccess) return 0;
+            const char *payload = NULL;
+            if (!cuda_model_stage_read(g_model_stage[bi],
+                                       g_model_stage_bytes,
+                                       img.device_offset + copied, n,
+                                       &payload)) return 0;
+            err = cudaMemcpyAsync(img.device_ptr + copied, payload, (size_t)n,
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream);
+            if (err != cudaSuccess ||
+                cudaEventRecord(g_model_stage_event[bi],
+                                g_model_upload_stream) != cudaSuccess) {
+                return 0;
+            }
+            copied += n;
+            ++chunk_index;
+        }
+    }
+    return cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
+}
+
 extern "C" int ds4_gpu_q4k_packed_slice_declare(
         const void *model_map, uint64_t model_size, uint64_t tensor_offset,
         uint32_t n_expert, uint32_t source_rows,
@@ -6322,7 +6499,7 @@ extern "C" int ds4_gpu_q4k_packed_slice_declare(
         model_map, model_size, tensor_offset, source_tensor_bytes,
         source_expert_bytes, source_row_bytes, packed_expert_bytes,
         packed_bytes, column_byte_base, column_byte_count, n_expert,
-        source_rows, row_base, row_count, kind, NULL, 0});
+        source_rows, row_base, row_count, kind, NULL, 0, 0, 0});
     g_q4k_packed_by_offset.emplace(tensor_offset, index);
     return 1;
 }
@@ -6335,15 +6512,16 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
         model_map, tensor_offset, row_base, row_count,
         column_byte_base, column_byte_count);
     if (!p) return 0;
-    if (p->device_ptr) return 1;
+    if (p->loaded) return 1;
     if (g_model_fd >= 0 && g_model_fd_host_base != model_map) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "packed Q4_K loader model-fd/map mismatch\n");
         return 0;
     }
 
-    void *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)p->packed_bytes);
+    void *dev = p->device_ptr;
+    cudaError_t err = cudaSuccess;
+    if (!dev) err = cudaMalloc(&dev, (size_t)p->packed_bytes);
     if (err != cudaSuccess || !dev) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "packed Q4_K slice allocation failed (%.2f MiB): %s\n",
@@ -6352,6 +6530,10 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
         (void)cudaGetLastError();
         return 0;
     }
+    if (!p->device_ptr) {
+        p->device_ptr = (char *)dev;
+        p->owns_device_ptr = 1;
+    }
 
     const int use_fd_staging = g_model_fd >= 0;
     const int strided = p->column_byte_base != 0u ||
@@ -6359,13 +6541,22 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
     uint64_t source_window_bytes = 0;
     if (!cuda_u64_mul_checked(p->row_count, p->source_row_bytes,
                               &source_window_bytes)) {
-        (void)cudaFree(dev);
+        if (p->owns_device_ptr) (void)cudaFree(dev);
+        p->device_ptr = NULL;
+        p->owns_device_ptr = 0;
         return 0;
     }
     void *packed_raw[4] = {};
     char *packed_stage[4] = {};
+    void *borrowed_device_stage = NULL;
     std::vector<char> host_pack;
     int ok = 1;
+
+    if (!p->owns_device_ptr) {
+        err = cudaMalloc(&borrowed_device_stage,
+                         (size_t)p->packed_expert_bytes);
+        if (err != cudaSuccess || !borrowed_device_stage) ok = 0;
+    }
 
     if (use_fd_staging) {
         uint64_t stage_need = strided ? source_window_bytes :
@@ -6408,7 +6599,7 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
                     (uint64_t)expert * p->packed_expert_bytes;
         if (use_fd_staging) {
             const uint32_t bi = expert % 4u;
-            if (expert >= 4u &&
+            if (p->owns_device_ptr && expert >= 4u &&
                 (err = cudaEventSynchronize(g_model_stage_event[bi])) !=
                     cudaSuccess) {
                 ok = 0;
@@ -6434,14 +6625,40 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
                 }
                 upload = packed_stage[bi];
             }
-            err = cudaMemcpyAsync(dst, upload,
-                                  (size_t)p->packed_expert_bytes,
-                                  cudaMemcpyHostToDevice,
-                                  g_model_upload_stream);
-            if (err != cudaSuccess ||
-                (err = cudaEventRecord(g_model_stage_event[bi],
-                                       g_model_upload_stream)) !=
-                    cudaSuccess) {
+            if (p->owns_device_ptr) {
+                err = cudaMemcpyAsync(dst, upload,
+                                      (size_t)p->packed_expert_bytes,
+                                      cudaMemcpyHostToDevice,
+                                      g_model_upload_stream);
+                if (err == cudaSuccess) {
+                    err = cudaEventRecord(g_model_stage_event[bi],
+                                          g_model_upload_stream);
+                }
+            } else {
+                err = cudaMemcpy(borrowed_device_stage, upload,
+                                 (size_t)p->packed_expert_bytes,
+                                 cudaMemcpyHostToDevice);
+                if (err == cudaSuccess) {
+                    const uint32_t threads = 256u;
+                    const uint32_t blocks = (uint32_t)(
+                        (p->packed_expert_bytes + threads - 1u) / threads);
+                    hipLaunchKernelGGL(cuda_copy_bytes_kernel,
+                        dim3(blocks), dim3(threads), 0,
+                        g_model_upload_stream, dst,
+                        (const char *)borrowed_device_stage,
+                        p->packed_expert_bytes);
+                    err = cudaGetLastError();
+                    if (err == cudaSuccess) {
+                        err = cudaStreamSynchronize(g_model_upload_stream);
+                    }
+                }
+            }
+            if (err != cudaSuccess) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "packed Q4_K upload failed expert=%u dst=%p "
+                        "bytes=%llu: %s\n", expert, (void *)dst,
+                        (unsigned long long)p->packed_expert_bytes,
+                        cudaGetErrorString(err));
                 ok = 0;
                 break;
             }
@@ -6478,17 +6695,20 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
     for (uint32_t i = 0; i < 4u; i++) {
         if (packed_raw[i]) (void)cudaFreeHost(packed_raw[i]);
     }
+    if (borrowed_device_stage) (void)cudaFree(borrowed_device_stage);
     if (!ok) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "packed Q4_K slice load failed at offset %.2f GiB: %s\n",
                 (double)p->tensor_offset / 1073741824.0,
                 err == cudaSuccess ? strerror(errno) : cudaGetErrorString(err));
-        (void)cudaFree(dev);
+        if (p->owns_device_ptr) (void)cudaFree(dev);
+        p->device_ptr = NULL;
+        p->owns_device_ptr = 0;
         (void)cudaGetLastError();
         return 0;
     }
 
-    p->device_ptr = (char *)dev;
+    p->loaded = 1;
     g_q4k_packed_slice_bytes += p->packed_bytes;
     cuda_model_load_progress_note(g_model_range_bytes +
                                   g_q4k_packed_slice_bytes);
@@ -6537,7 +6757,7 @@ extern "C" int ds4_gpu_q4k_packed_slice_resolve(
     cuda_q4k_packed_slice *p = cuda_q4k_packed_slice_find(
         model_map, tensor_offset, row_base, row_count,
         column_byte_base, column_byte_count);
-    if (!p || !p->device_ptr || p->n_expert != n_expert ||
+    if (!p || !p->device_ptr || !p->loaded || p->n_expert != n_expert ||
         p->source_rows != source_rows ||
         p->source_row_bytes != source_row_bytes || p->kind != kind) return 0;
     *device_ptr = p->device_ptr;
@@ -6937,6 +7157,32 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    if (g_token_span_start) {
+        (void)cudaEventDestroy(g_token_span_start);
+        g_token_span_start = NULL;
+    }
+    if (g_token_span_head) {
+        (void)cudaEventDestroy(g_token_span_head);
+        g_token_span_head = NULL;
+    }
+    for (uint32_t i = 0; i < DS4_GPU_TOKEN_HEAD_STAGE_COUNT; i++) {
+        if (g_token_span_head_stage[i]) {
+            (void)cudaEventDestroy(g_token_span_head_stage[i]);
+            g_token_span_head_stage[i] = NULL;
+        }
+    }
+    if (g_token_span_stop) {
+        (void)cudaEventDestroy(g_token_span_stop);
+        g_token_span_stop = NULL;
+    }
+    if (g_token_attn_span_start) {
+        (void)cudaEventDestroy(g_token_attn_span_start);
+        g_token_attn_span_start = NULL;
+    }
+    if (g_token_attn_span_stop) {
+        (void)cudaEventDestroy(g_token_attn_span_stop);
+        g_token_attn_span_stop = NULL;
+    }
     cuda_stream_cache_stats_print("cleanup");
     cuda_shared_gate_up_async_cleanup();
 #ifdef __HIP_PLATFORM_AMD__
@@ -6964,6 +7210,19 @@ extern "C" void ds4_gpu_cleanup(void) {
         (void)cudaFree(g_cuda_tmp);
         g_cuda_tmp = NULL;
         g_cuda_tmp_bytes = 0;
+    }
+    int attention_seq_saved_device = -1;
+    (void)cudaGetDevice(&attention_seq_saved_device);
+    for (int device = 0; device < DS4_MAX_GPUS; device++) {
+        if (!g_attention_seq_scratch[device]) continue;
+        if (cudaSetDevice(device) == cudaSuccess) {
+            (void)cudaFree(g_attention_seq_scratch[device]);
+        }
+        g_attention_seq_scratch[device] = NULL;
+        g_attention_seq_scratch_bytes[device] = 0;
+    }
+    if (attention_seq_saved_device >= 0) {
+        (void)cudaSetDevice(attention_seq_saved_device);
     }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
@@ -7206,6 +7465,127 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 }
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
+extern "C" int ds4_gpu_token_span_begin(void) {
+    if (!g_token_span_start &&
+        !cuda_ok(cudaEventCreate(&g_token_span_start),
+                 "token span start event create")) return 0;
+    if (!g_token_span_stop &&
+        !cuda_ok(cudaEventCreate(&g_token_span_stop),
+                 "token span stop event create")) return 0;
+    if (!g_token_span_head &&
+        !cuda_ok(cudaEventCreate(&g_token_span_head),
+                 "token span head event create")) return 0;
+    if (token_span_head_stage_profile_enabled()) {
+        for (uint32_t i = 0; i < DS4_GPU_TOKEN_HEAD_STAGE_COUNT; i++) {
+            if (!g_token_span_head_stage[i] &&
+                !cuda_ok(cudaEventCreate(&g_token_span_head_stage[i]),
+                         "token span head stage event create")) return 0;
+        }
+    }
+    g_token_span_active = 1;
+    g_token_span_head_valid = 0;
+    g_token_span_head_stage_mask = 0u;
+    return cuda_ok(cudaEventRecord(g_token_span_start, 0),
+                   "token span start event record");
+}
+
+extern "C" int ds4_gpu_token_span_head_stage(uint32_t stage) {
+    if (!g_token_span_active) return 1;
+    if (!token_span_head_stage_profile_enabled()) return 1;
+    if (!g_token_span_head_valid || stage >= DS4_GPU_TOKEN_HEAD_STAGE_COUNT) {
+        return 0;
+    }
+    if (!cuda_ok(cudaEventRecord(g_token_span_head_stage[stage], 0),
+                 "token span head stage event record")) return 0;
+    g_token_span_head_stage_mask |= 1u << stage;
+    return 1;
+}
+
+extern "C" int ds4_gpu_token_span_head(void) {
+    if (!g_token_span_active) return 1;
+    if (!cuda_ok(cudaEventRecord(g_token_span_head, 0),
+                 "token span head event record")) return 0;
+    g_token_span_head_valid = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_token_span_end(void) {
+    const int ok = g_token_span_start && g_token_span_stop &&
+        cuda_ok(cudaEventRecord(g_token_span_stop, 0),
+                "token span stop event record");
+    g_token_span_active = 0;
+    return ok;
+}
+
+extern "C" int ds4_gpu_token_span_sections_ms(float *pre_head_ms,
+                                                 float *head_ms) {
+    return pre_head_ms && head_ms && g_token_span_start &&
+           g_token_span_head && g_token_span_stop &&
+           g_token_span_head_valid &&
+           cuda_ok(cudaEventElapsedTime(pre_head_ms,
+                                        g_token_span_start,
+                                        g_token_span_head),
+                   "token span pre-head elapsed") &&
+           cuda_ok(cudaEventElapsedTime(head_ms,
+                                        g_token_span_head,
+                                        g_token_span_stop),
+                   "token span head elapsed");
+}
+
+extern "C" int ds4_gpu_token_span_head_stages_ms(
+        float elapsed_ms[DS4_GPU_TOKEN_HEAD_STAGE_COUNT]) {
+    if (!token_span_head_stage_profile_enabled() || !elapsed_ms ||
+        !g_token_span_head_valid ||
+        g_token_span_head_stage_mask !=
+            ((1u << DS4_GPU_TOKEN_HEAD_STAGE_COUNT) - 1u)) return 0;
+    cudaEvent_t previous = g_token_span_head;
+    for (uint32_t i = 0; i < DS4_GPU_TOKEN_HEAD_STAGE_COUNT; i++) {
+        if (!cuda_ok(cudaEventElapsedTime(&elapsed_ms[i], previous,
+                                          g_token_span_head_stage[i]),
+                     "token span head stage elapsed")) return 0;
+        previous = g_token_span_head_stage[i];
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_token_span_elapsed_ms(float *elapsed_ms) {
+    return elapsed_ms && g_token_span_start && g_token_span_stop &&
+           cuda_ok(cudaEventElapsedTime(elapsed_ms,
+                                        g_token_span_start,
+                                        g_token_span_stop),
+                   "token span event elapsed");
+}
+
+extern "C" int ds4_gpu_token_attn_span_begin(void) {
+    if (!g_token_attn_span_start &&
+        !cuda_ok(cudaEventCreate(&g_token_attn_span_start),
+                 "token attention span start event create")) return 0;
+    if (!g_token_attn_span_stop &&
+        !cuda_ok(cudaEventCreate(&g_token_attn_span_stop),
+                 "token attention span stop event create")) return 0;
+    g_token_attn_span_active = 1;
+    g_token_attn_span_valid = 0;
+    return cuda_ok(cudaEventRecord(g_token_attn_span_start, 0),
+                   "token attention span start event record");
+}
+
+extern "C" int ds4_gpu_token_attn_span_end(void) {
+    if (!g_token_attn_span_active || !g_token_attn_span_start ||
+        !g_token_attn_span_stop) return 0;
+    const int ok = cuda_ok(cudaEventRecord(g_token_attn_span_stop, 0),
+                           "token attention span stop event record");
+    g_token_attn_span_active = 0;
+    g_token_attn_span_valid = ok;
+    return ok;
+}
+
+extern "C" int ds4_gpu_token_attn_span_elapsed_ms(float *elapsed_ms) {
+    return elapsed_ms && g_token_attn_span_valid &&
+           cuda_ok(cudaEventElapsedTime(elapsed_ms,
+                                        g_token_attn_span_start,
+                                        g_token_attn_span_stop),
+                   "token attention span elapsed");
+}
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 extern "C" int ds4_gpu_flush_encoder(void) { return ds4_gpu_flush_commands(); }
 extern "C" int ds4_gpu_commands_active(void) { return 0; }
@@ -8259,6 +8639,271 @@ static int cuda_q4k_kshard_block_ranges_prepare(
     return 1;
 }
 
+static int cuda_q4k_kshard_evict_images_prepare(
+        const void *model_map, uint32_t rank,
+        const ds4_gpu_q4k_kshard_layer *layers, uint32_t n_layers) {
+    std::vector<size_t> indices;
+    size_t found_owned = 0;
+    try {
+        indices.reserve((size_t)n_layers * 3u);
+    } catch (...) {
+        return 0;
+    }
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        const ds4_gpu_q4k_kshard_layer &l = layers[il];
+        if ((l.n_expert & 1u) != 0u) return 0;
+        const uint64_t expert_bytes[3] = {
+            (uint64_t)l.expert_mid_dim * l.gate_row_bytes,
+            (uint64_t)l.expert_mid_dim * l.up_row_bytes,
+            (uint64_t)l.out_dim * l.down_row_bytes,
+        };
+        const uint64_t tensor_offsets[3] = {
+            l.gate_offset, l.up_offset, l.down_offset,
+        };
+        for (uint32_t which = 0; which < 3u; ++which) {
+            const uint64_t owned_bytes =
+                (uint64_t)(l.n_expert / 2u) * expert_bytes[which];
+            const uint64_t owned_offset = tensor_offsets[which] +
+                (uint64_t)rank * owned_bytes;
+            const uint64_t tensor_bytes =
+                (uint64_t)l.n_expert * expert_bytes[which];
+            size_t containing = SIZE_MAX;
+            for (size_t i = 0; i < g_model_images.size(); ++i) {
+                const cuda_model_image &img = g_model_images[i];
+                if (img.host_base != model_map) continue;
+                const uint64_t img_end = img.device_offset + img.size;
+                const uint64_t owned_end = owned_offset + owned_bytes;
+                if (img.device_offset > owned_offset || img_end < owned_end) {
+                    continue;
+                }
+                if (containing != SIZE_MAX) {
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX
+                            "Q4_K K-shard found duplicate residency for "
+                            "owned routed range: tensor_off=%llu "
+                            "owned_off=%llu owned_bytes=%llu\n",
+                            (unsigned long long)tensor_offsets[which],
+                            (unsigned long long)owned_offset,
+                            (unsigned long long)owned_bytes);
+                    return 0;
+                }
+                containing = i;
+            }
+            if (containing != SIZE_MAX) {
+                ++found_owned;
+            }
+        }
+    }
+    const size_t expected = (size_t)n_layers * 3u;
+    if (found_owned != 0u && found_owned != expected) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "Q4_K K-shard refuses partial routed-image carving "
+                "(%zu/%zu)\n", found_owned, expected);
+        return 0;
+    }
+    if (found_owned == 0u) return 1;
+    for (size_t i = 0; i < g_model_images.size(); ++i) {
+        const cuda_model_image &img = g_model_images[i];
+        if (img.host_base != model_map) continue;
+        for (uint32_t il = 0; il < n_layers; ++il) {
+            const ds4_gpu_q4k_kshard_layer &l = layers[il];
+            const uint64_t expert_bytes[3] = {
+                (uint64_t)l.expert_mid_dim * l.gate_row_bytes,
+                (uint64_t)l.expert_mid_dim * l.up_row_bytes,
+                (uint64_t)l.out_dim * l.down_row_bytes,
+            };
+            const uint64_t tensor_offsets[3] = {
+                l.gate_offset, l.up_offset, l.down_offset,
+            };
+            for (uint32_t which = 0; which < 3u; ++which) {
+                const uint64_t tensor_end = tensor_offsets[which] +
+                    (uint64_t)l.n_expert * expert_bytes[which];
+                const uint64_t img_end = img.device_offset + img.size;
+                const uint64_t cut_begin =
+                    std::max(img.device_offset, tensor_offsets[which]);
+                const uint64_t cut_end = std::min(img_end, tensor_end);
+                if (cut_begin < cut_end) {
+                    indices.push_back(i);
+                }
+            }
+        }
+    }
+    std::sort(indices.begin(), indices.end());
+    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+    uint64_t evict_bytes = 0;
+    for (size_t i : indices) {
+        const cuda_model_image &img = g_model_images[i];
+        if (!img.device_ptr || !img.owns_device_ptr ||
+            evict_bytes > UINT64_MAX - img.size) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "Q4_K K-shard refuses non-owning or invalid routed "
+                    "device image during evacuation\n");
+            return 0;
+        }
+        evict_bytes += img.size;
+    }
+
+    if (!cuda_ok(cudaDeviceSynchronize(),
+                 "Q4_K K-shard pre-evacuation sync")) return 0;
+
+    /* ROCm 7.14 on gfx1151 faults when the packed kernels read interior
+     * pointers carved out of the old grouped model allocations.  Evacuate
+     * each complete allocation that intersects routed weights, then reload
+     * dense spans and packed routed slices into fresh allocations.  This is
+     * a representation replacement, not a second persistent weight cache. */
+    g_q4k_kshard.evacuated = 1;
+    for (auto it = indices.rbegin(); it != indices.rend(); ++it) {
+        cuda_model_image &img = g_model_images[*it];
+        const cudaError_t err = cudaFree(img.device_ptr);
+        if (err != cudaSuccess) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "Q4_K K-shard routed-image evacuation failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_model_images.erase(g_model_images.begin() + (ptrdiff_t)*it);
+    }
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+            "Q4_K K-shard evacuated %zu routed-containing device images "
+            "(%.2f GiB) for zero-net-memory packed reload\n",
+            indices.size(), (double)evict_bytes / 1073741824.0);
+    return 1;
+}
+
+static int cuda_q4k_kshard_attach_borrowed(
+        cuda_q4k_packed_slice *p, uint64_t owned_offset,
+        uint64_t owned_bytes) {
+    if (!p) return 0;
+    for (const cuda_model_image &img : g_q4k_kshard_borrowed_images) {
+        if (img.host_base == p->host_base &&
+            owned_offset >= img.device_offset &&
+            owned_bytes <= img.size - (owned_offset - img.device_offset)) {
+            if (p->packed_bytes != owned_bytes) return 0;
+            p->device_ptr = img.device_ptr +
+                            (owned_offset - img.device_offset);
+            p->owns_device_ptr = 0;
+            p->loaded = 0;
+            return 1;
+        }
+    }
+    return g_q4k_kshard_borrowed_images.empty();
+}
+
+static int cuda_q4k_kshard_dense_coverage_ok(
+        const void *model_map, const uint64_t *offsets,
+        const uint64_t *sizes, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!cuda_model_image_range_ptr(model_map, offsets[i], sizes[i])) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "Q4_K K-shard dense coverage audit failed: span=%u "
+                    "offset=%.6f GiB bytes=%llu\n", i,
+                    (double)offsets[i] / 1073741824.0,
+                    (unsigned long long)sizes[i]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int cuda_q4k_kshard_overlay_packed_window(
+        const cuda_q4k_packed_slice &p, uint64_t packed_offset,
+        char *dst, uint64_t bytes) {
+    while (bytes != 0u) {
+        const uint64_t expert = packed_offset / p.packed_expert_bytes;
+        const uint64_t expert_offset =
+            packed_offset % p.packed_expert_bytes;
+        if (expert >= p.n_expert) return 0;
+        uint64_t source_offset = 0;
+        uint64_t take = 0;
+        if (p.column_byte_base == 0u &&
+            p.column_byte_count == p.source_row_bytes) {
+            source_offset = p.tensor_offset +
+                expert * p.source_expert_bytes +
+                (uint64_t)p.row_base * p.source_row_bytes + expert_offset;
+            take = std::min(bytes,
+                            p.packed_expert_bytes - expert_offset);
+        } else {
+            const uint64_t row = expert_offset / p.column_byte_count;
+            const uint64_t column = expert_offset % p.column_byte_count;
+            if (row >= p.row_count) return 0;
+            source_offset = p.tensor_offset +
+                expert * p.source_expert_bytes +
+                ((uint64_t)p.row_base + row) * p.source_row_bytes +
+                p.column_byte_base + column;
+            take = std::min(bytes, p.column_byte_count - column);
+        }
+        if (!cuda_pread_full(g_model_fd, dst, take, source_offset)) return 0;
+        packed_offset += take;
+        dst += take;
+        bytes -= take;
+    }
+    return 1;
+}
+
+static int cuda_q4k_kshard_load_borrowed_roots(void) {
+    if (g_q4k_kshard_borrowed_images.empty()) return 1;
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    uint64_t stage_bytes = chunk;
+    if (!cuda_u64_add_checked(
+            stage_bytes,
+            g_model_direct_align > 1u ? g_model_direct_align : 1u,
+            &stage_bytes) || !cuda_model_stage_pool_alloc(stage_bytes)) {
+        return 0;
+    }
+    for (const cuda_model_image &root : g_q4k_kshard_borrowed_images) {
+        uint64_t root_offset = 0;
+        while (root_offset < root.size) {
+            const uint64_t n = std::min(chunk, root.size - root_offset);
+            const char *payload = NULL;
+            if (!cuda_model_stage_read(g_model_stage[0],
+                                       g_model_stage_bytes,
+                                       root.device_offset + root_offset, n,
+                                       &payload)) return 0;
+            if (payload != (const char *)g_model_stage[0]) {
+                memmove(g_model_stage[0], payload, (size_t)n);
+            }
+            const uint64_t chunk_end = root_offset + n;
+            for (const cuda_q4k_packed_slice &p : g_q4k_packed_slices) {
+                if (!p.device_ptr || p.owns_device_ptr) continue;
+                if (p.device_ptr < root.device_ptr) continue;
+                const uint64_t packed_begin =
+                    (uint64_t)(p.device_ptr - root.device_ptr);
+                if (packed_begin > root.size ||
+                    p.packed_bytes > root.size - packed_begin) continue;
+                const uint64_t packed_end = packed_begin + p.packed_bytes;
+                const uint64_t overlap_begin =
+                    std::max(root_offset, packed_begin);
+                const uint64_t overlap_end =
+                    std::min(chunk_end, packed_end);
+                if (overlap_begin >= overlap_end) continue;
+                if (!cuda_q4k_kshard_overlay_packed_window(
+                        p, overlap_begin - packed_begin,
+                        (char *)g_model_stage[0] +
+                            (overlap_begin - root_offset),
+                        overlap_end - overlap_begin)) return 0;
+            }
+            cudaError_t err = cudaMemcpyAsync(
+                root.device_ptr + root_offset, g_model_stage[0], (size_t)n,
+                cudaMemcpyHostToDevice, g_model_upload_stream);
+            if (err != cudaSuccess ||
+                (err = cudaStreamSynchronize(g_model_upload_stream)) !=
+                    cudaSuccess) return 0;
+            root_offset += n;
+        }
+    }
+    for (cuda_q4k_packed_slice &p : g_q4k_packed_slices) {
+        if (!p.device_ptr || p.owns_device_ptr || p.loaded) continue;
+        p.loaded = 1;
+        g_q4k_packed_slice_bytes += p.packed_bytes;
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "loaded in-place packed Q4_K routed slice offset=%.2f GiB "
+                "bytes=%.2f MiB\n",
+                (double)p.tensor_offset / 1073741824.0,
+                (double)p.packed_bytes / 1048576.0);
+    }
+    return 1;
+}
+
 static int cuda_q4k_kshard_snapshot_begin(
         const void *model_map, uint64_t model_size) {
     if (g_q4k_kshard.snapshot_valid || g_q4k_kshard.installed ||
@@ -8274,7 +8919,16 @@ static int cuda_q4k_kshard_snapshot_begin(
     const int saved_direct_fd =
         g_model_direct_fd >= 0 ? dup(g_model_direct_fd) : -1;
     if (g_model_direct_fd >= 0 && saved_direct_fd < 0) return 0;
+    try {
+        g_q4k_kshard_pre_images = g_model_images;
+        g_q4k_kshard_borrowed_images.clear();
+    } catch (...) {
+        if (saved_direct_fd >= 0) (void)close(saved_direct_fd);
+        return 0;
+    }
     g_q4k_kshard.snapshot_valid = 1;
+    g_q4k_kshard.model_map = model_map;
+    g_q4k_kshard.model_size = model_size;
     g_q4k_kshard.pre_model_image_count = g_model_images.size();
     g_q4k_kshard.pre_model_host_base = g_model_host_base;
     g_q4k_kshard.pre_model_device_base = g_model_device_base;
@@ -8355,6 +9009,23 @@ extern "C" int ds4_gpu_q4k_kshard_install(
         cuda_q4k_kshard_state_clear();
         return 0;
     }
+    if (!cuda_q4k_kshard_evict_images_prepare(
+            model_map, rank, layers, n_layers)) {
+        cuda_q4k_kshard_state_clear();
+        return 0;
+    }
+    if (g_q4k_kshard.evacuated &&
+        !ds4_gpu_set_model_map_spans(
+            model_map, model_size, dense_offsets, dense_sizes, dense_count,
+            dense_max_tensor_bytes)) {
+        cuda_q4k_kshard_state_clear();
+        return 0;
+    }
+    if (!cuda_q4k_kshard_dense_coverage_ok(
+            model_map, dense_offsets, dense_sizes, dense_count)) {
+        cuda_q4k_kshard_state_clear();
+        return 0;
+    }
 
     const uint64_t block = sizeof(cuda_block_q4_K);
     const uint32_t row_base = rank == 0u ? 0u : 1024u;
@@ -8384,7 +9055,8 @@ extern "C" int ds4_gpu_q4k_kshard_install(
                  model_map, l.up_offset, row_base, 1024u, 0u,
                  l.up_row_bytes) &&
              ds4_gpu_q4k_packed_slice_load(
-                 model_map, l.down_offset, 0u, 4096u, down_base, 4u * block);
+                 model_map, l.down_offset, 0u, 4096u, down_base,
+                 4u * block);
     }
     if (!ok) {
         cuda_q4k_packed_slice_release_all();

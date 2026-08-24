@@ -83,6 +83,26 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
+enum { DS4_GPU_TOKEN_HEAD_STAGE_COUNT = 6 };
+#ifdef DS4_ROCM_BUILD
+/* Diagnostic-only whole-token span on the existing default compute stream.
+ * Recording does not synchronize; callers harvest only after their existing
+ * end-of-command wait. */
+int ds4_gpu_token_span_begin(void);
+int ds4_gpu_token_span_head(void);
+int ds4_gpu_token_span_head_stage(uint32_t stage);
+int ds4_gpu_token_span_end(void);
+int ds4_gpu_token_span_elapsed_ms(float *elapsed_ms);
+int ds4_gpu_token_span_sections_ms(float *pre_head_ms, float *head_ms);
+int ds4_gpu_token_span_head_stages_ms(
+        float elapsed_ms[DS4_GPU_TOKEN_HEAD_STAGE_COUNT]);
+/* Diagnostic-only span for one selected layer's context-scaling attention
+ * core.  The caller records the pair on the existing compute stream and
+ * harvests it only after the normal token completion wait. */
+int ds4_gpu_token_attn_span_begin(void);
+int ds4_gpu_token_attn_span_end(void);
+int ds4_gpu_token_attn_span_elapsed_ms(float *elapsed_ms);
+#endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);

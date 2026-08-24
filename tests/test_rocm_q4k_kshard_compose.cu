@@ -239,6 +239,19 @@ int main(void) {
         IN_DIM, FULL_MID, OUT_DIM,
         GATE_ROW_BYTES, GATE_ROW_BYTES, DOWN_ROW_BYTES
     };
+    const uint64_t resident_offsets[] = {
+        dense_offset,
+        gate_offset + gate_bytes / 2u,
+        up_offset + gate_bytes / 2u,
+        down_offset + down_bytes / 2u,
+    };
+    const uint64_t resident_sizes[] = {
+        dense_bytes, gate_bytes / 2u, gate_bytes / 2u, down_bytes / 2u,
+    };
+    CHECK(ds4_gpu_set_model_fd_for_map(fd, model), "resident model fd");
+    CHECK(ds4_gpu_set_model_map_spans(
+              model, model_bytes, resident_offsets, resident_sizes, 4u,
+              gate_bytes / 2u), "rank1 pre-transition residency");
     CHECK(ds4_gpu_q4k_kshard_install(
               model, model_bytes, fd, 1u,
               &dense_offset, &dense_bytes, 1u, dense_bytes,
@@ -248,6 +261,23 @@ int main(void) {
               windows.rank == 1u && windows.row_base == HALF_MID &&
               windows.down_column_byte_base == HALF_DOWN_ROW_BYTES,
           "rank1 installed windows");
+    const void *gate_p = NULL, *up_p = NULL, *down_p = NULL;
+    uint64_t rb = 0, eb = 0, pb = 0;
+    CHECK(ds4_gpu_q4k_packed_slice_resolve(
+              model, gate_offset, N_EXPERT, FULL_MID, GATE_ROW_BYTES,
+              HALF_MID, HALF_MID, 0u, GATE_ROW_BYTES,
+              DS4_GPU_Q4K_PACKED_ROW_RANGE, &gate_p, &pb, &eb, &rb),
+          "evacuated gate resolve");
+    CHECK(ds4_gpu_q4k_packed_slice_resolve(
+              model, up_offset, N_EXPERT, FULL_MID, GATE_ROW_BYTES,
+              HALF_MID, HALF_MID, 0u, GATE_ROW_BYTES,
+              DS4_GPU_Q4K_PACKED_ROW_RANGE, &up_p, &pb, &eb, &rb),
+          "evacuated up resolve");
+    CHECK(ds4_gpu_q4k_packed_slice_resolve(
+              model, down_offset, N_EXPERT, OUT_DIM, DOWN_ROW_BYTES,
+              0u, OUT_DIM, HALF_DOWN_ROW_BYTES, HALF_DOWN_ROW_BYTES,
+              DS4_GPU_Q4K_PACKED_K_RANGE, &down_p, &pb, &eb, &rb),
+          "evacuated down resolve");
     CHECK(ds4_gpu_routed_moe_one_packed_q4k_tensor(
               &out, &gate, &up, &mid, &down,
               model, model_bytes, gate_offset, up_offset, down_offset,
