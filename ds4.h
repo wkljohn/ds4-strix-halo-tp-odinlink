@@ -322,8 +322,9 @@ int ds4_token_assistant(ds4_engine *e);
  * the transport and arms the per-layer gate machinery.  Call once, after
  * ds4_tp_create() and before any session work. */
 struct ds4_tp;
-/* On success the engine owns tp and releases it before the registered GPU
- * slab during ds4_engine_close().  On failure ownership remains with caller. */
+/* Calling this function transfers ownership of tp to the engine. The engine
+ * releases it before the registered GPU slab during ds4_engine_close(), on
+ * both success and failure. */
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);

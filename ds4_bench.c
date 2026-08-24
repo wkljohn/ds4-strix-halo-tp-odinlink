@@ -1449,11 +1449,15 @@ int main(int argc, char **argv) {
                                     &tp_id.gate_slot_step,
                                     &tp_id.gates_per_token);
         if (!ds4_tp_create(&tp_leader, &cfg.tp, &tp_id,
-                           tp_err, sizeof(tp_err)) ||
-            !ds4_engine_tp_bind(engine, tp_leader,
-                                tp_err, sizeof(tp_err))) {
+                           tp_err, sizeof(tp_err))) {
             fprintf(stderr, "ds4-bench-tp: %s\n", tp_err);
             ds4_tp_free(tp_leader);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        if (!ds4_engine_tp_bind(engine, tp_leader,
+                                tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-bench-tp: %s\n", tp_err);
             ds4_engine_close(engine);
             return 1;
         }

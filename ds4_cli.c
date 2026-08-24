@@ -2162,10 +2162,17 @@ int main(int argc, char **argv) {
                                     &tp_id.gate_slot_start,
                                     &tp_id.gate_slot_step,
                                     &tp_id.gates_per_token);
-        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id, tp_err, sizeof(tp_err)) ||
-            !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
+        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
+                           tp_err, sizeof(tp_err))) {
             fprintf(stderr, "ds4: %s\n", tp_err);
             ds4_tp_free(tp_leader);
+            ds4_engine_close(engine);
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 1;
+        }
+        if (!ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4: %s\n", tp_err);
             ds4_engine_close(engine);
             ds4_dist_options_free(cfg.dist);
             free(cfg.prompt_owned);

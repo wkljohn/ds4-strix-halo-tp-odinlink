@@ -2968,7 +2968,6 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     }
     if (!ds4_engine_tp_bind(engine, tp, err, sizeof(err))) {
         ds4_log(stderr, DS4_LOG_ERROR, "tp worker: %s", err);
-        ds4_tp_free(tp);
         return 1;
     }
     ds4_tp_worker_sessions sessions = {0};
