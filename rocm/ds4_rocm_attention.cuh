@@ -1611,7 +1611,10 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
     }
 }
 
-enum { DS4_ATTN_SEQ_RECORD_FLOATS = 516u };
+enum {
+    DS4_ATTN_SEQ_RECORD_FLOATS = 516u,
+    DS4_ATTN_SEQ_MAX_ROWS_PER_TILE = 144u,
+};
 
 /* Research path for the contiguous one-token ratio-4 decode shape used by
  * the fixed 2K reporting workload.  Each block shares four KV rows across
@@ -1639,30 +1642,81 @@ __global__ static void attention_decode_mixed_heads8_seqtile_kernel(
     const uint32_t n_score = n_raw + n_comp;
     const uint32_t rows_per_tile = (n_score + n_tiles - 1u) / n_tiles;
     const uint32_t row_begin = tile * rows_per_tile;
+    if (row_begin >= n_score) {
+        if (valid_head) {
+            float *record = partials +
+                ((uint64_t)head * n_tiles + tile) *
+                DS4_ATTN_SEQ_RECORD_FLOATS;
+            if (lane == 0u) {
+                record[0] = -INFINITY;
+                record[1] = 0.0f;
+            }
+            for (uint32_t d = lane; d < head_dim; d += 32u) {
+                record[4u + d] = 0.0f;
+            }
+        }
+        return;
+    }
     const uint32_t row_end = row_begin + rows_per_tile < n_score
                            ? row_begin + rows_per_tile : n_score;
+    __shared__ float tile_scores[8u * DS4_ATTN_SEQ_MAX_ROWS_PER_TILE];
     __shared__ float4 kv_shared[4u * 128u];
 
     const float scale = rsqrtf((float)head_dim);
-    const float4 *q4 = valid_head
-        ? (const float4 *)(q + (uint64_t)head * head_dim) : NULL;
-    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 q1 = q0, q2 = q0, q3 = q0;
-    if (valid_head) {
-        q0 = q4[lane + 0u]; q1 = q4[lane + 32u];
-        q2 = q4[lane + 64u]; q3 = q4[lane + 96u];
-    }
+    const uint32_t tile_rows = row_end - row_begin;
+    if (tile_rows > DS4_ATTN_SEQ_MAX_ROWS_PER_TILE) return;
+    float *score_row = tile_scores + warp * DS4_ATTN_SEQ_MAX_ROWS_PER_TILE;
+    const float *qh = valid_head ? q + (uint64_t)head * head_dim : NULL;
 
-    float max_s = -INFINITY;
-    float sum_s = 0.0f;
+    /* Preserve the incumbent dot arithmetic: one thread computes one whole
+     * row with four serial float4 accumulators.  The first prototype split a
+     * row across a wave and crossed near ties after many decode layers. */
+    float local_max = -INFINITY;
+    if (valid_head) {
+        for (uint32_t local = lane; local < tile_rows; local += 32u) {
+            const uint32_t sr = row_begin + local;
+            const float *src;
+            if (sr < n_raw) {
+                const uint32_t raw_row = raw_cap
+                    ? (raw_start + sr) % raw_cap : sr;
+                src = raw_kv + (uint64_t)raw_row * head_dim;
+            } else {
+                src = comp_kv + (uint64_t)(sr - n_raw) * head_dim;
+            }
+            const float score =
+                attention_dot_f32_vec4_oldhip(qh, src, head_dim) * scale;
+            score_row[local] = score;
+            local_max = fmaxf(local_max, score);
+        }
+    }
+    float max_s = attention_warp_max_oldhip_w32(local_max);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    max_s = __shfl(max_s, 0, 32);
+#else
+    max_s = __shfl_sync(FULL_WARP_MASK, max_s, 0, 32);
+#endif
+
+    float local_sum = 0.0f;
+    if (valid_head) {
+        for (uint32_t local = lane; local < tile_rows; local += 32u) {
+            const float weight = expf(score_row[local] - max_s);
+            score_row[local] = weight;
+            local_sum += weight;
+        }
+    }
+    const float sum_s = attention_warp_sum_oldhip_w32(local_sum);
+
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
-    for (uint32_t row0 = row_begin; row0 < row_end; row0 += 4u) {
-        const uint32_t nr = row_end - row0 < 4u ? row_end - row0 : 4u;
-        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+    __syncthreads();
+    for (uint32_t local0 = 0u; local0 < tile_rows; local0 += 4u) {
+        const uint32_t nr = tile_rows - local0 < 4u
+                          ? tile_rows - local0 : 4u;
+        for (uint32_t off = threadIdx.x; off < nr * 128u;
+             off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
-            const uint32_t sr = row0 + rr;
+            const uint32_t sr = row_begin + local0 + rr;
             const float4 *src;
             if (sr < n_raw) {
                 const uint32_t raw_row = raw_cap
@@ -1678,32 +1732,23 @@ __global__ static void attention_decode_mixed_heads8_seqtile_kernel(
         __syncthreads();
         if (valid_head) {
             for (uint32_t rr = 0u; rr < nr; rr++) {
+                const float weight = score_row[local0 + rr];
                 const float4 *kv4 = kv_shared + rr * 128u;
                 const float4 k0 = kv4[lane + 0u];
                 const float4 k1 = kv4[lane + 32u];
                 const float4 k2 = kv4[lane + 64u];
                 const float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) + dot4_f32(q3, k3);
-                score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
-                const float new_max = fmaxf(max_s, score);
-                const float old_scale = isinf(max_s) ? 0.0f
-                                                     : expf(max_s - new_max);
-                const float row_scale = expf(score - new_max);
-                sum_s = sum_s * old_scale + row_scale;
-#define DS4_CONTIG_SEQ_ACCUM4(o, k) do { \
-                    (o).x = (o).x * old_scale + (k).x * row_scale; \
-                    (o).y = (o).y * old_scale + (k).y * row_scale; \
-                    (o).z = (o).z * old_scale + (k).z * row_scale; \
-                    (o).w = (o).w * old_scale + (k).w * row_scale; \
+#define DS4_CONTIG_SEQ_WEIGHTED_ACCUM4(o, k) do { \
+                    (o).x += (k).x * weight; \
+                    (o).y += (k).y * weight; \
+                    (o).z += (k).z * weight; \
+                    (o).w += (k).w * weight; \
                 } while (0)
-                DS4_CONTIG_SEQ_ACCUM4(o0, k0);
-                DS4_CONTIG_SEQ_ACCUM4(o1, k1);
-                DS4_CONTIG_SEQ_ACCUM4(o2, k2);
-                DS4_CONTIG_SEQ_ACCUM4(o3, k3);
-#undef DS4_CONTIG_SEQ_ACCUM4
-                max_s = new_max;
+                DS4_CONTIG_SEQ_WEIGHTED_ACCUM4(o0, k0);
+                DS4_CONTIG_SEQ_WEIGHTED_ACCUM4(o1, k1);
+                DS4_CONTIG_SEQ_WEIGHTED_ACCUM4(o2, k2);
+                DS4_CONTIG_SEQ_WEIGHTED_ACCUM4(o3, k3);
+#undef DS4_CONTIG_SEQ_WEIGHTED_ACCUM4
             }
         }
         __syncthreads();
@@ -1753,6 +1798,7 @@ __global__ static void attention_decode_indexed_mixed_heads8_seqtile_kernel(
 
     __shared__ uint32_t comp_rows[DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP];
     __shared__ uint32_t comp_count_s;
+    __shared__ float tile_scores[8u * DS4_ATTN_SEQ_MAX_ROWS_PER_TILE];
     __shared__ float4 kv_shared[4u * 128u];
 
     uint32_t visible_comp = n_comp;
@@ -1781,29 +1827,76 @@ __global__ static void attention_decode_indexed_mixed_heads8_seqtile_kernel(
     const uint32_t n_score = n_raw + comp_count;
     const uint32_t rows_per_tile = (n_score + n_tiles - 1u) / n_tiles;
     const uint32_t row_begin = tile * rows_per_tile;
+    if (row_begin >= n_score) {
+        if (valid_head) {
+            float *record = partials +
+                ((uint64_t)head * n_tiles + tile) *
+                DS4_ATTN_SEQ_RECORD_FLOATS;
+            if (lane == 0u) {
+                record[0] = -INFINITY;
+                record[1] = 0.0f;
+            }
+            for (uint32_t d = lane; d < head_dim; d += 32u) {
+                record[4u + d] = 0.0f;
+            }
+        }
+        return;
+    }
     const uint32_t row_end = row_begin + rows_per_tile < n_score
                            ? row_begin + rows_per_tile : n_score;
     const float scale = rsqrtf((float)head_dim);
-    const float4 *q4 = valid_head
-        ? (const float4 *)(q + (uint64_t)head * head_dim) : NULL;
-    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 q1 = q0, q2 = q0, q3 = q0;
-    if (valid_head) {
-        q0 = q4[lane + 0u]; q1 = q4[lane + 32u];
-        q2 = q4[lane + 64u]; q3 = q4[lane + 96u];
-    }
+    const uint32_t tile_rows = row_end - row_begin;
+    if (tile_rows > DS4_ATTN_SEQ_MAX_ROWS_PER_TILE) return;
+    float *score_row = tile_scores + warp * DS4_ATTN_SEQ_MAX_ROWS_PER_TILE;
+    const float *qh = valid_head ? q + (uint64_t)head * head_dim : NULL;
 
-    float max_s = -INFINITY;
-    float sum_s = 0.0f;
+    float local_max = -INFINITY;
+    if (valid_head) {
+        for (uint32_t local = lane; local < tile_rows; local += 32u) {
+            const uint32_t sr = row_begin + local;
+            const float *src;
+            if (sr < n_raw) {
+                const uint32_t raw_row = raw_cap
+                    ? (raw_start + sr) % raw_cap : sr;
+                src = raw_kv + (uint64_t)raw_row * head_dim;
+            } else {
+                const uint32_t comp_row = comp_rows[sr - n_raw];
+                src = comp_kv + (uint64_t)comp_row * head_dim;
+            }
+            const float score =
+                attention_dot_f32_vec4_oldhip(qh, src, head_dim) * scale;
+            score_row[local] = score;
+            local_max = fmaxf(local_max, score);
+        }
+    }
+    float max_s = attention_warp_max_oldhip_w32(local_max);
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    max_s = __shfl(max_s, 0, 32);
+#else
+    max_s = __shfl_sync(FULL_WARP_MASK, max_s, 0, 32);
+#endif
+
+    float local_sum = 0.0f;
+    if (valid_head) {
+        for (uint32_t local = lane; local < tile_rows; local += 32u) {
+            const float weight = expf(score_row[local] - max_s);
+            score_row[local] = weight;
+            local_sum += weight;
+        }
+    }
+    const float sum_s = attention_warp_sum_oldhip_w32(local_sum);
+
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
-
-    for (uint32_t row0 = row_begin; row0 < row_end; row0 += 4u) {
-        const uint32_t nr = row_end - row0 < 4u ? row_end - row0 : 4u;
-        for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
+    __syncthreads();
+    for (uint32_t local0 = 0u; local0 < tile_rows; local0 += 4u) {
+        const uint32_t nr = tile_rows - local0 < 4u
+                          ? tile_rows - local0 : 4u;
+        for (uint32_t off = threadIdx.x; off < nr * 128u;
+             off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
-            const uint32_t sr = row0 + rr;
+            const uint32_t sr = row_begin + local0 + rr;
             const float4 *src;
             if (sr < n_raw) {
                 const uint32_t raw_row = raw_cap
@@ -1820,32 +1913,23 @@ __global__ static void attention_decode_indexed_mixed_heads8_seqtile_kernel(
         __syncthreads();
         if (valid_head) {
             for (uint32_t rr = 0u; rr < nr; rr++) {
+                const float weight = score_row[local0 + rr];
                 const float4 *kv4 = kv_shared + rr * 128u;
                 const float4 k0 = kv4[lane + 0u];
                 const float4 k1 = kv4[lane + 32u];
                 const float4 k2 = kv4[lane + 64u];
                 const float4 k3 = kv4[lane + 96u];
-                float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
-                              dot4_f32(q2, k2) + dot4_f32(q3, k3);
-                score = warp_sum_f32(score) * scale;
-                score = __shfl_sync(FULL_WARP_MASK, score, 0);
-                const float new_max = fmaxf(max_s, score);
-                const float old_scale = isinf(max_s) ? 0.0f
-                                                     : expf(max_s - new_max);
-                const float row_scale = expf(score - new_max);
-                sum_s = sum_s * old_scale + row_scale;
-#define DS4_INDEXED_SEQ_ACCUM4(o, k) do { \
-                    (o).x = (o).x * old_scale + (k).x * row_scale; \
-                    (o).y = (o).y * old_scale + (k).y * row_scale; \
-                    (o).z = (o).z * old_scale + (k).z * row_scale; \
-                    (o).w = (o).w * old_scale + (k).w * row_scale; \
+#define DS4_INDEXED_SEQ_WEIGHTED_ACCUM4(o, k) do { \
+                    (o).x += (k).x * weight; \
+                    (o).y += (k).y * weight; \
+                    (o).z += (k).z * weight; \
+                    (o).w += (k).w * weight; \
                 } while (0)
-                DS4_INDEXED_SEQ_ACCUM4(o0, k0);
-                DS4_INDEXED_SEQ_ACCUM4(o1, k1);
-                DS4_INDEXED_SEQ_ACCUM4(o2, k2);
-                DS4_INDEXED_SEQ_ACCUM4(o3, k3);
-#undef DS4_INDEXED_SEQ_ACCUM4
-                max_s = new_max;
+                DS4_INDEXED_SEQ_WEIGHTED_ACCUM4(o0, k0);
+                DS4_INDEXED_SEQ_WEIGHTED_ACCUM4(o1, k1);
+                DS4_INDEXED_SEQ_WEIGHTED_ACCUM4(o2, k2);
+                DS4_INDEXED_SEQ_WEIGHTED_ACCUM4(o3, k3);
+#undef DS4_INDEXED_SEQ_WEIGHTED_ACCUM4
             }
         }
         __syncthreads();

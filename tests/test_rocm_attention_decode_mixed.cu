@@ -330,6 +330,53 @@ static int run_heads8_decode_shape_oracle(void) {
         }
     }
 
+    /* The original low-amplitude sinusoids cannot distinguish reduction
+     * orders that diverge on production-scale normalized activations.  Keep
+     * the same layout but raise Q/K RMS enough to make score association
+     * errors visible, and compare directly against the incumbent device
+     * kernel rather than only the FP64 host oracle. */
+    std::vector<float> q_stress = q;
+    std::vector<float> raw_stress = raw;
+    std::vector<float> comp_stress = comp;
+    for (float &v : q_stress) v *= 24.0f;
+    for (float &v : raw_stress) v *= 4.0f;
+    for (float &v : comp_stress) v *= 5.0f;
+    CHECK(ds4_gpu_tensor_write(&q_dev, 0, q_stress.data(),
+                               q_stress.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(&raw_dev, 0, raw_stress.data(),
+                               raw_stress.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(&comp_dev, 0, comp_stress.data(),
+                               comp_stress.size() * sizeof(float)),
+          "upload production-scale heads8 stress tensors");
+    ds4_gpu_set_quality(false);
+    CHECK(ds4_gpu_attention_decode_heads_tensor(
+              &heads_dev, sinks.data(), sinks.size() * sizeof(float), 0,
+              &q_dev, &raw_dev, n_raw, raw_cap, 159u,
+              &comp_dev, 0, 523u, NULL, 0, n_head, head_dim) &&
+          ds4_gpu_tensor_read(&heads_dev, 0, candidate.data(),
+                              candidate.size() * sizeof(float)),
+          "run production-scale heads8 candidate");
+    ds4_gpu_set_quality(true);
+    CHECK(ds4_gpu_attention_decode_heads_tensor(
+              &heads_dev, sinks.data(), sinks.size() * sizeof(float), 0,
+              &q_dev, &raw_dev, n_raw, raw_cap, 159u,
+              &comp_dev, 0, 523u, NULL, 0, n_head, head_dim) &&
+          ds4_gpu_tensor_read(&heads_dev, 0, dense.data(),
+                              dense.size() * sizeof(float)),
+          "run production-scale incumbent device kernel");
+    const double stress_rel = rel_rms(candidate, dense);
+    const double stress_max = max_scaled_error(candidate, dense);
+    fprintf(stderr,
+            "heads8_stress_device_ab candidate_dense=%g max_scaled=%g\n",
+            stress_rel, stress_max);
+    CHECK(stress_rel <= 2.0e-5 && stress_max <= 3.0e-4,
+          "production-scale candidate must match incumbent device kernel");
+
+    CHECK(ds4_gpu_tensor_write(&q_dev, 0, q.data(), q.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(&raw_dev, 0, raw.data(), raw.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(&comp_dev, 0, comp.data(), comp.size() * sizeof(float)),
+          "restore heads8 timing tensors");
+
     constexpr size_t timing_ring_size = 21u;
     std::vector<ds4_gpu_tensor> raw_ring(timing_ring_size);
     std::vector<ds4_gpu_tensor> comp_ring(timing_ring_size);
