@@ -8945,14 +8945,20 @@ static int cuda_q4k_kshard_snapshot_begin(
     return 1;
 }
 
+static int cuda_q4k_kshard_enabled(void) {
+    const char *legacy = getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
+    const char *disable = getenv("DS4_ROCM_DISABLE_Q4K_KSHARD");
+    if (disable && disable[0] == '1' && disable[1] == '\0') return 0;
+    return !legacy || (legacy[0] == '1' && legacy[1] == '\0');
+}
+
 extern "C" int ds4_gpu_q4k_kshard_install(
         const void *model_map, uint64_t model_size, int model_fd,
         uint32_t rank, const uint64_t *dense_offsets,
         const uint64_t *dense_sizes, uint32_t dense_count,
         uint64_t dense_max_tensor_bytes,
         const ds4_gpu_q4k_kshard_layer *layers, uint32_t n_layers) {
-    const char *enabled = getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
-    if (!enabled || enabled[0] != '1' || enabled[1] != '\0' ||
+    if (!cuda_q4k_kshard_enabled() ||
         !model_map || model_size == 0u || rank > 1u ||
         !layers || n_layers == 0u ||
         dense_count == 0u || !dense_offsets || !dense_sizes) return 0;

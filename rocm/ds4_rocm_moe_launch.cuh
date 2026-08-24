@@ -3998,8 +3998,7 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
         uint32_t layer_index) {
-    const char *enabled = getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
-    if (!enabled || enabled[0] != '1' || enabled[1] != '\0' ||
+    if (!cuda_q4k_kshard_enabled() ||
         !out || !gate || !up || !mid || !down || !model_map ||
         model_size == 0u ||
         !selected || !weights || !x || n_total_expert == 0u ||
@@ -4097,9 +4096,8 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         const ds4_gpu_tensor *x,
         uint32_t layer_index, uint32_t n_tokens,
         bool *mid_is_f16) {
-    const char *enabled = getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
     if (mid_is_f16) *mid_is_f16 = false;
-    if (!enabled || enabled[0] != '1' || enabled[1] != '\0' ||
+    if (!cuda_q4k_kshard_enabled() ||
         n_tokens == 0u || !out || !gate || !up || !mid || !down ||
         !model_map || model_size == 0u || !selected || !weights || !x ||
         n_total_expert == 0u || n_expert == 0u ||

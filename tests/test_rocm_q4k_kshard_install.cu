@@ -106,17 +106,19 @@ int main(void) {
     const uint64_t dense_offset = 0u, dense_size = 2048u;
     ds4_gpu_q4k_kshard_windows windows;
 
-    CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0, "research unset");
+    CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0, "legacy unset");
+    CHECK(setenv("DS4_ROCM_DISABLE_Q4K_KSHARD", "1", 1) == 0,
+          "rollback enabled");
     CHECK(!ds4_gpu_q4k_kshard_install(
               model, model_bytes, fd, 0u, &dense_offset, &dense_size, 1u,
-              dense_size, &layer, 1u), "default-off refusal");
+              dense_size, &layer, 1u), "explicit rollback refusal");
     CHECK(ds4_gpu_tp_expert_shard_active() == 1 &&
               ds4_gpu_q4k_packed_slice_bytes() == 0u &&
               !ds4_gpu_q4k_kshard_windows_get(&windows),
-          "default-off state unchanged");
+          "rollback state unchanged");
 
-    CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0,
-          "research enabled");
+    CHECK(unsetenv("DS4_ROCM_DISABLE_Q4K_KSHARD") == 0,
+          "validated default enabled");
     CHECK(!ds4_gpu_q4k_kshard_install(
               model, model_bytes, fd, 0u, NULL, NULL, 0u, 0u,
               &layer, 1u), "empty dense mapping refused");
