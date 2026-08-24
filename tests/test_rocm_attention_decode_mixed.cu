@@ -371,6 +371,15 @@ static int run_heads8_decode_shape_oracle(void) {
             stress_rel, stress_max);
     CHECK(stress_rel <= 2.0e-5 && stress_max <= 3.0e-4,
           "production-scale candidate must match incumbent device kernel");
+    const char *heads_dump = getenv("DS4_ATTN_TEST_HEADS_DUMP");
+    if (heads_dump && heads_dump[0]) {
+        FILE *stream = fopen(heads_dump, "wb");
+        CHECK(stream != NULL, "open production-scale heads dump");
+        CHECK(fwrite(candidate.data(), sizeof(float), candidate.size(), stream) ==
+                  candidate.size(),
+              "write production-scale heads dump");
+        CHECK(fclose(stream) == 0, "close production-scale heads dump");
+    }
 
     CHECK(ds4_gpu_tensor_write(&q_dev, 0, q.data(), q.size() * sizeof(float)) &&
           ds4_gpu_tensor_write(&raw_dev, 0, raw.data(), raw.size() * sizeof(float)) &&

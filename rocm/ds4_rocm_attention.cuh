@@ -1616,11 +1616,13 @@ enum {
     DS4_ATTN_SEQ_MAX_ROWS_PER_TILE = 144u,
 };
 
-/* Research path for the contiguous one-token ratio-4 decode shape used by
- * the fixed 2K reporting workload.  Each block shares four KV rows across
- * eight heads and emits one stable partial-softmax record per head/tile. */
+/* Research path for the contiguous one-token decode shape.  Stage 1 retains
+ * the eight independent sequence tiles, but writes exact incumbent-order
+ * row scores.  Stages 2 and 3 below deliberately reproduce the old-HIP
+ * global softmax and per-dimension value accumulation; only KV loads are
+ * shared across eight heads. */
 __global__ static void attention_decode_mixed_heads8_seqtile_kernel(
-        float *partials,
+        float *scores,
         const float *q,
         const float *raw_kv,
         const float *comp_kv,
@@ -1642,36 +1644,16 @@ __global__ static void attention_decode_mixed_heads8_seqtile_kernel(
     const uint32_t n_score = n_raw + n_comp;
     const uint32_t rows_per_tile = (n_score + n_tiles - 1u) / n_tiles;
     const uint32_t row_begin = tile * rows_per_tile;
-    if (row_begin >= n_score) {
-        if (valid_head) {
-            float *record = partials +
-                ((uint64_t)head * n_tiles + tile) *
-                DS4_ATTN_SEQ_RECORD_FLOATS;
-            if (lane == 0u) {
-                record[0] = -INFINITY;
-                record[1] = 0.0f;
-            }
-            for (uint32_t d = lane; d < head_dim; d += 32u) {
-                record[4u + d] = 0.0f;
-            }
-        }
-        return;
-    }
+    if (row_begin >= n_score) return;
     const uint32_t row_end = row_begin + rows_per_tile < n_score
                            ? row_begin + rows_per_tile : n_score;
-    __shared__ float tile_scores[8u * DS4_ATTN_SEQ_MAX_ROWS_PER_TILE];
-    __shared__ float4 kv_shared[4u * 128u];
-
     const float scale = rsqrtf((float)head_dim);
     const uint32_t tile_rows = row_end - row_begin;
     if (tile_rows > DS4_ATTN_SEQ_MAX_ROWS_PER_TILE) return;
-    float *score_row = tile_scores + warp * DS4_ATTN_SEQ_MAX_ROWS_PER_TILE;
     const float *qh = valid_head ? q + (uint64_t)head * head_dim : NULL;
+    float *score_row = valid_head
+        ? scores + (uint64_t)head * n_score : NULL;
 
-    /* Preserve the incumbent dot arithmetic: one thread computes one whole
-     * row with four serial float4 accumulators.  The first prototype split a
-     * row across a wave and crossed near ties after many decode layers. */
-    float local_max = -INFINITY;
     if (valid_head) {
         for (uint32_t local = lane; local < tile_rows; local += 32u) {
             const uint32_t sr = row_begin + local;
@@ -1685,38 +1667,71 @@ __global__ static void attention_decode_mixed_heads8_seqtile_kernel(
             }
             const float score =
                 attention_dot_f32_vec4_oldhip(qh, src, head_dim) * scale;
-            score_row[local] = score;
-            local_max = fmaxf(local_max, score);
+            score_row[sr] = score;
         }
     }
-    float max_s = attention_warp_max_oldhip_w32(local_max);
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    max_s = __shfl(max_s, 0, 32);
-#else
-    max_s = __shfl_sync(FULL_WARP_MASK, max_s, 0, 32);
-#endif
+}
 
+__global__ static void attention_decode_mixed_seqtile_softmax_kernel(
+        float *weights,
+        float *inv_denoms,
+        const float *sinks,
+        uint32_t n_score,
+        uint32_t n_head) {
+    const uint32_t head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (head >= n_head) return;
+    float *score_row = weights + (uint64_t)head * n_score;
+
+    /* Literal old-HIP tail: preserve the 256-thread row striding, reduction
+     * trees, sink placement, and reciprocal operation. */
+    float local_max = sinks[head];
+    for (uint32_t row = tid; row < n_score; row += blockDim.x) {
+        local_max = fmaxf(local_max, score_row[row]);
+    }
+    const float max_score = attention_block_max_oldhip_w32(local_max);
     float local_sum = 0.0f;
-    if (valid_head) {
-        for (uint32_t local = lane; local < tile_rows; local += 32u) {
-            const float weight = expf(score_row[local] - max_s);
-            score_row[local] = weight;
-            local_sum += weight;
-        }
+    for (uint32_t row = tid; row < n_score; row += blockDim.x) {
+        const float weight = expf(score_row[row] - max_score);
+        score_row[row] = weight;
+        local_sum += weight;
     }
-    const float sum_s = attention_warp_sum_oldhip_w32(local_sum);
+    if (tid == 0u) local_sum += expf(sinks[head] - max_score);
+    const float denom = attention_block_sum_oldhip_w32(local_sum);
+    if (tid == 0u) inv_denoms[head] = 1.0f / denom;
+}
 
+__global__ static void attention_decode_mixed_heads8_seqtile_output_kernel(
+        float *heads,
+        const float *weights,
+        const float *inv_denoms,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = blockIdx.x * 8u + warp;
+    const bool valid_head = head < n_head;
+    if (head_dim != 512u) return;
+    const uint32_t n_score = n_raw + n_comp;
+    const float *weight_row = valid_head
+        ? weights + (uint64_t)head * n_score : NULL;
+    const float inv_denom = valid_head ? inv_denoms[head] : 0.0f;
+    __shared__ float4 kv_shared[4u * 128u];
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
-    __syncthreads();
-    for (uint32_t local0 = 0u; local0 < tile_rows; local0 += 4u) {
-        const uint32_t nr = tile_rows - local0 < 4u
-                          ? tile_rows - local0 : 4u;
+    for (uint32_t row0 = 0u; row0 < n_score; row0 += 4u) {
+        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
         for (uint32_t off = threadIdx.x; off < nr * 128u;
              off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
-            const uint32_t sr = row_begin + local0 + rr;
+            const uint32_t sr = row0 + rr;
             const float4 *src;
             if (sr < n_raw) {
                 const uint32_t raw_row = raw_cap
@@ -1732,7 +1747,7 @@ __global__ static void attention_decode_mixed_heads8_seqtile_kernel(
         __syncthreads();
         if (valid_head) {
             for (uint32_t rr = 0u; rr < nr; rr++) {
-                const float weight = score_row[local0 + rr];
+                const float weight = weight_row[row0 + rr];
                 const float4 *kv4 = kv_shared + rr * 128u;
                 const float4 k0 = kv4[lane + 0u];
                 const float4 k1 = kv4[lane + 32u];
@@ -1753,15 +1768,16 @@ __global__ static void attention_decode_mixed_heads8_seqtile_kernel(
         }
         __syncthreads();
     }
-
     if (valid_head) {
-        float *record = partials +
-            ((uint64_t)head * n_tiles + tile) * DS4_ATTN_SEQ_RECORD_FLOATS;
-        if (lane == 0u) {
-            record[0] = max_s;
-            record[1] = sum_s;
-        }
-        float4 *out4 = (float4 *)(record + 4u);
+        o0.x *= inv_denom; o0.y *= inv_denom;
+        o0.z *= inv_denom; o0.w *= inv_denom;
+        o1.x *= inv_denom; o1.y *= inv_denom;
+        o1.z *= inv_denom; o1.w *= inv_denom;
+        o2.x *= inv_denom; o2.y *= inv_denom;
+        o2.z *= inv_denom; o2.w *= inv_denom;
+        o3.x *= inv_denom; o3.y *= inv_denom;
+        o3.z *= inv_denom; o3.w *= inv_denom;
+        float4 *out4 = (float4 *)(heads + (uint64_t)head * head_dim);
         out4[lane + 0u] = o0; out4[lane + 32u] = o1;
         out4[lane + 64u] = o2; out4[lane + 96u] = o3;
     }
