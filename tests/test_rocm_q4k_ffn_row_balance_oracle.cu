@@ -962,7 +962,7 @@ static int run_registry_packed_one_oracle(
               gate_row_bytes, down_row_bytes, row_base, MID_HALF,
               down_column_byte_base, half_down_row_bytes,
               selected, weights, N_USED, 0.0f,
-              x, NULL, 0u),
+              x, NULL, 0u, NULL),
           "packed one legacy rollback refusal");
     bool batch_mid_is_f16 = true;
     CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
@@ -983,7 +983,7 @@ static int run_registry_packed_one_oracle(
               gate_row_bytes, down_row_bytes, row_base, MID_HALF,
               down_column_byte_base, half_down_row_bytes,
               selected, weights, N_USED, 0.0f,
-              x, NULL, 0u),
+              x, NULL, 0u, NULL),
           "packed one production rollback refusal");
     CHECK(unsetenv("DS4_ROCM_DISABLE_Q4K_KSHARD") == 0,
           "packed one production rollback restore");
@@ -993,7 +993,7 @@ static int run_registry_packed_one_oracle(
               gate_row_bytes, down_row_bytes, row_base, MID_HALF,
               down_column_byte_base, half_down_row_bytes,
               selected, weights, N_USED, 0.0f,
-              x, NULL, 0u),
+              x, NULL, 0u, NULL),
           "packed one default-on registry primitive");
     CHECK(hipDeviceSynchronize() == hipSuccess,
           "packed one registry sync");

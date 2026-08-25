@@ -297,7 +297,7 @@ int main(void) {
               windows.row_base, windows.row_count,
               windows.down_column_byte_base,
               windows.down_column_byte_count,
-              &selected, &weights, N_USED, 0.0f, &x, &addend, 0u),
+              &selected, &weights, N_USED, 0.0f, &x, &addend, 0u, NULL),
           "rank1 installed packed compose");
     CHECK(hipDeviceSynchronize() == hipSuccess, "candidate sync");
     float candidate[OUT_DIM], reference[OUT_DIM];

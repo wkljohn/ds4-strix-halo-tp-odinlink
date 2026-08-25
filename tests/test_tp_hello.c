@@ -135,6 +135,17 @@ int main(void) {
                     DS4_TP_FEATURE_Q4K_KSHARD_INTERLEAVED,
                 DS4_TP_FEATURE_Q4K_KSHARD, 0,
                 "tp hello: runtime feature mismatch (local=0x00180000 peer=0x00080000)");
+    ok &= check("hello equal-q4k-kshard-slot-reconstruct",
+                DS4_TP_FEATURE_Q4K_KSHARD_INTERLEAVED |
+                    DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT,
+                DS4_TP_FEATURE_Q4K_KSHARD_INTERLEAVED |
+                    DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT,
+                1, NULL);
+    ok &= check("hello mismatched-q4k-kshard-slot-reconstruct",
+                DS4_TP_FEATURE_Q4K_KSHARD_INTERLEAVED |
+                    DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT,
+                DS4_TP_FEATURE_Q4K_KSHARD_INTERLEAVED, 0,
+                "tp hello: runtime feature mismatch (local=0x00300000 peer=0x00100000)");
     ok &= check("hello equal-batch-attn-head-split",
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT,
                 DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT, 1, NULL);

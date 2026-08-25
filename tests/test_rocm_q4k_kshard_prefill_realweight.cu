@@ -412,13 +412,18 @@ int main(void) {
           hipDeviceSynchronize() == hipSuccess, "compose half-K outputs");
 
     if (tokens == 1u) {
-        const uint64_t slot_bytes =
+        const uint64_t routed_slot_bytes =
             (uint64_t)N_USED * OUT_DIM * sizeof(float);
+        const uint64_t exchange_slot_bytes =
+            (uint64_t)(N_USED + 1u) * OUT_DIM * sizeof(float);
         void *slot_full_dev = NULL, *slot_half0_dev = NULL,
              *slot_half1_dev = NULL;
-        CHECK(hipMalloc(&slot_full_dev, slot_bytes) == hipSuccess &&
-              hipMalloc(&slot_half0_dev, slot_bytes) == hipSuccess &&
-              hipMalloc(&slot_half1_dev, slot_bytes) == hipSuccess,
+        CHECK(hipMalloc(&slot_full_dev, exchange_slot_bytes) == hipSuccess &&
+              hipMalloc(&slot_half0_dev, exchange_slot_bytes) == hipSuccess &&
+              hipMalloc(&slot_half1_dev, exchange_slot_bytes) == hipSuccess &&
+              hipMemset(slot_full_dev, 0, exchange_slot_bytes) == hipSuccess &&
+              hipMemset(slot_half0_dev, 0, exchange_slot_bytes) == hipSuccess &&
+              hipMemset(slot_half1_dev, 0, exchange_slot_bytes) == hipSuccess,
               "allocate per-slot decode outputs");
         for (uint32_t slot = 0; slot < N_USED; ++slot) {
             ds4_gpu_tensor sel_one = selected;
@@ -462,9 +467,9 @@ int main(void) {
         }
         CHECK(hipDeviceSynchronize() == hipSuccess,
               "per-slot decode controls sync");
-        float *slot_full = (float *)malloc((size_t)slot_bytes);
-        float *slot_half0 = (float *)malloc((size_t)slot_bytes);
-        float *slot_half1 = (float *)malloc((size_t)slot_bytes);
+        float *slot_full = (float *)malloc((size_t)routed_slot_bytes);
+        float *slot_half0 = (float *)malloc((size_t)routed_slot_bytes);
+        float *slot_half1 = (float *)malloc((size_t)routed_slot_bytes);
         float *owner_ref = (float *)malloc(OUT_DIM * sizeof(float));
         float *rank_group = (float *)malloc(OUT_DIM * sizeof(float));
         float *owner_group = (float *)malloc(OUT_DIM * sizeof(float));
@@ -472,11 +477,11 @@ int main(void) {
         float *slot_owner_group = (float *)malloc(OUT_DIM * sizeof(float));
         CHECK(slot_full && slot_half0 && slot_half1 && owner_ref &&
               rank_group && owner_group && slot_group && slot_owner_group &&
-              hipMemcpy(slot_full, slot_full_dev, slot_bytes,
+              hipMemcpy(slot_full, slot_full_dev, routed_slot_bytes,
                         hipMemcpyDeviceToHost) == hipSuccess &&
-              hipMemcpy(slot_half0, slot_half0_dev, slot_bytes,
+              hipMemcpy(slot_half0, slot_half0_dev, routed_slot_bytes,
                         hipMemcpyDeviceToHost) == hipSuccess &&
-              hipMemcpy(slot_half1, slot_half1_dev, slot_bytes,
+              hipMemcpy(slot_half1, slot_half1_dev, routed_slot_bytes,
                         hipMemcpyDeviceToHost) == hipSuccess,
               "read per-slot decode controls");
         for (uint32_t row = 0; row < OUT_DIM; ++row) {
@@ -519,6 +524,25 @@ int main(void) {
         print_decode_compose_metrics("slot", owner_ref, slot_group);
         print_decode_compose_metrics("slot-owner", owner_ref,
                                      slot_owner_group);
+        ds4_gpu_tensor local_slots = {};
+        ds4_gpu_tensor peer_slots = {};
+        local_slots.ptr = slot_half0_dev;
+        local_slots.bytes = exchange_slot_bytes;
+        peer_slots.ptr = slot_half1_dev;
+        peer_slots.bytes = exchange_slot_bytes;
+        CHECK(ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
+                  &out_sum, &local_slots, &peer_slots, &selected,
+                  0u, N_USED, OUT_DIM, N_TOTAL / 2u) != 0 &&
+              hipDeviceSynchronize() == hipSuccess,
+              "production slot-owner combine");
+        float *slot_owner_gpu = (float *)malloc(OUT_DIM * sizeof(float));
+        CHECK(slot_owner_gpu &&
+              ds4_gpu_tensor_read(&out_sum, 0, slot_owner_gpu,
+                                  OUT_DIM * sizeof(float)) != 0,
+              "read production slot-owner combine");
+        print_decode_compose_metrics("slot-owner-gpu", owner_ref,
+                                     slot_owner_gpu);
+        free(slot_owner_gpu);
         free(slot_owner_group);
         free(slot_group);
         free(owner_group);

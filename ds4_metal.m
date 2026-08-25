@@ -39710,14 +39710,25 @@ int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         uint64_t down_column_byte_count,
         const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
-        const ds4_gpu_tensor *add_in, uint32_t layer_index) {
+        const ds4_gpu_tensor *add_in, uint32_t layer_index,
+        bool *slot_output) {
     (void)out; (void)gate; (void)up; (void)mid; (void)experts;
     (void)model_map; (void)model_size; (void)gate_offset; (void)up_offset;
     (void)down_offset; (void)n_total_expert; (void)source_gate_row_bytes;
     (void)source_down_row_bytes; (void)row_base; (void)row_count;
     (void)down_column_byte_base; (void)down_column_byte_count;
     (void)selected; (void)weights; (void)n_expert; (void)clamp;
-    (void)x; (void)add_in; (void)layer_index;
+    (void)x; (void)add_in; (void)layer_index; (void)slot_output;
+    return 0;
+}
+
+int ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *local_slots,
+        const ds4_gpu_tensor *peer_slots, const ds4_gpu_tensor *selected,
+        uint32_t rank, uint32_t n_expert, uint32_t out_dim,
+        uint32_t expert_split) {
+    (void)out; (void)local_slots; (void)peer_slots; (void)selected;
+    (void)rank; (void)n_expert; (void)out_dim; (void)expert_split;
     return 0;
 }
 

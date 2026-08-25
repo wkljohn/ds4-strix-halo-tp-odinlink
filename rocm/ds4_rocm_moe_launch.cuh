@@ -2622,7 +2622,32 @@ static int routed_moe_launch(
                         midq_blocks == 4u && out_dim == 4096u &&
                         (force_halfk_down4 ||
                          routed_moe_q4k_decode_halfk_down4_enabled());
-                    if (use_halfk_down4) {
+                    const char *slot_reconstruct_env = getenv(
+                        "DS4_ROCM_Q4K_KSHARD_SLOT_RECONSTRUCT");
+                    const uint32_t use_halfk_slots =
+                        use_halfk_down4 && add_in && n_expert == 6u &&
+                        down->bytes >=
+                            (uint64_t)(n_expert + 1u) *
+                                out_dim * sizeof(float) &&
+                        slot_reconstruct_env &&
+                        slot_reconstruct_env[0] == '1' &&
+                        slot_reconstruct_env[1] == '\0';
+                    if (use_halfk_slots) {
+                        dim3 half_grid((out_dim + 63u) / 64u,
+                                       n_expert + 1u, 1u);
+                        moe_down_q4K_slots6_halfk4_kernel<<<half_grid, 256>>>(
+                            (float *)down->ptr,
+                            (const float *)add_in->ptr,
+                            down_w,
+                            midq,
+                            (const int32_t *)selected_exec->ptr,
+                            (const float *)weights->ptr,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            out_dim,
+                            n_expert);
+                        if (add_fused_out) *add_fused_out = 2;
+                    } else if (use_halfk_down4) {
                         dim3 half_grid((out_dim + 63u) / 64u, 1, 1);
                         moe_down_q4K_sum6_halfk4_kernel<<<half_grid, 256>>>(
                             (float *)out->ptr,
@@ -2673,7 +2698,9 @@ static int routed_moe_launch(
                             n_expert,
                             tp_skip_unowned && n_tokens == 1u);
                     }
-                    if (fuse_add && add_fused_out) *add_fused_out = 1;
+                    if (!use_halfk_slots && fuse_add && add_fused_out) {
+                        *add_fused_out = 1;
+                    }
                 } else {
                     moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                         (float *)out->ptr,
@@ -3997,7 +4024,9 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         uint32_t n_expert, float clamp,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
-        uint32_t layer_index) {
+        uint32_t layer_index,
+        bool *slot_output) {
+    if (slot_output) *slot_output = false;
     if (!cuda_q4k_kshard_enabled() ||
         !out || !gate || !up || !mid || !down || !model_map ||
         model_size == 0u ||
@@ -4069,6 +4098,10 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         &add_fused, layer_index, 1u, false,
         (const char *)gate_w, (const char *)up_w, (const char *)down_w,
         true, false, false);
+    if (rc && add_fused == 2) {
+        if (slot_output) *slot_output = true;
+        return 1;
+    }
     if (rc && add_in && !add_fused &&
         !ds4_gpu_add_tensor(out, out, add_in, 4096u)) return 0;
     if (!rc) {
@@ -4077,6 +4110,38 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
                 layer_index, row_base / row_count);
     }
     return rc;
+}
+
+extern "C" int ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
+        ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *local_slots,
+        const ds4_gpu_tensor *peer_slots,
+        const ds4_gpu_tensor *selected,
+        uint32_t rank,
+        uint32_t n_expert,
+        uint32_t out_dim,
+        uint32_t expert_split) {
+    const uint64_t slot_bytes =
+        (uint64_t)(n_expert + 1u) * out_dim * sizeof(float);
+    if (!out || !local_slots || !peer_slots || !selected || rank > 1u ||
+        n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
+        out_dim == 0u || expert_split == 0u ||
+        out->bytes < (uint64_t)out_dim * sizeof(float) ||
+        local_slots->bytes < slot_bytes || peer_slots->bytes < slot_bytes ||
+        selected->bytes <
+            (uint64_t)n_expert * sizeof(int32_t)) {
+        return 0;
+    }
+    const float *rank0 = (const float *)(rank == 0u ?
+        local_slots->ptr : peer_slots->ptr);
+    const float *rank1 = (const float *)(rank == 0u ?
+        peer_slots->ptr : local_slots->ptr);
+    moe_down_q4K_slots6_owner_combine_kernel<<<
+        (out_dim + 255u) / 256u, 256u>>>(
+            (float *)out->ptr, rank0, rank1,
+            (const int32_t *)selected->ptr, n_expert, out_dim, expert_split);
+    return cuda_ok(cudaGetLastError(),
+                   "Q4_K K-shard slot-owner combine launch");
 }
 
 extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(

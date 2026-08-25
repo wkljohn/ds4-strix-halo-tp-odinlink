@@ -25103,6 +25103,7 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", metal_graph_shared_out(g), DS4_N_EMBD, il, pos);
     }
+    bool tp_fold_kshard_slots = false;
     if (ok && tp_fold_ffn) {
         const bool kshard_requested =
             (ds4_gpu_get_tp_runtime_features() &
@@ -25115,13 +25116,19 @@ static bool metal_graph_encode_decode_layer_phase(
                     "ds4: Q4_K K-shard negotiated without installed windows\n");
             ok = false;
         } else if (kshard_ready) {
-            ok = ds4_gpu_routed_moe_one_packed_q4k_tensor(
+            const bool slot_reconstruct_requested =
+                (ds4_gpu_get_tp_runtime_features() &
+                 DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT) != 0u;
+            ds4_gpu_tensor *packed_down = slot_reconstruct_requested ?
+                metal_graph_batch_routed_down(g) : metal_graph_routed_down(g);
+            bool slot_output = false;
+            ok = packed_down && ds4_gpu_routed_moe_one_packed_q4k_tensor(
                     g->tp_out[il * DS4_TP_GATES_PER_LAYER +
                               DS4_TP_GATE_FFN],
                     metal_graph_routed_gate(g),
                     metal_graph_routed_up(g),
                     metal_graph_routed_mid(g),
-                    metal_graph_routed_down(g),
+                    packed_down,
                     model->map, model->size,
                     layer->ffn_gate_exps->abs_offset,
                     layer->ffn_up_exps->abs_offset,
@@ -25135,7 +25142,33 @@ static bool metal_graph_encode_decode_layer_phase(
                     metal_graph_router_selected(g),
                     metal_graph_router_weights(g),
                     DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP,
-                    metal_graph_ffn_norm(g), metal_graph_shared_out(g), il) != 0;
+                    metal_graph_ffn_norm(g), metal_graph_shared_out(g), il,
+                    &slot_output) != 0;
+            if (ok && slot_output != slot_reconstruct_requested) {
+                fprintf(stderr,
+                        "ds4: Q4_K K-shard slot reconstruction dispatch "
+                        "mismatch requested=%d observed=%d\n",
+                        slot_reconstruct_requested, slot_output);
+                ok = false;
+            }
+            if (ok && slot_output) {
+                const uint64_t slot_bytes =
+                    (uint64_t)(DS4_N_EXPERT_USED + 1u) *
+                    DS4_N_EMBD * sizeof(float);
+                ok = metal_graph_ensure_batch_ffn_out(g) &&
+                     ds4_gpu_tp_big_gate_encode(
+                         il, DS4_N_EXPERT_USED + 1u,
+                         packed_down, metal_graph_batch_ffn_out(g),
+                         slot_bytes) != 0 &&
+                     ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
+                         g->tp_out[il * DS4_TP_GATES_PER_LAYER +
+                                   DS4_TP_GATE_FFN],
+                         packed_down, metal_graph_batch_ffn_out(g),
+                         metal_graph_router_selected(g), g->tp_rank,
+                         DS4_N_EXPERT_USED, DS4_N_EMBD,
+                         DS4_N_EXPERT / 2u) != 0;
+                tp_fold_kshard_slots = ok;
+            }
         } else {
             ok = ds4_gpu_routed_moe_one_tensor(
                     g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN],
@@ -25177,8 +25210,13 @@ static bool metal_graph_encode_decode_layer_phase(
             ok = ds4_gpu_add_tensor(g->tp_out[tp_slot], metal_graph_shared_out(g), metal_graph_routed_out(g),
                                     DS4_N_EMBD) != 0;
         }
-        if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
-        if (ok) {
+        if (ok && !tp_fold_kshard_slots) {
+            ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
+        }
+        if (ok && tp_fold_kshard_slots) {
+            tp_ffn_a = g->tp_out[tp_slot];
+            tp_ffn_b = g->tp_zero;
+        } else if (ok) {
             ds4_gpu_tensor *first = g->tp_rank == 0 ? g->tp_out[tp_slot] : g->tp_in[tp_slot];
             ds4_gpu_tensor *second = g->tp_rank == 0 ? g->tp_in[tp_slot] : g->tp_out[tp_slot];
             if (keep_ffn_out || metal_graph_directional_steering_ffn_enabled(g)) {
@@ -52475,10 +52513,19 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         q4k_kshard_interleaved[0] == '1' &&
         q4k_kshard_interleaved[1] == '\0' ?
             DS4_TP_FEATURE_Q4K_KSHARD_INTERLEAVED : 0u;
+    const char *q4k_kshard_slot_reconstruct =
+        getenv("DS4_ROCM_Q4K_KSHARD_SLOT_RECONSTRUCT");
+    const uint32_t q4k_kshard_slot_reconstruct_feature =
+        q4k_kshard_interleaved_feature != 0u &&
+        q4k_kshard_slot_reconstruct &&
+        q4k_kshard_slot_reconstruct[0] == '1' &&
+        q4k_kshard_slot_reconstruct[1] == '\0' ?
+            DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT : 0u;
     return (saw_q4k_layer ? q4k_features : 0u) |
            (saw_iq2_layer ? iq2_features : 0u) |
            hc_features | indexer_features | q4k_kshard_feature |
            q4k_kshard_interleaved_feature |
+           q4k_kshard_slot_reconstruct_feature |
            placement_features;
 #endif
 }

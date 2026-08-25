@@ -2712,7 +2712,18 @@ int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         float                 clamp,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
-        uint32_t              layer_index);
+        uint32_t              layer_index,
+        bool                 *slot_output);
+
+int ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *local_slots,
+        const ds4_gpu_tensor *peer_slots,
+        const ds4_gpu_tensor *selected,
+        uint32_t              rank,
+        uint32_t              n_expert,
+        uint32_t              out_dim,
+        uint32_t              expert_split);
 
 int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         ds4_gpu_tensor       *out,

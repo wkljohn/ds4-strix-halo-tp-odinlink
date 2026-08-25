@@ -2516,6 +2516,75 @@ __global__ static void moe_down_q4K_sum6_halfk4_kernel(
     if (lane == 0u) out[row] = add_in ? total + add_in[row] : total;
 }
 
+/* K-shard numerical-repair path.  Preserve one row per routed slot until the
+ * two rank halves have been reconstructed; row 6 carries this rank's shared
+ * expert partial through the same single exchange. */
+__global__ static void moe_down_q4K_slots6_halfk4_kernel(
+        float *slots,
+        const float *shared,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    const uint32_t lane = threadIdx.x & 3u;
+    const uint32_t row = blockIdx.x * 64u + (threadIdx.x >> 2u);
+    const uint32_t slot = blockIdx.y;
+    if (row >= out_dim || slot > n_expert) return;
+    if (slot == n_expert) {
+        if (lane == 0u) slots[(uint64_t)slot * out_dim + row] = shared[row];
+        return;
+    }
+    float acc = 0.0f;
+    if (slot < n_expert && weights[slot] != 0.0f) {
+        const int32_t expert_i = selected[slot];
+        if (expert_i >= 0) {
+            const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+                down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+                (uint64_t)row * down_row_bytes);
+            const cuda_block_q8_K *xq = midq + (uint64_t)slot * 4u;
+            acc = dev_dot_q4_K_q8_K_block(wr + lane, xq + lane);
+            const uint32_t mask = 0xfu << (threadIdx.x & 28u);
+            acc += __shfl_down_sync(static_cast<MASK_T>(mask), acc, 2, 4);
+            acc += __shfl_down_sync(static_cast<MASK_T>(mask), acc, 1, 4);
+        }
+    }
+    if (lane == 0u) slots[(uint64_t)slot * out_dim + row] = acc;
+}
+
+/* Reproduce the predecessor's association: reconstruct each full expert from
+ * rank0+rank1 first, accumulate slots into their expert-owner group, append
+ * that owner's shared partial, then add the two owner groups. */
+__global__ static void moe_down_q4K_slots6_owner_combine_kernel(
+        float *out,
+        const float *rank0,
+        const float *rank1,
+        const int32_t *selected,
+        uint32_t n_expert,
+        uint32_t out_dim,
+        uint32_t expert_split) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim) return;
+    float owner0 = 0.0f;
+    float owner1 = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < n_expert; ++slot) {
+        const uint64_t i = (uint64_t)slot * out_dim + row;
+        const float expert = rank0[i] + rank1[i];
+        if (selected[slot] >= 0 && (uint32_t)selected[slot] < expert_split) {
+            owner0 += expert;
+        } else if (selected[slot] >= 0) {
+            owner1 += expert;
+        }
+    }
+    owner0 += rank0[(uint64_t)n_expert * out_dim + row];
+    owner1 += rank1[(uint64_t)n_expert * out_dim + row];
+    out[row] = owner0 + owner1;
+}
+
 /* One-token Q4_K down with the six mid-Q8_K slots staged in LDS.  Default-off
  * via DS4_ROCM_Q4K_DECODE_STAGE_MIDQ.  6 slots × 8 cuda_block_q8_K × 292 B =
  * 14,016 B.  The cooperative copy of all 48 blocks runs before any row,
