@@ -93,8 +93,12 @@ static int run_shape(uint32_t width, uint64_t in_dim, uint64_t out_dim,
     CHECK(hipEventCreate(&start) == hipSuccess &&
           hipEventCreate(&stop) == hipSuccess, "create events");
     const uint32_t warmup = 2u, iterations = 32u;
-    float serial_ms = 0.0f, candidate_ms = 0.0f;
-    for (uint32_t phase = 0u; phase < 2u; phase++) {
+    float serial_ms = 0.0f, batched_ms = 0.0f, candidate_ms = 0.0f;
+    for (uint32_t phase = 0u; phase < 3u; phase++) {
+        /* Phase 1 measures the production non-quality tiny-batch selector.
+         * The exactness oracle and ordered serial reference remain in quality
+         * mode so their FP32 reduction contract is unchanged. */
+        ds4_gpu_set_quality(phase != 1u);
         for (uint32_t i = 0u; i < warmup + iterations; i++) {
             if (i == warmup) CHECK(hipEventRecord(start) == hipSuccess,
                                    "record start");
@@ -108,6 +112,11 @@ static int run_shape(uint32_t width, uint64_t in_dim, uint64_t out_dim,
                               &yr, model, model_bytes, weight_offset,
                               in_dim, out_dim, &xr, 1u), "timed reference");
                 }
+            } else if (phase == 1u) {
+                CHECK(ds4_gpu_matmul_f16_tensor(
+                          &got, model, model_bytes, weight_offset,
+                          in_dim, out_dim, &x, width),
+                      "timed production batch");
             } else {
                 CHECK(ds4_gpu_matmul_f16_ordered_rows_exact_tensor(
                           &got, model, model_bytes, weight_offset,
@@ -121,14 +130,18 @@ static int run_shape(uint32_t width, uint64_t in_dim, uint64_t out_dim,
         CHECK(hipEventElapsedTime(&elapsed, start, stop) == hipSuccess,
               "read timing");
         if (phase == 0u) serial_ms = elapsed / iterations;
+        else if (phase == 1u) batched_ms = elapsed / iterations;
         else candidate_ms = elapsed / iterations;
     }
+    ds4_gpu_set_quality(true);
     fprintf(stderr,
-            "width=%u in=%llu out=%llu sets=%u serial_ms=%.6f candidate_ms=%.6f "
-            "speedup=%.3fx exact=yes\n",
+            "width=%u in=%llu out=%llu sets=%u serial_ms=%.6f "
+            "batched_ms=%.6f candidate_ms=%.6f serial_speedup=%.3fx "
+            "batch_speedup=%.3fx exact=yes\n",
             width, (unsigned long long)in_dim, (unsigned long long)out_dim,
             weight_sets,
-            serial_ms, candidate_ms, serial_ms / candidate_ms);
+            serial_ms, batched_ms, candidate_ms, serial_ms / candidate_ms,
+            batched_ms / candidate_ms);
 
     (void)hipEventDestroy(stop);
     (void)hipEventDestroy(start);
