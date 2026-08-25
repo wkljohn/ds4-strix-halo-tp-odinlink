@@ -4508,14 +4508,15 @@ extern "C" int ds4_gpu_rocm_q4k_batch_row_shard_gate_up_tensor(
                     routes.sorted_pairs, routes.offsets, routes.counts,
                     routes.tile_total, routes.tile_experts,
                     routes.tile_starts, (const float *)weights->ptr,
-                    row_count, n_expert, 0u, clamp);
+                    row_count, n_expert, 0u, 0u, clamp);
         } else {
             const dim3 egrid(1u, routes.tile_capacity, 1u);
             moe_gate_up_mid_q4K_routed_epilogue_kernel<<<egrid, 16u>>>(
                 (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                 routes.sorted_pairs, routes.offsets, routes.counts,
                 routes.tile_total, routes.tile_experts, routes.tile_starts,
-                (const float *)weights->ptr, row_count, n_expert, 0u, clamp);
+                (const float *)weights->ptr, row_count, n_expert,
+                0u, 0u, clamp);
         }
         ok = cuda_ok(cudaGetLastError(),
                      "q4k batch row-shard epilogue launch");

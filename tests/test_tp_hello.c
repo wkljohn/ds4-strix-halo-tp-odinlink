@@ -177,7 +177,7 @@ int main(void) {
                 DS4_TP_FEATURE_Q4K_ROW_SHARD, 1, NULL);
     ok &= check("hello mismatched-q4k-row-shard",
                 DS4_TP_FEATURE_Q4K_ROW_SHARD, 0, 0,
-                "tp hello: runtime feature mismatch (local=0x00010000 peer=0x00000000)");
+                "tp hello: runtime feature mismatch (local=0x00400000 peer=0x00000000)");
     /* Two layers: ordinary slots are [attn0,ffn0,attn1,ffn1] =
      * [0,1,3,4].  Row sharding inserts mid slots [2,5] before each FFN. */
     const uint32_t ordinary_slots[] = {0u, 1u, 3u, 4u, 0u};

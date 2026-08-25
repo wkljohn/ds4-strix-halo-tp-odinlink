@@ -118,6 +118,13 @@ struct cuda_q4k_packed_slice {
     int blocked_logged;
 };
 
+/* Historical row-shard launchers predate the generalized row/K packed-slice
+ * registry.  Keep one residency owner and adapt their read-only descriptor
+ * view instead of reviving a second offset index. */
+using cuda_q4k_packed_rows = cuda_q4k_packed_slice;
+#define DS4_GPU_Q4K_PACKED_GATE_UP DS4_GPU_Q4K_PACKED_ROW_RANGE
+#define DS4_GPU_Q4K_PACKED_DOWN DS4_GPU_Q4K_PACKED_ROW_RANGE
+
 struct cuda_q8_f16_range {
     const void *host_base;
     uint64_t offset;
@@ -861,6 +868,26 @@ static cuda_q4k_packed_slice *cuda_q4k_packed_slice_find(
             p.column_byte_count == column_byte_count) return &p;
     }
     return NULL;
+}
+
+static const cuda_q4k_packed_rows *cuda_q4k_packed_rows_resolve(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t n_expert, uint32_t full_rows, uint64_t row_bytes,
+        uint32_t row_base, uint32_t row_count,
+        ds4_gpu_q4k_packed_slice_kind kind) {
+    if (kind != DS4_GPU_Q4K_PACKED_ROW_RANGE) return NULL;
+    cuda_q4k_packed_slice *p = cuda_q4k_packed_slice_find(
+        model_map, tensor_offset, row_base, row_count, 0u, row_bytes);
+    if (!p || !p->loaded || !p->device_ptr ||
+        p->kind != DS4_GPU_Q4K_PACKED_ROW_RANGE ||
+        p->n_expert != n_expert || p->source_rows != full_rows ||
+        p->source_row_bytes != row_bytes || p->column_byte_base != 0u ||
+        p->column_byte_count != row_bytes ||
+        p->packed_expert_bytes != (uint64_t)row_count * row_bytes ||
+        p->packed_bytes != (uint64_t)n_expert * p->packed_expert_bytes) {
+        return NULL;
+    }
+    return p;
 }
 
 static cuda_q4k_packed_slice *cuda_q4k_packed_slice_intersection(
