@@ -954,8 +954,8 @@ static int run_registry_packed_one_oracle(
                    half_down_expert, half_down_row_bytes,
                    MID_HALF, OUT_DIM, N_TOTAL_MAX),
           "ordinary linear primitive refuses declared slices");
-    CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0,
-          "packed one research off");
+    CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "0", 1) == 0,
+          "packed one legacy rollback on");
     CHECK(!ds4_gpu_routed_moe_one_packed_q4k_tensor(
               out, gate, up, mid, down, full_model, full_model_bytes,
               full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
@@ -963,7 +963,7 @@ static int run_registry_packed_one_oracle(
               down_column_byte_base, half_down_row_bytes,
               selected, weights, N_USED, 0.0f,
               x, NULL, 0u),
-          "packed one default-off refusal");
+          "packed one legacy rollback refusal");
     bool batch_mid_is_f16 = true;
     CHECK(!ds4_gpu_routed_moe_batch_packed_q4k_tensor(
               out, gate, up, mid, down, full_model, full_model_bytes,
@@ -972,9 +972,21 @@ static int run_registry_packed_one_oracle(
               down_column_byte_base, half_down_row_bytes,
               selected, weights, N_USED, 0.0f,
               x, 0u, 1u, &batch_mid_is_f16),
-          "packed batch default-off refusal");
-    CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0,
-          "packed one research on");
+          "packed batch legacy rollback refusal");
+    CHECK(unsetenv("DS4_ROCM_Q4K_KSHARD_RESEARCH") == 0,
+          "packed one legacy rollback restore");
+    CHECK(setenv("DS4_ROCM_DISABLE_Q4K_KSHARD", "1", 1) == 0,
+          "packed one production rollback on");
+    CHECK(!ds4_gpu_routed_moe_one_packed_q4k_tensor(
+              out, gate, up, mid, down, full_model, full_model_bytes,
+              full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
+              gate_row_bytes, down_row_bytes, row_base, MID_HALF,
+              down_column_byte_base, half_down_row_bytes,
+              selected, weights, N_USED, 0.0f,
+              x, NULL, 0u),
+          "packed one production rollback refusal");
+    CHECK(unsetenv("DS4_ROCM_DISABLE_Q4K_KSHARD") == 0,
+          "packed one production rollback restore");
     CHECK(ds4_gpu_routed_moe_one_packed_q4k_tensor(
               out, gate, up, mid, down, full_model, full_model_bytes,
               full_gate_off, full_up_off, full_down_off, N_TOTAL_MAX,
@@ -982,7 +994,7 @@ static int run_registry_packed_one_oracle(
               down_column_byte_base, half_down_row_bytes,
               selected, weights, N_USED, 0.0f,
               x, NULL, 0u),
-          "packed one registry primitive");
+          "packed one default-on registry primitive");
     CHECK(hipDeviceSynchronize() == hipSuccess,
           "packed one registry sync");
     CHECK(ds4_gpu_tensor_read(out, 0, candidate, sizeof(candidate)),
@@ -990,7 +1002,8 @@ static int run_registry_packed_one_oracle(
     CHECK(memcmp(reference, candidate, sizeof(reference)) == 0,
           "packed one registry exact output");
     printf("test_rocm_q4k_packed_one_oracle: rank_half=%u output_fnv64=%016llx "
-           "linear_refusal=1 default_off=1 exact=1\n",
+           "linear_refusal=1 legacy_rollback=1 production_rollback=1 "
+           "default_on=1 exact=1\n",
            row_base / MID_HALF,
            (unsigned long long)fnv1a64(candidate, sizeof(candidate)));
 
