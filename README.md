@@ -18,19 +18,19 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 
 ## Performance
 
-| DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
+| Model and path | RDMA link | Prefill | Decode | Validation |
 |---|---|---:|---:|---|
-| Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **211.60 t/s** | **19.59 t/s** | three-run median, exact fingerprint |
-| **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **232.05 t/s** | **19.47 t/s** | three-run median, exact fingerprint |
-| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **278.81 t/s** | **20.48 t/s** | three-run median, exact fingerprint |
-| **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
+| Original Q4_K baseline | — | 34.11 t/s | 9.96 t/s | archived pre-acceleration TP=2 result |
+| Huihui Q2_K | RoCE v2 | **202.83 t/s** | **19.49 t/s** | three-run median |
+| Antirez Q4_K | OdinLink | **231.46 t/s** | **19.13 t/s** | three-run median |
+| Antirez Q4_K | RoCE v2 | **272.51 t/s** | **19.54 t/s** | three-run median |
+| Antirez Q4_K + DSpark | RDMA, 46/54 split | — | — | experimental; revalidation pending |
 
-Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
-generated tokens over mandatory RDMA. The current Q4_K rows use the Antirez
-reference model listed below. It does not fit one node's current 96 GiB ROCm
-aperture; TP=2 keeps one expert shard on each node. Q2_K and Q4_K run without a
-persistent expanded-weight cache.
+The measured rows use `ds4-bench-tp`: 2,048 prompt tokens followed by 300
+generated tokens, balanced 50/50 across two nodes, with mandatory RDMA and no
+persistent expanded-weight cache. The Q4_K rows use the 153.32 GiB Antirez
+model listed below. DSpark remains opt-in and is not included in the
+ordinary-inference results.
 
 The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
 release results.
