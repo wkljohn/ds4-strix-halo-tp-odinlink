@@ -15442,6 +15442,7 @@ typedef struct {
     ds4_gpu_tensor *tp_logits_half;
     bool tp_rank0_full_logits;
     bool tp_q4k_row_shard;
+    bool tp_q4k_row_shard_overlap;
     /* direct=1 prefill big-gate views (opt-in, DS4_TP_BIG_DIRECT=1). Aliases
      * into the engine-owned TP slab, exactly like tp_out/tp_batch_out above,
      * sized to this graph's prefill_cap. NULL when the feature is off or
@@ -22271,22 +22272,25 @@ static bool metal_graph_decode_q4k_row_shard_ffn(
         il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_MOE_MID;
     const uint32_t ffn_slot =
         il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
+    const bool overlap = g->tp_q4k_row_shard_overlap;
+    ds4_gpu_tensor *mid_out = g->tp_out ? g->tp_out[mid_slot] : NULL;
+    ds4_gpu_tensor *mid_in = g->tp_in ? g->tp_in[mid_slot] : NULL;
     ds4_gpu_tensor local_midq = {}, peer_midq = {};
     ds4_gpu_tensor local_shared = {}, peer_shared = {};
-    if (!g->tp_out || !g->tp_in || !g->tp_out[mid_slot] ||
+    if (!mid_out || !mid_in ||
         routed_midq_bytes > MID_SHARED_OFFSET ||
-        MID_SHARED_OFFSET > g->tp_out[mid_slot]->bytes ||
+        MID_SHARED_OFFSET > mid_out->bytes ||
         shared_half_bytes >
-            g->tp_out[mid_slot]->bytes - MID_SHARED_OFFSET ||
+            mid_out->bytes - MID_SHARED_OFFSET ||
         !metal_graph_borrow_tensor_view(
-            &local_midq, g->tp_out[mid_slot], 0u, routed_midq_bytes) ||
+            &local_midq, mid_out, 0u, routed_midq_bytes) ||
         !metal_graph_borrow_tensor_view(
-            &peer_midq, g->tp_in[mid_slot], 0u, routed_midq_bytes) ||
+            &peer_midq, mid_in, 0u, routed_midq_bytes) ||
         !metal_graph_borrow_tensor_view(
-            &local_shared, g->tp_out[mid_slot], MID_SHARED_OFFSET,
+            &local_shared, mid_out, MID_SHARED_OFFSET,
             shared_half_bytes) ||
         !metal_graph_borrow_tensor_view(
-            &peer_shared, g->tp_in[mid_slot], MID_SHARED_OFFSET,
+            &peer_shared, mid_in, MID_SHARED_OFFSET,
             shared_half_bytes)) return false;
 
     const uint64_t shared_gate_row_bytes =
@@ -22336,7 +22340,34 @@ static bool metal_graph_decode_q4k_row_shard_ffn(
             &local_midq, metal_graph_routed_mid(g),
             ROUTED_MID_HALF, DS4_N_EXPERT_USED) != 0;
     }
-    if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_MOE_MID) != 0;
+    ds4_gpu_tensor lane_partials = {};
+    const uint64_t lane_partial_bytes =
+        (uint64_t)DS4_N_EXPERT_USED * OUTPUT_HALF * 4u * sizeof(float);
+    uint64_t mid_exchange_seq = 0u;
+    if (ok && overlap) {
+        ok = metal_graph_batch_routed_down(g) &&
+             metal_graph_borrow_tensor_view(
+                 &lane_partials, metal_graph_batch_routed_down(g), 0u,
+                 lane_partial_bytes);
+    }
+    if (ok && overlap) {
+        mid_exchange_seq =
+            ds4_gpu_tp_gate_kick(il, DS4_TP_GATE_MOE_MID);
+        ok = mid_exchange_seq != 0u;
+    }
+    if (ok && overlap) {
+        ok = ds4_gpu_rocm_q4k_packed_row_down_local_partials_tensor(
+            &lane_partials, &local_midq, model->map,
+            layer->ffn_down_exps->abs_offset, down_row_bytes,
+            2048u, DS4_N_EMBD, metal_graph_router_selected(g),
+            metal_graph_router_weights(g), DS4_N_EXPERT,
+            DS4_N_EXPERT_USED, out_row_base, OUTPUT_HALF, rank) != 0;
+    }
+    if (ok && overlap) {
+        ok = ds4_gpu_tp_gate_wait(mid_exchange_seq) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_MOE_MID) != 0;
+    }
 
     const ds4_gpu_tensor *rank0_midq = rank == 0u ? &local_midq : &peer_midq;
     const ds4_gpu_tensor *rank1_midq = rank == 0u ? &peer_midq : &local_midq;
@@ -22344,7 +22375,17 @@ static bool metal_graph_decode_q4k_row_shard_ffn(
         rank == 0u ? metal_graph_shared_out(g) : &peer_shared;
     const ds4_gpu_tensor *rank1_shared =
         rank == 0u ? &peer_shared : metal_graph_shared_out(g);
-    if (ok) {
+    if (ok && overlap) {
+        ok = ds4_gpu_rocm_q4k_packed_row_down_finish_partials_tensor(
+            g->tp_out[ffn_slot], metal_graph_routed_gate(g),
+            metal_graph_routed_up(g), &lane_partials,
+            rank0_shared, rank1_shared, &peer_midq, model->map,
+            layer->ffn_down_exps->abs_offset, down_row_bytes,
+            2048u, DS4_N_EMBD, metal_graph_router_selected(g),
+            metal_graph_router_weights(g), DS4_N_EXPERT,
+            DS4_N_EXPERT_USED, DS4_N_EXPERT / 2u,
+            out_row_base, OUTPUT_HALF, rank) != 0;
+    } else if (ok) {
         ok = ds4_gpu_rocm_q4k_packed_row_down_tensor(
             g->tp_out[ffn_slot], metal_graph_routed_gate(g),
             metal_graph_routed_up(g), rank0_shared, rank1_shared,
@@ -52934,6 +52975,13 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         weights_q4k_row_shard_exact(&e->weights) && saw_q4k_layer &&
         (q4k_features & DS4_TP_FEATURE_Q4K_WMMA) != 0u ?
             DS4_TP_FEATURE_Q4K_ROW_SHARD : 0u;
+    const char *q4k_row_overlap_env =
+        getenv("DS4_ROCM_Q4K_ROW_SHARD_OVERLAP");
+    const bool q4k_row_overlap_enabled =
+        !q4k_row_overlap_env || strcmp(q4k_row_overlap_env, "0") != 0;
+    const uint32_t q4k_row_overlap_feature =
+        q4k_row_shard_feature && q4k_row_overlap_enabled ?
+            DS4_TP_FEATURE_Q4K_ROW_SHARD_OVERLAP : 0u;
     const char *q4k_kshard_legacy =
         getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
     const char *q4k_kshard_disable =
@@ -52970,6 +53018,7 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
            q4k_kshard_interleaved_feature |
            q4k_kshard_slot_reconstruct_feature |
            q4k_row_shard_feature |
+           q4k_row_overlap_feature |
            placement_features;
 #endif
 }
@@ -60989,6 +61038,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->graph.tp_q4k_row_shard =
             (ds4_tp_runtime_features(e->tp.ctx) &
              DS4_TP_FEATURE_Q4K_ROW_SHARD) != 0u;
+        s->graph.tp_q4k_row_shard_overlap =
+            (ds4_tp_runtime_features(e->tp.ctx) &
+             DS4_TP_FEATURE_Q4K_ROW_SHARD_OVERLAP) != 0u;
         /* direct=1 prefill big-gate fix (opt-in, DS4_TP_BIG_DIRECT=1): alias
          * the prefill FFN all-reduce tensors into the registered TP slab, the
          * same way tp_out/tp_batch_out already alias into it above, so

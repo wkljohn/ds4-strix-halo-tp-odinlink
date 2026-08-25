@@ -102,6 +102,9 @@ enum {
      * This changes both the arithmetic and the decode gate schedule, so it
      * must be an exact-matched hello capability. */
     DS4_TP_FEATURE_Q4K_ROW_SHARD = UINT32_C(1) << 22,
+    /* Exact row-shard decode overlaps its compact MID exchange with local
+     * Q4_K lane work. The transport schedule must match on both ranks. */
+    DS4_TP_FEATURE_Q4K_ROW_SHARD_OVERLAP = UINT32_C(1) << 23,
 };
 
 static inline uint32_t ds4_tp_q4k_kshard_feature(

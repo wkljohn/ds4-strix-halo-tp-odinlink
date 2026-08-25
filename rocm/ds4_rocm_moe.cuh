@@ -3013,6 +3013,77 @@ __global__ static void moe_down_q4K_packed_rows_one_group_kernel(
     if (lane == 0u) group_out[row] = total;
 }
 
+/* Phase one of exact decode MID overlap. Store the four lane values whose
+ * activation half is locally available. Keeping lane values—not a half sum—
+ * preserves the shipping eight-lane 4,2,1 reduction in phase two. */
+__global__ static void moe_down_q4K_packed_rows_local_lane_kernel(
+        float *partials, const char *down_base,
+        const cuda_block_q8_K *local_midq, const int32_t *selected,
+        const float *weights, uint64_t packed_expert_bytes,
+        uint64_t down_row_bytes, uint32_t half_blocks,
+        uint32_t row_count, uint32_t n_expert, uint32_t local_half) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t slot = blockIdx.y;
+    if (row >= row_count || slot >= n_expert || lane >= half_blocks) return;
+    const int32_t expert_i = selected[slot];
+    if (expert_i < 0 || weights[slot] == 0.0f) return;
+    const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+        down_base + (uint64_t)(uint32_t)expert_i * packed_expert_bytes +
+        (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq =
+        local_midq + (uint64_t)slot * half_blocks;
+    partials[((uint64_t)slot * row_count + row) * half_blocks + lane] =
+        dev_dot_q4_K_q8_K_block(wr + local_half * half_blocks + lane,
+                                xq + lane);
+}
+
+/* Phase two consumes the peer half plus the saved local lane values, then
+ * executes the unchanged quarter-wave reduction and ownership-group sums. */
+__global__ static void moe_down_q4K_packed_rows_finish_lane_kernel(
+        float *group0, float *group1, const float *partials,
+        const char *down_base, const cuda_block_q8_K *peer_midq,
+        const int32_t *selected, const float *weights,
+        uint64_t packed_expert_bytes, uint64_t down_row_bytes,
+        uint32_t half_blocks, uint32_t row_count, uint32_t n_expert,
+        uint32_t expert_split, uint32_t local_half) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= row_count) return;
+    float total0 = 0.0f;
+    float total1 = 0.0f;
+#pragma unroll
+    for (uint32_t slot = 0; slot < DS4_ROCM_N_EXPERT_USED; ++slot) {
+        if (slot >= n_expert || weights[slot] == 0.0f) continue;
+        const int32_t expert_i = selected[slot];
+        if (expert_i < 0) continue;
+        const bool local_lane = (lane / half_blocks) == local_half;
+        float acc;
+        if (local_lane) {
+            acc = partials[((uint64_t)slot * row_count + row) * half_blocks +
+                           (lane % half_blocks)];
+        } else {
+            const cuda_block_q4_K *wr = (const cuda_block_q4_K *)(
+                down_base + (uint64_t)(uint32_t)expert_i *
+                                packed_expert_bytes +
+                (uint64_t)row * down_row_bytes);
+            const cuda_block_q8_K *xq =
+                peer_midq + (uint64_t)slot * half_blocks;
+            acc = dev_dot_q4_K_q8_K_block(wr + lane,
+                                          xq + (lane % half_blocks));
+        }
+        const float sum = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0u) {
+            if ((uint32_t)expert_i < expert_split) total0 += sum;
+            else total1 += sum;
+        }
+    }
+    if (lane == 0u) {
+        group0[row] = total0;
+        group1[row] = total1;
+    }
+}
+
 __global__ static void moe_packed_row_groups_add_kernel(
         float *out, const float *group0, const float *group1,
         const float *shared0, const float *shared1, uint32_t count) {
