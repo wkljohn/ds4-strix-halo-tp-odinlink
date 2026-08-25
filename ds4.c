@@ -16782,8 +16782,15 @@ static bool metal_graph_debug_compare_tp_ffn_reference(
         il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
     TP_FFN_REFERENCE_READ("tp_ffn_local", g->tp_out[tp_slot],
                           gpu_ffn_out, embd_bytes);
-    TP_FFN_REFERENCE_READ("tp_ffn_peer", g->tp_in[tp_slot],
-                          gpu_ffn_peer, embd_bytes);
+    const bool slot_reconstruct =
+        (ds4_gpu_get_tp_runtime_features() &
+         DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT) != 0u;
+    if (slot_reconstruct) {
+        memset(gpu_ffn_peer, 0, (size_t)embd_bytes);
+    } else {
+        TP_FFN_REFERENCE_READ("tp_ffn_peer", g->tp_in[tp_slot],
+                              gpu_ffn_peer, embd_bytes);
+    }
     TP_FFN_REFERENCE_READ("after_ffn_hc", metal_graph_after_ffn_hc(g),
                           gpu_after_ffn, hc_dim * sizeof(float));
 #undef TP_FFN_REFERENCE_READ
