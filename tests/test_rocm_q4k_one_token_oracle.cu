@@ -8,6 +8,7 @@
  */
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
+#include "ds4_rocm.h"
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -198,9 +199,10 @@ __device__ static void dev_q4k_scale_min(uint32_t j, const uint8_t *scales,
 __device__ static int32_t dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int shift) {
     int32_t sum = 0;
     #pragma unroll
-    for (uint32_t i = 0; i < 32u; i++) {
-        const int v = (qs[i] >> shift) & 0x0f;
-        sum += v * (int)q8[i];
+    for (uint32_t i = 0; i < 32u; i += 4u) {
+        const int32_t v =
+            (*(const int32_t *)(qs + i) >> shift) & 0x0f0f0f0f;
+        sum = __dp4a(v, *(const int32_t *)(q8 + i), sum);
     }
     return sum;
 }
@@ -340,6 +342,7 @@ __global__ void k_q4k_down_row_shard(
         float *out,
         uint32_t experts,
         uint32_t rows,
+        uint32_t stored_rows,
         uint32_t stored_blocks_per_row,
         uint32_t block_begin,
         uint32_t blocks_per_rank) {
@@ -350,7 +353,7 @@ __global__ void k_q4k_down_row_shard(
     for (uint32_t expert = 0; expert < N_USED; ++expert) {
         if (expert >= experts) continue;
         const block_q4_K *wr = weights +
-            ((uint64_t)expert * rows + row) * stored_blocks_per_row +
+            ((uint64_t)expert * stored_rows + row) * stored_blocks_per_row +
             block_begin;
         const block_q8_K *xq = midq +
             (uint64_t)expert * stored_blocks_per_row + block_begin;
@@ -361,6 +364,88 @@ __global__ void k_q4k_down_row_shard(
         if (lane == 0u) total += acc;
     }
     if (lane == 0u) out[row] = total;
+}
+
+/* Two-phase exact down oracle for hiding the row-shard MID exchange.  The
+ * shipping eight-lane reduction assigns one of the eight Q4_K blocks to each
+ * lane, then reduces 4,2,1.  Phase 1 stores the four locally available lane
+ * values per route/output row.  Phase 2 restores those exact lane values,
+ * computes the four peer-half lanes, and executes the unchanged reduction.
+ * A single half subtotal would reassociate FP32 and is intentionally absent. */
+__global__ void k_q4k_down_local_lane_partials(
+        const block_q4_K *weights, const block_q8_K *midq, float *partials,
+        uint32_t rows, uint32_t local_half) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    const uint32_t expert = blockIdx.y;
+    if (row >= rows || expert >= N_USED || lane >= 4u) return;
+    const uint32_t block = local_half * 4u + lane;
+    const block_q4_K *wr = weights +
+        ((uint64_t)expert * OUT_DIM + row) * (MID_DIM / QK_K);
+    const block_q8_K *xq = midq +
+        (uint64_t)expert * (MID_DIM / QK_K);
+    partials[((uint64_t)expert * rows + row) * 4u + lane] =
+        dev_dot_q4k_q8k_block(wr[block], xq[block]);
+}
+
+__global__ void k_q4k_down_finish_lane_partials(
+        const block_q4_K *weights, const block_q8_K *midq,
+        const float *partials, float *out, uint32_t rows,
+        uint32_t local_half) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= rows) return;
+    float total = 0.0f;
+    for (uint32_t expert = 0; expert < N_USED; ++expert) {
+        const block_q4_K *wr = weights +
+            ((uint64_t)expert * OUT_DIM + row) * (MID_DIM / QK_K);
+        const block_q8_K *xq = midq +
+            (uint64_t)expert * (MID_DIM / QK_K);
+        const bool local_lane = (lane >> 2u) == local_half;
+        const float acc = local_lane
+            ? partials[((uint64_t)expert * rows + row) * 4u + (lane & 3u)]
+            : dev_dot_q4k_q8k_block(wr[lane], xq[lane]);
+        const float sum = subgroup8_sum(acc);
+        if (lane == 0u) total += sum;
+    }
+    if (lane == 0u) out[row] = total;
+}
+
+static int time_down_phase(
+        float *elapsed_ms, hipEvent_t start, hipEvent_t stop,
+        block_q4_K *const *weights, const block_q8_K *midq,
+        float *partials, float *out, uint32_t phase, uint32_t local_half) {
+    const uint32_t rows = OUT_DIM / 2u;
+    const dim3 grid((rows + 31u) / 32u, phase == 1u ? N_USED : 1u, 1u);
+    if (hipEventRecord(start) != hipSuccess) return 0;
+    for (uint32_t i = 0; i < ITERS; ++i) {
+        block_q4_K *w = weights[1u + i % COLD_COPIES];
+        if (phase == 0u) {
+            k_q4k_down_row_shard<<<grid, 256>>>(
+                w, midq, out, N_USED, rows, OUT_DIM, MID_DIM / QK_K,
+                0u, MID_DIM / QK_K);
+        } else if (phase == 1u) {
+            k_q4k_down_local_lane_partials<<<grid, 256>>>(
+                w, midq, partials, rows, local_half);
+        } else if (phase == 2u) {
+            k_q4k_down_finish_lane_partials<<<grid, 256>>>(
+                w, midq, partials, out, rows, local_half);
+        } else {
+            const dim3 local_grid((rows + 31u) / 32u, N_USED, 1u);
+            const dim3 finish_grid((rows + 31u) / 32u, 1u, 1u);
+            k_q4k_down_local_lane_partials<<<local_grid, 256>>>(
+                w, midq, partials, rows, local_half);
+            k_q4k_down_finish_lane_partials<<<finish_grid, 256>>>(
+                w, midq, partials, out, rows, local_half);
+        }
+    }
+    if (hipGetLastError() != hipSuccess ||
+        hipEventRecord(stop) != hipSuccess ||
+        hipEventSynchronize(stop) != hipSuccess) return 0;
+    float total = 0.0f;
+    if (hipEventElapsedTime(&total, start, stop) != hipSuccess) return 0;
+    *elapsed_ms = total / (float)ITERS;
+    return 1;
 }
 
 __device__ __forceinline__ static uint4 load_q4k_block_144(
@@ -521,6 +606,154 @@ static float median_float(const float *values, uint32_t count) {
     return sorted[count / 2u];
 }
 
+static int run_mid_overlap_oracle(void) {
+    const uint32_t rows = OUT_DIM / 2u;
+    const uint32_t blocks_per_row = MID_DIM / QK_K;
+    const uint64_t weight_bytes =
+        (uint64_t)N_USED * OUT_DIM * blocks_per_row * sizeof(block_q4_K);
+    const uint64_t partial_values = (uint64_t)N_USED * rows * 4u;
+
+    block_q4_K *host_weights =
+        (block_q4_K *)malloc((size_t)weight_bytes);
+    CHECK(host_weights, "allocate bounded down weights");
+    pack_q4k_table((unsigned char *)host_weights, N_USED, OUT_DIM,
+                   blocks_per_row, 73u);
+
+    block_q4_K *device_weights[MODEL_COPIES] = {};
+    for (uint32_t c = 0; c < MODEL_COPIES; ++c) {
+        CHECK(hipMalloc(&device_weights[c], (size_t)weight_bytes) == hipSuccess,
+              "allocate bounded device down weights");
+        CHECK(hipMemcpy(device_weights[c], host_weights, (size_t)weight_bytes,
+                        hipMemcpyHostToDevice) == hipSuccess,
+              "copy bounded device down weights");
+    }
+
+    block_q8_K host_midq[N_USED * (MID_DIM / QK_K)];
+    float host_mid[MID_DIM];
+    for (uint32_t expert = 0; expert < N_USED; ++expert) {
+        for (uint32_t i = 0; i < MID_DIM; ++i) {
+            host_mid[i] =
+                (float)((int)((i + 11u * expert) % 41u) - 20) *
+                0.01953125f;
+        }
+        quant_q8_K(host_mid,
+                   host_midq + expert * (MID_DIM / QK_K), MID_DIM);
+    }
+
+    block_q8_K *device_midq = nullptr;
+    float *partials = nullptr;
+    float *reference = nullptr;
+    float *candidate = nullptr;
+    CHECK(hipMalloc(&device_midq, sizeof(host_midq)) == hipSuccess,
+          "allocate bounded midq");
+    CHECK(hipMalloc(&partials, partial_values * sizeof(float)) == hipSuccess,
+          "allocate bounded lane partials");
+    CHECK(hipMalloc(&reference, rows * sizeof(float)) == hipSuccess,
+          "allocate bounded reference output");
+    CHECK(hipMalloc(&candidate, rows * sizeof(float)) == hipSuccess,
+          "allocate bounded candidate output");
+    CHECK(hipMemcpy(device_midq, host_midq, sizeof(host_midq),
+                    hipMemcpyHostToDevice) == hipSuccess,
+          "copy bounded midq");
+
+    const dim3 full_grid((rows + 31u) / 32u, 1u, 1u);
+    const dim3 local_grid((rows + 31u) / 32u, N_USED, 1u);
+    k_q4k_down_row_shard<<<full_grid, 256>>>(
+        device_weights[0], device_midq, reference, N_USED, rows,
+        OUT_DIM, blocks_per_row, 0u, blocks_per_row);
+    CHECK(hipGetLastError() == hipSuccess &&
+          hipDeviceSynchronize() == hipSuccess,
+          "bounded full control");
+
+    float host_reference[OUT_DIM / 2u];
+    float host_candidate[OUT_DIM / 2u];
+    CHECK(hipMemcpy(host_reference, reference, sizeof(host_reference),
+                    hipMemcpyDeviceToHost) == hipSuccess,
+          "read bounded full control");
+    for (uint32_t half = 0; half < 2u; ++half) {
+        k_q4k_down_local_lane_partials<<<local_grid, 256>>>(
+            device_weights[0], device_midq, partials, rows, half);
+        k_q4k_down_finish_lane_partials<<<full_grid, 256>>>(
+            device_weights[0], device_midq, partials, candidate, rows, half);
+        CHECK(hipGetLastError() == hipSuccess &&
+              hipDeviceSynchronize() == hipSuccess,
+              "bounded two-phase candidate");
+        CHECK(hipMemcpy(host_candidate, candidate, sizeof(host_candidate),
+                        hipMemcpyDeviceToHost) == hipSuccess,
+              "read bounded two-phase candidate");
+        CHECK(memcmp(host_reference, host_candidate,
+                     sizeof(host_reference)) == 0,
+              "bounded two-phase bit identity");
+    }
+
+    hipEvent_t start = nullptr, stop = nullptr;
+    CHECK(hipEventCreate(&start) == hipSuccess &&
+          hipEventCreate(&stop) == hipSuccess,
+          "bounded timing events");
+    float discarded = 0.0f;
+    for (uint32_t phase = 0; phase < 4u; ++phase) {
+        CHECK(time_down_phase(&discarded, start, stop, device_weights,
+                              device_midq, partials, candidate, phase, 0u),
+              "bounded timing warmup");
+    }
+
+    enum { SAMPLES = 15 };
+    float full[SAMPLES] = {};
+    float local[SAMPLES] = {};
+    float finish[SAMPLES] = {};
+    float two_phase[SAMPLES] = {};
+    for (uint32_t sample = 0; sample < SAMPLES; ++sample) {
+        const uint32_t order = sample & 3u;
+        for (uint32_t step = 0; step < 4u; ++step) {
+            const uint32_t phase = (order + step) & 3u;
+            float *dst = phase == 0u ? &full[sample] :
+                         phase == 1u ? &local[sample] :
+                         phase == 2u ? &finish[sample] :
+                                       &two_phase[sample];
+            CHECK(time_down_phase(dst, start, stop, device_weights,
+                                  device_midq, partials, candidate, phase, 0u),
+                  "bounded timing sample");
+        }
+    }
+
+    const float full_ms = median_float(full, SAMPLES);
+    const float local_ms = median_float(local, SAMPLES);
+    const float finish_ms = median_float(finish, SAMPLES);
+    const float two_phase_ms = median_float(two_phase, SAMPLES);
+    const float mid_ms = 0.044f;
+    const float serial_ms = mid_ms + full_ms;
+    /* Standalone finish repeatedly reads already-hot scratch and materially
+     * understates its cost after the producer kernel.  Preserve the measured
+     * dependency penalty by deriving finish from the sequential two-phase arm. */
+    const float dependent_finish_ms =
+        fmaxf(0.0f, two_phase_ms - local_ms);
+    const float overlapped_ms =
+        fmaxf(mid_ms, local_ms) + dependent_finish_ms;
+    const float saved_ms = serial_ms - overlapped_ms;
+    printf("q4k_down_mid_overlap rows=%u weights_mib=%.3f scratch_kib=%.3f "
+           "full_ms=%.6f local_ms=%.6f finish_ms=%.6f "
+           "dependent_finish_ms=%.6f two_phase_ms=%.6f "
+           "serial_with_mid_ms=%.6f "
+           "overlapped_ms=%.6f modeled_saved_us=%.3f exact=1 decision=%s\n",
+           rows, (double)weight_bytes / 1048576.0,
+           (double)(partial_values * sizeof(float)) / 1024.0,
+           full_ms, local_ms, finish_ms, dependent_finish_ms, two_phase_ms,
+           serial_ms,
+           overlapped_ms, saved_ms * 1000.0f,
+           saved_ms >= 0.010f ? "GO" : "STOP");
+
+    (void)hipEventDestroy(stop);
+    (void)hipEventDestroy(start);
+    (void)hipFree(candidate);
+    (void)hipFree(reference);
+    (void)hipFree(partials);
+    (void)hipFree(device_midq);
+    for (uint32_t c = 0; c < MODEL_COPIES; ++c)
+        (void)hipFree(device_weights[c]);
+    free(host_weights);
+    return 0;
+}
+
 static int time_row_shard_workload(
         float *elapsed_ms,
         hipEvent_t start,
@@ -550,7 +783,8 @@ static int time_row_shard_workload(
             up[copy], xq, up_out, experts, MID_DIM, gate_row_begin,
             gate_rows, IN_DIM / QK_K);
         k_q4k_down_row_shard<<<down_grid, 256>>>(
-            down[copy], midq, down_out, experts, OUT_DIM, MID_DIM / QK_K,
+            down[copy], midq, down_out, experts, OUT_DIM, OUT_DIM,
+            MID_DIM / QK_K,
             down_block_begin, down_blocks_per_rank);
     }
     if (hipGetLastError() != hipSuccess ||
@@ -567,19 +801,24 @@ static int time_row_shard_workload(
 int main(int argc, char **argv) {
     uint32_t owned = 6u;
     int row_shard_oracle = 0;
+    int mid_overlap_oracle = 0;
     if (argc > 2) {
         fprintf(stderr,
-                "usage: %s [owned-routes:1|3|6|row-shard]\n", argv[0]);
+                "usage: %s [owned-routes:1|3|6|row-shard|mid-overlap]\n",
+                argv[0]);
         return 2;
     }
     if (argc == 2 && strcmp(argv[1], "row-shard") == 0) {
         row_shard_oracle = 1;
+    } else if (argc == 2 && strcmp(argv[1], "mid-overlap") == 0) {
+        mid_overlap_oracle = 1;
     } else if (argc == 2) {
         owned = (uint32_t)strtoul(argv[1], NULL, 10);
     }
-    if (owned != 1u && owned != 3u && owned != 6u) {
+    if (!mid_overlap_oracle && owned != 1u && owned != 3u && owned != 6u) {
         fprintf(stderr,
-                "usage: %s [owned-routes:1|3|6|row-shard]\n", argv[0]);
+                "usage: %s [owned-routes:1|3|6|row-shard|mid-overlap]\n",
+                argv[0]);
         return 2;
     }
     CHECK(setenv("DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP", "1", 1) == 0,
@@ -597,6 +836,7 @@ int main(int argc, char **argv) {
     config.n_gpus = 1;
     config.device_indices[0] = 0;
     CHECK(ds4_gpu_init_multi(&config), "initialize ROCm backend");
+    if (mid_overlap_oracle) return run_mid_overlap_oracle();
 
     const uint64_t in_blocks = IN_DIM / QK_K;
     const uint64_t mid_blocks = MID_DIM / QK_K;
@@ -1017,7 +1257,7 @@ int main(int argc, char **argv) {
             IN_DIM / QK_K);
         k_q4k_down_row_shard<<<row_down_grid, 256>>>(
             load_down[0], d_row_midq, d_row_down0, 3u, OUT_DIM,
-            MID_DIM / QK_K, 0u, MID_DIM / QK_K);
+            OUT_DIM, MID_DIM / QK_K, 0u, MID_DIM / QK_K);
         CHECK(hipGetLastError() == hipSuccess &&
               hipDeviceSynchronize() == hipSuccess,
               "legacy row-shard oracle launch");
@@ -1081,7 +1321,7 @@ int main(int argc, char **argv) {
             k_q4k_down_row_shard<<<row_down_grid, 256>>>(
                 shard_down[0], d_row_midq,
                 half == 0u ? d_row_down0 : d_row_down1,
-                N_USED, OUT_DIM, MID_DIM / QK_K, block_begin,
+                N_USED, OUT_DIM, OUT_DIM, MID_DIM / QK_K, block_begin,
                 MID_DIM / QK_K / 2u);
             CHECK(hipGetLastError() == hipSuccess &&
                   hipDeviceSynchronize() == hipSuccess,
@@ -1131,6 +1371,103 @@ int main(int argc, char **argv) {
         }
         CHECK(shard_max_rel < 1e-5,
               "6xhalf reconstructed row-shard scalar oracle");
+
+        /* Exact local-down overlap precheck.  This is deliberately limited to
+         * the 2,048 output rows one rank would own. */
+        const uint32_t overlap_rows = OUT_DIM / 2u;
+        const uint64_t overlap_partial_values =
+            (uint64_t)N_USED * overlap_rows * 4u;
+        float *d_overlap_partials = nullptr;
+        float *d_overlap_out = nullptr;
+        CHECK(hipMalloc(&d_overlap_partials,
+                        (size_t)overlap_partial_values * sizeof(float)) ==
+                  hipSuccess,
+              "allocate local-down lane partials");
+        CHECK(hipMalloc(&d_overlap_out,
+                        overlap_rows * sizeof(float)) == hipSuccess,
+              "allocate local-down overlap output");
+        const dim3 overlap_local_grid(
+            (overlap_rows + 31u) / 32u, N_USED, 1u);
+        const dim3 overlap_finish_grid(
+            (overlap_rows + 31u) / 32u, 1u, 1u);
+        const dim3 overlap_full_grid(
+            (overlap_rows + 31u) / 32u, 1u, 1u);
+        k_q4k_down_row_shard<<<overlap_full_grid, 256>>>(
+            shard_down[0], d_row_midq, d_row_down0, N_USED,
+            overlap_rows, OUT_DIM, MID_DIM / QK_K, 0u, MID_DIM / QK_K);
+        CHECK(hipGetLastError() == hipSuccess &&
+              hipDeviceSynchronize() == hipSuccess,
+              "local-down full control");
+        float overlap_ref[OUT_DIM / 2u];
+        float overlap_got[OUT_DIM / 2u];
+        CHECK(hipMemcpy(overlap_ref, d_row_down0,
+                        sizeof(overlap_ref), hipMemcpyDeviceToHost) ==
+                  hipSuccess,
+              "read local-down full control");
+        for (uint32_t half = 0u; half < 2u; ++half) {
+            k_q4k_down_local_lane_partials<<<overlap_local_grid, 256>>>(
+                shard_down[0], d_row_midq, d_overlap_partials,
+                overlap_rows, half);
+            k_q4k_down_finish_lane_partials<<<overlap_finish_grid, 256>>>(
+                shard_down[0], d_row_midq, d_overlap_partials,
+                d_overlap_out, overlap_rows, half);
+            CHECK(hipGetLastError() == hipSuccess &&
+                  hipDeviceSynchronize() == hipSuccess,
+                  "local-down two-phase launch");
+            CHECK(hipMemcpy(overlap_got, d_overlap_out,
+                            sizeof(overlap_got), hipMemcpyDeviceToHost) ==
+                      hipSuccess,
+                  "read local-down two-phase output");
+            CHECK(memcmp(overlap_ref, overlap_got,
+                         sizeof(overlap_ref)) == 0,
+                  "local-down two-phase bit identity");
+        }
+
+        enum { OVERLAP_SAMPLES = 15 };
+        float overlap_full[OVERLAP_SAMPLES] = {};
+        float overlap_local[OVERLAP_SAMPLES] = {};
+        float overlap_finish[OVERLAP_SAMPLES] = {};
+        float overlap_total[OVERLAP_SAMPLES] = {};
+        for (uint32_t sample = 0; sample < OVERLAP_SAMPLES; ++sample) {
+            const uint32_t order = sample & 3u;
+            for (uint32_t step = 0; step < 4u; ++step) {
+                const uint32_t phase = (order + step) & 3u;
+                float *dst = phase == 0u ? &overlap_full[sample] :
+                             phase == 1u ? &overlap_local[sample] :
+                             phase == 2u ? &overlap_finish[sample] :
+                                           &overlap_total[sample];
+                CHECK(time_down_phase(
+                          dst, start, stop, shard_down, d_row_midq,
+                          d_overlap_partials, d_overlap_out, phase, 0u),
+                      "time local-down overlap phase");
+            }
+        }
+        const float overlap_full_ms =
+            median_float(overlap_full, OVERLAP_SAMPLES);
+        const float overlap_local_ms =
+            median_float(overlap_local, OVERLAP_SAMPLES);
+        const float overlap_finish_ms =
+            median_float(overlap_finish, OVERLAP_SAMPLES);
+        const float overlap_total_ms =
+            median_float(overlap_total, OVERLAP_SAMPLES);
+        const float mid_interval_ms = 0.044f;
+        const float exposed_ms =
+            fmaxf(mid_interval_ms, overlap_local_ms) + overlap_finish_ms;
+        const float serial_ms = mid_interval_ms + overlap_full_ms;
+        const float modeled_saved_ms = serial_ms - exposed_ms;
+        printf("q4k_down_mid_overlap rows=%u scratch_kib=%.3f "
+               "full_ms=%.6f local_ms=%.6f finish_ms=%.6f "
+               "two_phase_ms=%.6f serial_with_mid_ms=%.6f "
+               "overlapped_ms=%.6f modeled_saved_us=%.3f exact=1 "
+               "decision=%s\n",
+               overlap_rows,
+               (double)(overlap_partial_values * sizeof(float)) / 1024.0,
+               overlap_full_ms, overlap_local_ms, overlap_finish_ms,
+               overlap_total_ms, serial_ms, exposed_ms,
+               modeled_saved_ms * 1000.0f,
+               modeled_saved_ms >= 0.010f ? "GO" : "STOP");
+        (void)hipFree(d_overlap_out);
+        (void)hipFree(d_overlap_partials);
 
         enum { ROW_SHARD_SAMPLES = 31 };
         float full_samples[ROW_SHARD_SAMPLES] = {};

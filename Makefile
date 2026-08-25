@@ -101,6 +101,12 @@ tests/test_tp_completion_ordering.o: tests/test_tp_completion_ordering.cu ds4_tp
 tests/test_tp_completion_ordering: tests/test_tp_completion_ordering.o tests/ds4_tp_completion_ordering.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ -lm -pthread -ldl
 
+tests/test_tp_callback_free_mid.o: tests/test_tp_callback_free_mid.cu ds4_tp.h ds4.h
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_tp_callback_free_mid: tests/test_tp_callback_free_mid.o tests/ds4_tp_completion_ordering.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ -lm -pthread -ldl
+
 test-tp-completion-ordering: tests/test_tp_completion_ordering
 	@test -n "$(ROLE)" -a -n "$(ADDRESS)" -a -n "$(RDMA_DEVICE)" || { \
 		echo "error: set ROLE, ADDRESS, and RDMA_DEVICE" >&2; exit 2; }
@@ -763,4 +769,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_tp_hello tests/test_tp_completion_ordering tests/test_tp_dual_stream_progress tests/test_metal_session_batch tests/test_gpu_xdev tests/test_rocm_attention_output_tp tests/test_rocm_attention_decode_mixed tests/test_rocm_attention_decode_indexed_seqtile tests/test_rocm_attention_prefill_static_flash tests/test_rocm_q4k_decode_bench tests/test_rocm_shared_routed_overlap tests/test_rocm_q4k_fused_mid tests/test_rocm_q4k_staged_midq_oracle tests/test_rocm_q4k_ffn_row_balance_oracle tests/test_rocm_q4k_packed_slice_registry tests/test_rocm_shared_gu_swiglu_fused tests/test_rocm_q8_pair_pack4 tests/test_rocm_attention_q_b_fused tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/rocm_long_context_smoke tests/rocm_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_tp_hello tests/test_tp_completion_ordering tests/test_tp_callback_free_mid tests/test_tp_dual_stream_progress tests/test_metal_session_batch tests/test_gpu_xdev tests/test_rocm_attention_output_tp tests/test_rocm_attention_decode_mixed tests/test_rocm_attention_decode_indexed_seqtile tests/test_rocm_attention_prefill_static_flash tests/test_rocm_q4k_decode_bench tests/test_rocm_shared_routed_overlap tests/test_rocm_q4k_fused_mid tests/test_rocm_q4k_staged_midq_oracle tests/test_rocm_q4k_ffn_row_balance_oracle tests/test_rocm_q4k_packed_slice_registry tests/test_rocm_shared_gu_swiglu_fused tests/test_rocm_q8_pair_pack4 tests/test_rocm_attention_q_b_fused tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/rocm_long_context_smoke tests/rocm_long_context_smoke.o
