@@ -1421,16 +1421,13 @@ static void *ds4_tp_split_service_thread(void *opaque) {
             volatile uint64_t *flag;
             uint64_t first_seq;
         } wave_release = {
-            g_tp_chan[item->req.ch].cpu_flag,
+            g_tp_chan[1].cpu_flag,
             item->req.seq - (item->req.gate ? item->req.gate : 1u) + 1u,
         };
         int ok = 0;
         if (err == hipSuccess && !ds4_tp_fail_get()) {
             const struct ds4_tp_req *req = &item->req;
-            if (req->kind == DS4_TP_ROW) {
-                ok = g_tp_fn ?
-                    g_tp_fn(g_tp_ud, req->layer, req->gate, req->seq) : 0;
-            } else if (req->gate > 1u) {
+            if (req->gate > 1u) {
                 ok = (g_tp_big_wave_fn && req->out_ptr && req->in_ptr) ?
                     g_tp_big_wave_fn(
                         g_tp_ud, req->layer, req->seq,
@@ -1457,7 +1454,7 @@ static void *ds4_tp_split_service_thread(void *opaque) {
             /* Publish release while holding the same mutex that makes this
              * event slot reusable. A following kick therefore cannot observe
              * count==0 with a stale release word. */
-            __atomic_store_n(g_tp_chan[item->req.ch].cpu_flag, completed_seq,
+            __atomic_store_n(g_tp_chan[1].cpu_flag, completed_seq,
                              __ATOMIC_RELEASE);
         }
         g_tp_split_head = (g_tp_split_head + 1u) % DS4_TP_SPLIT_QUEUE;
@@ -1680,110 +1677,8 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     return ds4_tp_encode(0, &r);
 }
 
-extern "C" uint64_t ds4_gpu_tp_gate_kick(
-        uint32_t layer, uint32_t gate) {
-    if (!g_tp_thread_live || !g_tp_fn || gate >= 3u ||
-        ds4_tp_fail_get() || !ds4_tp_split_start()) return 0u;
-    struct ds4_tp_chan *c = &g_tp_chan[0];
-    pthread_mutex_lock(&g_tp_split_mutex);
-    if (!g_tp_split_run || g_tp_split_count >= DS4_TP_SPLIT_QUEUE) {
-        pthread_mutex_unlock(&g_tp_split_mutex);
-        fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "TP split row gate queue overflow or stopped\n");
-        ds4_tp_fail_release_gpu_waits();
-        return 0u;
-    }
-    const uint64_t released =
-        __atomic_load_n(c->cpu_flag, __ATOMIC_ACQUIRE);
-    /* A preceding normal row gate may already be submitted through an
-     * ordered default-stream callback. The producer event below sits behind
-     * that callback, so queuing this split gate is safe before its release
-     * word becomes host-visible. */
-    const uint64_t seq = ++c->seq;
-    if (seq - released >= DS4_TP_RING) {
-        pthread_mutex_unlock(&g_tp_split_mutex);
-        fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "TP split row gate exceeded sequence ring (seq %llu)\n",
-                (unsigned long long)seq);
-        ds4_tp_fail_release_gpu_waits();
-        return 0u;
-    }
-    const uint32_t tail =
-        (g_tp_split_head + g_tp_split_count) % DS4_TP_SPLIT_QUEUE;
-    struct ds4_tp_split_item *item = &g_tp_split_queue[tail];
-    if (!item->producer_event) {
-        const hipError_t create_err = hipEventCreateWithFlags(
-            &item->producer_event, hipEventDisableTiming);
-        if (create_err != hipSuccess) {
-            pthread_mutex_unlock(&g_tp_split_mutex);
-            fprintf(stderr, DS4_GPU_LOG_PREFIX
-                    "TP split row producer event create failed: %s\n",
-                    hipGetErrorString(create_err));
-            ds4_tp_fail_release_gpu_waits();
-            return 0u;
-        }
-    }
-    item->req = {};
-    item->req.kind = DS4_TP_ROW;
-    item->req.layer = layer;
-    item->req.gate = gate;
-    item->req.ch = 0u;
-    item->req.seq = seq;
-    const hipError_t record_err = hipEventRecord(item->producer_event, NULL);
-    if (record_err != hipSuccess) {
-        pthread_mutex_unlock(&g_tp_split_mutex);
-        fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "TP split row producer event record failed: %s\n",
-                hipGetErrorString(record_err));
-        ds4_tp_fail_release_gpu_waits();
-        return 0u;
-    }
-    g_tp_split_count++;
-    pthread_cond_signal(&g_tp_split_cond);
-    pthread_mutex_unlock(&g_tp_split_mutex);
-    return seq;
-}
-
-extern "C" int ds4_gpu_tp_gate_wait(uint64_t seq) {
-    if (!seq || !g_tp_thread_live || seq > g_tp_chan[0].seq) return 0;
-    const uint64_t started_ns = ds4_tp_monotonic_ns();
-    uint32_t polls = 0u;
-    for (;;) {
-        const uint64_t released =
-            __atomic_load_n(g_tp_chan[0].cpu_flag, __ATOMIC_ACQUIRE);
-        if (released == UINT64_MAX || ds4_tp_fail_get()) return 0;
-        if (released >= seq) {
-            /* Put the host-published completion on the producer/consumer
-             * stream as an acquire boundary for peer RDMA writes into the
-             * mapped slab. A host observation alone does not invalidate GPU
-             * caches before the finish kernel reads that payload. */
-            const hipError_t wait_err = hipStreamWaitValue64(
-                NULL, (void *)g_tp_chan[0].cpu_flag, (int64_t)seq,
-                hipStreamWaitValueGte, ~0ULL);
-            if (wait_err == hipSuccess) return 1;
-            fprintf(stderr, DS4_GPU_LOG_PREFIX
-                    "TP split row gate stream acquire failed: %s\n",
-                    hipGetErrorString(wait_err));
-            ds4_tp_fail_release_gpu_waits();
-            return 0;
-        }
-        for (int i = 0; i < 64; ++i) __builtin_ia32_pause();
-        if ((++polls & 255u) == 0u) {
-            if (ds4_tp_monotonic_ns() - started_ns >=
-                g_tp_host_sync_timeout_ns) {
-                fprintf(stderr, DS4_GPU_LOG_PREFIX
-                        "TP split row gate release timeout rank=%u seq=%llu\n",
-                        g_tp_split_rank, (unsigned long long)seq);
-                ds4_tp_fail_release_gpu_waits();
-                return 0;
-            }
-            sched_yield();
-        }
-    }
-}
-
 extern "C" int ds4_gpu_tp_gate_substitute(uint32_t layer, uint32_t gate) {
-    if (!g_tp_thread_live || ds4_tp_fail_get() || gate >= 3u) return 0;
+    if (!g_tp_thread_live || ds4_tp_fail_get() || gate >= 2u) return 0;
     struct ds4_tp_chan *c = &g_tp_chan[0];
     const uint64_t seq = ++c->seq;
     if (tp_trace()) {

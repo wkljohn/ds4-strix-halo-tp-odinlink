@@ -506,9 +506,6 @@ void ds4_gpu_tp_set_expert_split(uint32_t first_rank1);
 void ds4_gpu_tp_suspend_expert_sharding(int suspend);
 int ds4_gpu_tp_expert_shard_active(void);
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
-/* Split decode row gate used by exact producer/compute overlap. */
-uint64_t ds4_gpu_tp_gate_kick(uint32_t layer, uint32_t gate);
-int ds4_gpu_tp_gate_wait(uint64_t seq);
 /* Advance the decode row-gate identity after a negotiated big exchange has
  * replaced that row gate.  No transport operation is issued. */
 int ds4_gpu_tp_gate_substitute(uint32_t layer, uint32_t gate);
@@ -2808,44 +2805,6 @@ int ds4_gpu_rocm_q4k_packed_row_down_tensor(
         uint32_t              expert_split,
         uint32_t              row_base,
         uint32_t              row_count);
-
-int ds4_gpu_rocm_q4k_packed_row_down_local_partials_tensor(
-        ds4_gpu_tensor       *partials,
-        const ds4_gpu_tensor *local_midq,
-        const void           *model_map,
-        uint64_t              down_offset,
-        uint64_t              down_row_bytes,
-        uint32_t              expert_mid_dim,
-        uint32_t              out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t              n_total_expert,
-        uint32_t              n_expert,
-        uint32_t              row_base,
-        uint32_t              row_count,
-        uint32_t              local_half);
-
-int ds4_gpu_rocm_q4k_packed_row_down_finish_partials_tensor(
-        ds4_gpu_tensor       *out_compact,
-        ds4_gpu_tensor       *group0_compact,
-        ds4_gpu_tensor       *group1_compact,
-        const ds4_gpu_tensor *partials,
-        const ds4_gpu_tensor *shared0_compact,
-        const ds4_gpu_tensor *shared1_compact,
-        const ds4_gpu_tensor *peer_midq,
-        const void           *model_map,
-        uint64_t              down_offset,
-        uint64_t              down_row_bytes,
-        uint32_t              expert_mid_dim,
-        uint32_t              out_dim,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t              n_total_expert,
-        uint32_t              n_expert,
-        uint32_t              expert_split,
-        uint32_t              row_base,
-        uint32_t              row_count,
-        uint32_t              local_half);
 
 int ds4_gpu_rocm_q8k_stitch_halves_tensor(
         ds4_gpu_tensor       *full,
