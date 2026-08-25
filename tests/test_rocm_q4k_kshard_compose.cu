@@ -80,11 +80,14 @@ static void pack_q4k_table(unsigned char *dst, uint32_t rows,
 }
 
 static void pack_row_half(unsigned char *dst, const unsigned char *src,
-                          uint32_t row_base) {
+                          uint32_t rank, int interleaved) {
     for (uint32_t e = 0; e < N_EXPERT; ++e) {
         for (uint32_t row = 0; row < HALF_MID; ++row) {
+            const uint32_t source_row = interleaved ?
+                (2u * (row / QK_K) + rank) * QK_K + row % QK_K :
+                rank * HALF_MID + row;
             memcpy(dst + ((uint64_t)e * HALF_MID + row) * GATE_ROW_BYTES,
-                   src + ((uint64_t)e * FULL_MID + row_base + row) *
+                   src + ((uint64_t)e * FULL_MID + source_row) *
                              GATE_ROW_BYTES,
                    GATE_ROW_BYTES);
         }
@@ -92,14 +95,19 @@ static void pack_row_half(unsigned char *dst, const unsigned char *src,
 }
 
 static void pack_down_half(unsigned char *dst, const unsigned char *src,
-                           uint32_t block_base) {
+                           uint32_t rank, int interleaved) {
     for (uint32_t e = 0; e < N_EXPERT; ++e) {
         for (uint32_t row = 0; row < OUT_DIM; ++row) {
-            memcpy(dst + ((uint64_t)e * OUT_DIM + row) *
-                             HALF_DOWN_ROW_BYTES,
-                   src + ((uint64_t)e * OUT_DIM + row) * DOWN_ROW_BYTES +
-                             (uint64_t)block_base * Q4_BLOCK,
-                   HALF_DOWN_ROW_BYTES);
+            for (uint32_t block = 0; block < 4u; ++block) {
+                const uint32_t source_block = interleaved ?
+                    2u * block + rank : 4u * rank + block;
+                memcpy(dst + ((uint64_t)e * OUT_DIM + row) *
+                                 HALF_DOWN_ROW_BYTES +
+                                 (uint64_t)block * Q4_BLOCK,
+                       src + ((uint64_t)e * OUT_DIM + row) * DOWN_ROW_BYTES +
+                                 (uint64_t)source_block * Q4_BLOCK,
+                       Q4_BLOCK);
+            }
         }
     }
 }
@@ -157,6 +165,10 @@ int main(void) {
     CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0,
           "research enabled");
     CHECK(unsetenv("DS4_ROCM_Q4K_DECODE_STAGE_MIDQ") == 0, "MIDQ off");
+    const char *interleave_env =
+        getenv("DS4_ROCM_Q4K_KSHARD_INTERLEAVED");
+    const int interleaved = interleave_env &&
+        interleave_env[0] == '1' && interleave_env[1] == '\0';
 
     const uint64_t gate_expert = (uint64_t)FULL_MID * GATE_ROW_BYTES;
     const uint64_t down_expert = (uint64_t)OUT_DIM * DOWN_ROW_BYTES;
@@ -189,11 +201,11 @@ int main(void) {
     unsigned char *compact =
         (unsigned char *)malloc((size_t)compact_bytes);
     CHECK(compact, "compact reference allocation");
-    pack_row_half(compact, model + gate_offset, HALF_MID);
+    pack_row_half(compact, model + gate_offset, 1u, interleaved);
     pack_row_half(compact + compact_gate_bytes,
-                  model + up_offset, HALF_MID);
+                  model + up_offset, 1u, interleaved);
     pack_down_half(compact + compact_gate_bytes * 2u,
-                   model + down_offset, 4u);
+                   model + down_offset, 1u, interleaved);
 
     char path[] = "/tmp/ds4-q4k-kshard-compose-XXXXXX";
     const int fd = mkstemp(path);
@@ -314,8 +326,9 @@ int main(void) {
           "rank1 installed compose exact reference");
     ds4_gpu_tp_suspend_expert_sharding(0);
 
-    printf("q4k_kshard_compose rank=1 addend=nonzero exact=pass "
+    printf("q4k_kshard_compose rank=1 layout=%s addend=nonzero exact=pass "
            "fnv64=%016llx packed_bytes=%llu\n",
+           interleaved ? "even-odd" : "contiguous",
            (unsigned long long)fnv1a64(candidate, sizeof(candidate)),
            (unsigned long long)compact_bytes);
 

@@ -52468,9 +52468,17 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         saw_routed_layer && all_routed_q4k_kshard_layout,
         saw_q4k_layer &&
             (q4k_features & DS4_TP_FEATURE_Q4K_WMMA) != 0u);
+    const char *q4k_kshard_interleaved =
+        getenv("DS4_ROCM_Q4K_KSHARD_INTERLEAVED");
+    const uint32_t q4k_kshard_interleaved_feature =
+        q4k_kshard_feature != 0u && q4k_kshard_interleaved &&
+        q4k_kshard_interleaved[0] == '1' &&
+        q4k_kshard_interleaved[1] == '\0' ?
+            DS4_TP_FEATURE_Q4K_KSHARD_INTERLEAVED : 0u;
     return (saw_q4k_layer ? q4k_features : 0u) |
            (saw_iq2_layer ? iq2_features : 0u) |
            hc_features | indexer_features | q4k_kshard_feature |
+           q4k_kshard_interleaved_feature |
            placement_features;
 #endif
 }

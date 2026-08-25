@@ -88,6 +88,9 @@ enum {
      * disables ordinary expert-id remapping. Independently launched ranks
      * must agree before that incompatible residency layout is created. */
     DS4_TP_FEATURE_Q4K_KSHARD = UINT32_C(1) << 19,
+    /* Alternating 256-row/K blocks change the packed K-shard arithmetic
+     * layout. A mismatched pair would compute overlapping or missing rows. */
+    DS4_TP_FEATURE_Q4K_KSHARD_INTERLEAVED = UINT32_C(1) << 20,
 };
 
 static inline uint32_t ds4_tp_q4k_kshard_feature(

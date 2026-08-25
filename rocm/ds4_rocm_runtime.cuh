@@ -110,6 +110,8 @@ struct cuda_q4k_packed_slice {
     uint32_t row_base;
     uint32_t row_count;
     ds4_gpu_q4k_packed_slice_kind kind;
+    int interleaved;
+    uint32_t interleave_rank;
     char *device_ptr;
     int owns_device_ptr;
     int loaded;
@@ -6435,6 +6437,49 @@ static int cuda_q4k_kshard_restore_borrowed(void) {
     return cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
 }
 
+/* Translate a byte offset in one packed expert back to its GGUF source.
+ * The optional even/odd layout keeps the same compact tensor geometry while
+ * assigning alternating 256-row/K blocks to the two TP ranks. */
+static int cuda_q4k_packed_source_span(
+        const cuda_q4k_packed_slice &p, uint64_t packed_expert_offset,
+        uint64_t *source_expert_offset, uint64_t *span_bytes) {
+    if (!source_expert_offset || !span_bytes ||
+        packed_expert_offset >= p.packed_expert_bytes) return 0;
+    const uint64_t packed_row =
+        packed_expert_offset / p.column_byte_count;
+    const uint64_t packed_column =
+        packed_expert_offset % p.column_byte_count;
+    if (packed_row >= p.row_count) return 0;
+    if (!p.interleaved) {
+        *source_expert_offset =
+            ((uint64_t)p.row_base + packed_row) * p.source_row_bytes +
+            p.column_byte_base + packed_column;
+        *span_bytes = p.column_byte_count - packed_column;
+        return 1;
+    }
+    if (p.kind == DS4_GPU_Q4K_PACKED_ROW_RANGE) {
+        const uint64_t block = packed_row / CUDA_QK_K;
+        const uint64_t row_in_block = packed_row % CUDA_QK_K;
+        const uint64_t source_row =
+            (2u * block + p.interleave_rank) * CUDA_QK_K + row_in_block;
+        if (source_row >= p.source_rows) return 0;
+        *source_expert_offset =
+            source_row * p.source_row_bytes + packed_column;
+        *span_bytes = p.source_row_bytes - packed_column;
+        return 1;
+    }
+    const uint64_t q4_block_bytes = sizeof(cuda_block_q4_K);
+    const uint64_t packed_block = packed_column / q4_block_bytes;
+    const uint64_t byte_in_block = packed_column % q4_block_bytes;
+    const uint64_t source_block =
+        2u * packed_block + p.interleave_rank;
+    if ((source_block + 1u) * q4_block_bytes > p.source_row_bytes) return 0;
+    *source_expert_offset = packed_row * p.source_row_bytes +
+        source_block * q4_block_bytes + byte_in_block;
+    *span_bytes = q4_block_bytes - byte_in_block;
+    return 1;
+}
+
 extern "C" int ds4_gpu_q4k_packed_slice_declare(
         const void *model_map, uint64_t model_size, uint64_t tensor_offset,
         uint32_t n_expert, uint32_t source_rows,
@@ -6494,12 +6539,34 @@ extern "C" int ds4_gpu_q4k_packed_slice_declare(
                existing->source_row_bytes == source_row_bytes &&
                existing->kind == kind;
     }
+    const char *interleave_env =
+        getenv("DS4_ROCM_Q4K_KSHARD_INTERLEAVED");
+    const int interleave_requested = interleave_env &&
+        interleave_env[0] == '1' && interleave_env[1] == '\0';
+    uint32_t interleave_rank = 0u;
+    const int interleaved_row = interleave_requested &&
+        kind == DS4_GPU_Q4K_PACKED_ROW_RANGE && source_rows == 2048u &&
+        row_count == 1024u && (row_base == 0u || row_base == 1024u) &&
+        column_byte_base == 0u && column_byte_count == source_row_bytes;
+    const int interleaved_k = interleave_requested &&
+        kind == DS4_GPU_Q4K_PACKED_K_RANGE && source_rows == 4096u &&
+        row_base == 0u && row_count == 4096u &&
+        column_byte_count == 4u * sizeof(cuda_block_q4_K) &&
+        (column_byte_base == 0u ||
+         column_byte_base == 4u * sizeof(cuda_block_q4_K));
+    if (interleaved_row) interleave_rank = row_base / 1024u;
+    if (interleaved_k) {
+        interleave_rank = (uint32_t)(column_byte_base /
+            (4u * sizeof(cuda_block_q4_K)));
+    }
+    const int interleaved = interleaved_row || interleaved_k;
     const size_t index = g_q4k_packed_slices.size();
     g_q4k_packed_slices.push_back({
         model_map, model_size, tensor_offset, source_tensor_bytes,
         source_expert_bytes, source_row_bytes, packed_expert_bytes,
         packed_bytes, column_byte_base, column_byte_count, n_expert,
-        source_rows, row_base, row_count, kind, NULL, 0, 0, 0});
+        source_rows, row_base, row_count, kind, interleaved,
+        interleave_rank, NULL, 0, 0, 0});
     g_q4k_packed_by_offset.emplace(tensor_offset, index);
     return 1;
 }
@@ -6536,11 +6603,15 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
     }
 
     const int use_fd_staging = g_model_fd >= 0;
-    const int strided = p->column_byte_base != 0u ||
+    const int strided = p->interleaved || p->column_byte_base != 0u ||
                         p->column_byte_count != p->source_row_bytes;
     uint64_t source_window_bytes = 0;
-    if (!cuda_u64_mul_checked(p->row_count, p->source_row_bytes,
-                              &source_window_bytes)) {
+    const uint64_t source_window_base = p->interleaved ? 0u :
+        (uint64_t)p->row_base * p->source_row_bytes;
+    if (p->interleaved) {
+        source_window_bytes = p->source_expert_bytes;
+    } else if (!cuda_u64_mul_checked(p->row_count, p->source_row_bytes,
+                                     &source_window_bytes)) {
         if (p->owns_device_ptr) (void)cudaFree(dev);
         p->device_ptr = NULL;
         p->owns_device_ptr = 0;
@@ -6593,8 +6664,7 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
 
     for (uint32_t expert = 0; ok && expert < p->n_expert; expert++) {
         const uint64_t src_offset = p->tensor_offset +
-            (uint64_t)expert * p->source_expert_bytes +
-            (uint64_t)p->row_base * p->source_row_bytes;
+            (uint64_t)expert * p->source_expert_bytes + source_window_base;
         char *dst = (char *)dev +
                     (uint64_t)expert * p->packed_expert_bytes;
         if (use_fd_staging) {
@@ -6616,13 +6686,25 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
             }
             const char *upload = payload;
             if (strided) {
-                for (uint32_t row = 0; row < p->row_count; row++) {
-                    memcpy(packed_stage[bi] +
-                               (uint64_t)row * p->column_byte_count,
-                           payload + (uint64_t)row * p->source_row_bytes +
-                               p->column_byte_base,
-                           (size_t)p->column_byte_count);
+                uint64_t packed_offset = 0u;
+                while (packed_offset < p->packed_expert_bytes) {
+                    uint64_t source_expert_offset = 0u, take = 0u;
+                    if (!cuda_q4k_packed_source_span(
+                            *p, packed_offset, &source_expert_offset, &take) ||
+                        source_expert_offset < source_window_base ||
+                        source_expert_offset - source_window_base >
+                            source_window_bytes ||
+                        take > source_window_bytes -
+                            (source_expert_offset - source_window_base)) {
+                        ok = 0;
+                        break;
+                    }
+                    memcpy(packed_stage[bi] + packed_offset,
+                           payload + source_expert_offset - source_window_base,
+                           (size_t)take);
+                    packed_offset += take;
                 }
+                if (!ok) break;
                 upload = packed_stage[bi];
             }
             if (p->owns_device_ptr) {
@@ -6671,14 +6753,21 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
                              cudaMemcpyHostToDevice);
             if (err != cudaSuccess) ok = 0;
         } else {
-            const char *src = (const char *)model_map + src_offset;
-            for (uint32_t row = 0; row < p->row_count; row++) {
-                memcpy(host_pack.data() +
-                           (uint64_t)row * p->column_byte_count,
-                       src + (uint64_t)row * p->source_row_bytes +
-                           p->column_byte_base,
-                       (size_t)p->column_byte_count);
+            const char *expert_src = (const char *)model_map +
+                p->tensor_offset + (uint64_t)expert * p->source_expert_bytes;
+            uint64_t packed_offset = 0u;
+            while (packed_offset < p->packed_expert_bytes) {
+                uint64_t source_expert_offset = 0u, take = 0u;
+                if (!cuda_q4k_packed_source_span(
+                        *p, packed_offset, &source_expert_offset, &take)) {
+                    ok = 0;
+                    break;
+                }
+                memcpy(host_pack.data() + packed_offset,
+                       expert_src + source_expert_offset, (size_t)take);
+                packed_offset += take;
             }
+            if (!ok) break;
             err = cudaMemcpy(dst, host_pack.data(),
                              (size_t)p->packed_expert_bytes,
                              cudaMemcpyHostToDevice);
@@ -6715,14 +6804,15 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
     fprintf(stderr, DS4_GPU_LOG_PREFIX
             "loaded packed Q4_K routed slice offset=%.2f GiB "
             "rows=%u:%u columns=%llu:%llu experts=%u bytes=%.2f MiB "
-            "kind=%s\n",
+            "kind=%s layout=%s\n",
             (double)p->tensor_offset / 1073741824.0,
             p->row_base, p->row_base + p->row_count,
             (unsigned long long)p->column_byte_base,
             (unsigned long long)(p->column_byte_base +
                                  p->column_byte_count),
             p->n_expert, (double)p->packed_bytes / 1048576.0,
-            p->kind == DS4_GPU_Q4K_PACKED_ROW_RANGE ? "row" : "K");
+            p->kind == DS4_GPU_Q4K_PACKED_ROW_RANGE ? "row" : "K",
+            p->interleaved ? "even-odd" : "contiguous");
     return 1;
 }
 
@@ -8813,25 +8903,14 @@ static int cuda_q4k_kshard_overlay_packed_window(
         const uint64_t expert_offset =
             packed_offset % p.packed_expert_bytes;
         if (expert >= p.n_expert) return 0;
-        uint64_t source_offset = 0;
-        uint64_t take = 0;
-        if (p.column_byte_base == 0u &&
-            p.column_byte_count == p.source_row_bytes) {
-            source_offset = p.tensor_offset +
-                expert * p.source_expert_bytes +
-                (uint64_t)p.row_base * p.source_row_bytes + expert_offset;
-            take = std::min(bytes,
-                            p.packed_expert_bytes - expert_offset);
-        } else {
-            const uint64_t row = expert_offset / p.column_byte_count;
-            const uint64_t column = expert_offset % p.column_byte_count;
-            if (row >= p.row_count) return 0;
-            source_offset = p.tensor_offset +
-                expert * p.source_expert_bytes +
-                ((uint64_t)p.row_base + row) * p.source_row_bytes +
-                p.column_byte_base + column;
-            take = std::min(bytes, p.column_byte_count - column);
+        uint64_t source_expert_offset = 0u, source_span = 0u;
+        if (!cuda_q4k_packed_source_span(
+                p, expert_offset, &source_expert_offset, &source_span)) {
+            return 0;
         }
+        const uint64_t source_offset = p.tensor_offset +
+            expert * p.source_expert_bytes + source_expert_offset;
+        const uint64_t take = std::min(bytes, source_span);
         if (!cuda_pread_full(g_model_fd, dst, take, source_offset)) return 0;
         packed_offset += take;
         dst += take;
