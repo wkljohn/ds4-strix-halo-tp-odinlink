@@ -129,6 +129,18 @@ def main() -> int:
                        "--thresholds", str(thresholds))
         assert far_flip.returncode != 0
         assert json.loads(far_flip.stdout)["far_margin_inversions"] == 1
+
+        # A bounded diagnostic prefix may compare a short candidate against a
+        # longer immutable reference without copying or truncating evidence.
+        dump(reference / "decode_000001.logits.json", [0.0, 1.0, 2.0, 3.0])
+        assert run(str(reference), str(candidate)).returncode == 1
+        prefix = run(str(reference), str(candidate), "--max-steps", "1")
+        assert prefix.returncode == 0, prefix.stderr
+        assert json.loads(prefix.stdout)["steps"] == 1
+        assert run(str(reference), str(candidate),
+                   "--max-steps", "0").returncode == 1
+        assert run(str(reference), str(candidate),
+                   "--max-steps", "2").returncode == 1
     print("test_compare_teacher_logits: PASS")
     return 0
 

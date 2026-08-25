@@ -166,6 +166,8 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--steps-output", type=Path,
                         help="write every per-position metric as JSON Lines")
+    parser.add_argument("--max-steps", type=int,
+                        help="compare only the first N identically named dumps")
     parser.add_argument("--allow-quality-difference", action="store_true",
                         help="explicitly compare an unfused quality oracle with an optimized path")
     args = parser.parse_args()
@@ -173,6 +175,17 @@ def main() -> int:
         thresholds = load_thresholds(args.thresholds)
         reference_files = sorted(args.reference_dir.glob("decode_*.logits.json"))
         candidate_files = sorted(args.candidate_dir.glob("decode_*.logits.json"))
+        if args.max_steps is not None:
+            if args.max_steps <= 0:
+                raise ValueError("--max-steps must be positive")
+            if (len(reference_files) < args.max_steps or
+                    len(candidate_files) < args.max_steps):
+                raise ValueError(
+                    f"--max-steps={args.max_steps} exceeds available dumps "
+                    f"({len(reference_files)} reference, "
+                    f"{len(candidate_files)} candidate)")
+            reference_files = reference_files[:args.max_steps]
+            candidate_files = candidate_files[:args.max_steps]
         if not reference_files or [p.name for p in reference_files] != [p.name for p in candidate_files]:
             raise ValueError("reference and candidate decode-logit file sets must be non-empty and identical")
         steps = [compare_pair(load(ref, reference=True), load(cand), thresholds,
