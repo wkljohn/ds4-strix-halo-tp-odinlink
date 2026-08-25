@@ -270,11 +270,38 @@ fi
 CURRENT_OPT_ENV=(
   DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
 )
+Q2_ZERO_WEIGHT_TILE_SKIP=0
 if [[ $DSPARK == 1 ]]; then
+  ROUTED_FAMILY=$(python3 "$REPO/scripts/gguf_tensor_types.py" --routed-family "$MODEL") || {
+    echo "error: unable to inspect routed-expert quantization in $MODEL" >&2
+    exit 1
+  }
   # Paired one-token DP4A changes the committed target trajectory unless the
   # five-row verifier uses identical arithmetic. Keep the exact production
   # DSpark path; the runtime independently enforces this safety invariant.
   CURRENT_OPT_ENV+=(DS4_ROCM_Q8_DECODE_PAIR_DP4A=0)
+  case $ROUTED_FAMILY in
+    Q4_K)
+      # Keep DSpark's serial oracle and verifier frontier on the same safe
+      # Q4_K TP schedule as ordinary inference. Without peer-route omission,
+      # 128+ row prefill uses unordered FP32 atomic down accumulation; DSpark's
+      # extra allocations perturb wave order and can change the greedy stream.
+      TP_PREFILL_SKIP_UNOWNED=1
+      CURRENT_OPT_ENV+=(
+        DS4_ROCM_TP_SKIP_UNOWNED=1
+        DS4_ROCM_TP_PREFILL_SKIP_UNOWNED="$TP_PREFILL_SKIP_UNOWNED"
+      )
+      ;;
+    HYBRID_Q2)
+      # The hybrid-Q2 route-omission path changes full logits and remains
+      # rejected. Preserve its existing DSpark arithmetic.
+      TP_PREFILL_SKIP_UNOWNED=0
+      ;;
+    *)
+      echo "error: unsupported routed-expert quantization: $ROUTED_FAMILY" >&2
+      exit 1
+      ;;
+  esac
 else
   ROUTED_FAMILY=$(python3 "$REPO/scripts/gguf_tensor_types.py" --routed-family "$MODEL") || {
     echo "error: unable to inspect routed-expert quantization in $MODEL" >&2
@@ -290,6 +317,7 @@ else
   esac
   if [[ $ROUTED_FAMILY == HYBRID_Q2 ]]; then
     CURRENT_OPT_ENV+=(DS4_ROCM_TP_ZERO_WEIGHT_TILE_SKIP=1)
+    Q2_ZERO_WEIGHT_TILE_SKIP=1
     if [[ $CANDIDATE == 1 ]]; then
       for env_kv in "${EXTRA_ENV[@]}"; do
         if [[ $env_kv == DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=* &&
@@ -332,7 +360,7 @@ fi
 }
 
 if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
-  echo "validated_config rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
+  echo "validated_config rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$Q2_ZERO_WEIGHT_TILE_SKIP"
   exit 0
 fi
 
