@@ -25236,6 +25236,21 @@ static bool metal_graph_encode_decode_layer_phase(
             }
         }
     }
+    /* PROFILE-only graph dumps can compare the materialized reconstructed
+     * result with the predecessor's two rank partials at the first divergent
+     * layer.  The helper is a no-op in production and unless a dump prefix is
+     * explicitly configured. */
+    if (ok && g->tp_world == 2) {
+        const uint32_t tp_slot =
+            il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
+        metal_graph_debug_dump_tensor(
+            tp_fold_kshard_slots ? "tp_ffn_full" : "tp_ffn_local",
+            g->tp_out[tp_slot], DS4_N_EMBD, il, pos);
+        if (!tp_fold_kshard_slots) {
+            metal_graph_debug_dump_tensor(
+                "tp_ffn_peer", g->tp_in[tp_slot], DS4_N_EMBD, il, pos);
+        }
+    }
     DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_FFN_GATE);
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_ffn_out(g) &&

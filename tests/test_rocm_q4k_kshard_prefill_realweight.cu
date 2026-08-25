@@ -240,6 +240,29 @@ static void print_decode_compose_metrics(const char *name,
                                         OUT_DIM * sizeof(float)));
 }
 
+static void print_prefill_compose_metrics(const char *name,
+                                          const float *reference,
+                                          const float *candidate,
+                                          uint64_t elems) {
+    double diff_sq = 0.0, ref_sq = 0.0;
+    float max_abs = 0.0f;
+    uint64_t changed = 0;
+    for (uint64_t i = 0; i < elems; ++i) {
+        const float ref = reference[i];
+        const float got = candidate[i];
+        const float err = fabsf(got - ref);
+        max_abs = fmaxf(max_abs, err);
+        diff_sq += (double)err * err;
+        ref_sq += (double)ref * ref;
+        changed += memcmp(&ref, &got, sizeof(float)) != 0;
+    }
+    printf("prefill_compose=%s changed=%llu max_abs=%.9e nmse=%.9e "
+           "fnv=%016llx\n", name, (unsigned long long)changed, max_abs,
+           diff_sq / fmax(1.0e-30, ref_sq),
+           (unsigned long long)fnv1a64(candidate,
+                                        elems * sizeof(float)));
+}
+
 static int launch(ds4_gpu_tensor *out,
                   ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
                   ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
@@ -334,17 +357,23 @@ int main(void) {
     const uint64_t mid_bytes = pairs * MID_FULL * sizeof(float);
     const uint64_t down_bytes = pairs * OUT_DIM * sizeof(float);
     const uint64_t x_bytes = (uint64_t)tokens * IN_DIM * sizeof(float);
-    ds4_gpu_tensor selected = {}, weights = {}, x = {};
+    ds4_gpu_tensor selected = {}, weights = {}, owner_weights[2] = {}, x = {};
     ds4_gpu_tensor gate = {}, up = {}, mid = {}, down = {};
     ds4_gpu_tensor out_full = {}, out_half0 = {}, out_half1 = {}, out_sum = {};
+    ds4_gpu_tensor out_owner[2] = {}, out_owner_sum = {};
     int32_t *host_selected = (int32_t *)malloc((size_t)pairs * sizeof(int32_t));
     float *host_weights = (float *)malloc((size_t)pairs * sizeof(float));
+    float *host_owner_weights[2] = {
+        (float *)malloc((size_t)pairs * sizeof(float)),
+        (float *)malloc((size_t)pairs * sizeof(float)),
+    };
     char route_path[1024], weights_path[1024];
     snprintf(route_path, sizeof(route_path), "%s_layer0_pos0_topk.i32",
              route_prefix);
     snprintf(weights_path, sizeof(weights_path), "%s_layer0_pos0_weights.f32",
              route_prefix);
-    CHECK(host_selected && host_weights &&
+    CHECK(host_selected && host_weights && host_owner_weights[0] &&
+          host_owner_weights[1] &&
           (tokens == TOKENS ?
               read_exact(route_path, host_selected,
                          (size_t)pairs * sizeof(int32_t)) :
@@ -359,6 +388,10 @@ int main(void) {
     for (uint64_t p = 0; p < pairs; ++p) {
         CHECK(host_selected[p] >= 0 && host_selected[p] < N_TOTAL &&
               isfinite(host_weights[p]), "validate frozen layer-0 route");
+        const uint32_t owner = (uint32_t)host_selected[p] < N_TOTAL / 2u ?
+            0u : 1u;
+        host_owner_weights[0][p] = owner == 0u ? host_weights[p] : 0.0f;
+        host_owner_weights[1][p] = owner == 1u ? host_weights[p] : 0.0f;
     }
     unsigned char expert_seen[N_TOTAL] = {};
     uint32_t expert_coverage = 0;
@@ -375,6 +408,10 @@ int main(void) {
                                          pairs * sizeof(float));
     CHECK(alloc_upload(&selected, host_selected, pairs * sizeof(int32_t)) &&
           alloc_upload(&weights, host_weights, pairs * sizeof(float)) &&
+          alloc_upload(&owner_weights[0], host_owner_weights[0],
+                       pairs * sizeof(float)) &&
+          alloc_upload(&owner_weights[1], host_owner_weights[1],
+                       pairs * sizeof(float)) &&
           alloc_tensor(&x, x_bytes) &&
           alloc_tensor(&gate, mid_bytes) &&
           alloc_tensor(&up, mid_bytes) &&
@@ -383,7 +420,10 @@ int main(void) {
           alloc_tensor(&out_full, out_bytes) &&
           alloc_tensor(&out_half0, out_bytes) &&
           alloc_tensor(&out_half1, out_bytes) &&
-          alloc_tensor(&out_sum, out_bytes), "allocate numeric tensors");
+          alloc_tensor(&out_sum, out_bytes) &&
+          alloc_tensor(&out_owner[0], out_bytes) &&
+          alloc_tensor(&out_owner[1], out_bytes) &&
+          alloc_tensor(&out_owner_sum, out_bytes), "allocate numeric tensors");
     const uint64_t x_count = (uint64_t)tokens * IN_DIM;
     fill_input<<<(x_count + 255u) / 256u, 256>>>((float *)x.ptr, x_count);
     CHECK(hipGetLastError() == hipSuccess && hipDeviceSynchronize() == hipSuccess,
@@ -410,6 +450,25 @@ int main(void) {
     CHECK(ds4_gpu_add_tensor(&out_sum, &out_half0, &out_half1,
                              tokens * OUT_DIM) != 0 &&
           hipDeviceSynchronize() == hipSuccess, "compose half-K outputs");
+
+    /* The accepted TP prefill groups complete experts by their owner before
+     * the final rank add.  Compare that expression with the packed K-shard
+     * rank grouping; the older all-six full-K reference cannot expose this
+     * association difference. */
+    CHECK(launch(&out_owner[0], &gate, &up, &mid, &down,
+                 full_gate, full_up, full_down,
+                 gate_expert_bytes, gate_row_bytes,
+                 down_expert_bytes, down_row_bytes,
+                 &selected, &owner_weights[0], &x, MID_FULL, tokens, N_USED) &&
+          launch(&out_owner[1], &gate, &up, &mid, &down,
+                 full_gate, full_up, full_down,
+                 gate_expert_bytes, gate_row_bytes,
+                 down_expert_bytes, down_row_bytes,
+                 &selected, &owner_weights[1], &x, MID_FULL, tokens, N_USED) &&
+          ds4_gpu_add_tensor(&out_owner_sum, &out_owner[0], &out_owner[1],
+                             tokens * OUT_DIM) != 0 &&
+          hipDeviceSynchronize() == hipSuccess,
+          "compose expert-owner full-K prefill control");
 
     if (tokens == 1u) {
         const uint64_t routed_slot_bytes =
@@ -563,6 +622,14 @@ int main(void) {
           ds4_gpu_tensor_read(&out_full, 0, reference, out_bytes) != 0 &&
           ds4_gpu_tensor_read(&out_sum, 0, candidate, out_bytes) != 0,
           "read real-weight outputs");
+    float *owner_reference = (float *)malloc((size_t)out_bytes);
+    CHECK(owner_reference &&
+          ds4_gpu_tensor_read(&out_owner_sum, 0, owner_reference,
+                              out_bytes) != 0,
+          "read expert-owner prefill control");
+    print_prefill_compose_metrics("packed-rank-vs-full-owner",
+                                  owner_reference, candidate,
+                                  (uint64_t)tokens * OUT_DIM);
     double diff_sq = 0.0, ref_sq = 0.0;
     float max_rel = 0.0f, max_abs = 0.0f, max_ref = 0.0f;
     uint64_t nonfinite = 0, changed = 0;
@@ -605,11 +672,17 @@ int main(void) {
     const bool pass = nonfinite == 0 && changed > 0 &&
                       ref_sq > REF_SQ_FLOOR &&
                       max_rel <= MAX_REL_LIMIT && nmse <= NMSE_LIMIT;
+    free(owner_reference);
     free(candidate);
     free(reference);
+    free(host_owner_weights[1]);
+    free(host_owner_weights[0]);
     free(host_weights);
     free(host_selected);
     ds4_gpu_tensor_free_in_place(&out_sum);
+    ds4_gpu_tensor_free_in_place(&out_owner_sum);
+    ds4_gpu_tensor_free_in_place(&out_owner[1]);
+    ds4_gpu_tensor_free_in_place(&out_owner[0]);
     ds4_gpu_tensor_free_in_place(&out_half1);
     ds4_gpu_tensor_free_in_place(&out_half0);
     ds4_gpu_tensor_free_in_place(&out_full);
@@ -619,6 +692,8 @@ int main(void) {
     ds4_gpu_tensor_free_in_place(&gate);
     ds4_gpu_tensor_free_in_place(&x);
     ds4_gpu_tensor_free_in_place(&weights);
+    ds4_gpu_tensor_free_in_place(&owner_weights[1]);
+    ds4_gpu_tensor_free_in_place(&owner_weights[0]);
     ds4_gpu_tensor_free_in_place(&selected);
     for (uint32_t h = 0; h < 2u; ++h) {
         CHECK(hipFree(half_down[h]) == hipSuccess &&
