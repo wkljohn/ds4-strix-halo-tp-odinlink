@@ -492,6 +492,9 @@ void ds4_gpu_tp_set_expert_split(uint32_t first_rank1);
 void ds4_gpu_tp_suspend_expert_sharding(int suspend);
 int ds4_gpu_tp_expert_shard_active(void);
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate);
+/* Advance the decode row-gate identity after a negotiated big exchange has
+ * replaced that row gate.  No transport operation is issued. */
+int ds4_gpu_tp_gate_substitute(uint32_t layer, uint32_t gate);
 #if defined(DS4_ROCM_BUILD) && defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
 /* PROFILE=1-only route-skew recorder. Production call sites are compiled out;
  * the ROCm implementation is inert unless DS4_TP_ROUTE_SAMPLES=1. */

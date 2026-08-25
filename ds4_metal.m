@@ -39699,6 +39699,11 @@ void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
     (void)enabled;
 }
 
+int ds4_gpu_tp_gate_substitute(uint32_t layer, uint32_t gate) {
+    (void)layer; (void)gate;
+    return 0;
+}
+
 int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,

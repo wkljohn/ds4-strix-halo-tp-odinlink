@@ -1677,6 +1677,18 @@ extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     return ds4_tp_encode(0, &r);
 }
 
+extern "C" int ds4_gpu_tp_gate_substitute(uint32_t layer, uint32_t gate) {
+    if (!g_tp_thread_live || ds4_tp_fail_get() || gate >= 2u) return 0;
+    struct ds4_tp_chan *c = &g_tp_chan[0];
+    const uint64_t seq = ++c->seq;
+    if (tp_trace()) {
+        fprintf(stderr,
+                "[tp] substitute row gate seq=%llu layer=%u gate=%u\n",
+                (unsigned long long)seq, layer, gate);
+    }
+    return 1;
+}
+
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
 extern "C" void ds4_gpu_tp_route_profile(
         const ds4_gpu_tensor *selected, uint32_t n_selected,

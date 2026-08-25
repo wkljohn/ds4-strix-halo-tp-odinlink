@@ -25160,6 +25160,8 @@ static bool metal_graph_encode_decode_layer_phase(
                          il, DS4_N_EXPERT_USED + 1u,
                          packed_down, metal_graph_batch_ffn_out(g),
                          slot_bytes) != 0 &&
+                     ds4_gpu_tp_gate_substitute(
+                         il, DS4_TP_GATE_FFN) != 0 &&
                      ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
                          g->tp_out[il * DS4_TP_GATES_PER_LAYER +
                                    DS4_TP_GATE_FFN],
