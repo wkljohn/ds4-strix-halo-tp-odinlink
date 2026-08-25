@@ -13,6 +13,9 @@ static int routed_moe_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
 #ifndef DS4_TP_FEATURE_Q4K_FUSED_MID
 #define DS4_TP_FEATURE_Q4K_FUSED_MID (UINT32_C(1) << 16)
 #endif
+#ifndef DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT
+#define DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT (UINT32_C(1) << 21)
+#endif
 
 static int routed_moe_align256_checked(uint64_t v, uint64_t *out) {
     if (!out || v > UINT64_MAX - 255ull) return 0;
@@ -2920,7 +2923,15 @@ static int routed_moe_launch(
         if (ok && !direct_iq2_down_done && !use_atomic_down &&
             !use_direct_down_sum6 && !use_iq2_q2_float_down) {
             uint64_t n = (uint64_t)n_tokens * out_dim;
-            if (tp_prefill_skip_unowned) {
+            if (force_halfk_down4 &&
+                g_q4k_wmma_tp_runtime_features_valid &&
+                (g_q4k_wmma_tp_runtime_features &
+                 DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT)) {
+                moe_sum_owner_ordered_kernel<<<(n + 255) / 256, 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr,
+                    (const int32_t *)selected_exec->ptr,
+                    out_dim, n_expert, n_tokens, n_total_expert / 2u);
+            } else if (tp_prefill_skip_unowned) {
                 moe_sum_skip_negative_kernel<<<(n + 255) / 256, 256>>>(
                     (float *)out->ptr, (const float *)down->ptr,
                     (const int32_t *)selected_exec->ptr,
@@ -4113,7 +4124,8 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
 }
 
 extern "C" int ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
-        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *owner0_out,
+        ds4_gpu_tensor *owner1_out,
         const ds4_gpu_tensor *local_slots,
         const ds4_gpu_tensor *peer_slots,
         const ds4_gpu_tensor *selected,
@@ -4123,10 +4135,12 @@ extern "C" int ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
         uint32_t expert_split) {
     const uint64_t slot_bytes =
         (uint64_t)(n_expert + 1u) * out_dim * sizeof(float);
-    if (!out || !local_slots || !peer_slots || !selected || rank > 1u ||
+    if (!owner0_out || !owner1_out || owner0_out == owner1_out ||
+        !local_slots || !peer_slots || !selected || rank > 1u ||
         n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
         out_dim == 0u || expert_split == 0u ||
-        out->bytes < (uint64_t)out_dim * sizeof(float) ||
+        owner0_out->bytes < (uint64_t)out_dim * sizeof(float) ||
+        owner1_out->bytes < (uint64_t)out_dim * sizeof(float) ||
         local_slots->bytes < slot_bytes || peer_slots->bytes < slot_bytes ||
         selected->bytes <
             (uint64_t)n_expert * sizeof(int32_t)) {
@@ -4138,7 +4152,8 @@ extern "C" int ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
         peer_slots->ptr : local_slots->ptr);
     moe_down_q4K_slots6_owner_combine_kernel<<<
         (out_dim + 255u) / 256u, 256u>>>(
-            (float *)out->ptr, rank0, rank1,
+            (float *)owner0_out->ptr, (float *)owner1_out->ptr,
+            rank0, rank1,
             (const int32_t *)selected->ptr, n_expert, out_dim, expert_split);
     return cuda_ok(cudaGetLastError(),
                    "Q4_K K-shard slot-owner combine launch");

@@ -27819,7 +27819,8 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
 }
 
 extern "C" int ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
-        ds4_gpu_tensor *, const ds4_gpu_tensor *, const ds4_gpu_tensor *,
+        ds4_gpu_tensor *, ds4_gpu_tensor *,
+        const ds4_gpu_tensor *, const ds4_gpu_tensor *,
         const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t, uint32_t) {
     return 0;
 }

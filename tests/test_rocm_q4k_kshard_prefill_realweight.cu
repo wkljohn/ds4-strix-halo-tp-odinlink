@@ -311,6 +311,7 @@ int main(void) {
     config.n_gpus = 1;
     config.device_indices[0] = 0;
     CHECK(ds4_gpu_init_multi(&config), "initialize ROCm");
+    ds4_gpu_set_tp_runtime_features(0u, UINT32_C(1) << 21);
 
     const uint64_t gate_row_bytes = 16u * Q4_K_BYTES;
     const uint64_t gate_expert_bytes = MID_FULL * gate_row_bytes;
@@ -590,8 +591,11 @@ int main(void) {
         peer_slots.ptr = slot_half1_dev;
         peer_slots.bytes = exchange_slot_bytes;
         CHECK(ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
-                  &out_sum, &local_slots, &peer_slots, &selected,
+                  &out_half0, &out_half1,
+                  &local_slots, &peer_slots, &selected,
                   0u, N_USED, OUT_DIM, N_TOTAL / 2u) != 0 &&
+              ds4_gpu_add_tensor(&out_sum, &out_half0, &out_half1,
+                                 OUT_DIM) != 0 &&
               hipDeviceSynchronize() == hipSuccess,
               "production slot-owner combine");
         float *slot_owner_gpu = (float *)malloc(OUT_DIM * sizeof(float));

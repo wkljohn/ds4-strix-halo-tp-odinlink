@@ -16786,7 +16786,8 @@ static bool metal_graph_debug_compare_tp_ffn_reference(
         (ds4_gpu_get_tp_runtime_features() &
          DS4_TP_FEATURE_Q4K_KSHARD_SLOT_RECONSTRUCT) != 0u;
     if (slot_reconstruct) {
-        memset(gpu_ffn_peer, 0, (size_t)embd_bytes);
+        TP_FFN_REFERENCE_READ("tp_ffn_owner1", metal_graph_shared_out(g),
+                              gpu_ffn_peer, embd_bytes);
     } else {
         TP_FFN_REFERENCE_READ("tp_ffn_peer", g->tp_in[tp_slot],
                               gpu_ffn_peer, embd_bytes);
@@ -25172,6 +25173,7 @@ static bool metal_graph_encode_decode_layer_phase(
                      ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
                          g->tp_out[il * DS4_TP_GATES_PER_LAYER +
                                    DS4_TP_GATE_FFN],
+                         metal_graph_shared_out(g),
                          packed_down, metal_graph_batch_ffn_out(g),
                          metal_graph_router_selected(g), g->tp_rank,
                          DS4_N_EXPERT_USED, DS4_N_EMBD,
@@ -25224,7 +25226,7 @@ static bool metal_graph_encode_decode_layer_phase(
         }
         if (ok && tp_fold_kshard_slots) {
             tp_ffn_a = g->tp_out[tp_slot];
-            tp_ffn_b = g->tp_zero;
+            tp_ffn_b = metal_graph_shared_out(g);
         } else if (ok) {
             ds4_gpu_tensor *first = g->tp_rank == 0 ? g->tp_out[tp_slot] : g->tp_in[tp_slot];
             ds4_gpu_tensor *second = g->tp_rank == 0 ? g->tp_in[tp_slot] : g->tp_out[tp_slot];
@@ -25244,14 +25246,25 @@ static bool metal_graph_encode_decode_layer_phase(
         const uint32_t tp_slot =
             il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
         metal_graph_debug_dump_tensor(
-            tp_fold_kshard_slots ? "tp_ffn_full" : "tp_ffn_local",
+            tp_fold_kshard_slots ? "tp_ffn_owner0" : "tp_ffn_local",
             g->tp_out[tp_slot], DS4_N_EMBD, il, pos);
-        if (!tp_fold_kshard_slots) {
+        if (tp_fold_kshard_slots) {
+            metal_graph_debug_dump_tensor(
+                "tp_ffn_owner1", metal_graph_shared_out(g),
+                DS4_N_EMBD, il, pos);
+        } else {
             metal_graph_debug_dump_tensor(
                 "tp_ffn_peer", g->tp_in[tp_slot], DS4_N_EMBD, il, pos);
         }
     }
     DS4_ROCM_DECODE_ATTN_EVENT(DS4_GPU_DECODE_ATTN_EVENT_FFN_GATE);
+    if (ok && keep_ffn_out) {
+        if (tp_fold_kshard_slots) {
+            ok = ds4_gpu_add_tensor(metal_graph_routed_out(g),
+                                    tp_ffn_a, tp_ffn_b,
+                                    DS4_N_EMBD) != 0;
+        }
+    }
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_ffn_out(g) &&
              ds4_gpu_add_tensor(metal_graph_ffn_out(g),

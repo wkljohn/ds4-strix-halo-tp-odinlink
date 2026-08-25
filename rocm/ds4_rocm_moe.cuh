@@ -2559,7 +2559,8 @@ __global__ static void moe_down_q4K_slots6_halfk4_kernel(
  * rank0+rank1 first, accumulate slots into their expert-owner group, append
  * that owner's shared partial, then add the two owner groups. */
 __global__ static void moe_down_q4K_slots6_owner_combine_kernel(
-        float *out,
+        float *owner0_out,
+        float *owner1_out,
         const float *rank0,
         const float *rank1,
         const int32_t *selected,
@@ -2582,7 +2583,8 @@ __global__ static void moe_down_q4K_slots6_owner_combine_kernel(
     }
     owner0 += rank0[(uint64_t)n_expert * out_dim + row];
     owner1 += rank1[(uint64_t)n_expert * out_dim + row];
-    out[row] = owner0 + owner1;
+    owner0_out[row] = owner0;
+    owner1_out[row] = owner1;
 }
 
 /* One-token Q4_K down with the six mid-Q8_K slots staged in LDS.  Default-off
@@ -3269,6 +3271,42 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     float acc = 0.0f;
     for (uint32_t e = 0; e < n_expert; e++) acc += down[((uint64_t)tok * n_expert + e) * out_dim + row];
     out[gid] = acc;
+}
+
+/* Preserve the production expert-owner association while each TP rank holds
+ * one K-half of every selected expert.  Each rank still emits one ordinary
+ * token row, so this changes neither the bulk-gate payload nor its launch
+ * geometry.  The final cross-rank add remains a Lane-B reorder, but grouping
+ * the six local half-expert contributions 3+3 removes the avoidable inner
+ * association difference from the packed prefill path. */
+__global__ static void moe_sum_owner_ordered_kernel(
+        float *out,
+        const float *down,
+        const int32_t *selected,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        uint32_t expert_split) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    const uint32_t tok = (uint32_t)(gid / out_dim);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim);
+    const uint64_t pair0 = (uint64_t)tok * n_expert;
+    float owner0 = 0.0f;
+    float owner1 = 0.0f;
+    for (uint32_t slot = 0; slot < n_expert; ++slot) {
+        const uint64_t pair = pair0 + slot;
+        const int32_t expert = selected[pair];
+        if (expert < 0) continue;
+        const float value = down[pair * out_dim + row];
+        if ((uint32_t)expert < expert_split) {
+            owner0 += value;
+        } else {
+            owner1 += value;
+        }
+    }
+    out[gid] = owner0 + owner1;
 }
 
 /* Sum pair-major down rows in canonical route-slot order while omitting the

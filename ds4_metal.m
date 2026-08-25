@@ -39728,11 +39728,13 @@ int ds4_gpu_routed_moe_one_packed_q4k_tensor(
 }
 
 int ds4_gpu_q4k_kshard_slot_owner_combine_tensor(
-        ds4_gpu_tensor *out, const ds4_gpu_tensor *local_slots,
+        ds4_gpu_tensor *owner0_out, ds4_gpu_tensor *owner1_out,
+        const ds4_gpu_tensor *local_slots,
         const ds4_gpu_tensor *peer_slots, const ds4_gpu_tensor *selected,
         uint32_t rank, uint32_t n_expert, uint32_t out_dim,
         uint32_t expert_split) {
-    (void)out; (void)local_slots; (void)peer_slots; (void)selected;
+    (void)owner0_out; (void)owner1_out;
+    (void)local_slots; (void)peer_slots; (void)selected;
     (void)rank; (void)n_expert; (void)out_dim; (void)expert_split;
     return 0;
 }
