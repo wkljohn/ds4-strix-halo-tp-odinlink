@@ -55,7 +55,16 @@ EOF
   cat > "$dossier/$name.manifest" <<EOF
 tag=$name
 run_id=$name-run-id
-bench_config_sha256=fixture
+bench_config_sha256=$(printf 'e%.0s' {1..64})
+ds4_sha256=$(printf 'b%.0s' {1..64})
+peer_ds4_sha256=$(printf 'b%.0s' {1..64})
+ds4_bench_tp_sha256=$(printf 'd%.0s' {1..64})
+tp_runtime_features=0x00080001
+common_env=FIXTURE_COMMON=1
+worker_env=FIXTURE_WORKER=1
+coordinator_env=FIXTURE_COORDINATOR=1
+extra_env=FIXTURE_ARITHMETIC=1
+transport_library_path=
 model=$model_path
 model_size=$model_size
 model_sample_sha256=$model_sample
@@ -196,7 +205,14 @@ for index in range(300):
 numerical_manifest = (
     f"model={model_path}\nmodel_size={model_size}\nmodel_sample_sha256={model_sample}\n"
     f"source_commit={'0' * 40}\nsource_dirty=0\ntoolchain_id=synthetic-old\n"
-    f"prefix_tokens=2048\nfile_count=300\nfrozen_token_sha256={'c' * 64}\ndspark=0\n"
+    f"run_id=reference-numerical\nbench_config_sha256={'e' * 64}\n"
+    f"ds4_sha256={'a' * 64}\npeer_ds4_sha256={'a' * 64}\n"
+    f"ds4_bench_tp_sha256={'d' * 64}\ntp_runtime_features=0x00000001\n"
+    "common_env=FIXTURE_COMMON=1\nworker_env=FIXTURE_WORKER=1\n"
+    "coordinator_env=FIXTURE_COORDINATOR=1\nextra_env=FIXTURE_REFERENCE=1\n"
+    "transport_library_path=\n"
+    f"prefix_tokens=2048\nfrontier=2048\ncontext=2560\nprefill_chunk=2048\n"
+    f"file_count=300\nfrozen_token_sha256={'c' * 64}\ndspark=0\n"
 )
 numerical_manifest_sha = hashlib.sha256(numerical_manifest.encode()).hexdigest()
 fields = ["id", "target_tokens", "nll", "avg_nll", "api_top1_count",
@@ -246,6 +262,10 @@ record = {
         "quality": {"sha256": quality_sha, "manifest_sha256": quality_manifest_sha},
     },
     "thresholds": {
+        "arithmetic_identity": {
+            "ignored_env_keys": [],
+            "ignored_runtime_feature_mask": 0,
+        },
         "numerical": {
             "e_bound": 0.1, "max_abs": 0.1, "p99_abs": 0.1,
             "nmse": 0.0001, "tvd": 0.0001, "kl": 0.0001,
@@ -323,11 +343,25 @@ for directory in ("logits-reference", "logits-candidate"):
 (root / "logits-reference" / "manifest").write_text(
     f"model={model_path}\nmodel_size=1\nmodel_sample_sha256={model_sample}\n"
     f"source_commit={'0' * 40}\nsource_dirty=0\ntoolchain_id=synthetic-old\n"
-    f"prefix_tokens=2048\nfile_count=300\nfrozen_token_sha256={'c' * 64}\ndspark=0\n")
+    f"run_id=reference-numerical\nbench_config_sha256={'e' * 64}\n"
+    f"ds4_sha256={'a' * 64}\npeer_ds4_sha256={'a' * 64}\n"
+    f"ds4_bench_tp_sha256={'d' * 64}\ntp_runtime_features=0x00000001\n"
+    "common_env=FIXTURE_COMMON=1\nworker_env=FIXTURE_WORKER=1\n"
+    "coordinator_env=FIXTURE_COORDINATOR=1\nextra_env=FIXTURE_REFERENCE=1\n"
+    "transport_library_path=\n"
+    f"prefix_tokens=2048\nfrontier=2048\ncontext=2560\nprefill_chunk=2048\n"
+    f"file_count=300\nfrozen_token_sha256={'c' * 64}\ndspark=0\n")
 (root / "logits-candidate" / "manifest").write_text(
     f"model={model_path}\nmodel_size=1\nmodel_sample_sha256={model_sample}\n"
     f"source_commit={source_commit}\nsource_dirty=0\ntoolchain_id=synthetic-new\n"
-    f"prefix_tokens=2048\nfile_count=300\nfrozen_token_sha256={'c' * 64}\ndspark=0\n")
+    f"run_id=candidate-numerical\nbench_config_sha256={'e' * 64}\n"
+    f"ds4_sha256={'b' * 64}\npeer_ds4_sha256={'b' * 64}\n"
+    f"ds4_bench_tp_sha256={'d' * 64}\ntp_runtime_features=0x00080001\n"
+    "common_env=FIXTURE_COMMON=1\nworker_env=FIXTURE_WORKER=1\n"
+    "coordinator_env=FIXTURE_COORDINATOR=1\nextra_env=FIXTURE_ARITHMETIC=1\n"
+    "transport_library_path=\n"
+    f"prefix_tokens=2048\nfrontier=2048\ncontext=2560\nprefill_chunk=2048\n"
+    f"file_count=300\nfrozen_token_sha256={'c' * 64}\ndspark=0\n")
 numerical = {
     "baseline_id": baseline_id, "e_bound": 0.1, "max_abs": 0.1,
     "p99_abs": 0.1, "nmse": 0.0001, "tvd": 0.0001, "kl": 0.0001,

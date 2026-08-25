@@ -375,6 +375,7 @@ fi
 COMMON_ENV=(DS4_TP_TIMEOUT_SEC="$TP_TIMEOUT_SEC" "${CURRENT_OPT_ENV[@]}")
 RDMA_ARGS=(--rdma-device "$LOCAL_RDMA_DEVICE")
 WORKER_RDMA_ARGS=(--rdma-device "$PEER_RDMA_DEVICE")
+ODL_LD_PATH=
 if [[ $RDMA_PROFILE == odinlink ]]; then
   ODINLINK_ROOT=${DS4_ODINLINK_ROOT:-}
   [[ -n $ODINLINK_ROOT ]] || {
@@ -641,6 +642,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'worker_env=%s\n' "$WORKER_ENV_Q"
   printf 'coordinator_env=%s\n' "$COORD_ENV_Q"
   printf 'extra_env=%s\n' "$EXTRA_ENV_Q"
+  printf 'transport_library_path=%s\n' "$ODL_LD_PATH"
 } > "$MANIFEST"
 
 if pgrep -af '[d]s4-bench-tp.*--role coordinator.*--tensor-parallel' >/dev/null; then
@@ -789,6 +791,20 @@ wait_worker 180 || {
 WORKER_STARTED=0
 trap - EXIT
 "${PEER_SCP[@]}" "$PEER_MGMT:$REMOTE_WORKER_LOG" "$WORKER_LOG"
+COORD_RUNTIME_FEATURES=$(sed -n \
+  's/^ds4-tp: runtime features negotiated: \(0x[0-9a-fA-F]\{8\}\)$/\1/p' \
+  "$COORD_LOG" | tail -1)
+WORKER_RUNTIME_FEATURES=$(sed -n \
+  's/^ds4-tp: runtime features negotiated: \(0x[0-9a-fA-F]\{8\}\)$/\1/p' \
+  "$WORKER_LOG" | tail -1)
+if [[ ! $COORD_RUNTIME_FEATURES =~ ^0x[0-9a-fA-F]{8}$ ||
+      ! $WORKER_RUNTIME_FEATURES =~ ^0x[0-9a-fA-F]{8}$ ||
+      ${COORD_RUNTIME_FEATURES,,} != "${WORKER_RUNTIME_FEATURES,,}" ]]; then
+  echo "error: missing or mismatched negotiated TP runtime features: coordinator=$COORD_RUNTIME_FEATURES worker=$WORKER_RUNTIME_FEATURES" >&2
+  exit 1
+fi
+TP_RUNTIME_FEATURES=${COORD_RUNTIME_FEATURES,,}
+printf 'tp_runtime_features=%s\n' "$TP_RUNTIME_FEATURES" >> "$MANIFEST"
 if [[ $DECODE_SELF_CHECK == 1 ]]; then
   grep -q 'ds4-bench: decode self-check complete .*argmax_mismatches=0 ' \
     "$COORD_LOG" || {
@@ -843,20 +859,33 @@ if [[ -n $FROZEN_TOKEN_FILE ]]; then
   }
   {
     printf 'tag=%s\n' "$TAG"
+    printf 'run_id=%s\n' "$RUN_ID"
     printf 'source_commit=%s\n' "$SOURCE_COMMIT"
     printf 'source_dirty=%s\n' "$SOURCE_DIRTY"
+    printf 'bench_config=%s\n' "$BENCH_CONFIG"
+    printf 'bench_config_sha256=%s\n' "$BENCH_CONFIG_SHA256"
     printf 'toolchain_id=%s\n' "$TOOLCHAIN_ID"
     printf 'model=%s\n' "$MODEL"
     printf 'model_size=%s\n' "$LOCAL_MODEL_SIZE"
     printf 'model_sample_sha256=%s\n' "$LOCAL_MODEL_FINGERPRINT"
     printf 'ds4_sha256=%s\n' "$LOCAL_DS4_HASH"
+    printf 'peer_ds4_sha256=%s\n' "$PEER_DS4_HASH"
     printf 'ds4_bench_tp_sha256=%s\n' "$LOCAL_BENCH_HASH"
     printf 'prompt_sha256=%s\n' "$PROMPT_HASH"
     printf 'prefix_tokens=%s\n' "$FROZEN_PREFIX"
+    printf 'frontier=%s\n' "$FRONTIER"
+    printf 'context=%s\n' "$CONTEXT"
+    printf 'prefill_chunk=%s\n' "$PREFILL_CHUNK"
     printf 'frozen_token_sha256=%s\n' "$FROZEN_TOKEN_HASH"
     printf 'file_count=%s\n' "$FROZEN_COUNT"
     printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
+    printf 'tp_runtime_features=%s\n' "$TP_RUNTIME_FEATURES"
     printf 'dspark=0\n'
+    printf 'common_env=%s\n' "$COMMON_ENV_Q"
+    printf 'worker_env=%s\n' "$WORKER_ENV_Q"
+    printf 'coordinator_env=%s\n' "$COORD_ENV_Q"
+    printf 'extra_env=%s\n' "$EXTRA_ENV_Q"
+    printf 'transport_library_path=%s\n' "$ODL_LD_PATH"
   } > "$FROZEN_LOGITS_DIR/manifest"
   echo "frozen_logits_manifest=$FROZEN_LOGITS_DIR/manifest"
   echo "TP_FROZEN_TEACHER_LOGITS_RECORDED_NOT_BENCHMARKED"

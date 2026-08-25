@@ -102,7 +102,11 @@ for index, teacher in enumerate(tokens):
                 "quality": quality_ref,
             },
             "thresholds": {"numerical": numerical_thresholds,
-                           "quality": quality_thresholds},
+                           "quality": quality_thresholds,
+                           "arithmetic_identity": {
+                               "ignored_env_keys": [],
+                               "ignored_runtime_feature_mask": 0,
+                           }},
             "provenance": {"lane_origin": "bootstrap"},
         }
         predecessor_digest = GATE.canonical_sha256(predecessor)
@@ -207,7 +211,14 @@ for index, teacher in enumerate(tokens):
         (candidate_dir / "manifest").write_text(
             f"model={model}\nmodel_size=5\nmodel_sample_sha256={model_sample}\n"
             f"source_commit={'0' * 40}\nsource_dirty=0\ntoolchain_id=test\n"
-            f"prefix_tokens=2048\nfile_count=300\nfrozen_token_sha256={token_sha}\ndspark=0\n")
+            f"run_id=candidate-numerical\nbench_config_sha256={'e' * 64}\n"
+            f"ds4_sha256={'b' * 64}\npeer_ds4_sha256={'b' * 64}\n"
+            f"ds4_bench_tp_sha256={'d' * 64}\ntp_runtime_features=0x00080001\n"
+            "common_env=FIXTURE_COMMON=1\nworker_env=FIXTURE_WORKER=1\n"
+            "coordinator_env=FIXTURE_COORDINATOR=1\nextra_env=FIXTURE_ARITHMETIC=1\n"
+            "transport_library_path=\n"
+            f"prefix_tokens=2048\nfrontier=2048\ncontext=4096\nprefill_chunk=2048\n"
+            f"file_count=300\nfrozen_token_sha256={token_sha}\ndspark=0\n")
         baseline_id = "sha256:" + "1" * 64
         thresholds = {
             "baseline_id": baseline_id, "e_bound": 0.1, "max_abs": 0.1,
@@ -226,11 +237,16 @@ for index, teacher in enumerate(tokens):
         assert result.returncode == 0, result.stderr
         baseline = {
             "key": {"quantization": "Q4_K", "workload": {
-                "frontier": "2048", "frozen_token_sha256": token_sha}},
+                "frontier": "2048", "context": "4096",
+                "prefill_chunk": "2048", "frozen_token_sha256": token_sha}},
             "reference": {
                 "numerical": {"files": predecessor_files, "manifest_sha256": "0" * 64},
             },
             "thresholds": {
+                "arithmetic_identity": {
+                    "ignored_env_keys": [],
+                    "ignored_runtime_feature_mask": 0,
+                },
                 "numerical": {key: value for key, value in thresholds.items()
                               if key != "baseline_id"},
                 "oracle_numerical": {key: value for key, value in thresholds.items()

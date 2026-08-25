@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -180,6 +181,22 @@ def validate_quality_thresholds(thresholds: object, label: str) -> dict:
     return thresholds
 
 
+def validate_arithmetic_identity_contract(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise GateError("arithmetic_identity thresholds are missing")
+    if set(value) != {"ignored_env_keys", "ignored_runtime_feature_mask"}:
+        raise GateError("arithmetic_identity thresholds contain unknown keys")
+    keys = value["ignored_env_keys"]
+    mask = value["ignored_runtime_feature_mask"]
+    if (not isinstance(keys, list) or len(keys) != len(set(keys)) or
+            any(not isinstance(key, str) or not re.fullmatch(
+                r"[A-Z_][A-Z0-9_]*", key) for key in keys)):
+        raise GateError("arithmetic_identity ignored_env_keys are invalid")
+    if not isinstance(mask, int) or not 0 <= mask <= 0xffffffff:
+        raise GateError("arithmetic_identity ignored_runtime_feature_mask is invalid")
+    return value
+
+
 def sampled_model_sha256(path: Path) -> tuple[int, str]:
     size = path.stat().st_size
     offsets = (0, max(0, size // 2 - 4 * 1024 * 1024),
@@ -308,6 +325,8 @@ def load_baseline(root: Path, baseline_id: str) -> tuple[Path, dict]:
     if oracle_thresholds is not None:
         validate_numerical_thresholds(oracle_thresholds, "oracle_numerical")
     validate_quality_thresholds(value["thresholds"].get("quality"), "quality")
+    validate_arithmetic_identity_contract(
+        value["thresholds"].get("arithmetic_identity"))
     return path, value
 
 
@@ -369,6 +388,8 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
         raise GateError(
             "baseline genesis cannot preapprove canonical oracles or generators")
     workload = key.get("workload")
+    arithmetic_contract = validate_arithmetic_identity_contract(
+        record["thresholds"].get("arithmetic_identity"))
     if (not isinstance(workload, dict) or key.get("architecture") != "gfx1151" or
             key.get("tp_degree") != 2 or key.get("expert_split") != "128/128" or
             key.get("decode_mode") != "ordinary-greedy"):
@@ -400,6 +421,7 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
     provider_counts = {provider: 0 for provider in providers}
     run_ids = set()
     binary_hashes = set()
+    benchmark_arithmetic = set()
     for item in benchmark_items:
         if (not isinstance(item, dict) or
                 not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256", ""))) or
@@ -441,10 +463,14 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
                 local_binary != peer_binary):
             raise GateError("baseline genesis binaries differed across ranks")
         binary_hashes.add(local_binary)
+        benchmark_arithmetic.add(validate_arithmetic_manifest(
+            manifest, "baseline genesis benchmark manifest", arithmetic_contract))
     if any(count < 3 for count in provider_counts.values()):
         raise GateError("baseline genesis requires three runs per RDMA provider")
     if len(binary_hashes) != 1:
         raise GateError("baseline genesis benchmarks used different binaries")
+    if len(benchmark_arithmetic) != 1:
+        raise GateError("baseline genesis benchmarks used different arithmetic configurations")
 
     token_path = Path(str(artifacts.get("frozen_token_file", ""))).resolve()
     if token_path != root and root not in token_path.parents:
@@ -464,6 +490,10 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
             sha256(numerical_manifest) != numerical.get("manifest_sha256")):
         raise GateError("baseline genesis numerical manifest mismatch")
     numerical_values = read_manifest(numerical_manifest)
+    validate_numerical_geometry(
+        numerical_values, workload, "baseline genesis numerical manifest")
+    numerical_arithmetic = validate_arithmetic_manifest(
+        numerical_values, "baseline genesis numerical manifest", arithmetic_contract)
     if (numerical_values.get("model_size") != str(model_size) or
             numerical_values.get("model_sample_sha256") != model_sample or
             numerical_values.get("source_commit") != key.get("source_commit") or
@@ -474,6 +504,8 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
             workload.get("frozen_token_sha256") or
             numerical_values.get("dspark") != "0"):
         raise GateError("baseline genesis numerical manifest identity mismatch")
+    if benchmark_arithmetic != {numerical_arithmetic}:
+        raise GateError("baseline genesis numerical and timed arithmetic differ")
     bound_names = set()
     for item in numerical["files"]:
         if (not isinstance(item, dict) or not isinstance(item.get("name"), str) or
@@ -641,6 +673,78 @@ def read_manifest(path: Path) -> dict[str, str]:
         if separator:
             values[key] = value
     return values
+
+
+ARITHMETIC_MANIFEST_FIELDS = (
+    "common_env", "worker_env", "coordinator_env", "extra_env",
+    "tp_runtime_features",
+)
+
+
+def validate_arithmetic_manifest(values: dict[str, str], label: str,
+                                 contract: dict) -> tuple[object, ...]:
+    """Return a normalized identity for the arithmetic actually selected."""
+    for field in ARITHMETIC_MANIFEST_FIELDS:
+        if field not in values:
+            raise GateError(f"{label} is missing arithmetic provenance: {field}")
+    if "transport_library_path" not in values:
+        raise GateError(f"{label} is missing transport library provenance")
+    for field in ("bench_config_sha256", "ds4_sha256", "peer_ds4_sha256",
+                  "ds4_bench_tp_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(values.get(field, ""))):
+            raise GateError(f"{label} has invalid provenance hash: {field}")
+    if values["ds4_sha256"] != values["peer_ds4_sha256"]:
+        raise GateError(f"{label} used different engine binaries across ranks")
+    if not re.fullmatch(r"0x[0-9a-f]{8}", values["tp_runtime_features"]):
+        raise GateError(f"{label} has invalid negotiated TP runtime features")
+    if not values.get("run_id"):
+        raise GateError(f"{label} has no run identity")
+    ignored = set(contract["ignored_env_keys"])
+    normalized_env: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+    for field in ARITHMETIC_MANIFEST_FIELDS[:-1]:
+        selected: dict[str, str] = {}
+        try:
+            words = shlex.split(values[field], posix=True)
+        except ValueError as error:
+            raise GateError(f"{label} has malformed {field}: {error}") from error
+        for word in words:
+            if not word:
+                continue
+            key, separator, setting = word.partition("=")
+            if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                raise GateError(f"{label} has malformed {field} entry: {word}")
+            if key in ignored:
+                continue
+            if key == "LD_LIBRARY_PATH" and values["transport_library_path"]:
+                transport_components = set(
+                    values["transport_library_path"].split(":"))
+                setting = ":".join(
+                    component for component in setting.split(":")
+                    if component not in transport_components)
+                if not setting:
+                    continue
+            selected[key] = setting
+        normalized_env.append((field, tuple(sorted(selected.items()))))
+    feature_mask = int(values["tp_runtime_features"], 16)
+    feature_mask &= ~contract["ignored_runtime_feature_mask"] & 0xffffffff
+    return (
+        values["bench_config_sha256"], values["ds4_sha256"],
+        values["peer_ds4_sha256"], values["ds4_bench_tp_sha256"],
+        feature_mask, *normalized_env,
+    )
+
+
+def validate_numerical_geometry(values: dict[str, str], workload: dict,
+                                label: str) -> None:
+    expected = {
+        "prefix_tokens": str(workload.get("frontier", "")),
+        "frontier": str(workload.get("frontier", "")),
+        "context": str(workload.get("context", "")),
+        "prefill_chunk": str(workload.get("prefill_chunk", "")),
+    }
+    for field, wanted in expected.items():
+        if not wanted or values.get(field) != wanted:
+            raise GateError(f"{label} differs from baseline workload: {field}")
 
 
 def read_benchmark(path: Path) -> tuple[dict[str, str], dict[str, str], Path]:
@@ -829,6 +933,12 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
         if candidate_dump.get("model") != candidate_model["path"]:
             raise GateError("candidate teacher logits came from a different model path")
     candidate_identity = read_manifest(candidate_manifest)
+    validate_numerical_geometry(
+        candidate_identity, baseline["key"]["workload"],
+        "numerical candidate manifest")
+    candidate_arithmetic = validate_arithmetic_manifest(
+        candidate_identity, "numerical candidate manifest",
+        baseline["thresholds"]["arithmetic_identity"])
     if (candidate_identity.get("model") != candidate_model["path"] or
             candidate_identity.get("model_size") != str(candidate_model["size"]) or
             candidate_identity.get("model_sample_sha256") != candidate_model["sample_sha256"] or
@@ -848,6 +958,7 @@ def verify_numerical_evidence(repo: Path, root: Path, summary_path: Path,
             not isinstance(recorded.get("steps"), int) or
             recorded["steps"] < minimum):
         raise GateError("numerical envelope did not pass the versioned baseline")
+    recorded["_candidate_arithmetic_identity"] = candidate_arithmetic
     return recorded
 
 
@@ -1082,6 +1193,16 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         numerical_result = verify_numerical_evidence(
             repo, root, numerical_paths[0], value["baseline_id"], baseline,
             model, lane, source, toolchain, target_definition)
+        timed_arithmetic = {
+            validate_arithmetic_manifest(
+                manifest, "candidate benchmark manifest",
+                baseline["thresholds"]["arithmetic_identity"])
+            for _, manifest, _ in benchmark_rows
+        }
+        numerical_arithmetic = tuple(
+            numerical_result.pop("_candidate_arithmetic_identity"))
+        if timed_arithmetic != {numerical_arithmetic}:
+            raise GateError("candidate numerical and timed arithmetic configurations differ")
         quality_result = verify_quality_evidence(
             repo, root, quality_paths[0], value["baseline_id"], baseline, model, source)
         quality_anchor = baseline["reference"].get(
@@ -1230,7 +1351,8 @@ def amend_baseline(repo: Path, root: Path, amendment_path: Path) -> None:
 
     updates = amendment.get("threshold_updates", {})
     if not isinstance(updates, dict) or any(
-            key not in {"numerical", "oracle_numerical", "quality"} for key in updates):
+            key not in {"numerical", "oracle_numerical", "quality",
+                        "arithmetic_identity"} for key in updates):
         raise GateError("baseline amendment has unsupported threshold updates")
     for section, thresholds in updates.items():
         if not isinstance(thresholds, dict):
@@ -1248,7 +1370,7 @@ def amend_baseline(repo: Path, root: Path, amendment_path: Path) -> None:
             if (previous.get("allow_quality_difference", False) is False and
                     thresholds.get("allow_quality_difference", False) is True):
                 raise GateError(f"{section} amendment enables quality differences")
-        else:
+        elif section == "quality":
             validate_quality_thresholds(thresholds, "quality")
             previous = record["thresholds"]["quality"]
             for key in ("min_cases", "min_target_tokens", "min_api_top1_rate_delta",
@@ -1258,6 +1380,16 @@ def amend_baseline(repo: Path, root: Path, amendment_path: Path) -> None:
             for key in ("max_mean_nll_delta", "max_ci95_high_nll_delta"):
                 if key in previous and thresholds.get(key, previous[key]) > previous[key]:
                     raise GateError(f"quality amendment weakens {key}")
+        else:
+            validate_arithmetic_identity_contract(thresholds)
+            previous = record["thresholds"]["arithmetic_identity"]
+            if not set(thresholds["ignored_env_keys"]).issubset(
+                    previous["ignored_env_keys"]):
+                raise GateError("arithmetic_identity amendment adds env exemptions")
+            if (thresholds["ignored_runtime_feature_mask"] |
+                    previous["ignored_runtime_feature_mask"]) != \
+                    previous["ignored_runtime_feature_mask"]:
+                raise GateError("arithmetic_identity amendment adds feature exemptions")
         record.setdefault("thresholds", {})[section] = thresholds
     if generator is None and not updates:
         raise GateError("baseline amendment contains no governed change")

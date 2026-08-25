@@ -60344,6 +60344,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     ds4_gpu_set_tp_runtime_features((uint32_t)ds4_tp_rank(tp),
                                     ds4_tp_runtime_features(tp));
 #endif
+    fprintf(stderr, "ds4-tp: runtime features negotiated: 0x%08x\n",
+            ds4_tp_runtime_features(tp));
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
 #ifdef DS4_ROCM_BUILD

@@ -87,6 +87,13 @@ def build_fixture(root: Path) -> Path:
                 "frontier": 2048, "generated_tokens": 300, "context": 4096,
                 "prefill_chunk": 2048, "dspark": 0, "rdma_profile": provider,
                 "ds4_sha256": "b" * 64, "peer_ds4_sha256": "b" * 64,
+                "ds4_bench_tp_sha256": "d" * 64,
+                "bench_config_sha256": "e" * 64,
+                "tp_runtime_features": "0x00080001",
+                "common_env": "FIXTURE_COMMON=1", "worker_env": "FIXTURE_WORKER=1",
+                "coordinator_env": "FIXTURE_COORDINATOR=1",
+                "extra_env": "FIXTURE_ARITHMETIC=1",
+                "transport_library_path": "",
             })
             benchmarks.append({
                 "path": str(csv_path), "sha256": digest(csv_path),
@@ -116,7 +123,16 @@ def build_fixture(root: Path) -> Path:
         "model_size": model_size, "model_sample_sha256": model_sample,
         "source_commit": source_commit, "source_dirty": 0,
         "toolchain_id": toolchain, "prefix_tokens": 2048,
+        "frontier": 2048, "context": 4096, "prefill_chunk": 2048,
         "file_count": 300, "frozen_token_sha256": token_sha, "dspark": 0,
+        "run_id": "numerical-run-id", "bench_config_sha256": "e" * 64,
+        "ds4_sha256": "b" * 64, "peer_ds4_sha256": "b" * 64,
+        "ds4_bench_tp_sha256": "d" * 64,
+        "tp_runtime_features": "0x00080001",
+        "common_env": "FIXTURE_COMMON=1", "worker_env": "FIXTURE_WORKER=1",
+        "coordinator_env": "FIXTURE_COORDINATOR=1",
+        "extra_env": "FIXTURE_ARITHMETIC=1",
+        "transport_library_path": "",
     })
 
     quality_path = root / "quality.tsv"
@@ -180,7 +196,11 @@ def build_fixture(root: Path) -> Path:
             "quality": quality_ref, "quality_anchor": quality_ref,
         },
         "thresholds": {"numerical": numerical_thresholds,
-                       "quality": quality_thresholds},
+                       "quality": quality_thresholds,
+                       "arithmetic_identity": {
+                           "ignored_env_keys": [],
+                           "ignored_runtime_feature_mask": 0,
+                       }},
     }
     genesis = {
         "schema_version": 1, "kind": "ds4-baseline-genesis",
