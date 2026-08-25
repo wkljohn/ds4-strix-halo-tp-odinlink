@@ -362,6 +362,7 @@ int main(void) {
     ds4_gpu_tensor gate = {}, up = {}, mid = {}, down = {};
     ds4_gpu_tensor out_full = {}, out_half0 = {}, out_half1 = {}, out_sum = {};
     ds4_gpu_tensor out_owner[2] = {}, out_owner_sum = {};
+    ds4_gpu_tensor out_two_owner = {};
     int32_t *host_selected = (int32_t *)malloc((size_t)pairs * sizeof(int32_t));
     float *host_weights = (float *)malloc((size_t)pairs * sizeof(float));
     float *host_owner_weights[2] = {
@@ -424,7 +425,8 @@ int main(void) {
           alloc_tensor(&out_sum, out_bytes) &&
           alloc_tensor(&out_owner[0], out_bytes) &&
           alloc_tensor(&out_owner[1], out_bytes) &&
-          alloc_tensor(&out_owner_sum, out_bytes), "allocate numeric tensors");
+          alloc_tensor(&out_owner_sum, out_bytes) &&
+          alloc_tensor(&out_two_owner, out_bytes), "allocate numeric tensors");
     const uint64_t x_count = (uint64_t)tokens * IN_DIM;
     fill_input<<<(x_count + 255u) / 256u, 256>>>((float *)x.ptr, x_count);
     CHECK(hipGetLastError() == hipSuccess && hipDeviceSynchronize() == hipSuccess,
@@ -470,6 +472,62 @@ int main(void) {
                              tokens * OUT_DIM) != 0 &&
           hipDeviceSynchronize() == hipSuccess,
           "compose expert-owner full-K prefill control");
+
+    /* Capture the three controls before reusing the large output buffers for
+     * the two-owner-plane experiment below.  This keeps the 2,048-token oracle
+     * bounded to one additional output plane instead of retaining four more
+     * 32 MiB rank/owner planes. */
+    float *reference = (float *)malloc((size_t)out_bytes);
+    float *candidate = (float *)malloc((size_t)out_bytes);
+    float *owner_reference = (float *)malloc((size_t)out_bytes);
+    CHECK(reference && candidate && owner_reference &&
+          ds4_gpu_tensor_read(&out_full, 0, reference, out_bytes) != 0 &&
+          ds4_gpu_tensor_read(&out_sum, 0, candidate, out_bytes) != 0 &&
+          ds4_gpu_tensor_read(&out_owner_sum, 0, owner_reference,
+                              out_bytes) != 0,
+          "capture prefill composition controls");
+
+    /* Model a two-plane RDMA exchange without transport: first reconstruct
+     * the complete owner-0 sum from both K halves, then owner-1, and finally
+     * add the two owner planes in the accepted outer order.  This is closer
+     * than rank grouping but deliberately not claimed bit-exact because each
+     * owner's local half-experts are still associated before the rank add. */
+    CHECK(launch(&out_half0, &gate, &up, &mid, &down,
+                 half_gate[0], half_up[0], half_down[0],
+                 half_gate_expert_bytes, gate_row_bytes,
+                 half_down_expert_bytes, half_down_row_bytes,
+                 &selected, &owner_weights[0], &x, MID_HALF, tokens, N_USED) &&
+          launch(&out_half1, &gate, &up, &mid, &down,
+                 half_gate[1], half_up[1], half_down[1],
+                 half_gate_expert_bytes, gate_row_bytes,
+                 half_down_expert_bytes, half_down_row_bytes,
+                 &selected, &owner_weights[0], &x, MID_HALF, tokens, N_USED) &&
+          ds4_gpu_add_tensor(&out_two_owner, &out_half0, &out_half1,
+                             tokens * OUT_DIM) != 0 &&
+          launch(&out_owner[0], &gate, &up, &mid, &down,
+                 half_gate[0], half_up[0], half_down[0],
+                 half_gate_expert_bytes, gate_row_bytes,
+                 half_down_expert_bytes, half_down_row_bytes,
+                 &selected, &owner_weights[1], &x, MID_HALF, tokens, N_USED) &&
+          launch(&out_owner[1], &gate, &up, &mid, &down,
+                 half_gate[1], half_up[1], half_down[1],
+                 half_gate_expert_bytes, gate_row_bytes,
+                 half_down_expert_bytes, half_down_row_bytes,
+                 &selected, &owner_weights[1], &x, MID_HALF, tokens, N_USED) &&
+          ds4_gpu_add_tensor(&out_owner_sum, &out_owner[0], &out_owner[1],
+                             tokens * OUT_DIM) != 0 &&
+          ds4_gpu_add_tensor(&out_two_owner, &out_two_owner, &out_owner_sum,
+                             tokens * OUT_DIM) != 0 &&
+          hipDeviceSynchronize() == hipSuccess,
+          "compose two-owner-plane packed prefill");
+    float *two_owner = (float *)malloc((size_t)out_bytes);
+    CHECK(two_owner &&
+          ds4_gpu_tensor_read(&out_two_owner, 0, two_owner, out_bytes) != 0,
+          "read two-owner-plane prefill");
+    print_prefill_compose_metrics("packed-two-owner-vs-full-owner",
+                                  owner_reference, two_owner,
+                                  (uint64_t)tokens * OUT_DIM);
+    free(two_owner);
 
     if (tokens == 1u) {
         const uint64_t routed_slot_bytes =
@@ -620,17 +678,6 @@ int main(void) {
               "free per-slot decode outputs");
     }
 
-    float *reference = (float *)malloc((size_t)out_bytes);
-    float *candidate = (float *)malloc((size_t)out_bytes);
-    CHECK(reference && candidate &&
-          ds4_gpu_tensor_read(&out_full, 0, reference, out_bytes) != 0 &&
-          ds4_gpu_tensor_read(&out_sum, 0, candidate, out_bytes) != 0,
-          "read real-weight outputs");
-    float *owner_reference = (float *)malloc((size_t)out_bytes);
-    CHECK(owner_reference &&
-          ds4_gpu_tensor_read(&out_owner_sum, 0, owner_reference,
-                              out_bytes) != 0,
-          "read expert-owner prefill control");
     print_prefill_compose_metrics("packed-rank-vs-full-owner",
                                   owner_reference, candidate,
                                   (uint64_t)tokens * OUT_DIM);
@@ -684,6 +731,7 @@ int main(void) {
     free(host_weights);
     free(host_selected);
     ds4_gpu_tensor_free_in_place(&out_sum);
+    ds4_gpu_tensor_free_in_place(&out_two_owner);
     ds4_gpu_tensor_free_in_place(&out_owner_sum);
     ds4_gpu_tensor_free_in_place(&out_owner[1]);
     ds4_gpu_tensor_free_in_place(&out_owner[0]);
