@@ -291,6 +291,7 @@ typedef struct ds4_gpu_q4k_kshard_layer {
 } ds4_gpu_q4k_kshard_layer;
 
 typedef struct ds4_gpu_q4k_kshard_windows {
+    uint32_t output_row_shard;
     uint32_t rank;
     uint32_t n_layers;
     uint32_t n_expert;
@@ -299,6 +300,8 @@ typedef struct ds4_gpu_q4k_kshard_windows {
     uint32_t out_dim;
     uint32_t row_base;
     uint32_t row_count;
+    uint32_t out_row_base;
+    uint32_t out_row_count;
     uint64_t source_gate_row_bytes;
     uint64_t source_down_row_bytes;
     uint64_t down_column_byte_base;
@@ -308,6 +311,17 @@ typedef struct ds4_gpu_q4k_kshard_windows {
 } ds4_gpu_q4k_kshard_windows;
 
 int ds4_gpu_q4k_kshard_install(
+        const void                     *model_map,
+        uint64_t                        model_size,
+        int                             model_fd,
+        uint32_t                        rank,
+        const uint64_t                 *dense_offsets,
+        const uint64_t                 *dense_sizes,
+        uint32_t                        dense_count,
+        uint64_t                        dense_max_tensor_bytes,
+        const ds4_gpu_q4k_kshard_layer *layers,
+        uint32_t                        n_layers);
+int ds4_gpu_q4k_rowshard_install(
         const void                     *model_map,
         uint64_t                        model_size,
         int                             model_fd,
@@ -617,6 +631,17 @@ int ds4_gpu_matmul_q8_0_kslice_output_rows_tensor(
         uint64_t              full_in_dim,
         uint64_t              k_off,
         uint64_t              k_cnt,
+        uint64_t              full_out_dim,
+        uint64_t              row_base,
+        uint64_t              row_count,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_rows);
+int ds4_gpu_matmul_q8_0_output_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              full_in_dim,
         uint64_t              full_out_dim,
         uint64_t              row_base,
         uint64_t              row_count,
@@ -2871,6 +2896,18 @@ int ds4_gpu_rocm_q4k_batch_row_shard_reduce_compact_add_tensor(
         const ds4_gpu_tensor *selected,
         uint32_t              n_expert,
         uint32_t              n_tokens,
+        uint32_t              expert_split,
+        uint32_t              row_count);
+
+int ds4_gpu_rocm_q4k_batch_row_shard_reduce_split_add_tensor(
+        ds4_gpu_tensor       *out_compact,
+        const ds4_gpu_tensor *down_compact,
+        const ds4_gpu_tensor *rank0_add_rows,
+        const ds4_gpu_tensor *rank1_add_rows,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_expert,
+        uint32_t              n_tokens,
+        uint32_t              rank0_tokens,
         uint32_t              expert_split,
         uint32_t              row_count);
 

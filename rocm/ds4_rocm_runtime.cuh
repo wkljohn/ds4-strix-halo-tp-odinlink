@@ -9082,12 +9082,13 @@ static int cuda_q4k_kshard_enabled(void) {
     return !legacy || (legacy[0] == '1' && legacy[1] == '\0');
 }
 
-extern "C" int ds4_gpu_q4k_kshard_install(
+static int cuda_q4k_shard_install(
         const void *model_map, uint64_t model_size, int model_fd,
         uint32_t rank, const uint64_t *dense_offsets,
         const uint64_t *dense_sizes, uint32_t dense_count,
         uint64_t dense_max_tensor_bytes,
-        const ds4_gpu_q4k_kshard_layer *layers, uint32_t n_layers) {
+        const ds4_gpu_q4k_kshard_layer *layers, uint32_t n_layers,
+        int output_row_shard) {
     if (!cuda_q4k_kshard_enabled() ||
         !model_map || model_size == 0u || rank > 1u ||
         !layers || n_layers == 0u ||
@@ -9098,6 +9099,8 @@ extern "C" int ds4_gpu_q4k_kshard_install(
     key = cuda_q4k_kshard_hash_bytes(key, &model_size, sizeof(model_size));
     key = cuda_q4k_kshard_hash_bytes(key, &model_fd, sizeof(model_fd));
     key = cuda_q4k_kshard_hash_bytes(key, &rank, sizeof(rank));
+    key = cuda_q4k_kshard_hash_bytes(
+        key, &output_row_shard, sizeof(output_row_shard));
     key = cuda_q4k_kshard_hash_bytes(key, &n_layers, sizeof(n_layers));
     for (uint32_t il = 0; il < n_layers; ++il) {
         key = cuda_q4k_kshard_hash_layer(key, layers[il]);
@@ -9165,7 +9168,14 @@ extern "C" int ds4_gpu_q4k_kshard_install(
 
     const uint64_t block = sizeof(cuda_block_q4_K);
     const uint32_t row_base = rank == 0u ? 0u : 1024u;
-    const uint64_t down_base = rank == 0u ? 0u : 4u * block;
+    const uint32_t out_row_base = output_row_shard ? rank * 2048u : 0u;
+    const uint32_t out_row_count = output_row_shard ? 2048u : 4096u;
+    const uint64_t down_base = output_row_shard ? 0u :
+        (rank == 0u ? 0u : 4u * block);
+    const uint64_t down_bytes = output_row_shard ?
+        layers[0].down_row_bytes : 4u * block;
+    const ds4_gpu_q4k_packed_slice_kind down_kind = output_row_shard ?
+        DS4_GPU_Q4K_PACKED_ROW_RANGE : DS4_GPU_Q4K_PACKED_K_RANGE;
     int ok = 1;
     for (uint32_t il = 0; ok && il < n_layers; ++il) {
         const ds4_gpu_q4k_kshard_layer &l = layers[il];
@@ -9179,8 +9189,8 @@ extern "C" int ds4_gpu_q4k_kshard_install(
                  l.up_row_bytes, DS4_GPU_Q4K_PACKED_ROW_RANGE) &&
              ds4_gpu_q4k_packed_slice_declare(
                  model_map, model_size, l.down_offset, n_expert, 4096u,
-                 l.down_row_bytes, 0u, 4096u, down_base, 4u * block,
-                 DS4_GPU_Q4K_PACKED_K_RANGE);
+                 l.down_row_bytes, out_row_base, out_row_count, down_base,
+                 down_bytes, down_kind);
     }
     for (uint32_t il = 0; ok && il < n_layers; ++il) {
         const ds4_gpu_q4k_kshard_layer &l = layers[il];
@@ -9191,8 +9201,8 @@ extern "C" int ds4_gpu_q4k_kshard_install(
                  model_map, l.up_offset, row_base, 1024u, 0u,
                  l.up_row_bytes) &&
              ds4_gpu_q4k_packed_slice_load(
-                 model_map, l.down_offset, 0u, 4096u, down_base,
-                 4u * block);
+                 model_map, l.down_offset, out_row_base, out_row_count,
+                 down_base, down_bytes);
     }
     if (!ok) {
         cuda_q4k_packed_slice_release_all();
@@ -9200,6 +9210,7 @@ extern "C" int ds4_gpu_q4k_kshard_install(
     }
 
     ds4_gpu_q4k_kshard_windows windows = {};
+    windows.output_row_shard = output_row_shard ? 1u : 0u;
     windows.rank = rank;
     windows.n_layers = n_layers;
     windows.n_expert = n_expert;
@@ -9208,12 +9219,15 @@ extern "C" int ds4_gpu_q4k_kshard_install(
     windows.out_dim = 4096u;
     windows.row_base = row_base;
     windows.row_count = 1024u;
+    windows.out_row_base = out_row_base;
+    windows.out_row_count = out_row_count;
     windows.source_gate_row_bytes = 16u * block;
     windows.source_down_row_bytes = 8u * block;
     windows.down_column_byte_base = down_base;
-    windows.down_column_byte_count = 4u * block;
+    windows.down_column_byte_count = down_bytes;
     windows.packed_gate_expert_bytes = 1024u * 16u * block;
-    windows.packed_down_expert_bytes = 4096u * 4u * block;
+    windows.packed_down_expert_bytes =
+        (uint64_t)out_row_count * down_bytes;
     ds4_gpu_tp_suspend_expert_sharding(1);
     g_q4k_kshard.installed = 1;
     g_q4k_kshard.owns_shard_suspend = 1;
@@ -9222,6 +9236,28 @@ extern "C" int ds4_gpu_q4k_kshard_install(
     g_q4k_kshard.key_hash = key;
     g_q4k_kshard.windows = windows;
     return 1;
+}
+
+extern "C" int ds4_gpu_q4k_kshard_install(
+        const void *model_map, uint64_t model_size, int model_fd,
+        uint32_t rank, const uint64_t *dense_offsets,
+        const uint64_t *dense_sizes, uint32_t dense_count,
+        uint64_t dense_max_tensor_bytes,
+        const ds4_gpu_q4k_kshard_layer *layers, uint32_t n_layers) {
+    return cuda_q4k_shard_install(
+        model_map, model_size, model_fd, rank, dense_offsets, dense_sizes,
+        dense_count, dense_max_tensor_bytes, layers, n_layers, 0);
+}
+
+extern "C" int ds4_gpu_q4k_rowshard_install(
+        const void *model_map, uint64_t model_size, int model_fd,
+        uint32_t rank, const uint64_t *dense_offsets,
+        const uint64_t *dense_sizes, uint32_t dense_count,
+        uint64_t dense_max_tensor_bytes,
+        const ds4_gpu_q4k_kshard_layer *layers, uint32_t n_layers) {
+    return cuda_q4k_shard_install(
+        model_map, model_size, model_fd, rank, dense_offsets, dense_sizes,
+        dense_count, dense_max_tensor_bytes, layers, n_layers, 1);
 }
 
 extern "C" int ds4_gpu_q4k_kshard_windows_get(

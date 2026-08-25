@@ -3839,6 +3839,13 @@ extern "C" int ds4_gpu_q4k_kshard_install(
     return 0;
 }
 
+extern "C" int ds4_gpu_q4k_rowshard_install(
+        const void *, uint64_t, int, uint32_t, const uint64_t *,
+        const uint64_t *, uint32_t, uint64_t,
+        const ds4_gpu_q4k_kshard_layer *, uint32_t) {
+    return 0;
+}
+
 extern "C" int ds4_gpu_q4k_kshard_windows_get(
         ds4_gpu_q4k_kshard_windows *windows) {
     if (windows) memset(windows, 0, sizeof(*windows));

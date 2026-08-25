@@ -10258,6 +10258,18 @@ int ds4_gpu_q4k_kshard_install(
     return 0;
 }
 
+int ds4_gpu_q4k_rowshard_install(
+        const void *model_map, uint64_t model_size, int model_fd,
+        uint32_t rank, const uint64_t *dense_offsets,
+        const uint64_t *dense_sizes, uint32_t dense_count,
+        uint64_t dense_max_tensor_bytes,
+        const ds4_gpu_q4k_kshard_layer *layers, uint32_t n_layers) {
+    (void)model_map; (void)model_size; (void)model_fd; (void)rank;
+    (void)dense_offsets; (void)dense_sizes; (void)dense_count;
+    (void)dense_max_tensor_bytes; (void)layers; (void)n_layers;
+    return 0;
+}
+
 int ds4_gpu_q4k_kshard_windows_get(
         ds4_gpu_q4k_kshard_windows *windows) {
     if (windows) memset(windows, 0, sizeof(*windows));

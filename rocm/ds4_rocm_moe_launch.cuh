@@ -4810,6 +4810,45 @@ extern "C" int ds4_gpu_rocm_q4k_batch_row_shard_reduce_compact_add_tensor(
                    "q4k batch packed-row canonical reduce launch");
 }
 
+extern "C" int ds4_gpu_rocm_q4k_batch_row_shard_reduce_split_add_tensor(
+        ds4_gpu_tensor *out_compact, const ds4_gpu_tensor *down_compact,
+        const ds4_gpu_tensor *rank0_add_rows,
+        const ds4_gpu_tensor *rank1_add_rows,
+        const ds4_gpu_tensor *selected, uint32_t n_expert,
+        uint32_t n_tokens, uint32_t rank0_tokens,
+        uint32_t expert_split, uint32_t row_count) {
+    if (!out_compact || !down_compact || !rank0_add_rows || !selected ||
+        n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
+        n_tokens == 0u || rank0_tokens == 0u || rank0_tokens > n_tokens ||
+        (rank0_tokens < n_tokens && !rank1_add_rows) ||
+        expert_split == 0u || row_count == 0u) return 0;
+    uint64_t pairs = 0, out_values = 0, out_bytes = 0;
+    uint64_t down_values = 0, down_bytes = 0;
+    uint64_t rank0_values = 0, rank1_values = 0;
+    if (!cuda_u64_mul_checked(n_tokens, n_expert, &pairs) ||
+        !cuda_u64_mul_checked(n_tokens, row_count, &out_values) ||
+        !cuda_u64_mul_checked(out_values, sizeof(float), &out_bytes) ||
+        !cuda_u64_mul_checked(pairs, row_count, &down_values) ||
+        !cuda_u64_mul_checked(down_values, sizeof(float), &down_bytes) ||
+        !cuda_u64_mul_checked(rank0_tokens, row_count, &rank0_values) ||
+        !cuda_u64_mul_checked(n_tokens - rank0_tokens, row_count,
+                              &rank1_values) ||
+        out_compact->bytes < out_bytes || down_compact->bytes < down_bytes ||
+        selected->bytes < pairs * sizeof(int32_t) ||
+        rank0_add_rows->bytes < rank0_values * sizeof(float) ||
+        (rank1_values != 0u &&
+         rank1_add_rows->bytes < rank1_values * sizeof(float))) return 0;
+    moe_batch_row_shard_groups_reduce_split_add_kernel<<<
+        (out_values + 255u) / 256u, 256u>>>(
+            (float *)out_compact->ptr, (const float *)down_compact->ptr,
+            (const float *)rank0_add_rows->ptr,
+            rank1_add_rows ? (const float *)rank1_add_rows->ptr : NULL,
+            (const int32_t *)selected->ptr, n_expert, n_tokens,
+            rank0_tokens, expert_split, row_count);
+    return cuda_ok(cudaGetLastError(),
+                   "q4k batch packed-row split-add reduce launch");
+}
+
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, const ds4_gpu_tensor *add_in, uint32_t layer_index, bool force_resident) {
     /* DS4-TP-gfx1151 (patch 16): the addend must be folded AFTER the launch.
      *
