@@ -76,7 +76,8 @@ extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_
     return cuda_ok(cudaGetLastError(), "store_raw_kv launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t pos0, uint32_t n_tokens, uint32_t head_dim) {
-    if (!raw_cache || !kv || raw_cap == 0 ||
+    if (!raw_cache || !kv || raw_cap == 0 || n_tokens == 0 ||
+        n_tokens > raw_cap || head_dim == 0 ||
         raw_cache->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
         kv->bytes < (uint64_t)n_tokens * head_dim * sizeof(float)) {
         /* diag: which bound tripped? */
@@ -90,16 +91,13 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
         return 0;
     }
     uint64_t n = (uint64_t)n_tokens * head_dim;
-    /* diag: separate a STALE latched error from this launch's own. */
+    /* A previous unchecked HIP failure is still a failure.  Clear and report
+     * it before modifying the ring instead of silently attributing success to
+     * this launch. */
     const cudaError_t stale = cudaGetLastError();
+    if (!cuda_ok(stale, "store_raw_kv_batch prelaunch")) return 0;
     store_raw_kv_batch_kernel<<<(unsigned)((n + 255) / 256), 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     const cudaError_t mine = cudaGetLastError();
-    if (stale != cudaSuccess || mine != cudaSuccess) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "store_raw_kv_batch diag: stale=%d(%s) mine=%d(%s) "
-                "n=%llu grid=%llu n_tokens=%u head_dim=%u\n",
-                (int)stale, cudaGetErrorString(stale), (int)mine, cudaGetErrorString(mine),
-                (unsigned long long)n, (unsigned long long)((n + 255) / 256), n_tokens, head_dim);
-    }
     return cuda_ok(mine, "store_raw_kv_batch launch");
 }
 

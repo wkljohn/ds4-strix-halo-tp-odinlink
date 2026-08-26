@@ -30457,14 +30457,12 @@ static bool metal_graph_encode_layer_attention_batch(
                              n_tokens, index_counts, DS4_N_INDEXER_HEAD,
                              DS4_N_INDEXER_HEAD_DIM,
                              DS4_N_INDEXER_TOP_K, index_scale) != 0;
-                    for (uint32_t t = 0u; ok && t < n_tokens; t++) {
-                        ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(
-                                metal_graph_batch_kv(g), t, DS4_N_HEAD_DIM);
-                        ok = kv_view && ds4_gpu_store_raw_kv_tensor(
-                                g->layer_raw_cache[il], kv_view, g->raw_cap,
-                                (pos0 + t) % g->raw_cap,
+                    if (ok) {
+                        ok = ds4_gpu_store_raw_kv_batch_tensor(
+                                g->layer_raw_cache[il],
+                                metal_graph_batch_kv(g), g->raw_cap,
+                                pos0 % g->raw_cap, n_tokens,
                                 DS4_N_HEAD_DIM) != 0;
-                        ds4_gpu_tensor_free(kv_view);
                     }
                     if (ok && metal_graph_dspark_validate_stage_layer(il) &&
                         g->dspark_validate_batch_stages) {

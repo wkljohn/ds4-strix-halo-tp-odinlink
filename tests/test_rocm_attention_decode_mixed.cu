@@ -28,6 +28,8 @@
 typedef int (*ds4_tp_devcopy_fn)(void *, const void *, uint64_t);
 extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
 
+__global__ static void invalid_launch_probe(void) {}
+
 static float e4m3_value(int i) {
     const int exp = (i >> 3) & 15;
     const int mant = i & 7;
@@ -242,10 +244,14 @@ int main(void) {
 
     CHECK(ds4_gpu_set_model_map(sinks.data(), sinks.size() * sizeof(float)),
           "install attention sinks");
-    ds4_gpu_tensor q_dev = {}, kv_dev = {}, raw_dev = {}, comp_dev = {};
+    ds4_gpu_tensor q_dev = {}, kv_dev = {}, oversized_kv_dev = {};
+    ds4_gpu_tensor raw_dev = {}, comp_dev = {};
     ds4_gpu_tensor mask_dev = {}, heads_dev = {};
     CHECK(ds4_gpu_tensor_alloc_on(&q_dev, 0, q.size() * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&kv_dev, 0, kv_in.size() * sizeof(float)) == 0 &&
+          ds4_gpu_tensor_alloc_on(&oversized_kv_dev, 0,
+                                  (uint64_t)(raw_cap + 1u) * head_dim *
+                                      sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&raw_dev, 0, raw.size() * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&comp_dev, 0, comp.size() * sizeof(float)) == 0 &&
           ds4_gpu_tensor_alloc_on(&mask_dev, 0, mask.size() * sizeof(float)) == 0 &&
@@ -257,6 +263,22 @@ int main(void) {
           ds4_gpu_tensor_write(&comp_dev, 0, comp.data(), comp.size() * sizeof(float)) &&
           ds4_gpu_tensor_write(&mask_dev, 0, mask.data(), mask.size() * sizeof(float)),
           "upload tensors");
+    CHECK(!ds4_gpu_store_raw_kv_batch_tensor(&raw_dev, &kv_dev, raw_cap,
+                                              raw_start, 0u, head_dim),
+          "raw KV batch store must reject an empty batch");
+    CHECK(!ds4_gpu_store_raw_kv_batch_tensor(
+              &raw_dev, &oversized_kv_dev, raw_cap, raw_start,
+              raw_cap + 1u, head_dim),
+          "raw KV batch store must reject a batch larger than its ring");
+    invalid_launch_probe<<<0, 1>>>();
+    CHECK(hipPeekAtLastError() != hipSuccess,
+          "zero-grid probe must latch a HIP launch error");
+    CHECK(!ds4_gpu_store_raw_kv_batch_tensor(&raw_dev, &kv_dev, raw_cap,
+                                              raw_start, n_raw, head_dim),
+          "raw KV batch store must fail closed on a stale HIP error");
+    CHECK(ds4_gpu_store_raw_kv_batch_tensor(&raw_dev, &kv_dev, raw_cap,
+                                             raw_start, n_raw, head_dim),
+          "raw KV batch store must recover after clearing the stale error");
     CHECK(ds4_gpu_dsv4_fp8_kv_quantize_tensor(&kv_dev, n_raw, head_dim, n_rot) &&
           ds4_gpu_store_raw_kv_batch_tensor(&raw_dev, &kv_dev, raw_cap,
                                              raw_start, n_raw, head_dim) &&
@@ -314,6 +336,7 @@ int main(void) {
 
     ds4_gpu_tensor_free_in_place(&q_dev);
     ds4_gpu_tensor_free_in_place(&kv_dev);
+    ds4_gpu_tensor_free_in_place(&oversized_kv_dev);
     ds4_gpu_tensor_free_in_place(&raw_dev);
     ds4_gpu_tensor_free_in_place(&comp_dev);
     ds4_gpu_tensor_free_in_place(&mask_dev);
