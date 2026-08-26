@@ -27900,6 +27900,26 @@ static bool metal_graph_hc_rms_scale_project_rows_exact(
     }
     const uint64_t out_dim =
         2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+#ifdef DS4_ROCM_BUILD
+    /* The verifier's historical exact path launched the same one-row F16
+     * projection once per draft row.  The ordered multi-row primitive keeps
+     * each row's 32-lane reduction and lane-0 accumulation order intact, but
+     * streams the small HC matrix only once.  Batch RMS normalization is
+     * row-independent and uses the same per-row kernel arithmetic.  Keep F32
+     * HC matrices on the established typed fallback below. */
+    if (model && weight && weight->type == DS4_TENSOR_F16 &&
+        in_dim <= UINT32_MAX) {
+        bool ok = ds4_gpu_rms_norm_plain_rows_tensor(
+                      norm_scratch, x, (uint32_t)in_dim, n_tokens,
+                      DS4_RMS_EPS) != 0;
+        if (ok) {
+            ok = ds4_gpu_matmul_f16_ordered_rows_exact_tensor(
+                     out, model->map, model->size, weight->abs_offset,
+                     in_dim, out_dim, norm_scratch, n_tokens) != 0;
+        }
+        return ok;
+    }
+#endif
     bool ok = true;
     for (uint32_t row = 0u; ok && row < n_tokens; row++) {
         ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(

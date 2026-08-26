@@ -640,6 +640,10 @@ test-rocm-f16-ordered-rows-exact: tests/test_rocm_f16_ordered_rows_exact
 	./tests/test_rocm_f16_ordered_rows_exact token 3 4096 64 64
 	./tests/test_rocm_f16_ordered_rows_exact token 4 4096 64 64
 	./tests/test_rocm_f16_ordered_rows_exact token 5 4096 64 64
+	./tests/test_rocm_f16_ordered_rows_exact token 2 16384 24 64
+	./tests/test_rocm_f16_ordered_rows_exact token 3 16384 24 64
+	./tests/test_rocm_f16_ordered_rows_exact token 4 16384 24 64
+	./tests/test_rocm_f16_ordered_rows_exact token 5 16384 24 64
 
 tests/test_rocm_shared_gu_swiglu_fused.o: tests/test_rocm_shared_gu_swiglu_fused.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<

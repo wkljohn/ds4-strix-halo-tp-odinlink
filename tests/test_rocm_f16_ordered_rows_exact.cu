@@ -1,4 +1,4 @@
-/* Exactness and timing oracle for DSpark F16 indexer projections. */
+/* Exactness and timing oracle for DSpark F16 indexer and HC projections. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
