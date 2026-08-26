@@ -282,11 +282,15 @@ int main(int argc, char **argv) {
     float candidate_ms = 0.0f;
     CHECK(hipEventElapsedTime(&candidate_ms, start, stop) == hipSuccess,
           "candidate elapsed");
-    fprintf(stderr, "width=%u serial_ms=%.6f candidate_ms=%.6f speedup=%.3fx\n",
-            width, serial_ms / ITERS, candidate_ms / ITERS,
-            serial_ms / candidate_ms);
-    CHECK(width == 1u || serial_ms / candidate_ms >= 1.25f,
-          "W2-W5 isolated speedup must be at least 1.25x");
+    const float speedup = serial_ms / candidate_ms;
+    fprintf(stderr,
+            "width=%u serial_ms=%.6f candidate_ms=%.6f speedup=%.3fx status=%s\n",
+            width, serial_ms / ITERS, candidate_ms / ITERS, speedup,
+            width == 1u || speedup >= 1.25f ? "PASS" : "HOLD");
+    /* This experiment was retained as an exactness oracle after the production
+     * token-reuse candidate was rejected.  Keep the measured 1.25x bar visible,
+     * but do not make a hardware/toolchain-sensitive timing result fail the
+     * correctness suite for a path that is not enabled in production. */
 
     CHECK(hipEventDestroy(stop) == hipSuccess, "destroy stop");
     CHECK(hipEventDestroy(start) == hipSuccess, "destroy start");
