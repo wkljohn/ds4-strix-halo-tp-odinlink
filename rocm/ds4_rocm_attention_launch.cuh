@@ -1871,9 +1871,16 @@ extern "C" int ds4_gpu_attention_output_q8_tp_batch_tensor(
         const uint32_t slice_blocks = (uint32_t)(low_dim_owned / 32u);
         const unsigned expand_threads = weight_outer_expand_threads;
         const unsigned expand_rows_per_block = expand_threads / 32u;
+        unsigned expand_rows_per_wave =
+            n_tokens == 2u ? 1u : q8_toktile_rows_per_wave();
+        if ((out_dim %
+             (expand_rows_per_block * expand_rows_per_wave)) != 0u) {
+            expand_rows_per_wave = 1u;
+        }
         const dim3 expand_grid(
-            (unsigned)((out_dim + expand_rows_per_block - 1u) /
-                       expand_rows_per_block));
+            (unsigned)((out_dim +
+                        expand_rows_per_block * expand_rows_per_wave - 1u) /
+                       (expand_rows_per_block * expand_rows_per_wave)));
         if (n_tokens == 2u) {
             matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_tok2_kernel<<<
                     expand_grid, expand_threads,
@@ -1884,13 +1891,21 @@ extern "C" int ds4_gpu_attention_output_q8_tp_batch_tensor(
         } else {
             const size_t tile_shmem =
                 (size_t)n_tokens * 32u * 32u * sizeof(float);
-#define DS4_Q8_ATTN_OUT_EXPAND_TOK_CASE(NT) \
-            case NT: \
-                matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel<NT> \
+#define DS4_Q8_ATTN_OUT_EXPAND_TOK_RPW(NT, RPW) \
+                matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel<NT, RPW> \
                     <<<expand_grid, expand_threads, tile_shmem>>>( \
                     (float *)out->ptr, out_b + block_start * 34u, \
-                    (const float *)low->ptr, slice_blocks, out_dim, n_tokens, \
-                    row_b_bytes); \
+                    (const float *)low->ptr, slice_blocks, out_dim, \
+                    row_b_bytes)
+#define DS4_Q8_ATTN_OUT_EXPAND_TOK_CASE(NT) \
+            case NT: \
+                if (expand_rows_per_wave == 4u) { \
+                    DS4_Q8_ATTN_OUT_EXPAND_TOK_RPW(NT, 4u); \
+                } else if (expand_rows_per_wave == 2u) { \
+                    DS4_Q8_ATTN_OUT_EXPAND_TOK_RPW(NT, 2u); \
+                } else { \
+                    DS4_Q8_ATTN_OUT_EXPAND_TOK_RPW(NT, 1u); \
+                } \
                 break
             switch (n_tokens) {
                 DS4_Q8_ATTN_OUT_EXPAND_TOK_CASE(3u);
@@ -1899,6 +1914,7 @@ extern "C" int ds4_gpu_attention_output_q8_tp_batch_tensor(
                 default: return 0;
             }
 #undef DS4_Q8_ATTN_OUT_EXPAND_TOK_CASE
+#undef DS4_Q8_ATTN_OUT_EXPAND_TOK_RPW
         }
         return cuda_ok(cudaGetLastError(),
                        "attention_output_q8_tp weight-outer expand launch");

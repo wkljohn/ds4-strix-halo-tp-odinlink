@@ -674,7 +674,7 @@ matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_tok2_kernel(
     }
 }
 
-template <uint32_t TOK_TILE>
+template <uint32_t TOK_TILE, uint32_t ROWS_PER_WAVE = 1u>
 __global__ static void
 matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel(
         float *out,
@@ -682,7 +682,6 @@ matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel(
         const float *x,
         uint32_t n_blocks,
         uint64_t out_dim,
-        uint32_t n_tokens,
         uint64_t row_bytes) {
     constexpr uint32_t BLOCK_TILE = 32u;
     extern __shared__ float shx[];
@@ -691,20 +690,22 @@ matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel(
     const uint32_t wave = tid >> 5u;
     const uint32_t subgroup = lane >> 3u;
     const uint32_t lane8 = lane & 7u;
-    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t waves_per_block = blockDim.x >> 5u;
     const uint32_t in_dim = n_blocks << 5u;
-    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
-    if (row >= out_dim) return;
-    const unsigned char *wr = w + row * row_bytes;
-    float acc[TOK_TILE];
+    const uint64_t row0 =
+        ((uint64_t)blockIdx.x * waves_per_block + wave) * ROWS_PER_WAVE;
+    float acc[ROWS_PER_WAVE][TOK_TILE];
 #pragma unroll
-    for (uint32_t t = 0; t < TOK_TILE; t++) acc[t] = 0.0f;
+    for (uint32_t r = 0; r < ROWS_PER_WAVE; r++) {
+#pragma unroll
+        for (uint32_t t = 0; t < TOK_TILE; t++) acc[r][t] = 0.0f;
+    }
 
     for (uint32_t block0 = 0; block0 < n_blocks; block0 += BLOCK_TILE) {
         const uint32_t block_count =
             n_blocks - block0 < BLOCK_TILE ? n_blocks - block0 : BLOCK_TILE;
         const uint32_t tile_elems = block_count << 5u;
-        for (uint32_t i = tid; i < n_tokens * tile_elems; i += blockDim.x) {
+        for (uint32_t i = tid; i < TOK_TILE * tile_elems; i += blockDim.x) {
             const uint32_t tok = i / tile_elems;
             const uint32_t k = i - tok * tile_elems;
             shx[i] = x[(uint64_t)tok * in_dim +
@@ -716,27 +717,46 @@ matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel(
             if (bb >= block_count) continue;
             const uint32_t b = block0 + bb;
             const uint32_t elem = (bb << 5u) + (lane8 << 2u);
-            const unsigned char *blk = wr + (uint64_t)b * 34u;
-            const float d = q8_0_scale_scalar(blk);
-            const int8_t *q =
-                (const int8_t *)(blk + 2u + (lane8 << 2u));
+            float4 xv[TOK_TILE];
 #pragma unroll
             for (uint32_t t = 0; t < TOK_TILE; t++) {
-                if (t >= n_tokens) continue;
-                const float4 xv = *reinterpret_cast<const float4 *>(
+                xv[t] = *reinterpret_cast<const float4 *>(
                     shx + t * tile_elems + elem);
-                acc[t] = q8_pack4_block_fma_serial_odd_dag(
-                    acc[t], d, q, xv);
+            }
+#pragma unroll
+            for (uint32_t r = 0; r < ROWS_PER_WAVE; r++) {
+                const uint64_t row = row0 + r;
+                if (row >= out_dim) continue;
+                const unsigned char *blk =
+                    w + row * row_bytes + (uint64_t)b * 34u;
+                const float d = q8_0_scale_scalar(blk);
+                const int8_t *q =
+                    (const int8_t *)(blk + 2u + (lane8 << 2u));
+#pragma unroll
+                for (uint32_t t = 0; t < TOK_TILE; t++) {
+                    acc[r][t] = q8_pack4_block_fma_serial_odd_dag(
+                        acc[r][t], d, q, xv[t]);
+                }
             }
         }
         __syncthreads();
     }
 #pragma unroll
-    for (uint32_t t = 0; t < TOK_TILE; t++) acc[t] = warp_sum_f32(acc[t]);
-    if (lane == 0u) {
+    for (uint32_t r = 0; r < ROWS_PER_WAVE; r++) {
 #pragma unroll
         for (uint32_t t = 0; t < TOK_TILE; t++) {
-            if (t < n_tokens) out[(uint64_t)t * out_dim + row] = acc[t];
+            acc[r][t] = warp_sum_f32(acc[r][t]);
+        }
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t r = 0; r < ROWS_PER_WAVE; r++) {
+            const uint64_t row = row0 + r;
+            if (row >= out_dim) continue;
+#pragma unroll
+            for (uint32_t t = 0; t < TOK_TILE; t++) {
+                out[(uint64_t)t * out_dim + row] = acc[r][t];
+            }
         }
     }
 }

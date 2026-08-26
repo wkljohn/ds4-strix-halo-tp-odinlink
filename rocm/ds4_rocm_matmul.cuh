@@ -141,6 +141,13 @@ static int attention_q_b_qnorm_rope_enabled(void) {
     return enabled;
 }
 
+static unsigned q8_toktile_rows_per_wave(void) {
+    const char *value = getenv("DS4_ROCM_Q8_TOKTILE_ROWS_PER_WAVE");
+    if (!value || !value[0]) return 1u;
+    const unsigned rows = (unsigned)strtoul(value, NULL, 10);
+    return rows == 2u || rows == 4u ? rows : 1u;
+}
+
 static int q8_pair_f32_pack4_enabled(void) {
     static int enabled = -1;
     static int gfx1151;
@@ -1265,8 +1272,16 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     if (!w) return 0;
     const unsigned threads = 1024u;
     const unsigned rows_per_block = threads / 32u;
-    const dim3 grid((unsigned)((out_dim + rows_per_block - 1u) /
-                               rows_per_block), 1u, 1u);
+    const bool use_q_b_toktile = attention_q_b_pack4_enabled() &&
+        in_dim == 1024u && out_dim == 16384u && blocks == 32u;
+    unsigned rows_per_wave =
+        use_q_b_toktile ? q8_toktile_rows_per_wave() : 1u;
+    if ((out_dim % (rows_per_block * rows_per_wave)) != 0u) {
+        rows_per_wave = 1u;
+    }
+    const dim3 grid((unsigned)((out_dim +
+                               rows_per_block * rows_per_wave - 1u) /
+                              (rows_per_block * rows_per_wave)), 1u, 1u);
     const size_t shmem = (size_t)n_rows * 32u * 32u * sizeof(float);
 #define DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(NR) \
         matmul_q8_0_f32_kslice_verify_weight_outer_exact_w32_kernel<NR><<< \
@@ -1274,16 +1289,24 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 (float *)out->ptr, \
                 reinterpret_cast<const unsigned char *>(w), \
                 (const float *)x->ptr, (uint32_t)blocks, out_dim, row_bytes)
-    if (attention_q_b_pack4_enabled() && in_dim == 1024u &&
-        out_dim == 16384u && blocks == 32u) {
+    if (use_q_b_toktile) {
 #undef DS4_LAUNCH_Q8_DECODE_ROWS_EXACT
-#define DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(NR) \
-        matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel<NR><<< \
+#define DS4_LAUNCH_Q8_DECODE_ROWS_EXACT_RPW(NR, RPW) \
+        matmul_q8_0_f32_sharedx_warp_rows_w32_pack4_toktile_kernel<NR, RPW><<< \
                 grid, threads, shmem>>>( \
                 (float *)out->ptr, \
                 reinterpret_cast<const unsigned char *>(w), \
-                (const float *)x->ptr, (uint32_t)blocks, out_dim, n_rows, \
+                (const float *)x->ptr, (uint32_t)blocks, out_dim, \
                 row_bytes)
+#define DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(NR) do { \
+        if (rows_per_wave == 4u) { \
+            DS4_LAUNCH_Q8_DECODE_ROWS_EXACT_RPW(NR, 4u); \
+        } else if (rows_per_wave == 2u) { \
+            DS4_LAUNCH_Q8_DECODE_ROWS_EXACT_RPW(NR, 2u); \
+        } else { \
+            DS4_LAUNCH_Q8_DECODE_ROWS_EXACT_RPW(NR, 1u); \
+        } \
+    } while (0)
         switch (n_rows) {
             case 2u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(2u); break;
             case 3u: DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(3u); break;
@@ -1293,6 +1316,7 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         }
     } else {
 #undef DS4_LAUNCH_Q8_DECODE_ROWS_EXACT
+#undef DS4_LAUNCH_Q8_DECODE_ROWS_EXACT_RPW
 #define DS4_LAUNCH_Q8_DECODE_ROWS_EXACT(NR) \
         matmul_q8_0_f32_kslice_verify_weight_outer_exact_w32_kernel<NR><<< \
                 grid, threads, shmem>>>( \
