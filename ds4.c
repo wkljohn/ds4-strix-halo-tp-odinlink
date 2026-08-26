@@ -28602,6 +28602,14 @@ static bool metal_graph_encode_layer_attention_batch(
         ratio == 4u && !metal_graph_attn_comp_cache_is_f16() &&
         (ds4_gpu_get_tp_runtime_features() &
          DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2) != 0u;
+    /* Coalesce the 22 non-ratio-4 verifier layers only under its own exact-
+     * matched feature2 bit. This keeps rollback and attribution independent
+     * from the ratio-4 head2 path. */
+    const bool tp_batch_exact_mixed_token_batch =
+        tp_batch_attn_head_split && n_tokens >= 2u && n_tokens <= 5u &&
+        ratio != 4u && !metal_graph_attn_comp_cache_is_f16() &&
+        (g_tp_runtime_features2 &
+         DS4_TP_FEATURE2_DSPARK_EXACT_MIXED_TOKEN_BATCH) != 0u;
     const bool tp_batch_exact_indexer_token_batch =
         tp_batch_exact_attn_head2 &&
         (g_tp_runtime_features2 &
@@ -30403,9 +30411,66 @@ static bool metal_graph_encode_layer_attention_batch(
         }
 
         bool exact_head2_done = false;
+        bool exact_mixed_token_batch_done = false;
         const uint32_t decode_sparse_threshold =
             metal_graph_decode_indexer_sparse_threshold(g);
 #ifdef DS4_ROCM_BUILD
+        /* Ratio-128 and raw-only verifier layers used to append and attend
+         * one proposal row at a time.  When the final ring contains every
+         * earlier row without overwrite, pre-store the rows and launch the
+         * exact old-HIP CTA arithmetic for every (token, owned-head) pair in
+         * one grid.  Per-token raw starts and compressed counts remain
+         * explicit, so only launch boundaries change. */
+        if (ok && tp_batch_exact_mixed_token_batch && !zero_prefix &&
+            raw_prefix_tokens == 0u) {
+            uint32_t n_raw_by_token[5] = {0u};
+            uint32_t raw_start_by_token[5] = {0u};
+            uint32_t n_comp_by_token[5] = {0u};
+            uint32_t max_comp = 0u;
+            bool eligible = true;
+            for (uint32_t t = 0u; eligible && t < n_tokens; t++) {
+                const uint32_t pos = pos0 + t;
+                n_raw_by_token[t] = metal_graph_raw_span_for_batch(g, pos, 1u);
+                raw_start_by_token[t] = metal_graph_raw_start_for_span(
+                        g, pos, n_raw_by_token[t]);
+                n_comp_by_token[t] = comp_counts ? comp_counts[t] : 0u;
+                if (n_comp_by_token[t] > max_comp) {
+                    max_comp = n_comp_by_token[t];
+                }
+                eligible = n_raw_by_token[t] != 0u;
+            }
+            if (eligible &&
+                g->raw_cap - n_raw_by_token[0] >= n_tokens) {
+                ok = ds4_gpu_store_raw_kv_batch_tensor(
+                         g->layer_raw_cache[il], metal_graph_batch_kv(g),
+                         g->raw_cap, pos0 % g->raw_cap, n_tokens,
+                         DS4_N_HEAD_DIM) != 0;
+                if (ok) {
+                    const int launch_rc =
+                        ds4_gpu_attention_decode_mixed_exact_token_batch_tensor(
+                             metal_graph_batch_heads(g), model->map,
+                             model->size, tp_batch_sinks_offset,
+                             metal_graph_batch_q(g), g->layer_raw_cache[il],
+                             max_comp ? g->layer_attn_comp_cache[il] : NULL,
+                             metal_graph_attn_comp_cache_is_f16(), n_tokens,
+                             g->raw_cap, tp_batch_heads, DS4_N_HEAD_DIM,
+                             (ds4_gpu_get_tp_runtime_features() &
+                              DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC) != 0u ?
+                                 5u : 3u,
+                             n_raw_by_token, raw_start_by_token,
+                             n_comp_by_token);
+                    if (launch_rc < 0) {
+                        ok = false;
+                    } else {
+                        /* A validation rejection is safe after the pre-store:
+                         * the ring proof above makes later rows invisible to
+                         * earlier windows, and the serial store is idempotent. */
+                        exact_mixed_token_batch_done = launch_rc == 1;
+                    }
+                }
+            }
+        }
+
         /* The serial verifier selects an unsorted exact top-k independently
          * for every row, appends that row's raw KV, then launches one 256-
          * thread CTA per owned head.  Preserve those selections and raw-ring
@@ -30590,7 +30655,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                   DS4_N_HEAD_DIM) != 0;
             }
         }
-        if (!exact_head2_done && raw_prefix_tokens < n_tokens) {
+        if (!exact_head2_done && !exact_mixed_token_batch_done &&
+            raw_prefix_tokens < n_tokens) {
             for (uint32_t t = raw_prefix_tokens; ok && t < n_tokens; t++) {
                 const uint32_t pos = pos0 + t;
                 const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
@@ -53208,6 +53274,10 @@ uint32_t ds4_engine_tp_runtime_features2(ds4_engine *e) {
     if (metal_graph_tp_env_flag(
             "DS4_ROCM_ENABLE_EXACT_INDEXER_TOKEN_BATCH", false)) {
         features |= DS4_TP_FEATURE2_DSPARK_EXACT_INDEXER_TOKEN_BATCH;
+    }
+    if (metal_graph_tp_env_flag(
+            "DS4_ROCM_DSPARK_EXACT_MIXED_TOKEN_BATCH", false)) {
+        features |= DS4_TP_FEATURE2_DSPARK_EXACT_MIXED_TOKEN_BATCH;
     }
     return features;
 #endif

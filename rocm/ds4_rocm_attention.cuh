@@ -668,6 +668,93 @@ __device__ __forceinline__ static uint4 attention_exact_state_for_token(
     }
 }
 
+/* Exact launch-coalesced form of attention_decode_mixed_one_fast_oldhip.
+ * Every (token, head) remains an independent 256-thread CTA and executes the
+ * shipped float4 dot, block reductions, and raw-then-compressed PV recurrence
+ * unchanged.  Only the host launch boundary is shared across verifier rows.
+ * Per-token raw-ring and compressed-count state is passed explicitly because
+ * ratio-128 verifier layers expose a different state after every proposal. */
+__global__ static void attention_decode_mixed_exact_token_batch_kernel(
+        float *heads,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const float *sinks,
+        uint32_t n_tokens,
+        uint32_t raw_cap,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint4 state0,
+        uint4 state1,
+        uint4 state2,
+        uint4 state3,
+        uint4 state4) {
+    const uint32_t h = (uint32_t)blockIdx.x;
+    const uint32_t t = (uint32_t)blockIdx.y;
+    if (t >= n_tokens || h >= n_head) return;
+    const uint4 state = attention_exact_state_for_token(
+        t, state0, state1, state2, state3, state4);
+    const uint32_t n_raw = state.x;
+    const uint32_t raw_start = state.y;
+    const uint32_t n_comp = state.z;
+    extern __shared__ float scores[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t n_rows = n_raw + n_comp;
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const float scale = rsqrtf((float)head_dim);
+    const uint32_t use_vec4 = (uint32_t)((head_dim & 3u) == 0u);
+
+    float local_max = sinks[h];
+    for (uint32_t r = tid; r < n_raw; r += blockDim.x) {
+        const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
+        const float *kv = raw_kv + (uint64_t)row * head_dim;
+        float s = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim)
+                           : 0.0f;
+        if (!use_vec4) {
+            for (uint32_t i = 0; i < head_dim; i++) s += qh[i] * kv[i];
+        }
+        s *= scale;
+        scores[r] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    for (uint32_t c = tid; c < n_comp; c += blockDim.x) {
+        const float *kv = comp_kv + (uint64_t)c * head_dim;
+        float dot = use_vec4 ? attention_dot_f32_vec4_oldhip(qh, kv, head_dim)
+                             : 0.0f;
+        if (!use_vec4) {
+            for (uint32_t i = 0; i < head_dim; i++) dot += qh[i] * kv[i];
+        }
+        const float s = dot * scale;
+        scores[n_raw + c] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    const float max_score = attention_block_max_oldhip_w32(local_max);
+
+    float local_sum = 0.0f;
+    for (uint32_t r = tid; r < n_rows; r += blockDim.x) {
+        const float w = expf(scores[r] - max_score);
+        scores[r] = w;
+        local_sum += w;
+    }
+    if (tid == 0u) local_sum += expf(sinks[h] - max_score);
+    const float denom = attention_block_sum_oldhip_w32(local_sum);
+    const float inv_denom = 1.0f / denom;
+
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < n_raw; r++) {
+            const uint32_t row = raw_cap ? ((raw_start + r) % raw_cap) : r;
+            acc += scores[r] * raw_kv[(uint64_t)row * head_dim + d];
+        }
+        for (uint32_t c = 0; c < n_comp; c++) {
+            acc += scores[n_raw + c] *
+                   comp_kv[(uint64_t)c * head_dim + d];
+        }
+        heads[((uint64_t)t * n_head + h) * head_dim + d] =
+            acc * inv_denom;
+    }
+}
+
 /* Exact H=2 indexed-attention batch prototype. Each token remains a separate
  * grid row; each 256-thread subgroup owns one head and retains the shipped
  * row striding, serial float4 dot, softmax reduction, and raw-then-comp output

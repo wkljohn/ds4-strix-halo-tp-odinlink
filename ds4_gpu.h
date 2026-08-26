@@ -2117,6 +2117,24 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                head_dim);
 
 #ifdef DS4_ROCM_BUILD
+int ds4_gpu_attention_decode_mixed_exact_token_batch_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        uint32_t              n_tokens,
+        uint32_t              raw_cap,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              max_tokens_per_launch,
+        const uint32_t       *n_raw_by_token,
+        const uint32_t       *raw_start_by_token,
+        const uint32_t       *n_comp_by_token);
+
 int ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,

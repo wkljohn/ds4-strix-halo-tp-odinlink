@@ -76,6 +76,34 @@ static int run_serial(ds4_gpu_tensor *heads,
     return 1;
 }
 
+static int run_serial_mixed(ds4_gpu_tensor *heads,
+                            const ds4_gpu_tensor *q,
+                            const ds4_gpu_tensor *raw,
+                            const ds4_gpu_tensor *comp,
+                            const float *sinks,
+                            const uint32_t *n_raw,
+                            const uint32_t *raw_start,
+                            const uint32_t *n_comp,
+                            uint32_t raw_cap,
+                            uint32_t width) {
+    const uint64_t row_bytes =
+        (uint64_t)N_HEAD * HEAD_DIM * sizeof(float);
+    for (uint32_t t = 0; t < width; t++) {
+        ds4_gpu_tensor *o = ds4_gpu_tensor_view(
+            heads, (uint64_t)t * row_bytes, row_bytes);
+        ds4_gpu_tensor *qt = ds4_gpu_tensor_view(
+            q, (uint64_t)t * row_bytes, row_bytes);
+        const int ok = o && qt && ds4_gpu_attention_decode_heads_tensor(
+            o, sinks, (uint64_t)N_HEAD * sizeof(float), 0u, qt, raw,
+            n_raw[t], raw_cap, raw_start[t], n_comp[t] ? comp : NULL, 0u,
+            n_comp[t], NULL, 0u, N_HEAD, HEAD_DIM);
+        ds4_gpu_tensor_free(qt);
+        ds4_gpu_tensor_free(o);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
 static int compare_outputs(const char *label,
                            const float *ref,
                            const float *got,
@@ -195,6 +223,56 @@ int main(int argc, char **argv) {
                           ref_h, got_h, width),
           "H=2 output must be bit-exact");
 
+    /* Ratio-128/raw-only verifier layers use the same serial old-HIP CTA but
+     * launch it once per token.  The candidate shares only the launch
+     * boundary and must preserve every output bit.  Use visible compressed
+     * counts to model the per-token state exposed by those layers. */
+    CHECK(run_serial_mixed(&serial, &q, &raw, &comp, sinks, n_raw,
+                           raw_start, visible, RAW_CAP, width),
+          "run serial mixed oracle");
+    CHECK(ds4_gpu_attention_decode_mixed_exact_token_batch_tensor(
+              &candidate, sinks, sizeof(sinks), 0u, &q, &raw, &comp, 0u,
+              width, RAW_CAP, N_HEAD, HEAD_DIM, 3u,
+              n_raw, raw_start, visible) == 1,
+          "run exact mixed token batch");
+    CHECK(ds4_gpu_tensor_read(&serial, 0, ref_h, bytes) &&
+          ds4_gpu_tensor_read(&candidate, 0, got_h, bytes),
+          "read exact mixed outputs");
+    CHECK(compare_outputs("mixed-token-batch", ref_h, got_h, width),
+          "mixed token batch must be bit-exact");
+    CHECK(ds4_gpu_attention_decode_mixed_exact_token_batch_tensor(
+              &candidate, sinks, sizeof(sinks), 0u, &q, &raw, &comp, 0u,
+              width, RAW_CAP, N_HEAD, HEAD_DIM, 5u,
+              n_raw, raw_start, visible) == 1,
+          "run exact mixed full token batch");
+    CHECK(ds4_gpu_tensor_read(&candidate, 0, got_h, bytes),
+          "read exact mixed full outputs");
+    CHECK(compare_outputs("mixed-token-full-batch", ref_h, got_h, width),
+          "mixed full token batch must be bit-exact");
+
+    uint32_t no_comp[MAX_W] = {0u};
+    CHECK(run_serial_mixed(&serial, &q, &raw, &comp, sinks, n_raw,
+                           raw_start, no_comp, RAW_CAP, width),
+          "run raw-only serial mixed oracle");
+    CHECK(ds4_gpu_attention_decode_mixed_exact_token_batch_tensor(
+              &candidate, sinks, sizeof(sinks), 0u, &q, &raw, NULL, 0u,
+              width, RAW_CAP, N_HEAD, HEAD_DIM, 3u,
+              n_raw, raw_start, no_comp) == 1,
+          "run raw-only exact mixed token batch");
+    CHECK(ds4_gpu_tensor_read(&serial, 0, ref_h, bytes) &&
+          ds4_gpu_tensor_read(&candidate, 0, got_h, bytes),
+          "read raw-only exact mixed outputs");
+    CHECK(compare_outputs("mixed-token-raw-only", ref_h, got_h, width),
+          "raw-only mixed token batch must be bit-exact");
+
+    ds4_gpu_set_quality(true);
+    CHECK(ds4_gpu_attention_decode_mixed_exact_token_batch_tensor(
+              &candidate, sinks, sizeof(sinks), 0u, &q, &raw, &comp, 0u,
+              width, RAW_CAP, N_HEAD, HEAD_DIM, 3u,
+              n_raw, raw_start, visible) == 0,
+          "quality mode must reject the old-HIP mixed token batch");
+    ds4_gpu_set_quality(false);
+
     /* Force the wrapper's raw-overwrite safety fallback. */
     uint32_t sat_n_raw[MAX_W] = {126u, 126u, 127u, 127u, 128u};
     uint32_t sat_start[MAX_W] = {123u, 124u, 125u, 126u, 127u};
@@ -253,6 +331,46 @@ int main(int argc, char **argv) {
             serial_ms / candidate_ms);
     CHECK(serial_ms / candidate_ms >= 1.0f,
           "unstaged H=2 prototype must not regress any width");
+
+    for (uint32_t i = 0; i < WARMUP; i++) {
+        CHECK(run_serial_mixed(&serial, &q, &raw, &comp, sinks, n_raw,
+                               raw_start, visible, RAW_CAP, width),
+              "warm serial mixed");
+        CHECK(ds4_gpu_attention_decode_mixed_exact_token_batch_tensor(
+                  &candidate, sinks, sizeof(sinks), 0u, &q, &raw, &comp, 0u,
+                  width, RAW_CAP, N_HEAD, HEAD_DIM, 5u,
+                  n_raw, raw_start, visible) == 1,
+              "warm exact mixed token batch");
+    }
+    CHECK(hipDeviceSynchronize() == hipSuccess, "finish mixed warmup");
+    CHECK(hipEventRecord(start) == hipSuccess, "mixed serial start");
+    for (uint32_t i = 0; i < ITERS; i++)
+        CHECK(run_serial_mixed(&serial, &q, &raw, &comp, sinks, n_raw,
+                               raw_start, visible, RAW_CAP, width),
+              "time serial mixed");
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess, "mixed serial stop");
+    float mixed_serial_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&mixed_serial_ms, start, stop) == hipSuccess,
+          "mixed serial elapsed");
+    CHECK(hipEventRecord(start) == hipSuccess, "mixed batch start");
+    for (uint32_t i = 0; i < ITERS; i++)
+        CHECK(ds4_gpu_attention_decode_mixed_exact_token_batch_tensor(
+                  &candidate, sinks, sizeof(sinks), 0u, &q, &raw, &comp, 0u,
+                  width, RAW_CAP, N_HEAD, HEAD_DIM, 5u,
+                  n_raw, raw_start, visible) == 1,
+              "time exact mixed token batch");
+    CHECK(hipEventRecord(stop) == hipSuccess &&
+          hipEventSynchronize(stop) == hipSuccess, "mixed batch stop");
+    float mixed_batch_ms = 0.0f;
+    CHECK(hipEventElapsedTime(&mixed_batch_ms, start, stop) == hipSuccess,
+          "mixed batch elapsed");
+    fprintf(stderr,
+            "width=%u mixed_serial_ms=%.6f mixed_batch_ms=%.6f "
+            "speedup=%.3fx\n", width, mixed_serial_ms / ITERS,
+            mixed_batch_ms / ITERS, mixed_serial_ms / mixed_batch_ms);
+    CHECK(mixed_serial_ms / mixed_batch_ms >= 1.0f,
+          "exact mixed token batch must not regress any width");
 
     CHECK(hipEventDestroy(stop) == hipSuccess, "destroy stop");
     CHECK(hipEventDestroy(start) == hipSuccess, "destroy start");

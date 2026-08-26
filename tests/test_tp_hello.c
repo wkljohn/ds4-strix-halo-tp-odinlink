@@ -155,6 +155,12 @@ int main(void) {
     ok &= check2("hello2 mismatched-dspark-indexer-token-batch",
                  DS4_TP_FEATURE2_DSPARK_EXACT_INDEXER_TOKEN_BATCH, 0, 0,
                  "tp hello: runtime feature2 mismatch (local=0x00000001 peer=0x00000000)");
+    ok &= check2("hello2 equal-dspark-mixed-token-batch",
+                 DS4_TP_FEATURE2_DSPARK_EXACT_MIXED_TOKEN_BATCH,
+                 DS4_TP_FEATURE2_DSPARK_EXACT_MIXED_TOKEN_BATCH, 1, NULL);
+    ok &= check2("hello2 mismatched-dspark-mixed-token-batch",
+                 DS4_TP_FEATURE2_DSPARK_EXACT_MIXED_TOKEN_BATCH, 0, 0,
+                 "tp hello: runtime feature2 mismatch (local=0x00000002 peer=0x00000000)");
     ok &= check("hello equal-dspark-batch-argmax",
                 DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX,
                 DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX, 1, NULL);

@@ -749,6 +749,88 @@ static int attention_exact_head8_qk_pv_enabled(void) {
     return enabled;
 }
 
+extern "C" int ds4_gpu_attention_decode_mixed_exact_token_batch_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        uint32_t              n_tokens,
+        uint32_t              raw_cap,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              max_tokens_per_launch,
+        const uint32_t       *n_raw_by_token,
+        const uint32_t       *raw_start_by_token,
+        const uint32_t       *n_comp_by_token) {
+    if (!cuda_runtime_config()->oldhip_attention_decode ||
+        !heads || !q || !raw_kv || !model_map ||
+        comp_kv_f16 != 0u || !n_raw_by_token || !raw_start_by_token ||
+        !n_comp_by_token || n_tokens < 2u || n_tokens > 5u ||
+        raw_cap == 0u || n_head == 0u || head_dim == 0u ||
+        max_tokens_per_launch == 0u || max_tokens_per_launch > 5u ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+        raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float)) {
+        return 0;
+    }
+    uint4 states[5] = {};
+    uint32_t max_comp = 0u;
+    for (uint32_t t = 0u; t < n_tokens; t++) {
+        if (n_raw_by_token[t] == 0u || n_raw_by_token[t] > raw_cap ||
+            raw_start_by_token[t] >= raw_cap) return 0;
+        states[t] = make_uint4(n_raw_by_token[t], raw_start_by_token[t],
+                               n_comp_by_token[t], 0u);
+        if (n_comp_by_token[t] > max_comp) max_comp = n_comp_by_token[t];
+    }
+    if (max_comp != 0u &&
+        (!comp_kv || comp_kv->bytes <
+            (uint64_t)max_comp * head_dim * sizeof(float))) return 0;
+    const float *sinks = (const float *)cuda_model_range_ptr(
+        model_map, sinks_offset, (uint64_t)n_head * sizeof(float),
+        "attn_sinks");
+    if (!sinks) return 0;
+    /* The exact-matched async transport schedule selects five rows; the
+     * conservative schedule selects three. Both ranks therefore use the
+     * same grouping and every CTA still executes identical arithmetic. */
+    const uint64_t row_elems = (uint64_t)n_head * head_dim;
+    for (uint32_t token0 = 0u; token0 < n_tokens;
+         token0 += max_tokens_per_launch) {
+        const uint32_t nt = n_tokens - token0 < max_tokens_per_launch ?
+            n_tokens - token0 : max_tokens_per_launch;
+        uint4 group_states[5] = {};
+        uint32_t group_max_rows = 0u;
+        uint32_t group_max_comp = 0u;
+        for (uint32_t t = 0u; t < nt; t++) {
+            group_states[t] = states[token0 + t];
+            const uint32_t rows = group_states[t].x + group_states[t].z;
+            if (rows > group_max_rows) group_max_rows = rows;
+            if (group_states[t].z > group_max_comp)
+                group_max_comp = group_states[t].z;
+        }
+        const dim3 grid(n_head, nt, 1u);
+        const size_t shmem =
+            (size_t)(group_max_rows ? group_max_rows : 1u) * sizeof(float);
+        attention_decode_mixed_exact_token_batch_kernel<<<grid, 256, shmem>>>(
+            (float *)heads->ptr + (uint64_t)token0 * row_elems,
+            (const float *)q->ptr + (uint64_t)token0 * row_elems,
+            (const float *)raw_kv->ptr,
+            group_max_comp ? (const float *)comp_kv->ptr :
+                             (const float *)raw_kv->ptr,
+            sinks, nt, raw_cap, n_head, head_dim,
+            group_states[0], group_states[1], group_states[2],
+            group_states[3], group_states[4]);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention exact token batch launch")) return -1;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,

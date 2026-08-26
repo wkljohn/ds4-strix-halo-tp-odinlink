@@ -38,6 +38,10 @@ enum {
  * exact-matched hello word instead of aliasing an established production bit. */
 enum {
     DS4_TP_FEATURE2_DSPARK_EXACT_INDEXER_TOKEN_BATCH = UINT32_C(1) << 0,
+    /* Non-ratio-4 DSpark verifier attention may coalesce independent token
+     * rows into one exact old-HIP launch. Keep it independently switchable
+     * from ratio-4 head packing for attribution and rollback. */
+    DS4_TP_FEATURE2_DSPARK_EXACT_MIXED_TOKEN_BATCH = UINT32_C(1) << 1,
 };
 
 enum {
