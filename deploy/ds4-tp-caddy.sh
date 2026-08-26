@@ -253,7 +253,8 @@ start() {
       DS4_DSPARK_SUPPORT_TOPK=6
       DS4_DSPARK_MAX_DRAFT_TOKENS=5
       DS4_ROCM_Q8_SMALL_BATCH_TILE=1
-      DS4_ROCM_Q8_SMALL_BATCH_DP4A=1)
+      DS4_ROCM_Q8_SMALL_BATCH_DP4A=1
+      DS4_ROCM_ENABLE_F16_INDEXER_Q_WVSPLIT=1)
     support_args=(--mtp "$MTP" --dspark)
   else
     routed_family=$(python3 "$REPO/scripts/gguf_tensor_types.py" --routed-family "$MODEL") || {

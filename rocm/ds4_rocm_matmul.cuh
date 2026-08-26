@@ -1517,7 +1517,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         return cuda_ok(cudaGetLastError(), "f16 HC five-row launch");
     }
     const int indexer_q_cus =
-        (in_dim == 1024u || in_dim == 1536u) &&
+        in_dim == 1024u &&
         out_dim == 8192u && n_tok <= 5u &&
         !g_quality_mode && !cuda_runtime_config()->graph_dump
             ? f16_indexer_q_wvsplit_cus() : 0;

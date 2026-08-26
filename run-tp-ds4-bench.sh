@@ -453,6 +453,12 @@ if [[ $DSPARK == 1 ]]; then
     DS4_DSPARK_STATS=1
     DS4_ROCM_Q8_SMALL_BATCH_TILE=1
     DS4_ROCM_Q8_SMALL_BATCH_DP4A=1
+    # DSpark verifies two to five proposed rows together. On gfx1151 this
+    # production-shaped F16 indexer-Q kernel is substantially faster than the
+    # generic small GEMM and has passed the fixed token/top-k gates. Keep it
+    # inside the DSpark environment so ordinary decode retains its independent
+    # dispatch and rollback surface.
+    DS4_ROCM_ENABLE_F16_INDEXER_Q_WVSPLIT=1
   )
   WORKER_ENV+=("${DSPARK_ENV[@]}")
   COORD_ENV+=("${DSPARK_ENV[@]}" DS4_DSPARK_RESIDENT_Q8=1)

@@ -40,6 +40,46 @@ __global__ static void f32_to_f16(_Float16 *dst, const float *src,
     if (i < n) dst[i] = (_Float16)src[i];
 }
 
+/* Match the ordinary N=1 DS4 fallback closely enough to expose the extra
+ * F32->F16 activation conversion used by the speculative wave-split path.
+ * Unlike the hipBLAS reference below, this reference consumes the original
+ * F32 activation row. */
+__device__ static float wave_sum(float v) {
+    for (uint32_t offset = 16u; offset != 0u; offset >>= 1u) {
+        v += __shfl_down(v, offset, 32);
+    }
+    return v;
+}
+
+template <uint32_t TOKENS>
+__global__ static void f16_f32_sharedx_reference(
+        float *out, const _Float16 *weights, const float *x,
+        uint32_t kdim, uint32_t mdim) {
+    extern __shared__ float sx[];
+    const uint32_t token = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const float *xt = x + (uint64_t)token * kdim;
+    for (uint32_t k = tid; k < kdim; k += blockDim.x) sx[k] = xt[k];
+    __syncthreads();
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    if (row >= mdim) return;
+    const _Float16 *wr = weights + (uint64_t)row * kdim;
+    float acc = 0.0f;
+    uint32_t k = lane;
+    for (; k + 224u < kdim; k += 256u) {
+#pragma unroll
+        for (uint32_t u = 0u; u < 8u; u++) {
+            acc += (float)wr[k + u * 32u] * sx[k + u * 32u];
+        }
+    }
+    for (; k < kdim; k += 32u) acc += (float)wr[k] * sx[k];
+    acc = wave_sum(acc);
+    if (lane == 0u) out[(uint64_t)token * mdim + row] = acc;
+}
+
 union alignas(16) pack8h {
     _Float16 h[8];
     float4 raw;
@@ -160,11 +200,13 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations,
     for (auto &v : hx) v = dist(rng);
 
     _Float16 *dw = nullptr, *dxh = nullptr;
-    float *dxf = nullptr, *dref = nullptr, *dcand = nullptr;
+    float *dxf = nullptr, *dref = nullptr, *dref_f32 = nullptr, *dcand = nullptr;
     check(hipMalloc(&dw, w_total * sizeof(*dw)), "hipMalloc weights");
     check(hipMalloc(&dxh, x_count * sizeof(*dxh)), "hipMalloc xh");
     check(hipMalloc(&dxf, x_count * sizeof(*dxf)), "hipMalloc xf");
     check(hipMalloc(&dref, o_count * sizeof(*dref)), "hipMalloc ref");
+    check(hipMalloc(&dref_f32, o_count * sizeof(*dref_f32)),
+          "hipMalloc F32 reference");
     check(hipMalloc(&dcand, o_count * sizeof(*dcand)), "hipMalloc cand");
     check(hipMemcpy(dw, hw.data(), w_total * sizeof(*dw), hipMemcpyHostToDevice),
           "copy weights");
@@ -186,6 +228,16 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations,
                                  HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
                    "hipblasGemmEx");
     };
+    auto launch_ref_f32 = [&](uint32_t set) {
+        const _Float16 *wset = dw + (uint64_t)(set % weight_sets) * w_count;
+        const uint32_t threads = 256u;
+        const uint32_t rows_per_block = threads / 32u;
+        f16_f32_sharedx_reference<TOKENS><<<
+            dim3((mdim + rows_per_block - 1u) / rows_per_block, TOKENS),
+            threads, (size_t)kdim * sizeof(float)>>>(
+                dref_f32, wset, dxf, kdim, mdim);
+        check(hipGetLastError(), "F32 reference launch");
+    };
     int device = 0, cu_count = 0;
     check(hipGetDevice(&device), "hipGetDevice");
     check(hipDeviceGetAttribute(&cu_count, hipDeviceAttributeMultiprocessorCount,
@@ -204,20 +256,27 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations,
     };
 
     launch_ref(0u);
+    launch_ref_f32(0u);
     launch_cand(0u);
     check(hipDeviceSynchronize(), "warmup synchronize");
-    std::vector<float> href(o_count), hcand(o_count);
+    std::vector<float> href(o_count), href_f32(o_count), hcand(o_count);
     check(hipMemcpy(href.data(), dref, o_count * sizeof(float), hipMemcpyDeviceToHost),
           "copy reference");
     check(hipMemcpy(hcand.data(), dcand, o_count * sizeof(float), hipMemcpyDeviceToHost),
           "copy candidate");
-    double sq = 0.0, ref_sq = 0.0;
-    float max_abs = 0.0f;
+    check(hipMemcpy(href_f32.data(), dref_f32, o_count * sizeof(float),
+                    hipMemcpyDeviceToHost), "copy F32 reference");
+    double sq = 0.0, ref_sq = 0.0, sq_f32 = 0.0, ref_sq_f32 = 0.0;
+    float max_abs = 0.0f, max_abs_f32 = 0.0f;
     for (uint64_t i = 0; i < o_count; ++i) {
         const float d = std::fabs(href[i] - hcand[i]);
         max_abs = std::max(max_abs, d);
         sq += (double)d * d;
         ref_sq += (double)href[i] * href[i];
+        const float d_f32 = std::fabs(href_f32[i] - hcand[i]);
+        max_abs_f32 = std::max(max_abs_f32, d_f32);
+        sq_f32 += (double)d_f32 * d_f32;
+        ref_sq_f32 += (double)href_f32[i] * href_f32[i];
     }
 
     hipEvent_t a, b;
@@ -234,16 +293,28 @@ static void run_shape(uint32_t kdim, uint32_t mdim, uint32_t iterations,
     check(hipEventSynchronize(b), "sync candidate");
     const float cand_ms = elapsed(a, b) / iterations;
 
+    const double rel_rms = std::sqrt(sq / std::max(ref_sq, 1e-30));
+    const double rel_rms_f32 =
+        std::sqrt(sq_f32 / std::max(ref_sq_f32, 1e-30));
     std::printf("shape N=%u K=%u M=%u sets=%u hipblas_ms=%.6f wvsplitk_ms=%.6f "
-                "speedup=%.3fx max_abs=%.9g rel_rms=%.9g\n",
+                "speedup=%.3fx max_abs=%.9g rel_rms=%.9g "
+                "f32_max_abs=%.9g f32_rel_rms=%.9g\n",
                 TOKENS, kdim, mdim, weight_sets, ref_ms, cand_ms,
                 ref_ms / cand_ms, max_abs,
-                std::sqrt(sq / std::max(ref_sq, 1e-30)));
+                rel_rms, max_abs_f32, rel_rms_f32);
+    if (kdim == 1024u && mdim == 8192u &&
+        (ref_ms / cand_ms < 1.5f || rel_rms > 1.0e-5 ||
+         rel_rms_f32 > 5.0e-4)) {
+        std::fprintf(stderr,
+                     "FAIL: indexer-Q wave-split performance/accuracy gate\n");
+        std::exit(1);
+    }
 
     hipEventDestroy(b);
     hipEventDestroy(a);
     hipblasDestroy(blas);
     hipFree(dcand);
+    hipFree(dref_f32);
     hipFree(dref);
     hipFree(dxf);
     hipFree(dxh);
