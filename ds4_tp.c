@@ -46,7 +46,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 9u
+#define DS4_TP_PROTOCOL_VERSION 10u
 
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
@@ -76,10 +76,10 @@ typedef struct {
     uint32_t quant_bits;
     uint32_t ctx_size;
     uint32_t runtime_features;
+    uint32_t runtime_features2;
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint32_t pad;
 } ds4_tp_hello_fixed;
 
 typedef struct {
@@ -279,6 +279,7 @@ struct ds4_tp {
     bool rdma_active;
     uint32_t peer_ctx;
     uint32_t runtime_features;
+    uint32_t runtime_features2;
     uint32_t n_layer;
     uint32_t n_embd;
     uint64_t vec_bytes;
@@ -347,6 +348,15 @@ static int tp_hello_validate_runtime_features(uint32_t local, uint32_t peer,
     return 0;
 }
 
+static int tp_hello_validate_runtime_features2(uint32_t local, uint32_t peer,
+                                               char *err, size_t errlen) {
+    if (local == peer) return 1;
+    tp_set_err(err, errlen,
+               "tp hello: runtime feature2 mismatch (local=0x%08x peer=0x%08x)",
+               local, peer);
+    return 0;
+}
+
 /* Resolve the negotiated data transport in one fail-closed place.  AUTO may
  * deliberately fall back to TCP; an explicit RDMA request never may.  Keep
  * this separate from device probing and the hello socket so the policy has a
@@ -373,6 +383,11 @@ static int tp_select_transport(ds4_tp_transport requested,
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
                                                 char *err, size_t errlen) {
     return tp_hello_validate_runtime_features(local, peer, err, errlen);
+}
+
+int ds4_tp_test_hello_validate_runtime_features2(uint32_t local, uint32_t peer,
+                                                 char *err, size_t errlen) {
+    return tp_hello_validate_runtime_features2(local, peer, err, errlen);
 }
 
 int ds4_tp_test_select_transport(ds4_tp_transport requested,
@@ -1987,6 +2002,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .quant_bits = id->quant_bits,
         .ctx_size = id->ctx_size,
         .runtime_features = id->runtime_features,
+        .runtime_features2 = id->runtime_features2,
         .gate_slot_start = id->gate_slot_start,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
@@ -2015,6 +2031,11 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                                             err, errlen)) {
         return 0;
     }
+    if (!tp_hello_validate_runtime_features2(mine.runtime_features2,
+                                             theirs.runtime_features2,
+                                             err, errlen)) {
+        return 0;
+    }
     if (theirs.gguf_bytes != mine.gguf_bytes || theirs.model_id != mine.model_id ||
         theirs.n_layer != mine.n_layer || theirs.n_embd != mine.n_embd ||
         theirs.n_vocab != mine.n_vocab || theirs.quant_bits != mine.quant_bits ||
@@ -2030,6 +2051,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     }
     tp->peer_ctx = theirs.ctx_size;
     tp->runtime_features = mine.runtime_features;
+    tp->runtime_features2 = mine.runtime_features2;
     tp->n_layer = id->n_layer;
     tp->n_embd = id->n_embd;
     tp->vec_bytes = (uint64_t)id->n_embd * sizeof(float);
@@ -2169,6 +2191,10 @@ bool ds4_tp_requires_host_slab(const ds4_tp *tp) {
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 uint32_t ds4_tp_runtime_features(const ds4_tp *tp) {
     return tp ? tp->runtime_features : 0;
+}
+
+uint32_t ds4_tp_runtime_features2(const ds4_tp *tp) {
+    return tp ? tp->runtime_features2 : 0;
 }
 bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
@@ -3358,6 +3384,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
         .ctx_size = 0, /* adopt the leader's */
         .runtime_features = ds4_engine_tp_runtime_features(engine),
+        .runtime_features2 = ds4_engine_tp_runtime_features2(engine),
     };
     ds4_engine_tp_gate_schedule(engine,
                                 &id.gate_slot_start,

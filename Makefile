@@ -45,7 +45,15 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+# Prefer the workspace-pinned gfx1151 ROCm 7.14 installation when this checkout
+# lives beside ../toolchains.  HIPCC on the command line/environment remains the
+# explicit escape hatch for deliberate cross-version research.
+DS4_WORKSPACE_ROCM_714 := $(abspath $(CURDIR)/../toolchains/rocm-7.14.0-gfx1151/install)
+ifneq ($(wildcard $(DS4_WORKSPACE_ROCM_714)/bin/hipcc),)
+HIPCC ?= $(DS4_WORKSPACE_ROCM_714)/bin/hipcc
+else
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
+endif
 HIPCC_PATH := $(shell command -v "$(HIPCC)" 2>/dev/null || printf '%s' "$(HIPCC)")
 ROCM_HOME ?= $(shell p=$$(readlink -f "$(HIPCC_PATH)"); dirname "$$(dirname "$$p")")
 ROCM_ARCH ?= gfx1151
@@ -57,7 +65,24 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-big-gate-overlap test-tp-verify-gate-latency test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-q4k-verify-batch-oracle test-rocm-q8-attn-out-weight-outer test-rocm-indexer-exact-token-loop test-rocm-attention-exact-head2 test-rocm-argmax-rows test-rocm-compressor-row-shard-oracle test-rocm-f16-pair-temporal-exact test-rocm-f16-ordered-rows-exact test-rocm-f16-indexer-q-wvsplit dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-big-gate-overlap test-tp-verify-gate-latency test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-q4k-verify-batch-oracle test-rocm-q8-attn-out-weight-outer test-rocm-indexer-exact-token-loop test-rocm-attention-exact-head2 test-rocm-argmax-rows test-rocm-compressor-row-shard-oracle test-rocm-f16-pair-temporal-exact test-rocm-f16-ordered-rows-exact test-rocm-f16-indexer-q-wvsplit dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm check-rocm-714 rocm-toolchain
+
+rocm-toolchain:
+	@echo "HIPCC=$(HIPCC_PATH)"
+	@"$(HIPCC_PATH)" --version | sed -n '1,2p'
+	@echo "ROCM_HOME=$(ROCM_HOME)"
+
+check-rocm-714:
+	@version="$$("$(HIPCC_PATH)" --version 2>&1 | sed -n 's/^HIP version: //p' | head -1)"; \
+	if printf '%s\n' "$$version" | grep -q '^7\.14\.'; then \
+		echo "ROCm toolchain: $$version ($(HIPCC_PATH))"; \
+	elif [ "$(DS4_ALLOW_UNVALIDATED_ROCM)" = "1" ]; then \
+		echo "warning: deliberate unvalidated ROCm toolchain $$version ($(HIPCC_PATH))" >&2; \
+	else \
+		echo "error: Strix Halo production builds require ROCm 7.14; resolved $$version at $(HIPCC_PATH)" >&2; \
+		echo "       set HIPCC=/path/to/7.14/bin/hipcc, or DS4_ALLOW_UNVALIDATED_ROCM=1 only for cross-version research" >&2; \
+		exit 2; \
+	fi
 
 test-quality-gates:
 	python3 tests/test_frontier_logits_gate.py
@@ -65,7 +90,7 @@ test-quality-gates:
 test-moe-wave-plan:
 	python3 tests/test_moe_wave_plan.py
 
-tests/test_rocm_moe_wave_plan: tests/test_rocm_moe_wave_plan.cu
+tests/test_rocm_moe_wave_plan: tests/test_rocm_moe_wave_plan.cu | check-rocm-714
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $<
 
 test-rocm-moe-wave-plan: tests/test_rocm_moe_wave_plan
@@ -80,7 +105,7 @@ tests/test_tp_hello: tests/test_tp_hello.c tests/ds4_tp_hello_test.o ds4_tp.h ds
 test-tp-hello: tests/test_tp_hello
 	./tests/test_tp_hello
 
-tests/roce_v2_mr_probe: tests/roce_v2_mr_probe.cpp
+tests/roce_v2_mr_probe: tests/roce_v2_mr_probe.cpp | check-rocm-714
 	$(HIPCC) -O2 -o $@ $< -libverbs
 
 test-roce-v2-mr: tests/roce_v2_mr_probe
@@ -91,10 +116,10 @@ tests/ds4_tp_completion_ordering.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1 \
 		-ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
 
-tests/test_tp_completion_ordering.o: tests/test_tp_completion_ordering.cu ds4_tp.h ds4.h
+tests/test_tp_completion_ordering.o: tests/test_tp_completion_ordering.cu ds4_tp.h ds4.h | check-rocm-714
 	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
 
-tests/test_tp_completion_ordering: tests/test_tp_completion_ordering.o tests/ds4_tp_completion_ordering.o
+tests/test_tp_completion_ordering: tests/test_tp_completion_ordering.o tests/ds4_tp_completion_ordering.o | check-rocm-714
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ -lm -pthread -ldl
 
 test-tp-completion-ordering: tests/test_tp_completion_ordering
@@ -121,10 +146,10 @@ test-tp-big-gate-overlap: tests/test_tp_big_gate_overlap
 		"$(if $(TP_CHUNKS),$(TP_CHUNKS),8)" \
 		"$(if $(TP_WORK_ITERS),$(TP_WORK_ITERS),4096)"
 
-tests/test_tp_verify_gate_latency.o: tests/test_tp_verify_gate_latency.cu ds4_tp.h ds4.h
+tests/test_tp_verify_gate_latency.o: tests/test_tp_verify_gate_latency.cu ds4_tp.h ds4.h | check-rocm-714
 	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
 
-tests/test_tp_verify_gate_latency: tests/test_tp_verify_gate_latency.o tests/ds4_tp_big_gate_overlap.o
+tests/test_tp_verify_gate_latency: tests/test_tp_verify_gate_latency.o tests/ds4_tp_big_gate_overlap.o | check-rocm-714
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ -lm -pthread -ldl
 
 test-tp-verify-gate-latency: tests/test_tp_verify_gate_latency
@@ -245,14 +270,14 @@ cuda:
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
-strix-halo:
+strix-halo: check-rocm-714
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
-strix-halo-quality-score:
+strix-halo-quality-score: check-rocm-714
 	$(MAKE) -B gguf-tools/quality-testing/score_official \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1" \
@@ -379,13 +404,13 @@ ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
-ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
+ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS) | check-rocm-714
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
-ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
+ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h | check-rocm-714
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_compat.cu
 
-ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
+ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu | check-rocm-714
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o

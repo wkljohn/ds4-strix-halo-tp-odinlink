@@ -154,7 +154,7 @@ __global__ static void indexer_scores_exact_token_loop_kernel(
 
     __shared__ float krow[128];
     __shared__ float partial[4];
-    krow[tid] = index_comp[(uint64_t)c * 128u + tid];
+    if (tid < 128u) krow[tid] = index_comp[(uint64_t)c * 128u + tid];
     __syncthreads();
 
     const uint32_t counts[5] = {count0, count1, count2, count3, count4};
@@ -1040,6 +1040,21 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
                                  n_head, head_dim, 1, scale, 0);
 }
 
+static std::atomic<uint64_t> g_indexer_select_exact_token_loop_calls{0u};
+static pthread_once_t g_indexer_select_exact_token_loop_report_once =
+    PTHREAD_ONCE_INIT;
+
+static void indexer_select_exact_token_loop_report(void) {
+    fprintf(stderr,
+            "ds4_rocm_exact_indexer_token_batch_summary calls=%llu\n",
+            (unsigned long long)g_indexer_select_exact_token_loop_calls.load(
+                std::memory_order_relaxed));
+}
+
+static void indexer_select_exact_token_loop_register_report(void) {
+    (void)atexit(indexer_select_exact_token_loop_report);
+}
+
 extern "C" int ds4_gpu_indexer_scores_exact_token_loop_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -1370,6 +1385,42 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "indexer topk launch");
+}
+
+extern "C" int ds4_gpu_indexer_select_exact_token_loop_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                score_stride,
+        uint32_t                n_tokens,
+        const uint32_t         *index_counts,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                top_k,
+        float                   scale) {
+    if (!selected || !index_counts || top_k == 0u || n_tokens == 0u ||
+        n_tokens > 5u) {
+        return 0;
+    }
+    for (uint32_t t = 0u; t < n_tokens; t++) {
+        if (index_counts[t] <= top_k || index_counts[t] > score_stride) {
+            return 0;
+        }
+    }
+    if (!ds4_gpu_indexer_scores_exact_token_loop_tensor(
+            scores, q, weights, index_comp, score_stride, n_tokens,
+            index_counts, n_head, head_dim, scale) ||
+        !ds4_gpu_indexer_topk_tensor(
+            selected, scores, score_stride, n_tokens, top_k)) {
+        return 0;
+    }
+    g_indexer_select_exact_token_loop_calls.fetch_add(
+        1u, std::memory_order_relaxed);
+    (void)pthread_once(&g_indexer_select_exact_token_loop_report_once,
+                       indexer_select_exact_token_loop_register_report);
+    return 1;
 }
 
 extern "C" int ds4_gpu_argmax_tensor(

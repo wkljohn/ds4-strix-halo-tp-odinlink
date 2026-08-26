@@ -57,6 +57,9 @@
 
 #if defined(DS4_ROCM_BUILD)
 extern void ds4_gpu_rocm_mark_speculative_decode(void);
+/* The second TP feature word is protocol state used by ROCm graph selection;
+ * it is set only after the two independently launched ranks match in hello. */
+static uint32_t g_tp_runtime_features2;
 #endif
 
 /* Profiling and dump hooks are intentionally absent from production hot
@@ -28599,6 +28602,10 @@ static bool metal_graph_encode_layer_attention_batch(
         ratio == 4u && !metal_graph_attn_comp_cache_is_f16() &&
         (ds4_gpu_get_tp_runtime_features() &
          DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2) != 0u;
+    const bool tp_batch_exact_indexer_token_batch =
+        tp_batch_exact_attn_head2 &&
+        (g_tp_runtime_features2 &
+         DS4_TP_FEATURE2_DSPARK_EXACT_INDEXER_TOKEN_BATCH) != 0u;
     const bool tp_batch_attn_rows_exact =
         tp_batch_attn_head_split && n_tokens >= 2u && n_tokens <= 5u &&
         layer->attn_q_a->type == DS4_TENSOR_Q8_0 &&
@@ -30432,50 +30439,109 @@ static bool metal_graph_encode_layer_attention_batch(
                 const float index_scale = 1.0f /
                     sqrtf((float)(DS4_N_INDEXER_HEAD_DIM *
                                   DS4_N_INDEXER_HEAD));
-                for (uint32_t t = 0u; ok && t < n_tokens; t++) {
-                    ds4_gpu_tensor *indexer_q_view = metal_graph_tensor_row_view(
-                            metal_graph_batch_indexer_q(g), t,
-                            (uint64_t)DS4_N_INDEXER_HEAD *
-                                DS4_N_INDEXER_HEAD_DIM);
-                    ds4_gpu_tensor *indexer_w_view = metal_graph_tensor_row_view(
-                            metal_graph_batch_indexer_weights(g), t,
-                            DS4_N_INDEXER_HEAD);
-                    ds4_gpu_tensor *selected_view = metal_graph_tensor_row_view(
-                            metal_graph_comp_selected(g), t,
-                            DS4_N_INDEXER_TOP_K);
-                    ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(
-                            metal_graph_batch_kv(g), t, DS4_N_HEAD_DIM);
-                    ok = indexer_q_view && indexer_w_view && selected_view &&
-                         kv_view &&
-                         ds4_gpu_indexer_score_one_tensor(
-                             metal_graph_indexer_scores(g), indexer_q_view,
-                             indexer_w_view, g->layer_index_comp_cache[il],
-                             index_counts[t], DS4_N_INDEXER_HEAD,
-                             DS4_N_INDEXER_HEAD_DIM, index_scale) != 0 &&
-                         ds4_gpu_indexer_topk_tensor(
-                             selected_view, metal_graph_indexer_scores(g),
-                             index_counts[t], 1u,
-                             DS4_N_INDEXER_TOP_K) != 0 &&
-                         ds4_gpu_store_raw_kv_tensor(
-                             g->layer_raw_cache[il], kv_view, g->raw_cap,
-                             (pos0 + t) % g->raw_cap,
-                             DS4_N_HEAD_DIM) != 0;
-                    if (ok && t + 1u == n_tokens &&
-                        metal_graph_dspark_validate_stage_layer(il) &&
+                if (tp_batch_exact_indexer_token_batch) {
+                    DS4_VERIFY_ATTN_EVENT(
+                        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_START);
+                    uint32_t score_stride = 0u;
+                    for (uint32_t t = 0u; t < n_tokens; t++) {
+                        if (index_counts[t] > score_stride) {
+                            score_stride = index_counts[t];
+                        }
+                    }
+                    ok = ds4_gpu_indexer_select_exact_token_loop_tensor(
+                             metal_graph_comp_selected(g),
+                             metal_graph_indexer_scores(g),
+                             metal_graph_batch_indexer_q(g),
+                             metal_graph_batch_indexer_weights(g),
+                             g->layer_index_comp_cache[il], score_stride,
+                             n_tokens, index_counts, DS4_N_INDEXER_HEAD,
+                             DS4_N_INDEXER_HEAD_DIM,
+                             DS4_N_INDEXER_TOP_K, index_scale) != 0;
+                    for (uint32_t t = 0u; ok && t < n_tokens; t++) {
+                        ds4_gpu_tensor *kv_view = metal_graph_tensor_row_view(
+                                metal_graph_batch_kv(g), t, DS4_N_HEAD_DIM);
+                        ok = kv_view && ds4_gpu_store_raw_kv_tensor(
+                                g->layer_raw_cache[il], kv_view, g->raw_cap,
+                                (pos0 + t) % g->raw_cap,
+                                DS4_N_HEAD_DIM) != 0;
+                        ds4_gpu_tensor_free(kv_view);
+                    }
+                    if (ok && metal_graph_dspark_validate_stage_layer(il) &&
                         g->dspark_validate_batch_stages) {
                         const uint64_t hc_elems =
                             (uint64_t)DS4_N_HC * DS4_N_EMBD;
-                        ok = ds4_gpu_tensor_copy(
+                        ds4_gpu_tensor *selected_view =
+                            metal_graph_tensor_row_view(
+                                metal_graph_comp_selected(g), n_tokens - 1u,
+                                DS4_N_INDEXER_TOP_K);
+                        ok = selected_view && ds4_gpu_tensor_copy(
                                 g->dspark_validate_batch_stages,
-                                19u * hc_elems * sizeof(float),
-                                selected_view, 0,
-                                (uint64_t)DS4_N_INDEXER_TOP_K *
-                                    sizeof(int32_t)) != 0;
+                                19u * hc_elems * sizeof(float), selected_view,
+                                0, (uint64_t)DS4_N_INDEXER_TOP_K *
+                                       sizeof(int32_t)) != 0;
+                        ds4_gpu_tensor_free(selected_view);
                     }
-                    ds4_gpu_tensor_free(kv_view);
-                    ds4_gpu_tensor_free(selected_view);
-                    ds4_gpu_tensor_free(indexer_w_view);
-                    ds4_gpu_tensor_free(indexer_q_view);
+                    DS4_VERIFY_ATTN_EVENT(
+                        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_END);
+                } else {
+                    /* Preserve the established serial launch and raw-store
+                     * order byte-for-byte when the new feature is disabled. */
+                    DS4_VERIFY_ATTN_EVENT(
+                        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_START);
+                    for (uint32_t t = 0u; ok && t < n_tokens; t++) {
+                        ds4_gpu_tensor *indexer_q_view =
+                            metal_graph_tensor_row_view(
+                                metal_graph_batch_indexer_q(g), t,
+                                (uint64_t)DS4_N_INDEXER_HEAD *
+                                    DS4_N_INDEXER_HEAD_DIM);
+                        ds4_gpu_tensor *indexer_w_view =
+                            metal_graph_tensor_row_view(
+                                metal_graph_batch_indexer_weights(g), t,
+                                DS4_N_INDEXER_HEAD);
+                        ds4_gpu_tensor *selected_view =
+                            metal_graph_tensor_row_view(
+                                metal_graph_comp_selected(g), t,
+                                DS4_N_INDEXER_TOP_K);
+                        ds4_gpu_tensor *kv_view =
+                            metal_graph_tensor_row_view(
+                                metal_graph_batch_kv(g), t,
+                                DS4_N_HEAD_DIM);
+                        ok = indexer_q_view && indexer_w_view &&
+                             selected_view && kv_view &&
+                             ds4_gpu_indexer_score_one_tensor(
+                                 metal_graph_indexer_scores(g),
+                                 indexer_q_view, indexer_w_view,
+                                 g->layer_index_comp_cache[il],
+                                 index_counts[t], DS4_N_INDEXER_HEAD,
+                                 DS4_N_INDEXER_HEAD_DIM, index_scale) != 0 &&
+                             ds4_gpu_indexer_topk_tensor(
+                                 selected_view,
+                                 metal_graph_indexer_scores(g),
+                                 index_counts[t], 1u,
+                                 DS4_N_INDEXER_TOP_K) != 0 &&
+                             ds4_gpu_store_raw_kv_tensor(
+                                 g->layer_raw_cache[il], kv_view,
+                                 g->raw_cap, (pos0 + t) % g->raw_cap,
+                                 DS4_N_HEAD_DIM) != 0;
+                        if (ok && t + 1u == n_tokens &&
+                            metal_graph_dspark_validate_stage_layer(il) &&
+                            g->dspark_validate_batch_stages) {
+                            const uint64_t hc_elems =
+                                (uint64_t)DS4_N_HC * DS4_N_EMBD;
+                            ok = ds4_gpu_tensor_copy(
+                                    g->dspark_validate_batch_stages,
+                                    19u * hc_elems * sizeof(float),
+                                    selected_view, 0,
+                                    (uint64_t)DS4_N_INDEXER_TOP_K *
+                                        sizeof(int32_t)) != 0;
+                        }
+                        ds4_gpu_tensor_free(kv_view);
+                        ds4_gpu_tensor_free(selected_view);
+                        ds4_gpu_tensor_free(indexer_w_view);
+                        ds4_gpu_tensor_free(indexer_q_view);
+                    }
+                    DS4_VERIFY_ATTN_EVENT(
+                        DS4_GPU_VERIFY_STAGE_EVENT_ATTN_INDEXER_END);
                 }
                 if (ok) {
                     ok = ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
@@ -30494,6 +30560,7 @@ static bool metal_graph_encode_layer_attention_batch(
                 exact_head2_done = ok;
             }
         }
+
 #endif
 
         if (raw_prefix_tokens != 0) {
@@ -53128,6 +53195,26 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
 #endif
 }
 
+uint32_t ds4_engine_tp_runtime_features2(ds4_engine *e) {
+#if !defined(DS4_ROCM_BUILD)
+    (void)e;
+    return 0u;
+#else
+    if (!e || e->quality || e->support_kind != DS4_SUPPORT_DSPARK ||
+        !e->dspark ||
+        !metal_graph_tp_env_flag("DS4_TP_BATCH_ATTN_HEAD_SPLIT", false) ||
+        !metal_graph_tp_env_flag("DS4_ROCM_DSPARK_EXACT_ATTN_HEAD2", false)) {
+        return 0u;
+    }
+    uint32_t features = 0u;
+    if (metal_graph_tp_env_flag(
+            "DS4_ROCM_ENABLE_EXACT_INDEXER_TOKEN_BATCH", false)) {
+        features |= DS4_TP_FEATURE2_DSPARK_EXACT_INDEXER_TOKEN_BATCH;
+    }
+    return features;
+#endif
+}
+
 bool ds4_engine_has_output_head(ds4_engine *e) {
     return e && weights_have_output_head(&e->weights);
 }
@@ -60487,6 +60574,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
 #ifdef DS4_ROCM_BUILD
     ds4_gpu_set_tp_runtime_features((uint32_t)ds4_tp_rank(tp),
                                     ds4_tp_runtime_features(tp));
+    g_tp_runtime_features2 = ds4_tp_runtime_features2(tp);
 #endif
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);

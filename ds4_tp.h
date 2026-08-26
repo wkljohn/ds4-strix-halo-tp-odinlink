@@ -34,6 +34,12 @@ enum {
     DS4_TP_BATCH_MAX_ROWS = 8,
 };
 
+/* The primary feature word is full.  Keep verifier experiments in a second
+ * exact-matched hello word instead of aliasing an established production bit. */
+enum {
+    DS4_TP_FEATURE2_DSPARK_EXACT_INDEXER_TOKEN_BATCH = UINT32_C(1) << 0,
+};
+
 enum {
     DS4_TP_FEATURE_Q4K_WMMA = UINT32_C(1) << 0,
     /* The verifier attention head split changes the per-layer big-gate
@@ -162,6 +168,7 @@ typedef struct {
     uint32_t quant_bits;
     uint32_t ctx_size;
     uint32_t runtime_features;
+    uint32_t runtime_features2;
     /* Decode gate schedule, used to place RDMA recvs into the right slab
      * slot: slot(seq) = start + ((seq-1) % per_token) * step.
      * per_token 0 falls back to the identity mapping over all slots
@@ -240,9 +247,12 @@ bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *tp);
 bool ds4_tp_requires_host_slab(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 uint32_t ds4_tp_runtime_features(const ds4_tp *tp);
+uint32_t ds4_tp_runtime_features2(const ds4_tp *tp);
 #ifdef DS4_TP_TEST_HOOKS
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
                                                 char *err, size_t errlen);
+int ds4_tp_test_hello_validate_runtime_features2(uint32_t local, uint32_t peer,
+                                                 char *err, size_t errlen);
 int ds4_tp_test_select_transport(ds4_tp_transport requested,
                                  int local_rdma_ok,
                                  int peer_rdma_ok,

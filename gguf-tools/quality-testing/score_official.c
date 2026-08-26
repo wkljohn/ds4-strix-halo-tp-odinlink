@@ -642,6 +642,7 @@ int main(int argc, char **argv) {
             .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
             .ctx_size = (uint32_t)ctx_size,
             .runtime_features = ds4_engine_tp_runtime_features(engine),
+            .runtime_features2 = ds4_engine_tp_runtime_features2(engine),
         };
         ds4_engine_tp_gate_schedule(engine,
                                     &tp_id.gate_slot_start,

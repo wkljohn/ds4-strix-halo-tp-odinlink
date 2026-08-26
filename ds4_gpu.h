@@ -579,6 +579,22 @@ int ds4_gpu_indexer_scores_exact_token_loop_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         float                   scale);
+
+/* Exact small-width score plus top-k composition used by the DSpark verifier.
+ * Every authoritative row count must be strictly larger than top_k. */
+int ds4_gpu_indexer_select_exact_token_loop_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp,
+        uint32_t                score_stride,
+        uint32_t                n_tokens,
+        const uint32_t         *index_counts,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                top_k,
+        float                   scale);
 #endif
 
 int ds4_gpu_indexer_scores_prefill_tensor(

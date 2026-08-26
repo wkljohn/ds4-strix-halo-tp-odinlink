@@ -24,6 +24,26 @@ static int check(const char *name, uint32_t local, uint32_t peer, int want,
     return 1;
 }
 
+static int check2(const char *name, uint32_t local, uint32_t peer, int want,
+                  const char *want_error) {
+    char err[160] = "";
+    const int got = ds4_tp_test_hello_validate_runtime_features2(
+            local, peer, err, sizeof(err));
+    if (got != want) {
+        fprintf(stderr,
+                "FAIL %s: local=0x%08x peer=0x%08x got=%d want=%d\n",
+                name, local, peer, got, want);
+        return 0;
+    }
+    if (want_error && strcmp(err, want_error) != 0) {
+        fprintf(stderr, "FAIL %s: error='%s' want='%s'\n",
+                name, err, want_error);
+        return 0;
+    }
+    fprintf(stderr, "PASS %s\n", name);
+    return 1;
+}
+
 static int check_transport(const char *name,
                            ds4_tp_transport requested,
                            int local_rdma_ok,
@@ -132,6 +152,9 @@ int main(void) {
     ok &= check("hello mismatched-dspark-exact-attn-head2",
                 DS4_TP_FEATURE_DSPARK_EXACT_ATTN_HEAD2, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00800000 peer=0x00000000)");
+    ok &= check2("hello2 mismatched-dspark-indexer-token-batch",
+                 DS4_TP_FEATURE2_DSPARK_EXACT_INDEXER_TOKEN_BATCH, 0, 0,
+                 "tp hello: runtime feature2 mismatch (local=0x00000001 peer=0x00000000)");
     ok &= check("hello equal-dspark-batch-argmax",
                 DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX,
                 DS4_TP_FEATURE_DSPARK_BATCH_ARGMAX, 1, NULL);

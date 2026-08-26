@@ -607,7 +607,11 @@ printf -v PEER_REPO_Q '%q' "$PEER_REPO"
     [[ -n $path ]] || continue
     printf -v soname_q '%q' "$soname"
     printf -v path_q '%q' "$path"
-    "${PEER_SSH[@]}" "p=$path_q; n=$soname_q; test -r \"\$p\" || { printf '%s\\t%s\\tMISSING\\n' \"\$n\" \"\$p\"; exit 0; }; p=\$(readlink -f \"\$p\"); h=\$(sha256sum \"\$p\" | awk '{print \$1}'); printf '%s\\t%s\\t%s\\n' \"\$n\" \"\$p\" \"\$h\""
+    # An ssh client reads stdin unless detached.  This loop itself consumes
+    # ldd output, so detach every nested ssh or the first lookup drains the
+    # remaining library records and leaves a misleading one-line inventory.
+    "${PEER_SSH[@]}" "p=$path_q; n=$soname_q; test -r \"\$p\" || { printf '%s\\t%s\\tMISSING\\n' \"\$n\" \"\$p\"; exit 0; }; p=\$(readlink -f \"\$p\"); h=\$(sha256sum \"\$p\" | awk '{print \$1}'); printf '%s\\t%s\\t%s\\n' \"\$n\" \"\$p\" \"\$h\"" \
+      </dev/null
   done | sort > "$PEER_RUNTIME_INVENTORY"
 LOCAL_RUNTIME_INVENTORY_HASH=$(sha256sum "$LOCAL_RUNTIME_INVENTORY" | awk '{print $1}')
 PEER_RUNTIME_INVENTORY_HASH=$(sha256sum "$PEER_RUNTIME_INVENTORY" | awk '{print $1}')
@@ -618,6 +622,18 @@ PEER_RUNTIME_INVENTORY_HASH=$(sha256sum "$PEER_RUNTIME_INVENTORY" | awk '{print 
 if grep -q $'\tMISSING$' "$LOCAL_RUNTIME_INVENTORY" "$PEER_RUNTIME_INVENTORY"; then
   echo "error: runtime library inventory contains an unresolved library" >&2
   exit 1
+fi
+if ! grep -Eq $'^libamdhip64[^\t]*\t.*(rocm-7\.14|libamdhip64\.so\.7\.14\.)' \
+       "$LOCAL_RUNTIME_INVENTORY" ||
+   ! grep -Eq $'^libamdhip64[^\t]*\t.*(rocm-7\.14|libamdhip64\.so\.7\.14\.)' \
+       "$PEER_RUNTIME_INVENTORY"; then
+  if [[ ${DS4_ALLOW_UNVALIDATED_ROCM:-0} == 1 ]]; then
+    echo "warning: benchmark is using an explicitly allowed non-7.14 ROCm runtime" >&2
+  else
+    echo "error: Strix Halo benchmarks require ROCm 7.14 on both ranks" >&2
+    echo "       rebuild with make strix-halo; set DS4_ALLOW_UNVALIDATED_ROCM=1 only for cross-version research" >&2
+    exit 1
+  fi
 fi
 
 # Preserve the complete non-secret control configuration beside every run.

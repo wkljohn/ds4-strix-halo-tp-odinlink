@@ -41,6 +41,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
