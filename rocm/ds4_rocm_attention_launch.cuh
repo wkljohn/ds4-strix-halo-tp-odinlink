@@ -727,6 +727,30 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 
+static uint64_t g_attention_exact_head8_qk_pv_calls;
+static int g_attention_exact_head8_qk_pv_report_registered;
+
+static void attention_exact_head8_qk_pv_report(void) {
+    fprintf(stderr,
+            "ds4_rocm_exact_head8_qk_pv_summary calls=%llu\n",
+            (unsigned long long)g_attention_exact_head8_qk_pv_calls);
+}
+
+static int attention_exact_head8_qk_pv_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_ROCM_ENABLE_EXACT_HEAD8_QK_PV");
+        const char *disable = getenv("DS4_ROCM_DISABLE_EXACT_HEAD8_QK_PV");
+        enabled = value && strcmp(value, "1") == 0 &&
+                  !(disable && strcmp(disable, "1") == 0);
+        if (enabled && !g_attention_exact_head8_qk_pv_report_registered) {
+            g_attention_exact_head8_qk_pv_report_registered = 1;
+            (void)atexit(attention_exact_head8_qk_pv_report);
+        }
+    }
+    return enabled;
+}
+
 extern "C" int ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
         ds4_gpu_tensor       *heads,
         const void           *model_map,
@@ -763,6 +787,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
     }
     uint4 states[5] = {};
     uint32_t max_comp = 0u;
+    uint32_t max_raw = 0u;
     uint32_t score_stride = 0u;
     for (uint32_t t = 0; t < n_tokens; t++) {
         if (n_raw_by_token[t] == 0u || n_raw_by_token[t] > raw_cap ||
@@ -772,6 +797,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
         states[t] = make_uint4(n_raw_by_token[t], raw_start_by_token[t],
                                n_comp_by_token[t], visible_comp_by_token[t]);
         if (n_comp_by_token[t] > max_comp) max_comp = n_comp_by_token[t];
+        if (n_raw_by_token[t] > max_raw) max_raw = n_raw_by_token[t];
         const uint32_t rows = n_raw_by_token[t] +
             (top_k < visible_comp_by_token[t] ? top_k : visible_comp_by_token[t]);
         if (rows > score_stride) score_stride = rows;
@@ -808,6 +834,80 @@ extern "C" int ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
         }
         return cuda_ok(cudaGetLastError(),
                        "attention indexed exact head2 serial fallback");
+    }
+
+    /* Width two remains faster in the fused head-pair kernel. Widths three to
+     * five reuse each QK row across eight adjacent heads, retain the shipped
+     * softmax partition, and use an ordered head16/float4 PV grid. */
+    if (n_tokens >= 3u && attention_exact_head8_qk_pv_enabled()) {
+        g_attention_exact_head8_qk_pv_calls++;
+        const uint32_t raw_score_stride = max_raw + top_k;
+        const uint64_t weights_bytes =
+            (uint64_t)n_tokens * score_stride * n_head * sizeof(float);
+        const uint64_t inv_bytes =
+            (uint64_t)n_tokens * n_head * sizeof(float);
+        const uint64_t comp_rows_bytes =
+            (uint64_t)n_tokens * top_k * sizeof(uint32_t);
+        const uint64_t comp_counts_bytes =
+            (uint64_t)n_tokens * sizeof(uint32_t);
+        const uint64_t scores_bytes =
+            (uint64_t)n_tokens * raw_score_stride * n_head * sizeof(float);
+        uint64_t offset = 0u;
+        const uint64_t weights_offset = offset;
+        offset = (offset + weights_bytes + 255u) & ~UINT64_C(255);
+        const uint64_t inv_offset = offset;
+        offset = (offset + inv_bytes + 255u) & ~UINT64_C(255);
+        const uint64_t comp_rows_offset = offset;
+        offset = (offset + comp_rows_bytes + 255u) & ~UINT64_C(255);
+        const uint64_t comp_counts_offset = offset;
+        offset = (offset + comp_counts_bytes + 255u) & ~UINT64_C(255);
+        const uint64_t scores_offset = offset;
+        offset += scores_bytes;
+        unsigned char *scratch = (unsigned char *)cuda_tmp_alloc(
+            offset, "exact head8 QK/PV");
+        if (!scratch) return 0;
+        float *weights = (float *)(scratch + weights_offset);
+        float *inv_denoms = (float *)(scratch + inv_offset);
+        uint32_t *token_comp_rows =
+            (uint32_t *)(scratch + comp_rows_offset);
+        uint32_t *token_comp_counts =
+            (uint32_t *)(scratch + comp_counts_offset);
+        float *scores = (float *)(scratch + scores_offset);
+
+        const dim3 qk_grid((raw_score_stride + 31u) / 32u,
+                           (n_head + 7u) / 8u, n_tokens);
+        attention_decode_indexed_exact_head8_qk_kernel<<<qk_grid, 256>>>(
+            scores, (const float *)q->ptr, (const float *)raw_kv->ptr,
+            (const float *)comp_kv->ptr, (const int32_t *)topk->ptr,
+            n_tokens, raw_cap, top_k, n_head, head_dim, raw_score_stride,
+            states[0], states[1], states[2], states[3], states[4]);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention exact head8 QK launch")) return 0;
+
+        const dim3 softmax_grid(n_tokens, n_head / 2u, 1u);
+        const size_t softmax_shmem =
+            (size_t)top_k * (sizeof(uint32_t) + sizeof(uint16_t)) +
+            (size_t)32u * sizeof(float) + 4u;
+        attention_decode_indexed_exact_head2_softmax_kernel<<<
+            softmax_grid, 512, softmax_shmem>>>(
+                weights, inv_denoms, token_comp_rows, token_comp_counts,
+                scores, (const int32_t *)topk->ptr, sinks, n_tokens, top_k,
+                n_head, raw_score_stride, score_stride, states[0], states[1],
+                states[2], states[3], states[4]);
+        if (!cuda_ok(cudaGetLastError(),
+                     "attention exact head2 softmax launch")) return 0;
+
+        const dim3 pv_grid((n_head + 15u) / 16u,
+                           (head_dim + 63u) / 64u, n_tokens);
+        attention_decode_indexed_exact_head16_pv_vec4_kernel<<<
+            pv_grid, 256, (size_t)score_stride * sizeof(uint32_t)>>>(
+                (float *)heads->ptr, weights, inv_denoms, token_comp_rows,
+                token_comp_counts, (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr, n_tokens, raw_cap, top_k, n_head,
+                head_dim, score_stride, states[0], states[1], states[2],
+                states[3], states[4]);
+        return cuda_ok(cudaGetLastError(),
+                       "attention exact head16 PV launch");
     }
 
     const dim3 grid(n_tokens, n_head / 2u, 1u);

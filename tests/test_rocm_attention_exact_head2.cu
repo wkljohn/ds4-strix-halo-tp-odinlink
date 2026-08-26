@@ -96,6 +96,10 @@ static int compare_outputs(const char *label,
 
 int main(int argc, char **argv) {
     const uint32_t width = argc > 1 ? (uint32_t)atoi(argv[1]) : 5u;
+    const char *overlap = argc > 2 ? argv[2] : "production";
+    const char *candidate_env = getenv("DS4_TEST_EXACT_HEAD8_QK_PV");
+    const int test_candidate =
+        candidate_env && strcmp(candidate_env, "1") == 0;
     CHECK(width >= 2u && width <= MAX_W,
           "usage: test_rocm_attention_exact_head2 [2-5]");
     int devices = 0;
@@ -131,11 +135,29 @@ int main(int argc, char **argv) {
     uint32_t raw_start[MAX_W] = {251u, 252u, 253u, 254u, 255u};
     uint32_t n_comp[MAX_W] = {557u, 557u, 558u, 558u, 559u};
     uint32_t visible[MAX_W] = {553u, 554u, 555u, 556u, 557u};
+    const int crafted = strcmp(overlap, "zero") == 0 ||
+                        strcmp(overlap, "half") == 0 ||
+                        strcmp(overlap, "full") == 0;
+    CHECK(crafted || strcmp(overlap, "production") == 0,
+          "overlap must be production, zero, half, or full");
     for (uint32_t t = 0; t < MAX_W; t++) {
         for (uint32_t i = 0; i < TOP_K; i++) {
-            int32_t c = (int32_t)((i * 509u + t * 31u + 7u) % visible[t]);
-            if ((i % 97u) == 0u) c = -1;
-            else if ((i % 89u) == 0u) c = (int32_t)(visible[t] + 3u);
+            int32_t c = -1;
+            if (!crafted) {
+                c = (int32_t)((i * 509u + t * 31u + 7u) % visible[t]);
+                if ((i % 97u) == 0u) c = -1;
+                else if ((i % 89u) == 0u)
+                    c = (int32_t)(visible[t] + 3u);
+            } else if (i < 96u) {
+                if (strcmp(overlap, "zero") == 0) {
+                    c = (int32_t)(t * 96u + i);
+                } else if (strcmp(overlap, "full") == 0) {
+                    c = (int32_t)i;
+                } else {
+                    c = i < 48u ? (int32_t)i :
+                        (int32_t)(48u + t * 48u + (i - 48u));
+                }
+            }
             topk_h[(uint64_t)t * TOP_K + i] = c;
         }
     }
@@ -158,6 +180,10 @@ int main(int argc, char **argv) {
     CHECK(run_serial(&serial, &q, &raw, &comp, &topk, sinks, n_raw,
                      raw_start, n_comp, visible, RAW_CAP, width),
           "run serial oracle");
+    if (test_candidate) {
+        CHECK(setenv("DS4_ROCM_ENABLE_EXACT_HEAD8_QK_PV", "1", 1) == 0,
+              "enable exact head8 QK/PV candidate");
+    }
     CHECK(ds4_gpu_attention_indexed_mixed_exact_head2_batch_tensor(
               &candidate, sinks, sizeof(sinks), 0u, &q, &raw, &comp, 0u, &topk,
               width, RAW_CAP, TOP_K, N_HEAD, HEAD_DIM, n_raw, raw_start,
@@ -165,7 +191,8 @@ int main(int argc, char **argv) {
     const uint64_t bytes = (uint64_t)width * N_HEAD * HEAD_DIM * sizeof(float);
     CHECK(ds4_gpu_tensor_read(&serial, 0, ref_h, bytes) &&
           ds4_gpu_tensor_read(&candidate, 0, got_h, bytes), "read outputs");
-    CHECK(compare_outputs("head2", ref_h, got_h, width),
+    CHECK(compare_outputs(test_candidate ? "head8-qk-pv" : "head2",
+                          ref_h, got_h, width),
           "H=2 output must be bit-exact");
 
     /* Force the wrapper's raw-overwrite safety fallback. */
@@ -218,8 +245,11 @@ int main(int argc, char **argv) {
     float candidate_ms = 0.0f;
     CHECK(hipEventElapsedTime(&candidate_ms, start, stop) == hipSuccess,
           "candidate elapsed");
-    fprintf(stderr, "width=%u serial_ms=%.6f head2_ms=%.6f speedup=%.3fx\n",
-            width, serial_ms / ITERS, candidate_ms / ITERS,
+    fprintf(stderr,
+            "width=%u mode=%s overlap=%s serial_ms=%.6f head2_ms=%.6f "
+            "speedup=%.3fx\n",
+            width, test_candidate ? "head8-qk-pv" : "baseline", overlap,
+            serial_ms / ITERS, candidate_ms / ITERS,
             serial_ms / candidate_ms);
     CHECK(serial_ms / candidate_ms >= 1.0f,
           "unstaged H=2 prototype must not regress any width");

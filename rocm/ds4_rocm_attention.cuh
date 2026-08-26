@@ -778,6 +778,227 @@ __global__ static void attention_decode_indexed_exact_head2_batch_kernel(
     }
 }
 
+/* Regrid independent QK dots as 32 logical rows by eight head-contiguous
+ * lanes. Each lane calls the shipped serial float4 helper verbatim; only the
+ * mapping of independent (row, head) scores changes. Compressed scores remain
+ * indexed by their original top-k slot so softmax can compact them later
+ * without an atomic planning pass. */
+__global__ static void attention_decode_indexed_exact_head8_qk_kernel(
+        float *scores,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        const int32_t *topk,
+        uint32_t n_tokens,
+        uint32_t raw_cap,
+        uint32_t top_k,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t raw_score_stride,
+        uint4 state0,
+        uint4 state1,
+        uint4 state2,
+        uint4 state3,
+        uint4 state4) {
+    const uint32_t t = blockIdx.z;
+    const uint32_t local_row = threadIdx.x >> 3u;
+    const uint32_t local_head = threadIdx.x & 7u;
+    const uint32_t logical_row = blockIdx.x * 32u + local_row;
+    const uint32_t h = blockIdx.y * 8u + local_head;
+    if (t >= n_tokens || h >= n_head || blockDim.x != 256u ||
+        head_dim != 512u || logical_row >= raw_score_stride) return;
+
+    const uint4 state = attention_exact_state_for_token(
+        t, state0, state1, state2, state3, state4);
+    const uint32_t raw_stride = raw_score_stride - top_k;
+    const float *kv = NULL;
+    if (logical_row < raw_stride) {
+        if (logical_row >= state.x) return;
+        const uint32_t row = (state.y + logical_row) % raw_cap;
+        kv = raw_kv + (uint64_t)row * head_dim;
+    } else {
+        const uint32_t slot = logical_row - raw_stride;
+        const int32_t ci = topk[(uint64_t)t * top_k + slot];
+        if (ci < 0) return;
+        const uint32_t row = (uint32_t)ci;
+        if (row >= state.z || row >= state.w) return;
+        kv = comp_kv + (uint64_t)row * head_dim;
+    }
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const float dot = attention_dot_f32_vec4_oldhip(qh, kv, head_dim);
+    scores[((uint64_t)t * raw_score_stride + logical_row) * n_head + h] =
+        dot * rsqrtf((float)head_dim);
+}
+
+/* Preserve the shipped head-pair max/sum partition exactly, replacing only
+ * QK dot calls with score loads. The separate raw/comp max loops and single
+ * concatenated sum loop are numerically significant. */
+__global__ static void attention_decode_indexed_exact_head2_softmax_kernel(
+        float *weights,
+        float *inv_denoms,
+        uint32_t *token_comp_rows,
+        uint32_t *token_comp_counts,
+        const float *scores,
+        const int32_t *topk,
+        const float *sinks,
+        uint32_t n_tokens,
+        uint32_t top_k,
+        uint32_t n_head,
+        uint32_t raw_score_stride,
+        uint32_t weight_stride,
+        uint4 state0,
+        uint4 state1,
+        uint4 state2,
+        uint4 state3,
+        uint4 state4) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t subgroup = threadIdx.x >> 8u;
+    const uint32_t sub_tid = threadIdx.x & 255u;
+    const uint32_t h = blockIdx.y * 2u + subgroup;
+    if (t >= n_tokens || h >= n_head || blockDim.x != 512u) return;
+
+    extern __shared__ unsigned char smem_bytes[];
+    uint32_t *comp_rows = (uint32_t *)smem_bytes;
+    uint16_t *comp_slots = (uint16_t *)(comp_rows + top_k);
+    uintptr_t reduce_addr = (uintptr_t)(comp_slots + top_k);
+    reduce_addr = (reduce_addr + 3u) & ~(uintptr_t)3u;
+    float *reduce_max = (float *)reduce_addr;
+    float *reduce_sum = reduce_max + 16u;
+    __shared__ uint32_t comp_count_s;
+
+    const uint4 state = attention_exact_state_for_token(
+        t, state0, state1, state2, state3, state4);
+    const uint32_t n_raw = state.x;
+    const uint32_t raw_stride = raw_score_stride - top_k;
+    if (threadIdx.x == 0u) {
+        comp_count_s = 0u;
+        for (uint32_t i = 0u;
+             i < top_k && comp_count_s < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
+             i++) {
+            const int32_t ci = topk[(uint64_t)t * top_k + i];
+            if (ci < 0) continue;
+            const uint32_t row = (uint32_t)ci;
+            if (row < state.z && row < state.w) {
+                comp_rows[comp_count_s] = row;
+                comp_slots[comp_count_s] = (uint16_t)i;
+                comp_count_s++;
+            }
+        }
+        token_comp_counts[t] = comp_count_s;
+        for (uint32_t c = 0u; c < comp_count_s; c++) {
+            token_comp_rows[(uint64_t)t * top_k + c] = comp_rows[c];
+        }
+    }
+    __syncthreads();
+    const uint32_t comp_count = comp_count_s;
+    const float *token_scores =
+        scores + (uint64_t)t * raw_score_stride * n_head;
+
+    float local_max = sinks[h];
+    for (uint32_t r = sub_tid; r < n_raw; r += 256u) {
+        local_max = fmaxf(local_max,
+            token_scores[(uint64_t)r * n_head + h]);
+    }
+    for (uint32_t c = sub_tid; c < comp_count; c += 256u) {
+        const uint32_t slot = comp_slots[c];
+        local_max = fmaxf(local_max, token_scores[
+            (uint64_t)(raw_stride + slot) * n_head + h]);
+    }
+    float *head_reduce_max = reduce_max + subgroup * 8u;
+    float *head_reduce_sum = reduce_sum + subgroup * 8u;
+    const float max_score = attention_subgroup_max_oldhip_w32(
+        local_max, head_reduce_max, sub_tid);
+
+    const uint32_t n_rows = n_raw + comp_count;
+    float local_sum = 0.0f;
+    for (uint32_t r = sub_tid; r < n_rows; r += 256u) {
+        const float s = r < n_raw
+            ? token_scores[(uint64_t)r * n_head + h]
+            : token_scores[(uint64_t)(raw_stride + comp_slots[r - n_raw]) *
+                           n_head + h];
+        const float w = expf(s - max_score);
+        weights[((uint64_t)t * weight_stride + r) * n_head + h] = w;
+        local_sum += w;
+    }
+    if (sub_tid == 0u) local_sum += expf(sinks[h] - max_score);
+    const float denom = attention_subgroup_sum_oldhip_w32(
+        local_sum, head_reduce_sum, sub_tid);
+    if (sub_tid == 0u) {
+        inv_denoms[(uint64_t)t * n_head + h] = 1.0f / denom;
+    }
+}
+
+/* A token-grid, head-contiguous PV layout. Each lane owns four consecutive
+ * dimensions and retains one ordered raw-then-compressed recurrence per
+ * output. Row ids are staged once per CTA. */
+__global__ static void attention_decode_indexed_exact_head16_pv_vec4_kernel(
+        float *heads,
+        const float *weights,
+        const float *inv_denoms,
+        const uint32_t *token_comp_rows,
+        const uint32_t *token_comp_counts,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t n_tokens,
+        uint32_t raw_cap,
+        uint32_t top_k,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t weight_stride,
+        uint4 state0,
+        uint4 state1,
+        uint4 state2,
+        uint4 state3,
+        uint4 state4) {
+    const uint32_t t = blockIdx.z;
+    if (t >= n_tokens || blockDim.x != 256u || head_dim != 512u) return;
+    const uint4 state = attention_exact_state_for_token(
+        t, state0, state1, state2, state3, state4);
+    const uint32_t n_raw = state.x;
+    const uint32_t comp_count = token_comp_counts[t];
+    extern __shared__ uint32_t rows[];
+    for (uint32_t r = threadIdx.x; r < n_raw; r += blockDim.x) {
+        rows[r] = (state.y + r) % raw_cap;
+    }
+    for (uint32_t c = threadIdx.x; c < comp_count; c += blockDim.x) {
+        rows[n_raw + c] = token_comp_rows[(uint64_t)t * top_k + c];
+    }
+    __syncthreads();
+
+    const uint32_t h = blockIdx.x * 16u + (threadIdx.x & 15u);
+    const uint32_t d =
+        (blockIdx.y * 16u + (threadIdx.x >> 4u)) * 4u;
+    if (h >= n_head || d + 3u >= head_dim) return;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint32_t r = 0u; r < n_raw; r++) {
+        const float w =
+            weights[((uint64_t)t * weight_stride + r) * n_head + h];
+        const float4 v = *(const float4 *)(raw_kv +
+            (uint64_t)rows[r] * head_dim + d);
+        acc0 = fmaf(w, v.x, acc0);
+        acc1 = fmaf(w, v.y, acc1);
+        acc2 = fmaf(w, v.z, acc2);
+        acc3 = fmaf(w, v.w, acc3);
+    }
+    for (uint32_t c = 0u; c < comp_count; c++) {
+        const float w = weights[
+            ((uint64_t)t * weight_stride + n_raw + c) * n_head + h];
+        const float4 v = *(const float4 *)(comp_kv +
+            (uint64_t)rows[n_raw + c] * head_dim + d);
+        acc0 = fmaf(w, v.x, acc0);
+        acc1 = fmaf(w, v.y, acc1);
+        acc2 = fmaf(w, v.z, acc2);
+        acc3 = fmaf(w, v.w, acc3);
+    }
+    const float inv = inv_denoms[(uint64_t)t * n_head + h];
+    const uint64_t out = ((uint64_t)t * n_head + h) * head_dim + d;
+    heads[out + 0u] = acc0 * inv;
+    heads[out + 1u] = acc1 * inv;
+    heads[out + 2u] = acc2 * inv;
+    heads[out + 3u] = acc3 * inv;
+}
+
 __global__ static void attention_decode_mixed_kernel(
         float *heads,
         const float *sinks,
