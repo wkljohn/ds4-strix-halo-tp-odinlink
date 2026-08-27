@@ -67,17 +67,51 @@ def sharded_moe_two_ranks(x, gate, up, down, ids, weights, split=1024):
 
 
 def kda_reference(state, q, k, v, beta, gate):
-    """Reference linear-attention update used only for order/shape checks.
+    """Reference Kimi Delta Attention recurrent update.
 
-    State is [value][key].  The update is applied before the query read and
-    uses the same beta/gate for every key/value element, making accidental
-    rank-local transposes easy to detect.
+    ``state`` is [key][value].  KDA applies a *vector* channel-wise decay,
+    then subtracts the decayed state's prediction at ``k`` and writes the
+    rank-one correction.  This is the recurrence used by the upstream KDA
+    reference, not the older scalar-gate GDN approximation.
     """
-    value_dim, key_dim = len(state), len(state[0])
-    for i in range(value_dim):
-        for j in range(key_dim):
-            state[i][j] = gate * state[i][j] + beta * v[i] * k[j]
-    return [dot(row, q) for row in state]
+    key_dim, value_dim = len(state), len(state[0])
+    assert len(q) == key_dim and len(k) == key_dim
+    assert len(v) == value_dim and len(gate) == key_dim
+    for i in range(key_dim):
+        decay = math.exp(gate[i])
+        for j in range(value_dim):
+            state[i][j] *= decay
+    prediction = [sum(k[i] * state[i][j] for i in range(key_dim))
+                  for j in range(value_dim)]
+    for i in range(key_dim):
+        for j in range(value_dim):
+            state[i][j] += beta * k[i] * (v[j] - prediction[j])
+    return [sum(q[i] * state[i][j] for i in range(key_dim))
+            for j in range(value_dim)]
+
+
+def kda_sharded_output(state, q, k, v, beta, gate, split):
+    """Run KDA with key rows split across two ranks and compose the output."""
+    full = kda_reference([row[:] for row in state], q, k, v, beta, gate)
+    parts = []
+    for rank in (0, 1):
+        lo, hi = rank * split, (rank + 1) * split
+        local = [[0.0] * len(state[0]) for _ in range(len(state))]
+        # Each rank receives the same pre-update state rows it owns.  The
+        # prediction needs the global reduction, so compute that explicitly
+        # before applying the identical write to each owned row.
+        decayed = [[state[i][j] * math.exp(gate[i])
+                    for j in range(len(state[0]))]
+                   for i in range(len(state))]
+        prediction = [sum(k[i] * decayed[i][j] for i in range(len(state)))
+                      for j in range(len(state[0]))]
+        for i in range(lo, hi):
+            for j in range(len(state[0])):
+                local[i][j] = decayed[i][j] + beta * k[i] * (v[j] - prediction[j])
+        parts.append([sum(q[i] * local[i][j] for i in range(len(state)))
+                      for j in range(len(state[0]))])
+    composed = [sum(part[j] for part in parts) for j in range(len(parts[0]))]
+    return full, composed
 
 
 def nope_sparse_mla(query, keys, values, scores, top_k):
@@ -118,11 +152,21 @@ def test_nope_uses_selected_rows_only():
 
 
 def test_kda_update_is_deterministic():
-    initial = [[0.1 * (i + j + 1) for j in range(3)] for i in range(2)]
-    args = ([0.2, -0.1, 0.3], [0.5, -0.25, 0.75],
-            [1.0, -2.0], 0.125, 0.9)
+    initial = [[0.1 * (i + j + 1) for j in range(3)] for i in range(4)]
+    args = ([0.2, -0.1, 0.3, 0.4], [0.5, -0.25, 0.75, -0.2],
+            [1.0, -2.0, 0.5], 0.125, [-0.3, -0.1, -0.7, -0.2])
     assert close(kda_reference([row[:] for row in initial], *args),
                  kda_reference([row[:] for row in initial], *args))
+
+
+def test_kda_key_shards_require_global_prediction_reduction():
+    initial = [[0.03 * (i + 2 * j + 1) for j in range(3)] for i in range(4)]
+    q = [0.2, -0.1, 0.3, 0.4]
+    k = [0.5, -0.25, 0.75, -0.2]
+    v = [1.0, -2.0, 0.5]
+    full, composed = kda_sharded_output(initial, q, k, v, 0.125,
+                                         [-0.3, -0.1, -0.7, -0.2], 2)
+    assert close(full, composed)
 
 
 def test_intermediate_shards_compose_to_monolithic():
