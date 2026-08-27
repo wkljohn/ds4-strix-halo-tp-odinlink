@@ -158,6 +158,35 @@ def main(argv):
     if any(name.startswith("blk.45.hc_") for name in tensors):
         raise ValueError("block 45 unexpectedly contains mHC tensors")
 
+    # Validate every descriptor in each family.  A count-only check would let
+    # one malformed layer or an axis-swapped conversion pass unnoticed.
+    family_shapes = {
+        ".kda_q.weight": ((4096, 8192), 30),
+        ".kda_k.weight": ((4096, 8192), 30),
+        ".kda_v.weight": ((4096, 8192), 30),
+        ".kda_output.weight": ((8192, 4096), 30),
+        ".indexer.attn_q_b.weight": ((1536, 4096), 30),
+        ".indexer.attn_k.weight": ((4096, 128), 30),
+        ".indexer.proj.weight": ((4096, 32), 30),
+        ".attn_q_a.weight": ((4096, 1536), 8),
+        ".attn_q_b.weight": ((1536, 16384), 8),
+        ".attn_kv_a_mqa.weight": ((4096, 512), 8),
+        ".attn_k_b.weight": ((256, 512, 64), 8),
+        ".attn_v_b.weight": ((512, 256, 64), 8),
+        ".attn_output.weight": ((16384, 4096), 8),
+        ".ffn_gate_exps.weight": ((4096, 2048, 288), 12),
+        ".ffn_up_exps.weight": ((4096, 2048, 288), 12),
+        ".ffn_down_exps.weight": ((2048, 4096, 288), 12),
+        ".hc_attn_fn.weight": ((16384, 24), 30),
+        ".hc_ffn_fn.weight": ((16384, 24), 30),
+    }
+    for name, (shape, typ) in family_shapes.items():
+        for tensor_name, (got_shape, got_type, _offset) in tensors.items():
+            if (tensor_name.startswith("blk.") and tensor_name.endswith(name)
+                    and not (name.startswith(".attn_") and ".indexer." in tensor_name)):
+                if (got_shape, got_type) != (shape, typ):
+                    raise ValueError(f"tensor {tensor_name}: expected {(shape, typ)!r}, got {(got_shape, got_type)!r}")
+
     layers = Counter()
     for name in tensors:
         if name.startswith("blk.") and "." in name[4:]:
