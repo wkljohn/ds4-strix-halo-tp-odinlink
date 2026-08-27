@@ -42,6 +42,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_glm5_kda.h"
 #include "ds4_tp.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
@@ -4431,20 +4432,49 @@ typedef struct {
     ds4_tensor *output_norm;
     ds4_tensor *output;
     ds4_glm5_next_layer_weights layer[DS4_MAX_LAYER];
+    ds4_glm5_layer_kind schedule[DS4_MAX_LAYER];
+    uint32_t layer_count;
+    uint32_t kda_count;
+    bool schedule_valid;
+    bool kda_layouts_valid;
 } ds4_glm5_next_weights;
 
 static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
-                                   const ds4_model *m) {
+                                   const ds4_model *m,
+                                   uint32_t layer_count) {
     memset(w, 0, sizeof(*w));
+    if (layer_count == 0u || layer_count > DS4_MAX_LAYER) {
+        ds4_die("glm5-next layer count is outside the binding capacity");
+    }
     w->token_embd = required_tensor(m, "token_embd.weight");
     w->output_norm = required_tensor(m, "output_norm.weight");
     w->output = required_tensor(m, "output.weight");
 
-    for (uint32_t il = 0; il < 46u; ++il) {
+    bool has_kda_q[DS4_MAX_LAYER] = {false};
+    bool has_mla_q[DS4_MAX_LAYER] = {false};
+    for (uint32_t il = 0; il < layer_count; ++il) {
+        has_kda_q[il] = tensor_by_namef(m, "blk.%u.kda_q.weight", il) != NULL;
+        has_mla_q[il] = tensor_by_namef(m, "blk.%u.attn_q_a.weight", il) != NULL;
+        if (has_kda_q[il] == has_mla_q[il]) {
+            fprintf(stderr,
+                    "ds4: glm5-next layer %u must contain exactly one of "
+                    "kda_q or attn_q_a\n", il);
+            exit(1);
+        }
+    }
+    if (!ds4_glm5_kda_build_schedule(w->schedule, DS4_MAX_LAYER,
+                                     has_kda_q, has_mla_q, layer_count,
+                                     &w->kda_count)) {
+        ds4_die("glm5-next tensor-derived attention schedule is invalid");
+    }
+    w->layer_count = layer_count;
+    w->schedule_valid = true;
+
+    for (uint32_t il = 0; il < layer_count; ++il) {
         ds4_glm5_next_layer_weights *l = &w->layer[il];
         l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
         l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
-        if (il % 4u == 3u || il == 45u) {
+        if (!w->schedule[il].is_kda) {
             l->mla_q_a = required_tensorf(m, "blk.%u.attn_q_a.weight", il);
             l->mla_q_b = required_tensorf(m, "blk.%u.attn_q_b.weight", il);
             l->mla_kv_a_mqa = required_tensorf(m, "blk.%u.attn_kv_a_mqa.weight", il);
@@ -6054,18 +6084,20 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
     /* Keep the metadata gate and tensor gate together.  This is intentionally
      * run before graph construction; the legacy GLM-5.2 binder has a
      * different KDA/MLA schedule and must never see this model. */
-    tensor_expect_layout(required_tensor(m, "token_embd.weight"),
+    ds4_glm5_next_weights bound = {0};
+    glm5_next_weights_bind(&bound, m, layers);
+    tensor_expect_layout(bound.token_embd,
                          DS4_TENSOR_BF16, 2, 4096, 154880, 0);
-    tensor_expect_layout(required_tensor(m, "output_norm.weight"),
+    tensor_expect_layout(bound.output_norm,
                          DS4_TENSOR_F32, 1, 4096, 0, 0);
-    tensor_expect_layout(required_tensor(m, "output.weight"),
+    tensor_expect_layout(bound.output,
                          DS4_TENSOR_BF16, 2, 4096, 154880, 0);
-    for (uint32_t il = 0; il < 46; ++il) {
+    for (uint32_t il = 0; il < layers; ++il) {
         tensor_expect_layout(required_tensorf(m, "blk.%u.attn_norm.weight", il),
                              DS4_TENSOR_F32, 1, 4096, 0, 0);
         tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_norm.weight", il),
                              DS4_TENSOR_F32, 1, 4096, 0, 0);
-        if (il % 4u == 3u || il == 45u) {
+        if (!bound.schedule[il].is_kda) {
             tensor_expect_layout(required_tensorf(m, "blk.%u.attn_q_a.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 1536, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.attn_q_b.weight", il), DS4_TENSOR_Q8_0, 2, 1536, 16384, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.attn_kv_a_mqa.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 512, 0);
@@ -6119,15 +6151,10 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
             tensor_expect_layout(required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il), DS4_TENSOR_F32, 1, 3, 0, 0);
         }
     }
-
-    /* Exercise the real mmap-backed name-to-pointer binding before the
-     * fail-closed boundary.  The table is intentionally short-lived until
-     * the GLM graph owns a matching engine field; no model payload is copied. */
-    ds4_glm5_next_weights bound = {0};
-    glm5_next_weights_bind(&bound, m);
-    if (!bound.layer[0].kda_q || !bound.layer[3].mla_q_a ||
-        !bound.layer[3].ffn_gate_exps || !bound.layer[45].mla_output) {
-        ds4_die("glm5-next tensor binding produced an incomplete reference table");
+    bound.kda_layouts_valid = true;
+    if (!bound.schedule_valid || bound.layer_count != layers ||
+        bound.kda_count == 0u || !bound.kda_layouts_valid) {
+        ds4_die("glm5-next tensor-derived attention schedule was not validated");
     }
     ds4_die("glm5-next metadata and tensor binding are validated, but its graph is not implemented yet; refusing to run");
 }

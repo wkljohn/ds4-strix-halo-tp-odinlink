@@ -88,7 +88,20 @@ enum {
      * disables ordinary expert-id remapping. Independently launched ranks
      * must agree before that incompatible residency layout is created. */
     DS4_TP_FEATURE_Q4K_KSHARD = UINT32_C(1) << 19,
+    /* GLM-5.3 KDA keeps one FP32 recurrent state per tensor-derived KDA
+     * layer.  Exact negotiation prevents independently loaded ranks from
+     * entering different attention families or state schedules. */
+    DS4_TP_FEATURE_GLM5_RESIDENT_KDA = UINT32_C(1) << 20,
 };
+
+static inline uint32_t ds4_tp_glm5_resident_kda_feature(
+        int glm5_next,
+        int rocm_ready,
+        int schedule_valid,
+        int all_kda_layouts_valid) {
+    return glm5_next && rocm_ready && schedule_valid && all_kda_layouts_valid
+        ? DS4_TP_FEATURE_GLM5_RESIDENT_KDA : 0u;
+}
 
 static inline uint32_t ds4_tp_q4k_kshard_feature(
         const char *env,

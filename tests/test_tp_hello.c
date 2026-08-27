@@ -120,6 +120,12 @@ int main(void) {
     ok &= check("hello mismatched-q4k-kshard",
                 DS4_TP_FEATURE_Q4K_KSHARD, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00080000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-resident-kda",
+                DS4_TP_FEATURE_GLM5_RESIDENT_KDA,
+                DS4_TP_FEATURE_GLM5_RESIDENT_KDA, 1, NULL);
+    ok &= check("hello mismatched-glm5-resident-kda",
+                DS4_TP_FEATURE_GLM5_RESIDENT_KDA, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00100000 peer=0x00000000)");
     ok &= check("hello q4k-wmma-kshard mismatch",
                 DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD,
                 DS4_TP_FEATURE_Q4K_WMMA, 0,
@@ -150,6 +156,37 @@ int main(void) {
         ok = 0;
     } else {
         fprintf(stderr, "PASS expert split feature round trip\n");
+    }
+    const uint32_t prior_features =
+        DS4_TP_FEATURE_Q4K_WMMA |
+        DS4_TP_FEATURE_BATCH_ATTN_HEAD_SPLIT |
+        DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC |
+        DS4_TP_FEATURE_RDMA_LOGITS |
+        DS4_TP_FEATURE_RANK0_FULL_LOGITS |
+        DS4_TP_FEATURE_GREEDY_TOP2 |
+        DS4_TP_FEATURE_IQ2_I8_WMMA |
+        DS4_TP_FEATURE_TEMPORAL_COMPRESSOR |
+        DS4_TP_FEATURE_EXPERT_SPLIT_MASK |
+        DS4_TP_FEATURE_Q4K_FUSED_MID |
+        DS4_TP_FEATURE_HC_STAGE_EXACT_COOP |
+        DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE |
+        DS4_TP_FEATURE_Q4K_KSHARD;
+    if ((DS4_TP_FEATURE_GLM5_RESIDENT_KDA & prior_features) != 0u) {
+        fprintf(stderr, "FAIL GLM5 resident KDA feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS GLM5 resident KDA feature is disjoint\n");
+    }
+    if (ds4_tp_glm5_resident_kda_feature(1, 1, 1, 1) !=
+            DS4_TP_FEATURE_GLM5_RESIDENT_KDA ||
+        ds4_tp_glm5_resident_kda_feature(0, 1, 1, 1) != 0u ||
+        ds4_tp_glm5_resident_kda_feature(1, 0, 1, 1) != 0u ||
+        ds4_tp_glm5_resident_kda_feature(1, 1, 0, 1) != 0u ||
+        ds4_tp_glm5_resident_kda_feature(1, 1, 1, 0) != 0u) {
+        fprintf(stderr, "FAIL GLM5 resident KDA advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS GLM5 resident KDA advertisement predicate\n");
     }
     const char *invalid_kshard_env[] = {
         NULL, "", "0", "true", "10", "1 ", "1\n"

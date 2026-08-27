@@ -53,6 +53,29 @@ int ds4_glm5_kda_state_bytes(uint64_t kda_count, uint32_t slot_count,
     return 1;
 }
 
+int ds4_glm5_kda_build_schedule(ds4_glm5_layer_kind *out,
+                                uint32_t capacity,
+                                const bool *has_kda_q,
+                                const bool *has_mla_q,
+                                uint32_t layer_count,
+                                uint32_t *kda_count) {
+    if (!out || !has_kda_q || !has_mla_q || !kda_count ||
+        layer_count == 0u || capacity < layer_count) {
+        return 0;
+    }
+    uint32_t count = 0;
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        if (has_kda_q[layer] == has_mla_q[layer]) return 0;
+        if (has_kda_q[layer]) ++count;
+    }
+    for (uint32_t layer = 0; layer < layer_count; ++layer) {
+        out[layer].layer = layer;
+        out[layer].is_kda = has_kda_q[layer];
+    }
+    *kda_count = count;
+    return 1;
+}
+
 void ds4_glm5_kda_slot_free(ds4_glm5_kda_slot *slot) {
     if (!slot) return;
     if (slot->layer) {
