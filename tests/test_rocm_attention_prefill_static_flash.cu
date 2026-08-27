@@ -409,6 +409,32 @@ int main(void) {
     CHECK(memcmp(direct_small.data(), t2_gated_small.data(),
                  direct_small.size() * sizeof(float)) == 0,
           "T=2 gate must preserve direct-KV below its n_q threshold");
+
+    /* Exercise the paired-query tail immediately above the dispatch threshold.
+     * The final block owns one query and must not read or write its absent
+     * partner. */
+    constexpr uint32_t odd_rows = 33;
+    const size_t odd_elems = (size_t)odd_rows * n_head * head_dim;
+    std::vector<float> direct_odd(odd_elems), t2_odd(odd_elems);
+    unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2");
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+              &heads_dev, model.data(), model.size(), sinks_offset,
+              &q_dev, &raw_dev, &comp_dev, 0, 0, odd_rows, n_tokens,
+              n_comp, window, ratio, n_head, head_dim) &&
+          ds4_gpu_tensor_read(&heads_dev, 0, direct_odd.data(),
+                              direct_odd.size() * sizeof(float)),
+          "run odd direct-KV flash attention");
+    setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2", "1", 1);
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+              &heads_dev, model.data(), model.size(), sinks_offset,
+              &q_dev, &raw_dev, &comp_dev, 0, 0, odd_rows, n_tokens,
+              n_comp, window, ratio, n_head, head_dim) &&
+          ds4_gpu_tensor_read(&heads_dev, 0, t2_odd.data(),
+                              t2_odd.size() * sizeof(float)),
+          "run odd paired-query direct-KV flash attention");
+    CHECK(memcmp(direct_odd.data(), t2_odd.data(),
+                 direct_odd.size() * sizeof(float)) == 0,
+          "paired-query direct-KV odd tail must match direct-KV bitwise");
     unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2");
     unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT");
 
