@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Read-only structural checker for the GLM-5.3-Flash GGUF contract.
+
+It reads only the GGUF header, metadata and tensor descriptors; tensor payloads
+are never mapped or allocated.  The checker intentionally accepts extension
+quantization type 30 as opaque until its codec is implemented.
+"""
+from __future__ import annotations
+
+import struct
+import sys
+from collections import Counter
+from pathlib import Path
+
+
+class Reader:
+    def __init__(self, fp):
+        self.fp = fp
+
+    def u8(self): return struct.unpack("<B", self.fp.read(1))[0]
+    def u32(self): return struct.unpack("<I", self.fp.read(4))[0]
+    def u64(self): return struct.unpack("<Q", self.fp.read(8))[0]
+
+    def string(self):
+        n = self.u64()
+        b = self.fp.read(n)
+        if len(b) != n:
+            raise ValueError("truncated GGUF string")
+        return b.decode("utf-8", "replace")
+
+    def skip_value(self, typ):
+        sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4,
+                 7: 1, 10: 8, 11: 8, 12: 8}
+        if typ in sizes:
+            self.fp.seek(sizes[typ], 1)
+        elif typ == 8:
+            self.fp.seek(self.u64(), 1)
+        elif typ == 9:
+            elem = self.u32()
+            for _ in range(self.u64()):
+                self.skip_value(elem)
+        else:
+            raise ValueError(f"unsupported metadata type {typ}")
+
+
+def read(path: Path):
+    with path.open("rb") as fp:
+        r = Reader(fp)
+        magic, version, nt, nk = struct.unpack("<IIQQ", fp.read(24))
+        if magic != 0x46554747 or version != 3:
+            raise ValueError("expected GGUF version 3")
+        meta = {}
+        for _ in range(nk):
+            key = r.string()
+            typ = r.u32()
+            if typ == 8:
+                meta[key] = r.string()
+            elif typ == 4:
+                meta[key] = r.u32()
+            elif typ == 6:
+                meta[key] = struct.unpack("<f", fp.read(4))[0]
+            elif typ == 7:
+                meta[key] = bool(r.u8())
+            elif typ == 10:
+                meta[key] = r.u64()
+            else:
+                r.skip_value(typ)
+        tensors = {}
+        for _ in range(nt):
+            name = r.string()
+            nd = r.u32()
+            dims = tuple(r.u64() for _ in range(nd))
+            typ = r.u32()
+            offset = r.u64()
+            tensors[name] = (dims, typ, offset)
+        return meta, tensors
+
+
+def require(meta, key, expected):
+    got = meta.get(key)
+    if got != expected:
+        raise ValueError(f"metadata {key}: expected {expected!r}, got {got!r}")
+
+
+def main(argv):
+    if len(argv) != 2:
+        print(f"usage: {argv[0]} MODEL.gguf", file=sys.stderr)
+        return 2
+    meta, tensors = read(Path(argv[1]))
+    require(meta, "general.architecture", "glm5-next")
+    for key, value in {
+        "glm5-next.block_count": 46,
+        "glm5-next.trunk_block_count": 45,
+        "glm5-next.nextn_predict_layers": 1,
+        "glm5-next.embedding_length": 4096,
+        "glm5-next.vocab_size": 154880,
+        "glm5-next.expert_count": 288,
+        "glm5-next.expert_used_count": 8,
+        "glm5-next.expert_feed_forward_length": 2048,
+        "glm5-next.feed_forward_length": 12288,
+        "glm5-next.attention.head_count": 64,
+        "glm5-next.attention.key_length": 256,
+        "glm5-next.attention.value_length": 256,
+        "glm5-next.attention.indexer.top_k": 2048,
+        "glm5-next.linear_attention.conv_kernel": 4,
+    }.items():
+        require(meta, key, value)
+
+    required = {
+        "blk.3.ffn_gate_exps.weight": ((4096, 2048, 288), 12),
+        "blk.3.ffn_up_exps.weight": ((4096, 2048, 288), 12),
+        "blk.3.ffn_down_exps.weight": ((2048, 4096, 288), 12),
+        "blk.0.kda_q.weight": ((4096, 8192), 30),
+        "blk.3.attn_q_a.weight": ((4096, 1536), 8),
+        "blk.3.hc_attn_fn.weight": ((16384, 24), 30),
+    }
+    for name, (shape, typ) in required.items():
+        got = tensors.get(name)
+        if got is None or got[:2] != (shape, typ):
+            raise ValueError(f"tensor {name}: expected shape/type {(shape, typ)!r}, got {got!r}")
+
+    layers = Counter()
+    for name in tensors:
+        if name.startswith("blk.") and "." in name[4:]:
+            layers[name.split(".", 2)[1]] += 1
+    print("PASS glm5-next metadata/tensor contract")
+    print(f"tensors={len(tensors)} routed_expert_layers="
+          f"{sum(1 for n in tensors if n.endswith('ffn_gate_exps.weight'))}")
+    print("type_counts=" + ",".join(f"{k}:{v}" for k, v in sorted(Counter(t[1] for t in tensors.values()).items())))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
