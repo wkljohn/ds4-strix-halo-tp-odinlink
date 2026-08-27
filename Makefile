@@ -80,7 +80,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
 	python3 tests/test_frontier_logits_gate.py
@@ -215,6 +215,14 @@ tests/roce_v2_mr_probe: tests/roce_v2_mr_probe.cpp
 test-roce-v2-mr: tests/roce_v2_mr_probe
 	@test -n "$(RDMA_DEVICE)" || { echo "error: set RDMA_DEVICE=mlx5_N" >&2; exit 2; }
 	./tests/roce_v2_mr_probe "$(RDMA_DEVICE)"
+
+tests/rocm_gtt_residency_probe: tests/rocm_gtt_residency_probe.cu
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $<
+
+test-rocm-gtt-residency: tests/rocm_gtt_residency_probe
+	@test -n "$(GTT_RESIDENT_BYTES)" || { \
+		echo "error: set GTT_RESIDENT_BYTES to the planner's required_resident_bytes" >&2; exit 2; }
+	./tests/rocm_gtt_residency_probe "$(GTT_RESIDENT_BYTES)"
 
 tests/ds4_tp_completion_ordering.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1 \
