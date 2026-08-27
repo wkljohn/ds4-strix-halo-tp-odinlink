@@ -15,6 +15,17 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 GATE = REPO / "scripts" / "candidate-gate.py"
+GLM_TP_LAYOUT = {
+    "kind": "q4k-ffn-intermediate",
+    "intermediate_size": 2048,
+    "shards": [1024, 1024],
+    "expert_count": 288,
+    "experts_used": 8,
+    "reduction": {
+        "op": "sum", "scope": "all-ranks", "count": 42,
+        "width": 4096, "dtype": "f32",
+    },
+}
 
 
 def digest(path: Path) -> str:
@@ -42,7 +53,7 @@ def write_manifest(path: Path, values: dict[str, object]) -> None:
     path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
 
 
-def build_fixture(root: Path) -> Path:
+def build_fixture(root: Path, structured: bool = False) -> Path:
     model = root / "model.gguf"
     model.write_bytes(b"synthetic model")
     model_size, model_sample = sampled(model)
@@ -79,7 +90,7 @@ def build_fixture(root: Path) -> Path:
                     "gen_token_fnv64": fnv,
                 })
             manifest = csv_path.with_suffix(".manifest")
-            write_manifest(manifest, {
+            manifest_values = {
                 "tag": name, "run_id": f"{name}-run-id",
                 "source_commit": source_commit, "source_dirty": 0,
                 "model_size": model_size, "model_sample_sha256": model_sample,
@@ -87,7 +98,18 @@ def build_fixture(root: Path) -> Path:
                 "frontier": 2048, "generated_tokens": 300, "context": 4096,
                 "prefill_chunk": 2048, "dspark": 0, "rdma_profile": provider,
                 "ds4_sha256": "b" * 64, "peer_ds4_sha256": "b" * 64,
-            })
+            }
+            if structured:
+                manifest_values.update({
+                    "tp_weight_layout": "q4k-ffn-intermediate",
+                    "tp_intermediate_size": "2048",
+                    "tp_intermediate_shards": "1024/1024",
+                    "tp_expert_count": "288", "tp_experts_used": "8",
+                    "tp_reduce_op": "sum", "tp_reduce_scope": "all-ranks",
+                    "tp_reduce_count": "42", "tp_reduce_width": "4096",
+                    "tp_reduce_dtype": "f32",
+                })
+            write_manifest(manifest, manifest_values)
             benchmarks.append({
                 "path": str(csv_path), "sha256": digest(csv_path),
                 "manifest_sha256": digest(manifest),
@@ -157,13 +179,14 @@ def build_fixture(root: Path) -> Path:
     quality_ref = {"sha256": digest(quality_path),
                    "manifest_sha256": digest(quality_manifest)}
     record = {
-        "schema_version": 1, "kind": "ds4-numerical-baseline",
+        "schema_version": 2 if structured else 1,
+        "kind": "ds4-numerical-baseline",
         "key": {
             "model_sample_sha256": model_sample, "model_sha256": model_sha,
             "model_size": model_size, "quantization": "Q4_K",
             "source_commit": source_commit, "toolchain_id": toolchain,
             "architecture": "gfx1151", "tp_degree": 2,
-            "expert_split": "128/128", "decode_mode": "ordinary-greedy",
+            "decode_mode": "ordinary-greedy",
             "workload_id": "ds4-bench-tp-2048x300",
             "workload": {
                 "prompt_sha256": prompt_sha, "frontier": "2048",
@@ -182,6 +205,10 @@ def build_fixture(root: Path) -> Path:
         "thresholds": {"numerical": numerical_thresholds,
                        "quality": quality_thresholds},
     }
+    if structured:
+        record["key"]["tp_layout"] = GLM_TP_LAYOUT
+    else:
+        record["key"]["expert_split"] = "128/128"
     genesis = {
         "schema_version": 1, "kind": "ds4-baseline-genesis",
         "genesis_id": "fixture-rocm714", "rationale": "test fixture",
@@ -210,10 +237,10 @@ def run_gate(root: Path, genesis: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def expect_failure(mutator, expected: str) -> None:
+def expect_failure(mutator, expected: str, structured: bool = False) -> None:
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        genesis = build_fixture(root)
+        genesis = build_fixture(root, structured=structured)
         mutator(root, genesis)
         result = run_gate(root, genesis)
         assert result.returncode != 0
@@ -259,6 +286,18 @@ def main() -> int:
         assert duplicate.returncode != 0
         assert "refusing to overwrite" in duplicate.stderr
 
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        genesis = build_fixture(root, structured=True)
+        result = run_gate(root, genesis)
+        if result.returncode != 0:
+            raise AssertionError(result.stderr)
+        baseline_id = result.stdout.strip()
+        baseline = root / "baselines" / "sha256" / f"{baseline_id[7:]}.json"
+        value = json.loads(baseline.read_text())
+        assert value["schema_version"] == 2
+        assert value["key"]["tp_layout"] == GLM_TP_LAYOUT
+
     expect_failure(
         lambda _root, genesis: mutate_genesis(
             genesis, lambda value: value["record"]["reference"].__setitem__(
@@ -301,6 +340,35 @@ def main() -> int:
                 value["record"]["key"].pop("source_commit"),
                 value["record"]["key"].pop("toolchain_id"))),
         "requires source and toolchain identity")
+    expect_failure(
+        lambda _root, genesis: mutate_genesis(
+            genesis, lambda value: value["record"]["key"]["tp_layout"].__setitem__(
+                "kind", "q4k-ffn-intermedate")),
+        "unsupported kind", structured=True)
+    expect_failure(
+        lambda _root, genesis: mutate_genesis(
+            genesis, lambda value: value["record"]["key"].__setitem__(
+                "expert_split", "128/128")),
+        "exactly one", structured=True)
+    expect_failure(
+        lambda _root, genesis: mutate_genesis(
+            genesis, lambda value: value["record"]["key"]["tp_layout"].__setitem__(
+                "shards", [1024, 1000])),
+        "shards must be positive", structured=True)
+    expect_failure(
+        lambda _root, genesis: mutate_genesis(
+            genesis, lambda value: value["record"]["key"]["tp_layout"].__setitem__(
+                "experts_used", 289)),
+        "invalid expert topology", structured=True)
+    expect_failure(
+        lambda _root, genesis: mutate_benchmark_manifest(
+            genesis, 0, lambda values: values.pop("tp_reduce_width")),
+        "differs in tp_reduce_width", structured=True)
+    expect_failure(
+        lambda _root, genesis: mutate_genesis(
+            genesis, lambda value: value["record"].__setitem__(
+                "schema_version", 1)),
+        "schema v1 requires legacy", structured=True)
 
     def symlink_escape(root: Path, genesis: Path) -> None:
         value = json.loads(genesis.read_text())

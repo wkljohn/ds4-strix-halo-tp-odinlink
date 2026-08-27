@@ -92,6 +92,7 @@ for index, teacher in enumerate(tokens):
             "key": {
                 "model_sample_sha256": "a" * 64, "model_sha256": "b" * 64,
                 "model_size": 5, "quantization": "Q4_K",
+                "expert_split": "128/128",
                 "workload": {"frontier": "2048", "frozen_token_sha256": token_sha},
             },
             "reference": {

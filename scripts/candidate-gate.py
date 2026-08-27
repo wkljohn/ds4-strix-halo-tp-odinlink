@@ -232,6 +232,97 @@ def dossier_path(root: Path, candidate_id: str) -> Path:
     return root / "candidates" / candidate_id
 
 
+def tp_layout_contract(value: dict, label: str) -> dict:
+    """Return a canonical, fail-closed TP weight-layout contract.
+
+    Baseline schema v1 and existing candidate dossiers describe DeepSeek's
+    historical expert ownership with ``expert_split=128/128``.  Schema v2
+    records use a structured discriminated layout so an FFN-intermediate
+    shard cannot be mistaken for expert ownership.
+    """
+    if not isinstance(value, dict):
+        raise GateError(f"{label} must be an object")
+    has_legacy = "expert_split" in value
+    has_structured = "tp_layout" in value
+    if has_legacy == has_structured:
+        raise GateError(
+            f"{label} must contain exactly one of expert_split or tp_layout")
+    if has_legacy:
+        if value.get("expert_split") != "128/128":
+            raise GateError(f"{label} has an unsupported legacy expert split")
+        return {"expert_split": "128/128"}
+
+    layout = value.get("tp_layout")
+    if not isinstance(layout, dict):
+        raise GateError(f"{label}.tp_layout must be an object")
+    expected_fields = {
+        "kind", "intermediate_size", "shards", "expert_count",
+        "experts_used", "reduction",
+    }
+    if set(layout) != expected_fields:
+        raise GateError(
+            f"{label}.tp_layout fields must be exactly " +
+            ", ".join(sorted(expected_fields)))
+    if layout.get("kind") != "q4k-ffn-intermediate":
+        raise GateError(f"{label}.tp_layout has an unsupported kind")
+    tp_degree = value.get("tp_degree")
+    intermediate_size = layout.get("intermediate_size")
+    shards = layout.get("shards")
+    expert_count = layout.get("expert_count")
+    experts_used = layout.get("experts_used")
+    if (type(tp_degree) is not int or tp_degree <= 0 or
+            type(intermediate_size) is not int or intermediate_size <= 0 or
+            not isinstance(shards, list) or len(shards) != tp_degree or
+            any(type(shard) is not int or shard <= 0 for shard in shards) or
+            sum(shards) != intermediate_size):
+        raise GateError(
+            f"{label}.tp_layout shards must be positive integers matching "
+            "tp_degree and intermediate_size")
+    if (type(expert_count) is not int or expert_count <= 0 or
+            type(experts_used) is not int or experts_used <= 0 or
+            experts_used > expert_count):
+        raise GateError(f"{label}.tp_layout has invalid expert topology")
+    reduction = layout.get("reduction")
+    reduction_fields = {"op", "scope", "count", "width", "dtype"}
+    if (not isinstance(reduction, dict) or
+            set(reduction) != reduction_fields or
+            reduction.get("op") != "sum" or
+            reduction.get("scope") != "all-ranks" or
+            reduction.get("dtype") != "f32" or
+            type(reduction.get("count")) is not int or
+            reduction["count"] <= 0 or
+            type(reduction.get("width")) is not int or
+            reduction["width"] <= 0):
+        raise GateError(f"{label}.tp_layout has an invalid reduction contract")
+    return {"tp_layout": json.loads(json.dumps(layout, sort_keys=True))}
+
+
+def tp_layout_manifest_fields(contract: dict) -> dict[str, str]:
+    if "expert_split" in contract:
+        return {}
+    layout = contract["tp_layout"]
+    reduction = layout["reduction"]
+    return {
+        "tp_weight_layout": layout["kind"],
+        "tp_intermediate_size": str(layout["intermediate_size"]),
+        "tp_intermediate_shards": "/".join(str(item) for item in layout["shards"]),
+        "tp_expert_count": str(layout["expert_count"]),
+        "tp_experts_used": str(layout["experts_used"]),
+        "tp_reduce_op": reduction["op"],
+        "tp_reduce_scope": reduction["scope"],
+        "tp_reduce_count": str(reduction["count"]),
+        "tp_reduce_width": str(reduction["width"]),
+        "tp_reduce_dtype": reduction["dtype"],
+    }
+
+
+def verify_tp_layout_manifest(manifest: dict[str, str], contract: dict,
+                              label: str) -> None:
+    for key, expected in tp_layout_manifest_fields(contract).items():
+        if manifest.get(key) != expected:
+            raise GateError(f"{label} differs in {key}")
+
+
 def load_baseline(root: Path, baseline_id: str) -> tuple[Path, dict]:
     match = re.fullmatch(r"sha256:([0-9a-f]{64})", baseline_id)
     if not match:
@@ -246,11 +337,17 @@ def load_baseline(root: Path, baseline_id: str) -> tuple[Path, dict]:
         raise GateError(f"invalid baseline JSON: {error}") from error
     if canonical_sha256(value) != digest:
         raise GateError(f"baseline content digest does not match its id: {path}")
-    if value.get("schema_version") != 1 or value.get("kind") != "ds4-numerical-baseline":
+    if value.get("schema_version") not in {1, 2} or value.get("kind") != "ds4-numerical-baseline":
         raise GateError(f"unsupported baseline schema: {path}")
     for section in ("key", "reference", "thresholds", "provenance"):
         if not isinstance(value.get(section), dict):
             raise GateError(f"baseline is missing {section}: {path}")
+    key = value["key"]
+    layout = tp_layout_contract(key, "baseline key")
+    if value["schema_version"] == 1 and "expert_split" not in layout:
+        raise GateError(f"baseline schema v1 requires legacy expert ownership: {path}")
+    if value["schema_version"] == 2 and "tp_layout" not in layout:
+        raise GateError(f"baseline schema v2 requires structured TP layout: {path}")
     fnv = str(value["reference"].get("fnv64", ""))
     if not re.fullmatch(r"[0-9a-f]{16}", fnv):
         raise GateError(f"baseline has invalid reference fingerprint: {path}")
@@ -354,7 +451,7 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
     if not isinstance(record, dict) or not isinstance(artifacts, dict):
         raise GateError("baseline genesis requires record and artifacts objects")
     record = json.loads(json.dumps(record))
-    if (record.get("schema_version") != 1 or
+    if (record.get("schema_version") not in {1, 2} or
             record.get("kind") != "ds4-numerical-baseline"):
         raise GateError("baseline genesis record has an unsupported schema")
     for section in ("key", "reference", "thresholds"):
@@ -370,9 +467,14 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
             "baseline genesis cannot preapprove canonical oracles or generators")
     workload = key.get("workload")
     if (not isinstance(workload, dict) or key.get("architecture") != "gfx1151" or
-            key.get("tp_degree") != 2 or key.get("expert_split") != "128/128" or
+            key.get("tp_degree") != 2 or
             key.get("decode_mode") != "ordinary-greedy"):
         raise GateError("baseline genesis is not balanced ordinary gfx1151 TP=2")
+    layout = tp_layout_contract(key, "baseline genesis key")
+    if record["schema_version"] == 1 and "expert_split" not in layout:
+        raise GateError("baseline genesis schema v1 requires legacy expert ownership")
+    if record["schema_version"] == 2 and "tp_layout" not in layout:
+        raise GateError("baseline genesis schema v2 requires structured TP layout")
     if (not re.fullmatch(r"[0-9a-f]{40}", str(key.get("source_commit", ""))) or
             not isinstance(key.get("toolchain_id"), str) or
             not key["toolchain_id"]):
@@ -430,6 +532,8 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
                 manifest.get("toolchain_id") != key.get("toolchain_id") or
                 manifest.get("dspark") != "0"):
             raise GateError("baseline genesis benchmark identity mismatch")
+        verify_tp_layout_manifest(manifest, layout,
+                                  "baseline genesis benchmark layout")
         for field in ("prompt_sha256", "frontier", "generated_tokens",
                       "context", "prefill_chunk", "dspark"):
             if manifest.get(field) != str(workload.get(field, "")):
@@ -1044,10 +1148,11 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
                     not target_definition["id"]):
                 raise GateError("Lane C requires an explicit target definition id")
         if (not isinstance(workload, dict) or workload.get("architecture") != "gfx1151" or
-                workload.get("tp_degree") != 2 or workload.get("expert_split") != "128/128" or
+                workload.get("tp_degree") != 2 or
                 workload.get("decode_mode") != "ordinary-greedy" or
                 not isinstance(workload.get("workload_id"), str) or not workload["workload_id"]):
             raise GateError("candidate workload is not the ordinary balanced gfx1151 TP=2 contract")
+        candidate_layout = tp_layout_contract(workload, "candidate workload")
         providers = transport.get("providers") if isinstance(transport, dict) else None
         if (not isinstance(providers, list) or not providers or
                 any(provider not in {"odinlink", "roce-v2"} for provider in providers)):
@@ -1075,6 +1180,11 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
                     raise GateError(f"candidate benchmark differs from baseline workload: {key}")
             if manifest.get("rdma_profile") not in providers:
                 raise GateError("candidate benchmark used an undeclared RDMA provider")
+            verify_tp_layout_manifest(manifest, candidate_layout,
+                                      "candidate benchmark layout")
+        baseline_layout = tp_layout_contract(baseline_key, "predecessor baseline key")
+        if candidate_layout != baseline_layout:
+            raise GateError("candidate TP layout differs from predecessor baseline")
         numerical_paths = paths_by_kind.get("numerical-envelope", [])
         quality_paths = paths_by_kind.get("reference-score", [])
         if len(numerical_paths) != 1 or len(quality_paths) != 1:
@@ -1119,7 +1229,7 @@ def promote_candidate(repo: Path, root: Path, candidate_id: str) -> None:
         workload = value["workload"]
         toolchain = value["toolchain"]
         record = {
-            "schema_version": 1,
+            "schema_version": derived["baseline"]["schema_version"],
             "kind": "ds4-numerical-baseline",
             "key": {
                 "model_sample_sha256": model["sample_sha256"],
@@ -1130,7 +1240,6 @@ def promote_candidate(repo: Path, root: Path, candidate_id: str) -> None:
                 "toolchain_id": toolchain["id"],
                 "architecture": workload["architecture"],
                 "tp_degree": workload["tp_degree"],
-                "expert_split": workload["expert_split"],
                 "decode_mode": workload["decode_mode"],
                 "workload_id": workload["workload_id"],
                 "workload": {
@@ -1166,6 +1275,7 @@ def promote_candidate(repo: Path, root: Path, candidate_id: str) -> None:
             },
             "oracle_generators": derived["baseline"].get("oracle_generators", []),
         }
+        record["key"].update(tp_layout_contract(workload, "candidate workload"))
         record["key"]["workload"]["frozen_token_sha256"] = \
             derived["baseline"]["key"]["workload"]["frozen_token_sha256"]
         if value["lane"] == "C" and derived["target_definition"].get("changed") is True:
