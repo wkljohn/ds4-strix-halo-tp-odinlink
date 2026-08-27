@@ -4401,6 +4401,105 @@ static void tensor_expect_layout(
     }
 }
 
+/* GLM-5.3 has a different graph and therefore cannot use ds4_layer_weights,
+ * whose fields encode the older GLM/DeepSeek attention schedule.  This small
+ * reference-only table reuses the normal GGUF name lookup and mmap-backed
+ * ds4_tensor pointers without allocating or copying any payload.  It is the
+ * first binding stage for glm5-next; execution remains fail-closed below. */
+typedef struct {
+    ds4_tensor *attn_norm;
+    ds4_tensor *ffn_norm;
+    ds4_tensor *kda_q, *kda_k, *kda_v, *kda_output;
+    ds4_tensor *kda_q_conv, *kda_k_conv, *kda_v_conv;
+    ds4_tensor *kda_f_a, *kda_f_b, *kda_g_a, *kda_g_b, *kda_beta;
+    ds4_tensor *kda_o_norm, *kda_dt_bias, *kda_a_log;
+    ds4_tensor *mla_q_a, *mla_q_b, *mla_kv_a_mqa, *mla_k_b, *mla_v_b;
+    ds4_tensor *mla_output;
+    ds4_tensor *indexer_q_b, *indexer_k, *indexer_proj;
+    ds4_tensor *indexer_pool_ape, *indexer_pool_gate;
+    ds4_tensor *indexer_k_norm, *indexer_k_norm_b;
+    ds4_tensor *ffn_gate, *ffn_up, *ffn_down;
+    ds4_tensor *ffn_gate_exps, *ffn_up_exps, *ffn_down_exps;
+    ds4_tensor *ffn_gate_inp, *exp_probs_b;
+    ds4_tensor *ffn_gate_shexp, *ffn_up_shexp, *ffn_down_shexp;
+    ds4_tensor *hc_attn_fn, *hc_ffn_fn, *hc_attn_base, *hc_ffn_base;
+    ds4_tensor *hc_attn_scale, *hc_ffn_scale;
+} ds4_glm5_next_layer_weights;
+
+typedef struct {
+    ds4_tensor *token_embd;
+    ds4_tensor *output_norm;
+    ds4_tensor *output;
+    ds4_glm5_next_layer_weights layer[DS4_MAX_LAYER];
+} ds4_glm5_next_weights;
+
+static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
+                                   const ds4_model *m) {
+    memset(w, 0, sizeof(*w));
+    w->token_embd = required_tensor(m, "token_embd.weight");
+    w->output_norm = required_tensor(m, "output_norm.weight");
+    w->output = required_tensor(m, "output.weight");
+
+    for (uint32_t il = 0; il < 46u; ++il) {
+        ds4_glm5_next_layer_weights *l = &w->layer[il];
+        l->attn_norm = required_tensorf(m, "blk.%u.attn_norm.weight", il);
+        l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
+        if (il % 4u == 3u || il == 45u) {
+            l->mla_q_a = required_tensorf(m, "blk.%u.attn_q_a.weight", il);
+            l->mla_q_b = required_tensorf(m, "blk.%u.attn_q_b.weight", il);
+            l->mla_kv_a_mqa = required_tensorf(m, "blk.%u.attn_kv_a_mqa.weight", il);
+            l->mla_k_b = required_tensorf(m, "blk.%u.attn_k_b.weight", il);
+            l->mla_v_b = required_tensorf(m, "blk.%u.attn_v_b.weight", il);
+            l->mla_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+            l->indexer_q_b = required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il);
+            l->indexer_k = required_tensorf(m, "blk.%u.indexer.attn_k.weight", il);
+            l->indexer_proj = required_tensorf(m, "blk.%u.indexer.proj.weight", il);
+            l->indexer_pool_ape = required_tensorf(m, "blk.%u.indexer.pool_ape.weight", il);
+            l->indexer_pool_gate = required_tensorf(m, "blk.%u.indexer.pool_gate.weight", il);
+            l->indexer_k_norm = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
+            l->indexer_k_norm_b = required_tensorf(m, "blk.%u.indexer.k_norm.bias", il);
+        } else {
+            l->kda_q = required_tensorf(m, "blk.%u.kda_q.weight", il);
+            l->kda_k = required_tensorf(m, "blk.%u.kda_k.weight", il);
+            l->kda_v = required_tensorf(m, "blk.%u.kda_v.weight", il);
+            l->kda_output = required_tensorf(m, "blk.%u.kda_output.weight", il);
+            l->kda_q_conv = required_tensorf(m, "blk.%u.kda_q_conv.weight", il);
+            l->kda_k_conv = required_tensorf(m, "blk.%u.kda_k_conv.weight", il);
+            l->kda_v_conv = required_tensorf(m, "blk.%u.kda_v_conv.weight", il);
+            l->kda_f_a = required_tensorf(m, "blk.%u.kda_f_a.weight", il);
+            l->kda_f_b = required_tensorf(m, "blk.%u.kda_f_b.weight", il);
+            l->kda_g_a = required_tensorf(m, "blk.%u.kda_g_a.weight", il);
+            l->kda_g_b = required_tensorf(m, "blk.%u.kda_g_b.weight", il);
+            l->kda_beta = required_tensorf(m, "blk.%u.kda_beta.weight", il);
+            l->kda_o_norm = required_tensorf(m, "blk.%u.kda_o_norm.weight", il);
+            l->kda_dt_bias = required_tensorf(m, "blk.%u.kda_dt_bias.weight", il);
+            l->kda_a_log = required_tensorf(m, "blk.%u.kda_a_log.weight", il);
+        }
+        if (il < 3u) {
+            l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
+            l->ffn_up = required_tensorf(m, "blk.%u.ffn_up.weight", il);
+            l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
+        } else {
+            l->ffn_gate_exps = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+            l->ffn_up_exps = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+            l->ffn_down_exps = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+            l->ffn_gate_inp = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+            l->exp_probs_b = required_tensorf(m, "blk.%u.exp_probs_b.bias", il);
+            l->ffn_gate_shexp = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+            l->ffn_up_shexp = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+            l->ffn_down_shexp = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+        }
+        if (il < 45u) {
+            l->hc_attn_fn = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
+            l->hc_ffn_fn = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
+            l->hc_attn_base = required_tensorf(m, "blk.%u.hc_attn_base.weight", il);
+            l->hc_ffn_base = required_tensorf(m, "blk.%u.hc_ffn_base.weight", il);
+            l->hc_attn_scale = required_tensorf(m, "blk.%u.hc_attn_scale.weight", il);
+            l->hc_ffn_scale = required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il);
+        }
+    }
+}
+
 static bool tensor_type_is_glm_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
@@ -6021,7 +6120,16 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
         }
     }
 
-    ds4_die("glm5-next metadata is recognized and validated, but its graph is not implemented yet; refusing to run");
+    /* Exercise the real mmap-backed name-to-pointer binding before the
+     * fail-closed boundary.  The table is intentionally short-lived until
+     * the GLM graph owns a matching engine field; no model payload is copied. */
+    ds4_glm5_next_weights bound = {0};
+    glm5_next_weights_bind(&bound, m);
+    if (!bound.layer[0].kda_q || !bound.layer[3].mla_q_a ||
+        !bound.layer[3].ffn_gate_exps || !bound.layer[45].mla_output) {
+        ds4_die("glm5-next tensor binding produced an incomplete reference table");
+    }
+    ds4_die("glm5-next metadata and tensor binding are validated, but its graph is not implemented yet; refusing to run");
 }
 
 static void config_validate_model(const ds4_model *m) {
