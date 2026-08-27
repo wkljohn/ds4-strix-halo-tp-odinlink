@@ -5952,6 +5952,75 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
     config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, 1.0e-5f);
     config_expect_f32("hyper_connection.epsilon", hc_eps, 1.0e-6f);
 
+    /* Keep the metadata gate and tensor gate together.  This is intentionally
+     * run before graph construction; the legacy GLM-5.2 binder has a
+     * different KDA/MLA schedule and must never see this model. */
+    tensor_expect_layout(required_tensor(m, "token_embd.weight"),
+                         DS4_TENSOR_BF16, 2, 4096, 154880, 0);
+    tensor_expect_layout(required_tensor(m, "output_norm.weight"),
+                         DS4_TENSOR_F32, 1, 4096, 0, 0);
+    tensor_expect_layout(required_tensor(m, "output.weight"),
+                         DS4_TENSOR_BF16, 2, 4096, 154880, 0);
+    for (uint32_t il = 0; il < 46; ++il) {
+        tensor_expect_layout(required_tensorf(m, "blk.%u.attn_norm.weight", il),
+                             DS4_TENSOR_F32, 1, 4096, 0, 0);
+        tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_norm.weight", il),
+                             DS4_TENSOR_F32, 1, 4096, 0, 0);
+        if (il % 4u == 3u || il == 45u) {
+            tensor_expect_layout(required_tensorf(m, "blk.%u.attn_q_a.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 1536, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.attn_q_b.weight", il), DS4_TENSOR_Q8_0, 2, 1536, 16384, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.attn_kv_a_mqa.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 512, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.attn_k_b.weight", il), DS4_TENSOR_Q8_0, 3, 256, 512, 64);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.attn_v_b.weight", il), DS4_TENSOR_Q8_0, 3, 512, 256, 64);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.attn_output.weight", il), DS4_TENSOR_Q8_0, 2, 16384, 4096, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.attn_q_b.weight", il), DS4_TENSOR_BF16, 2, 1536, 4096, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.attn_k.weight", il), DS4_TENSOR_BF16, 2, 4096, 128, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.proj.weight", il), DS4_TENSOR_BF16, 2, 4096, 32, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.pool_ape.weight", il), DS4_TENSOR_BF16, 2, 128, 4, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.pool_gate.weight", il), DS4_TENSOR_BF16, 2, 4096, 128, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.k_norm.weight", il), DS4_TENSOR_F32, 1, 128, 0, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.k_norm.bias", il), DS4_TENSOR_F32, 1, 128, 0, 0);
+        } else {
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_q.weight", il), DS4_TENSOR_BF16, 2, 4096, 8192, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_k.weight", il), DS4_TENSOR_BF16, 2, 4096, 8192, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_v.weight", il), DS4_TENSOR_BF16, 2, 4096, 8192, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_output.weight", il), DS4_TENSOR_BF16, 2, 8192, 4096, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_q_conv.weight", il), DS4_TENSOR_F32, 3, 4, 1, 8192);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_k_conv.weight", il), DS4_TENSOR_F32, 3, 4, 1, 8192);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_v_conv.weight", il), DS4_TENSOR_F32, 3, 4, 1, 8192);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_f_a.weight", il), DS4_TENSOR_BF16, 2, 4096, 128, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_f_b.weight", il), DS4_TENSOR_BF16, 2, 128, 8192, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_g_a.weight", il), DS4_TENSOR_BF16, 2, 4096, 128, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_g_b.weight", il), DS4_TENSOR_BF16, 2, 128, 8192, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_beta.weight", il), DS4_TENSOR_BF16, 2, 4096, 64, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_o_norm.weight", il), DS4_TENSOR_F32, 1, 128, 0, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_dt_bias.weight", il), DS4_TENSOR_F32, 1, 8192, 0, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_a_log.weight", il), DS4_TENSOR_F32, 1, 64, 0, 0);
+        }
+        if (il < 3u) {
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_gate.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 12288, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_up.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 12288, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_down.weight", il), DS4_TENSOR_Q8_0, 2, 12288, 4096, 0);
+        } else {
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il), DS4_TENSOR_Q4_K, 3, 4096, 2048, 288);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_up_exps.weight", il), DS4_TENSOR_Q4_K, 3, 4096, 2048, 288);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_down_exps.weight", il), DS4_TENSOR_Q4_K, 3, 2048, 4096, 288);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il), DS4_TENSOR_F32, 2, 4096, 288, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.exp_probs_b.bias", il), DS4_TENSOR_F32, 1, 288, 0, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 2048, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 2048, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il), DS4_TENSOR_Q8_0, 2, 2048, 4096, 0);
+        }
+        if (il < 45u) {
+            tensor_expect_layout(required_tensorf(m, "blk.%u.hc_attn_fn.weight", il), DS4_TENSOR_BF16, 2, 16384, 24, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il), DS4_TENSOR_BF16, 2, 16384, 24, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.hc_attn_base.weight", il), DS4_TENSOR_F32, 1, 24, 0, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.hc_ffn_base.weight", il), DS4_TENSOR_F32, 1, 24, 0, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.hc_attn_scale.weight", il), DS4_TENSOR_F32, 1, 3, 0, 0);
+            tensor_expect_layout(required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il), DS4_TENSOR_F32, 1, 3, 0, 0);
+        }
+    }
+
     ds4_die("glm5-next metadata is recognized and validated, but its graph is not implemented yet; refusing to run");
 }
 
