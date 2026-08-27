@@ -119,6 +119,27 @@ def main(argv):
         if got is None or got[:2] != (shape, typ):
             raise ValueError(f"tensor {name}: expected shape/type {(shape, typ)!r}, got {got!r}")
 
+    def count_suffix(suffix):
+        return sum(name.endswith(suffix) for name in tensors)
+
+    # Freeze the architecture schedule observed in the reference GGUF.
+    # These counts are deliberately separate from metadata: tensor presence
+    # catches partial or incorrectly converted files.
+    for suffix, expected in {
+        ".kda_q.weight": 34,
+        ".attn_q_a.weight": 12,
+        ".ffn_gate_exps.weight": 43,
+        ".hc_attn_fn.weight": 45,
+        ".hc_ffn_fn.weight": 45,
+        ".nextn.eh_proj.weight": 1,
+    }.items():
+        got = count_suffix(suffix)
+        if got != expected:
+            raise ValueError(f"tensor schedule {suffix}: expected {expected}, got {got}")
+
+    if any(name.startswith("blk.45.hc_") for name in tensors):
+        raise ValueError("block 45 unexpectedly contains mHC tensors")
+
     layers = Counter()
     for name in tensors:
         if name.startswith("blk.") and "." in name[4:]:
