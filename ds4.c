@@ -5861,7 +5861,22 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
     const uint32_t dense = required_u32(m, "glm5-next.feed_forward_length");
     const uint32_t heads = required_u32(m, "glm5-next.attention.head_count");
     const uint32_t head_dim = required_u32(m, "glm5-next.attention.key_length");
+    const uint32_t value_dim = required_u32(m, "glm5-next.attention.value_length");
+    const uint32_t q_lora = required_u32(m, "glm5-next.attention.q_lora_rank");
+    const uint32_t kv_lora = required_u32(m, "glm5-next.attention.kv_lora_rank");
+    const uint32_t rope_dim = required_u32(m, "glm5-next.attention.rope_dimension_count");
+    const uint32_t trunk_layers = required_u32(m, "glm5-next.trunk_block_count");
+    const uint32_t nextn = required_u32(m, "glm5-next.nextn_predict_layers");
+    const uint32_t leading_dense = required_u32(m, "glm5-next.leading_dense_block_count");
+    const uint32_t indexer_heads = required_u32(m, "glm5-next.attention.indexer.head_count");
+    const uint32_t indexer_dim = required_u32(m, "glm5-next.attention.indexer.key_length");
     const uint32_t indexer_topk = required_u32(m, "glm5-next.attention.indexer.top_k");
+    const uint32_t indexer_pool = required_u32(m, "glm5-next.attention.indexer.pool_size");
+    const uint32_t linear_heads = required_u32(m, "glm5-next.linear_attention.head_count");
+    const uint32_t linear_dim = required_u32(m, "glm5-next.linear_attention.head_dimension");
+    const uint32_t linear_conv = required_u32(m, "glm5-next.linear_attention.conv_kernel");
+    const uint32_t hc_count = required_u32(m, "glm5-next.hyper_connection.count");
+    const uint32_t hc_iters = required_u32(m, "glm5-next.hyper_connection.sinkhorn_iterations");
 
     config_expect_u32("block_count", layers, 46);
     config_expect_u64("context_length", context, 1048576);
@@ -5873,7 +5888,27 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
     config_expect_u32("feed_forward_length", dense, 12288);
     config_expect_u32("attention.head_count", heads, 64);
     config_expect_u32("attention.key_length", head_dim, 256);
+    config_expect_u32("attention.value_length", value_dim, 256);
+    config_expect_u32("attention.q_lora_rank", q_lora, 1536);
+    config_expect_u32("attention.kv_lora_rank", kv_lora, 512);
+    config_expect_u32("attention.rope_dimension_count", rope_dim, 0);
+    config_expect_u32("trunk_block_count", trunk_layers, 45);
+    config_expect_u32("nextn_predict_layers", nextn, 1);
+    config_expect_u32("leading_dense_block_count", leading_dense, 3);
+    config_expect_u32("attention.indexer.head_count", indexer_heads, 32);
+    config_expect_u32("attention.indexer.key_length", indexer_dim, 128);
     config_expect_u32("attention.indexer.top_k", indexer_topk, 2048);
+    config_expect_u32("attention.indexer.pool_size", indexer_pool, 4);
+    config_expect_u32("linear_attention.head_count", linear_heads, 64);
+    config_expect_u32("linear_attention.head_dimension", linear_dim, 128);
+    config_expect_u32("linear_attention.conv_kernel", linear_conv, 4);
+    config_expect_u32("hyper_connection.count", hc_count, 4);
+    config_expect_u32("hyper_connection.sinkhorn_iterations", hc_iters, 20);
+
+    const float rms_eps = required_f32(m, "glm5-next.attention.layer_norm_rms_epsilon");
+    const float hc_eps = required_f32(m, "glm5-next.hyper_connection.epsilon");
+    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, 1.0e-5f);
+    config_expect_f32("hyper_connection.epsilon", hc_eps, 1.0e-6f);
 
     ds4_die("glm5-next metadata is recognized and validated, but its graph is not implemented yet; refusing to run");
 }
