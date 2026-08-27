@@ -101,6 +101,7 @@ def main(argv):
         "glm5-next.attention.head_count": 64,
         "glm5-next.attention.key_length": 256,
         "glm5-next.attention.value_length": 256,
+        "glm5-next.attention.indexer.pool_size": 4,
         "glm5-next.attention.indexer.top_k": 2048,
         "glm5-next.linear_attention.conv_kernel": 4,
     }.items():
@@ -168,6 +169,10 @@ def main(argv):
         ".indexer.attn_q_b.weight": ((1536, 4096), 30),
         ".indexer.attn_k.weight": ((4096, 128), 30),
         ".indexer.proj.weight": ((4096, 32), 30),
+        ".indexer.pool_ape.weight": ((128, 4), 30),
+        ".indexer.pool_gate.weight": ((4096, 128), 30),
+        ".indexer.k_norm.weight": ((128,), 0),
+        ".indexer.k_norm.bias": ((128,), 0),
         ".attn_q_a.weight": ((4096, 1536), 8),
         ".attn_q_b.weight": ((1536, 16384), 8),
         ".attn_kv_a_mqa.weight": ((4096, 512), 8),

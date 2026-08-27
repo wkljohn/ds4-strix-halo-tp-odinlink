@@ -104,6 +104,14 @@ test-glm5-next-contract:
 test-glm5-next-kda-projection:
 	python3 scripts/probe-glm5-next-kda-projection.py "$(DS4_GLM5_MODEL)"
 
+.PHONY: test-glm5-next-mhc-oracle
+test-glm5-next-mhc-oracle:
+	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "error: set DS4_RESEARCH_ROOT" >&2; exit 2; }
+	python3 scripts/probe-glm5-next-mhc-payload.py --layer 0 --site attn \
+		--output "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/mhc-layer0-attn-oracle.json" \
+		"$(DS4_GLM5_MODEL)"
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" python3 tests/test_glm5_mhc_external_reference.py
+
 tests/test_rocm_moe_wave_plan: tests/test_rocm_moe_wave_plan.cu
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $<
 

@@ -21,6 +21,14 @@ def softmax(values):
     return [x / z for x in e]
 
 
+def sigmoid(value):
+    if value >= 0.0:
+        e = math.exp(-value)
+        return 1.0 / (1.0 + e)
+    e = math.exp(value)
+    return e / (1.0 + e)
+
+
 def stable_topk(values, k):
     # Explicit index tie-break makes both TP ranks select the same experts.
     return sorted(range(len(values)), key=lambda i: (-values[i], i))[:k]
@@ -206,35 +214,94 @@ def nope_sparse_mla(query, keys, values, top_k):
             for j in range(len(values[0]))]
 
 
-def weighted_stream_mix(branches, logits):
-    """Simple stream average, retained as a pre/post projection helper."""
-    assert len(branches) == 4 and len(logits) == 4
-    w = softmax(logits)
-    return [sum(w[i] * branches[i][j] for i in range(4))
-            for j in range(len(branches[0]))]
+def rms_norm_unweighted(values, eps):
+    rms = math.sqrt(sum(x * x for x in values) / len(values) + eps)
+    return [x / rms for x in values]
 
 
-def sinkhorn(matrix, iterations=20, eps=1e-6):
-    """Project a positive 4x4 residual map toward doubly-stochastic form."""
-    out = [[math.exp(max(-20.0, min(20.0, x))) for x in row]
-           for row in matrix]
-    for _ in range(iterations):
-        for i in range(len(out)):
-            z = sum(out[i]) + eps
-            out[i] = [x / z for x in out[i]]
-        for j in range(len(out[0])):
-            z = sum(out[i][j] for i in range(len(out))) + eps
-            for i in range(len(out)):
-                out[i][j] /= z
-    return out
+def mhc_mapping(hidden_streams, fn, base, scale, iterations=20,
+                hc_eps=1e-6, rms_eps=1e-5):
+    """Exact GLM-5.3 mHC mapping used by the official Transformers graph.
+
+    ``hidden_streams`` is [H][D], ``fn`` is [(2+H)*H][H*D], and the
+    24 mapping outputs for H=4 are split into pre, post, and comb. The first
+    comb normalization is column-only because its rows came from a softmax;
+    the remaining Sinkhorn iterations alternate row and column.
+    """
+    hc = len(hidden_streams)
+    width = len(hidden_streams[0])
+    assert hc == 4 and all(len(row) == width for row in hidden_streams)
+    assert len(fn) == (2 + hc) * hc
+    assert all(len(row) == hc * width for row in fn)
+    assert len(base) == len(fn) and len(scale) == 3
+
+    flat = rms_norm_unweighted(
+        [x for stream in hidden_streams for x in stream], rms_eps)
+    mixed = [dot(row, flat) for row in fn]
+    pre_logits = mixed[:hc]
+    post_logits = mixed[hc:2 * hc]
+    comb_logits = [mixed[2 * hc + i * hc:2 * hc + (i + 1) * hc]
+                   for i in range(hc)]
+    pre = [sigmoid(pre_logits[i] * scale[0] + base[i]) + hc_eps
+           for i in range(hc)]
+    post = [2.0 * sigmoid(post_logits[i] * scale[1] + base[hc + i])
+            for i in range(hc)]
+    comb = []
+    for i in range(hc):
+        logits = [comb_logits[i][j] * scale[2] +
+                  base[2 * hc + i * hc + j] for j in range(hc)]
+        comb.append([x + hc_eps for x in softmax(logits)])
+    for j in range(hc):
+        z = sum(comb[i][j] for i in range(hc)) + hc_eps
+        for i in range(hc):
+            comb[i][j] /= z
+    for _ in range(iterations - 1):
+        for i in range(hc):
+            z = sum(comb[i]) + hc_eps
+            comb[i] = [x / z for x in comb[i]]
+        for j in range(hc):
+            z = sum(comb[i][j] for i in range(hc)) + hc_eps
+            for i in range(hc):
+                comb[i][j] /= z
+    collapsed = [sum(pre[i] * hidden_streams[i][j] for i in range(hc))
+                 for j in range(width)]
+    return post, comb, collapsed
 
 
-def mhc_residual_mix(branches, raw_map):
-    assert len(branches) == 4 and len(raw_map) == 4
-    matrix = sinkhorn(raw_map)
-    return [[sum(matrix[i][j] * branches[i][k] for i in range(4))
-             for k in range(len(branches[0]))]
-            for j in range(4)]
+def mhc_compose(residual_streams, branch, post, comb):
+    """Apply ``post * branch + comb.T @ residual`` in model stream order."""
+    hc = len(residual_streams)
+    width = len(branch)
+    return [[post[j] * branch[k] +
+             sum(comb[i][j] * residual_streams[i][k] for i in range(hc))
+             for k in range(width)] for j in range(hc)]
+
+
+def glm5_kpool(keys, gate_scores, valid, ape, pool_size=4):
+    """Reference learned key pooling, including first-valid-token alignment."""
+    assert len(keys) == len(gate_scores) == len(valid)
+    assert len(ape) == pool_size
+    width = len(keys[0])
+    assert all(len(row) == width for row in keys)
+    assert all(len(row) == width for row in gate_scores)
+    assert all(len(row) == width for row in ape)
+    first = next((i for i, is_valid in enumerate(valid) if is_valid), len(valid))
+    pools = []
+    indices = []
+    for start in range(first, len(keys), pool_size):
+        idx = list(range(start, min(start + pool_size, len(keys))))
+        if len(idx) != pool_size or not all(valid[i] for i in idx):
+            continue
+        pooled = []
+        for channel in range(width):
+            probability = softmax([
+                gate_scores[token][channel] + ape[offset][channel]
+                for offset, token in enumerate(idx)])
+            pooled.append(sum(probability[offset] * keys[token][channel]
+                              for offset, token in enumerate(idx)))
+        pools.append(pooled)
+        indices.append(idx)
+    return pools, indices
 
 
 def close(a, b, eps=1e-12):
@@ -260,23 +327,42 @@ def test_glm5_router_bias_only_changes_choice():
 
 
 def test_mhc_is_normalized_and_ordered():
-    branches = [[float(i + j) for j in range(4)] for i in range(4)]
-    got = weighted_stream_mix(branches, [0.0, 0.0, 0.0, 0.0])
-    assert got == [1.5 + j for j in range(4)]
+    streams = [[float(i + j) for j in range(3)] for i in range(4)]
+    fn = [[0.0] * 12 for _ in range(24)]
+    post, comb, collapsed = mhc_mapping(
+        streams, fn, [0.0] * 24, [1.0, 1.0, 1.0])
+    assert all(abs(x - 1.0) < 1e-12 for x in post)
+    expected = [(0.5 + 1e-6) * (6.0 + 4.0 * j) for j in range(3)]
+    assert close(collapsed, expected, 1e-12)
+    for row in comb:
+        assert all(abs(x - 0.25) < 2e-6 for x in row)
 
 
 def test_mhc_sinkhorn_preserves_stream_mass():
-    branches = [[float(10 * i + j) for j in range(3)] for i in range(4)]
-    mixed = mhc_residual_mix(
-        branches,
-        [[3.0, -1.0, 0.5, 2.0], [0.1, 4.0, -2.0, 0.3],
-         [1.0, 0.2, 2.5, -0.4], [-1.0, 0.7, 0.4, 3.5]])
-    assert len(mixed) == 4
-    # Sinkhorn's residual map preserves each feature's sum (up to the
-    # finite-iteration epsilon), unlike a per-row softmax.
-    for j in range(3):
-        assert abs(sum(mixed[i][j] for i in range(4)) -
-                   sum(branches[i][j] for i in range(4))) < 2e-2
+    streams = [[float(10 * i + j) for j in range(3)] for i in range(4)]
+    fn = [[0.0] * 12 for _ in range(24)]
+    base = [0.0] * 8 + [
+        3.0, -1.0, 0.5, 2.0, 0.1, 4.0, -2.0, 0.3,
+        1.0, 0.2, 2.5, -0.4, -1.0, 0.7, 0.4, 3.5,
+    ]
+    post, comb, _ = mhc_mapping(streams, fn, base, [1.0, 1.0, 1.0])
+    mixed = mhc_compose(streams, [0.0, 0.0, 0.0], post, comb)
+    # The doubly-stochastic residual map preserves feature mass to the
+    # explicit finite-iteration epsilon, unlike a per-row-only softmax.
+    for feature in range(3):
+        assert abs(sum(mixed[i][feature] for i in range(4)) -
+                   sum(streams[i][feature] for i in range(4))) < 2e-2
+
+
+def test_glm5_kpool_aligns_after_padding_and_omits_tail():
+    keys = [[10.0 * token + channel for channel in range(2)]
+            for token in range(8)]
+    gates = [[0.0, 0.0] for _ in keys]
+    valid = [False, False, True, True, True, True, True, True]
+    ape = [[0.0, 0.0] for _ in range(4)]
+    pools, indices = glm5_kpool(keys, gates, valid, ape)
+    assert indices == [[2, 3, 4, 5]]
+    assert close(pools[0], [35.0, 36.0])
 
 
 def test_nope_uses_selected_rows_only():
