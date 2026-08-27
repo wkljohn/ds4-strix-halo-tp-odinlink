@@ -66,6 +66,12 @@ HIPCC_PATH := $(shell command -v "$(HIPCC)" 2>/dev/null || printf '%s' "$(HIPCC)
 ROCM_HOME ?= $(shell p=$$(readlink -f "$(HIPCC_PATH)"); dirname "$$(dirname "$$p")")
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
+ifeq ($(ROCM_ARCH),gfx1151)
+# The GLM-5 KDA recurrence uses 32-lane shuffle reductions.  Make the
+# gfx1151 ABI choice explicit instead of relying on the compiler default;
+# ds4_rocm_compat.cu independently rejects a runtime device that is not wave32.
+ROCM_CFLAGS += -mno-wavefrontsize64 -DDS4_GFX1151_WAVE32=1
+endif
 ROCM_CFLAGS += $(DS4_PROFILE_CFLAGS)
 ROCM_LDLIBS ?= -L$(ROCM_HOME)/lib -Wl,-rpath,$(ROCM_HOME)/lib -lm -pthread -lhipblas -lhipblaslt
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
@@ -103,8 +109,11 @@ tests/test_rocm_moe_wave_plan: tests/test_rocm_moe_wave_plan.cu
 test-rocm-moe-wave-plan: tests/test_rocm_moe_wave_plan
 	./tests/test_rocm_moe_wave_plan
 
-tests/test_rocm_glm5_kda_ref: tests/test_rocm_glm5_kda_ref.cu rocm/ds4_rocm_glm5_kda_ref.cuh
-	$(HIPCC) $(ROCM_CFLAGS) -I. -o $@ $<
+tests/test_rocm_glm5_kda_ref.o: tests/test_rocm_glm5_kda_ref.cu ds4_gpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_kda_ref: tests/test_rocm_glm5_kda_ref.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-glm5-kda-ref: tests/test_rocm_glm5_kda_ref
 	./tests/test_rocm_glm5_kda_ref

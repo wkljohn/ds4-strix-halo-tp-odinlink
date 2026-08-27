@@ -1160,6 +1160,21 @@ int ds4_gpu_glm5_causal_conv4_tensor(
         uint32_t              n_tokens,
         uint32_t              channels);
 
+/* Fixed-shape GLM-5 KDA sequential recurrence. q/k/v/gate and output are
+ * F32 [n_tokens, 64, 128], beta is F32 [n_tokens, 64], and mutable state is
+ * F32 [64, 128, 128]. Unsupported sizes and aliases fail without launching. */
+int ds4_gpu_glm5_kda_recurrent_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *beta,
+        uint32_t              n_tokens,
+        uint32_t              n_heads,
+        uint32_t              head_dim);
+
 int ds4_gpu_rms_norm_weight_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,

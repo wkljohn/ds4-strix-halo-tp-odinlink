@@ -64,6 +64,91 @@ extern "C" int ds4_gpu_glm5_causal_conv4_tensor(
     return hipGetLastError() == hipSuccess;
 }
 
+static int rocm_glm5_wave32_available(void) {
+#if defined(DS4_GFX1151_WAVE32) && DS4_GFX1151_WAVE32
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int device = 0;
+    hipDeviceProp_t properties = {};
+    if (hipGetDevice(&device) != hipSuccess ||
+        hipGetDeviceProperties(&properties, device) != hipSuccess) {
+        cached = 0;
+    } else {
+        cached = properties.warpSize == 32 ? 1 : 0;
+    }
+    return cached;
+#else
+    return 0;
+#endif
+}
+
+extern "C" int ds4_gpu_glm5_kda_recurrent_tensor(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *beta,
+        uint32_t n_tokens,
+        uint32_t n_heads,
+        uint32_t head_dim) {
+#if !defined(DS4_GFX1151_WAVE32) || !DS4_GFX1151_WAVE32
+    (void)out;
+    (void)state;
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)gate;
+    (void)beta;
+    (void)n_tokens;
+    (void)n_heads;
+    (void)head_dim;
+    return 0;
+#else
+    constexpr uint32_t expected_heads = 64u;
+    constexpr uint32_t expected_dim = 128u;
+    if (!out || !state || !q || !k || !v || !gate || !beta ||
+        !out->ptr || !state->ptr || !q->ptr || !k->ptr || !v->ptr ||
+        !gate->ptr || !beta->ptr || n_tokens == 0u ||
+        n_heads != expected_heads || head_dim != expected_dim ||
+        !rocm_glm5_wave32_available()) {
+        return 0;
+    }
+    const uint64_t row_values = (uint64_t)n_heads * head_dim;
+    const uint64_t vector_bytes =
+        (uint64_t)n_tokens * row_values * sizeof(float);
+    const uint64_t beta_bytes =
+        (uint64_t)n_tokens * n_heads * sizeof(float);
+    const uint64_t state_bytes =
+        (uint64_t)n_heads * head_dim * head_dim * sizeof(float);
+    if (out->bytes < vector_bytes || q->bytes < vector_bytes ||
+        k->bytes < vector_bytes || v->bytes < vector_bytes ||
+        gate->bytes < vector_bytes || beta->bytes < beta_bytes ||
+        state->bytes < state_bytes ||
+        out->device_id != state->device_id ||
+        out->device_id != q->device_id || out->device_id != k->device_id ||
+        out->device_id != v->device_id || out->device_id != gate->device_id ||
+        out->device_id != beta->device_id ||
+        rocm_ranges_overlap(out, state) || rocm_ranges_overlap(out, q) ||
+        rocm_ranges_overlap(out, k) || rocm_ranges_overlap(out, v) ||
+        rocm_ranges_overlap(out, gate) || rocm_ranges_overlap(out, beta) ||
+        rocm_ranges_overlap(state, q) || rocm_ranges_overlap(state, k) ||
+        rocm_ranges_overlap(state, v) || rocm_ranges_overlap(state, gate) ||
+        rocm_ranges_overlap(state, beta)) {
+        return 0;
+    }
+    hipLaunchKernelGGL(ds4_glm5_kda_wave32_kernel,
+                       dim3(1u, n_heads, head_dim / 4u),
+                       dim3(32u, 4u), 0, 0,
+                       (float *)out->ptr, (float *)state->ptr,
+                       (const float *)q->ptr, (const float *)k->ptr,
+                       (const float *)v->ptr, (const float *)gate->ptr,
+                       (const float *)beta->ptr, n_tokens);
+    return hipGetLastError() == hipSuccess;
+#endif
+}
+
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus != 1) {
         fprintf(stderr, "ds4: ROCm supports one GPU per process\n");
