@@ -32,6 +32,22 @@ def route_top8(logits):
     return ids, weights
 
 
+def glm5_route_top8(router_logits, correction_bias=None, scale=2.5):
+    """GLM-5.3 sparse router contract (one group, sigmoid affinity).
+
+    The correction bias affects selection only; normalized output weights come
+    from the unbiased sigmoid scores and are multiplied by the model scale.
+    """
+    if correction_bias is None:
+        correction_bias = [0.0] * len(router_logits)
+    assert len(router_logits) == len(correction_bias)
+    scores = [1.0 / (1.0 + math.exp(-x)) for x in router_logits]
+    choice = [scores[i] + correction_bias[i] for i in range(len(scores))]
+    ids = stable_topk(choice, 8)
+    z = sum(scores[i] for i in ids) + 1e-20
+    return ids, [scale * scores[i] / z for i in ids]
+
+
 def sharded_moe(x, gate, up, down, ids, weights, split=1024):
     """Reference 1024/1024 FFN-intermediate split.
 
@@ -162,6 +178,18 @@ def test_routing_is_stable():
     ids, weights = route_top8([1.0] * 288)
     assert ids == list(range(8))
     assert abs(sum(weights) - 1.0) < 1e-12
+
+
+def test_glm5_router_bias_only_changes_choice():
+    logits = [0.0] * 288
+    bias = [0.0] * 288
+    bias[17] = 0.5
+    ids, weights = glm5_route_top8(logits, bias)
+    assert ids[0] == 17
+    assert len(ids) == 8 and abs(sum(weights) - 2.5) < 1e-12
+    # Selection correction is not allowed to alter the affinity used for
+    # expert weighting: equal raw logits produce equal selected weights.
+    assert max(weights) - min(weights) < 1e-12
 
 
 def test_mhc_is_normalized_and_ordered():
