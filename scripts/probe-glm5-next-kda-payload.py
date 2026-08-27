@@ -87,10 +87,13 @@ def f32_vec(blob, base, count):
             for i in range(count)]
 
 
-def softplus(x):
-    # Keep the payload smoke finite even if a future conversion produces a
-    # large positive gate preactivation.
-    return x + math.log1p(math.exp(-x)) if x > 0.0 else math.log1p(math.exp(x))
+def sigmoid(x):
+    # Stable for the real payload values and for future conversion changes.
+    if x >= 0.0:
+        e = math.exp(-x)
+        return 1.0 / (1.0 + e)
+    e = math.exp(x)
+    return e / (1.0 + e)
 
 
 def main(argv):
@@ -140,7 +143,10 @@ def main(argv):
            for i in range(128)]
     gate_proj = [sum(a * b for a, b in zip(row(blob, fb, 8192, 128, i, 128), low))
                  for i in range(8)]
-    gate = [-math.exp(alogv[i]) * softplus(gate_proj[i] + dtv[i])
+    # GLM-5 uses the configured lower-bounded KDA gate.  The softplus branch
+    # is only the fallback when no lower bound is present; using it here
+    # would validate a different recurrence than the shipped model.
+    gate = [-5.0 * sigmoid(math.exp(alogv[i]) * (gate_proj[i] + dtv[i]))
             for i in range(8)]
     # beta is a scalar per value head in this model; use its first row sample.
     beta_raw = sum(a * b for a, b in zip(row(blob, beta_w, 64, 4096, 0, 4096), x))
