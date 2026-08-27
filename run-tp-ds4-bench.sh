@@ -211,6 +211,8 @@ fi
   echo "error: DS4_BENCH_VALIDATE_CONFIG_ONLY must be 0 or 1" >&2
   exit 2
 }
+ATTN_STATIC_DIRECT_REQUESTED=0
+ATTN_STATIC_DIRECT_T2_REQUESTED=0
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
@@ -220,6 +222,14 @@ for env_kv in "${EXTRA_ENV[@]}"; do
     DS4_ROCM_ENABLE_Q8_F16_CACHE=*|DS4_ROCM_STREAM_Q8_F16_CACHE_GB=*)
       echo "error: ds4-bench-tp results must not use the memory-heavy Q8-to-FP16 cache" >&2
       exit 2
+      ;;
+  esac
+  case $env_kv in
+    DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT=1)
+      ATTN_STATIC_DIRECT_REQUESTED=1
+      ;;
+    DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2=1)
+      ATTN_STATIC_DIRECT_T2_REQUESTED=1
       ;;
   esac
   if [[ $env_kv == DS4_TP_EXPERT_SPLIT=* && $DSPARK == 0 ]]; then
@@ -243,6 +253,11 @@ for env_kv in "${EXTRA_ENV[@]}"; do
     esac
   fi
 done
+if [[ $ATTN_STATIC_DIRECT_T2_REQUESTED == 1 &&
+      $ATTN_STATIC_DIRECT_REQUESTED != 1 ]]; then
+  echo "error: paired-query static attention requires DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT=1" >&2
+  exit 2
+fi
 if [[ $DECODE_SELF_CHECK == 1 ]]; then
   CANDIDATE_ARGS+=(--decode-self-check)
 elif [[ $DECODE_SELF_CHECK != 0 ]]; then
