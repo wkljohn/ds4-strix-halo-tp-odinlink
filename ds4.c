@@ -4437,7 +4437,6 @@ typedef struct {
     uint32_t layer_count;
     uint32_t kda_count;
     bool schedule_valid;
-    bool kda_layouts_valid;
 } ds4_glm5_next_weights;
 
 static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
@@ -6170,12 +6169,11 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
             tensor_expect_layout(required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il), DS4_TENSOR_F32, 1, 3, 0, 0);
         }
     }
-    bound.kda_layouts_valid = true;
     if (!bound.schedule_valid || bound.layer_count != layers ||
-        bound.kda_count == 0u || !bound.kda_layouts_valid) {
+        bound.kda_count == 0u) {
         ds4_die("glm5-next tensor-derived attention schedule was not validated");
     }
-    ds4_die("glm5-next resident KDA component validated; sparse MLA/indexer, mHC, FFN, output, and full TP graph remain unimplemented; refusing inference");
+    ds4_die("glm5-next metadata and tensor layouts validated; resident KDA is component-gated only, while sparse MLA/indexer, mHC, FFN, output, and the full TP graph remain unimplemented; refusing inference");
 }
 
 static void config_validate_model(const ds4_model *m) {

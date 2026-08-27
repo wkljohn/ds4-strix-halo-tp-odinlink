@@ -7,7 +7,7 @@ if [[ -z "$model" || ! -f "$model" ]]; then
     exit 2
 fi
 
-expected='ds4: glm5-next resident KDA component validated; sparse MLA/indexer, mHC, FFN, output, and full TP graph remain unimplemented; refusing inference'
+expected='ds4: glm5-next metadata and tensor layouts validated; resident KDA is component-gated only, while sparse MLA/indexer, mHC, FFN, output, and the full TP graph remain unimplemented; refusing inference'
 log=$(mktemp)
 lock=$(mktemp -u /tmp/ds4-glm5-refusal.XXXXXX.lock)
 trap 'rm -f "$log" "$lock"' EXIT
