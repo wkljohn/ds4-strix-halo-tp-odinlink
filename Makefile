@@ -152,6 +152,25 @@ tests/test_glm5_kda_tp_digest: tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c ds
 test-glm5-kda-tp-digest: tests/test_glm5_kda_tp_digest
 	./tests/test_glm5_kda_tp_digest
 
+.PHONY: test-glm5-next-runtime-refusal test-glm5-resident-kda
+test-glm5-next-runtime-refusal:
+	@test -x ./ds4 || { echo "error: build the intended backend before this gate" >&2; exit 2; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+		./tests/test-glm5-next-runtime-refusal.sh
+
+test-glm5-resident-kda: test-glm5-next-contract \
+		test-glm5-next-kda-projection \
+		test-rocm-glm5-conv-ref \
+		test-rocm-glm5-kda-ref \
+		test-rocm-glm5-kda-layer \
+		test-glm5-kda-tp-digest \
+		test-tp-hello \
+		test-glm5-next-runtime-refusal \
+		tests/test_glm5_kda_state \
+		tests/test_glm5_kda_binding
+	./tests/test_glm5_kda_state
+	./tests/test_glm5_kda_binding
+
 tests/test_glm5_kda_state: tests/test_glm5_kda_state.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_state.c ds4_glm5_kda.c $(LDLIBS)
 

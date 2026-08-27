@@ -6175,7 +6175,7 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
         bound.kda_count == 0u || !bound.kda_layouts_valid) {
         ds4_die("glm5-next tensor-derived attention schedule was not validated");
     }
-    ds4_die("glm5-next metadata and tensor binding are validated, but its graph is not implemented yet; refusing to run");
+    ds4_die("glm5-next resident KDA component validated; sparse MLA/indexer, mHC, FFN, output, and full TP graph remain unimplemented; refusing inference");
 }
 
 static void config_validate_model(const ds4_model *m) {
