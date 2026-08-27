@@ -65,6 +65,33 @@ static int attention_prefill_static_flash_direct_enabled(void) {
     return value != NULL && strcmp(value, "1") == 0;
 }
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+/* Coverage diagnostics are absent from production builds.  A per-launch line
+ * is intentional here: the static path is selected independently by each
+ * model layer, so a log-once message cannot establish production coverage or
+ * the query-row shapes that dominate it. */
+static int attention_prefill_static_flash_coverage_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv(
+            "DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_COVERAGE");
+        enabled = value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    }
+    return enabled;
+}
+
+static void attention_prefill_static_flash_coverage_log(
+        int direct, uint32_t n_q, uint32_t q_row0, uint32_t n_tokens,
+        uint32_t n_comp, uint32_t window, uint32_t ratio, uint32_t n_head) {
+    if (!attention_prefill_static_flash_coverage_enabled()) return;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+            "static flash coverage path=%s n_q=%u q_row0=%u tokens=%u "
+            "comp=%u window=%u ratio=%u heads=%u\n",
+            direct ? "direct" : "lds", n_q, q_row0, n_tokens, n_comp,
+            window, ratio, n_head);
+}
+#endif
+
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
@@ -1062,6 +1089,11 @@ static int attention_prefill_mixed_launch(
         ((window != 0u ? window : n_tokens) + n_comp <= 768u)) {
         dim3 grid(n_q, (n_head + 7u) / 8u, 1);
         if (attention_prefill_static_flash_enabled()) {
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+            attention_prefill_static_flash_coverage_log(
+                attention_prefill_static_flash_direct_enabled(), n_q, q_row0,
+                n_tokens, n_comp, window, ratio, n_head);
+#endif
             if (attention_prefill_static_flash_direct_enabled()) {
                 static int logged;
                 if (!logged) {
