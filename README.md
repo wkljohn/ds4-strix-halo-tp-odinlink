@@ -69,8 +69,13 @@ Build on both nodes:
 ```sh
 git clone https://github.com/wkljohn/ds4-strix-halo-tp-odinlink.git
 cd ds4-strix-halo-tp-odinlink
-make -j"$(nproc)" strix-halo
+DS4_ROCM_HOME=/absolute/path/to/rocm-7.14.0 \
+  make -j"$(nproc)" strix-halo
 ```
+
+`DS4_ROCM_HOME` must name the ROCm 7.14 installation root containing
+`bin/hipcc`; setting it explicitly prevents an older `/opt/rocm` installation
+from being selected accidentally.
 
 Create the benchmark configuration on node 1:
 
@@ -171,6 +176,8 @@ the API on `127.0.0.1:8090`, and supports either RDMA transport behind Caddy:
 
 ```sh
 cp deploy/config.env.example deploy/config.env.local
+sed -i "s/^DS4_SERVER_SHA256=.*/DS4_SERVER_SHA256=$(sha256sum ./ds4-server | awk '{print $1}')/" \
+  deploy/config.env.local
 $EDITOR deploy/config.env.local
 deploy/ds4-tp-caddy.sh start
 deploy/ds4-tp-caddy.sh status

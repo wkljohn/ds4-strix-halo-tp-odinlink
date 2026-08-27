@@ -7,16 +7,20 @@ and exposes DS4 only on
 public hostname.
 
 ```sh
-make strix-halo
+DS4_ROCM_HOME=/absolute/path/to/rocm-7.14.0 \
+  make -j"$(nproc)" strix-halo
 cp deploy/config.env.example deploy/config.env.local
+sed -i "s/^DS4_SERVER_SHA256=.*/DS4_SERVER_SHA256=$(sha256sum ./ds4-server | awk '{print $1}')/" \
+  deploy/config.env.local
 $EDITOR deploy/config.env.local
 deploy/ds4-tp-caddy.sh start
 deploy/ds4-tp-caddy.sh status
 ```
 
-After the final build, set `DS4_SERVER_SHA256` in `config.env.local` from
-`sha256sum ./ds4-server`. Startup fails closed if that pin does not match, so a
-stale coordinator cannot use a different TP gate schedule from the worker.
+`DS4_ROCM_HOME` must name the ROCm 7.14 installation root containing
+`bin/hipcc`. The `sed` command pins the final `ds4-server` build in
+`config.env.local`. Startup fails closed if that pin does not match, so a stale
+coordinator cannot use a different TP gate schedule from the worker.
 
 The launcher starts both independent model loads together, validates the
 selected RDMA provider plus matching binary and sampled model fingerprints,
