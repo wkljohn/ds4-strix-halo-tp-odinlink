@@ -46,4 +46,4 @@ for pair in "$host1:$dev1" "$host2:$dev2"; do
 done
 
 echo "status=READ_ONLY; exact 124-GiB GTT compatibility requires a reboot with the required cmdline on both hosts"
-echo "next=make -C tests roce_v2_mr_probe && run it separately on each host after production is stopped"
+echo "next=make tests/roce_v2_mr_probe && run ./tests/roce_v2_mr_probe <device> separately on each host after production is stopped"
