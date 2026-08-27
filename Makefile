@@ -28,6 +28,7 @@ DS4_TEST_MODEL ?= ds4flash.gguf
 DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support.gguf
+DS4_GLM5_MODEL ?= models/GLM-5.3-Flash-Q4_K.gguf
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -83,6 +84,13 @@ test-quality-gates:
 
 test-moe-wave-plan:
 	python3 tests/test_moe_wave_plan.py
+
+# Header-only and CPU-oracle gate for the GLM-5.3 research branch.  This is
+# intentionally independent of GPU/CUDA availability and never starts DS4.
+test-glm5-next-contract:
+	python3 scripts/check-glm5-next-gguf.py "$(DS4_GLM5_MODEL)"
+	python3 scripts/probe-glm5-next-weights.py . "$(DS4_GLM5_MODEL)"
+	python3 tests/test_glm5_next_oracles.py
 
 tests/test_rocm_moe_wave_plan: tests/test_rocm_moe_wave_plan.cu
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $<
