@@ -27,6 +27,16 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return 0;
 }
 
+
+int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset,
+                        void *data, uint64_t bytes) {
+    (void)tensor;
+    (void)offset;
+    (void)data;
+    (void)bytes;
+    return 0;
+}
+
 #define CHECK(expr, message) do { \
     if (!(expr)) { \
         fprintf(stderr, "FAIL %s\n", message); \

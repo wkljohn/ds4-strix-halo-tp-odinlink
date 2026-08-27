@@ -300,3 +300,68 @@ int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
     state->token_count += n_tokens;
     return 1;
 }
+
+static int tensor_fnv64(const ds4_gpu_tensor *tensor, uint64_t bytes,
+                        uint64_t *digest) {
+    enum { CHUNK_BYTES = 1u << 20 };
+    if (!tensor || !digest || bytes == 0u ||
+        ds4_gpu_tensor_bytes(tensor) < bytes) return 0;
+    unsigned char *buffer = malloc(CHUNK_BYTES);
+    if (!buffer) return 0;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (uint64_t offset = 0; offset < bytes;) {
+        const uint64_t remaining = bytes - offset;
+        const uint64_t count = remaining < CHUNK_BYTES ? remaining : CHUNK_BYTES;
+        if (!ds4_gpu_tensor_read(tensor, offset, buffer, count)) {
+            free(buffer);
+            return 0;
+        }
+        for (uint64_t i = 0; i < count; ++i) {
+            hash ^= buffer[i];
+            hash *= UINT64_C(1099511628211);
+        }
+        offset += count;
+    }
+    free(buffer);
+    *digest = hash;
+    return 1;
+}
+
+int ds4_glm5_kda_layer_digest(const ds4_glm5_kda_layer_state *state,
+                              const ds4_gpu_tensor *output,
+                              uint64_t output_floats,
+                              ds4_glm5_kda_digest *digest) {
+    uint64_t output_bytes = 0;
+    uint64_t history_bytes = 0;
+    uint64_t recurrent_bytes = 0;
+    uint64_t ignored = 0;
+    if (!state || !state->valid || !state->q_history || !state->k_history ||
+        !state->v_history || !state->recurrent || !output || !digest ||
+        output_floats == 0u ||
+        !mul_u64(output_floats, sizeof(float), &output_bytes) ||
+        !layer_bytes(&history_bytes, &recurrent_bytes, &ignored)) return 0;
+    ds4_glm5_kda_digest value = {0};
+    if (!tensor_fnv64(output, output_bytes, &value.output_fnv64) ||
+        !tensor_fnv64(state->q_history, history_bytes,
+                      &value.q_history_fnv64) ||
+        !tensor_fnv64(state->k_history, history_bytes,
+                      &value.k_history_fnv64) ||
+        !tensor_fnv64(state->v_history, history_bytes,
+                      &value.v_history_fnv64) ||
+        !tensor_fnv64(state->recurrent, recurrent_bytes,
+                      &value.recurrent_fnv64)) return 0;
+    value.token_count = state->token_count;
+    *digest = value;
+    return 1;
+}
+
+int ds4_glm5_kda_digest_equal(const ds4_glm5_kda_digest *rank0,
+                              const ds4_glm5_kda_digest *rank1) {
+    return rank0 && rank1 &&
+           rank0->output_fnv64 == rank1->output_fnv64 &&
+           rank0->q_history_fnv64 == rank1->q_history_fnv64 &&
+           rank0->k_history_fnv64 == rank1->k_history_fnv64 &&
+           rank0->v_history_fnv64 == rank1->v_history_fnv64 &&
+           rank0->recurrent_fnv64 == rank1->recurrent_fnv64 &&
+           rank0->token_count == rank1->token_count;
+}

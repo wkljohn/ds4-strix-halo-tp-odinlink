@@ -145,6 +145,13 @@ test-rocm-glm5-kda-layer: tests/test_rocm_glm5_kda_layer
 	DS4_GLM5_KDA_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/kda-layer0-oracle" \
 		./tests/test_rocm_glm5_kda_layer
 
+.PHONY: test-glm5-kda-tp-digest
+tests/test_glm5_kda_tp_digest: tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c $(LDLIBS)
+
+test-glm5-kda-tp-digest: tests/test_glm5_kda_tp_digest
+	./tests/test_glm5_kda_tp_digest
+
 tests/test_glm5_kda_state: tests/test_glm5_kda_state.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_state.c ds4_glm5_kda.c $(LDLIBS)
 

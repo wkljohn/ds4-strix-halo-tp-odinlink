@@ -55,6 +55,14 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return tensor ? tensor->bytes : 0;
 }
 
+int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset,
+                        void *data, uint64_t bytes) {
+    if (!tensor || !data || offset > tensor->bytes ||
+        bytes > tensor->bytes - offset) return 0;
+    memcpy(data, (const unsigned char *)tensor->data + offset, (size_t)bytes);
+    return 1;
+}
+
 static void reset_fakes(void) {
     alloc_calls = 0;
     free_calls = 0;

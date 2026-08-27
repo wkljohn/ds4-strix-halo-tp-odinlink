@@ -1,6 +1,9 @@
 #include "ds4_glm5_kda.h"
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
+extern "C" {
+#include "ds4_tp.h"
+}
 
 #include <hip/hip_runtime.h>
 
@@ -23,6 +26,24 @@
 
 typedef int (*ds4_tp_devcopy_fn)(void *, const void *, uint64_t);
 extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
+
+static uint64_t g_transport_calls;
+extern "C" int ds4_tp_gate_exchange(ds4_tp *, uint32_t, uint32_t, uint64_t) {
+    ++g_transport_calls; return 0;
+}
+extern "C" int ds4_tp_batch_gate_exchange(ds4_tp *, uint32_t, uint32_t,
+                                             uint64_t) {
+    ++g_transport_calls; return 0;
+}
+extern "C" int ds4_tp_big_gate_exchange(ds4_tp *, uint32_t, uint64_t,
+                                           const void *, void *, uint64_t) {
+    ++g_transport_calls; return 0;
+}
+extern "C" int ds4_tp_big_gate_exchange_waves(
+        ds4_tp *, uint32_t, uint64_t, const void *, void *, uint64_t,
+        uint64_t, uint32_t, ds4_tp_big_wave_ready_fn, void *) {
+    ++g_transport_calls; return 0;
+}
 
 #define CHECK(expr, message) do { \
     if (!(expr)) { \
@@ -234,6 +255,119 @@ static double nmse(const ErrorStats &stats) {
         std::max(stats.reference_sq, (long double)1.0e-30));
 }
 
+static bool read_state(const ds4_glm5_kda_layer_state &state,
+                       std::vector<float> &values) {
+    const uint64_t history =
+        (uint64_t)DS4_GLM5_KDA_CHANNELS * DS4_GLM5_KDA_HISTORY;
+    const uint64_t recurrent =
+        (uint64_t)DS4_GLM5_KDA_HEADS * DS4_GLM5_KDA_HEAD_DIM *
+        DS4_GLM5_KDA_HEAD_DIM;
+    values.resize((size_t)(3u * history + recurrent));
+    return ds4_gpu_tensor_read(state.q_history, 0, values.data(),
+                               history * sizeof(float)) &&
+           ds4_gpu_tensor_read(state.k_history, 0, values.data() + history,
+                               history * sizeof(float)) &&
+           ds4_gpu_tensor_read(state.v_history, 0,
+                               values.data() + 2u * history,
+                               history * sizeof(float)) &&
+           ds4_gpu_tensor_read(state.recurrent, 0,
+                               values.data() + 3u * history,
+                               recurrent * sizeof(float));
+}
+
+static bool handoff_case(uint32_t prefill,
+                         const ds4_glm5_kda_weight_offsets &weights,
+                         const MappedGGUF &gguf) {
+    const uint32_t total = prefill + 1u;
+    std::vector<float> host_input((size_t)total * 4096u);
+    for (uint64_t i = 0; i < host_input.size(); ++i) {
+        const int32_t centered = (int32_t)((i * 17u + 23u) % 257u) - 128;
+        host_input[i] = (float)centered * (1.0f / 1024.0f);
+    }
+    ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(
+        (uint64_t)host_input.size() * sizeof(float));
+    ds4_gpu_tensor *chunk_output = ds4_gpu_tensor_alloc(
+        (uint64_t)prefill * 4096u * sizeof(float));
+    ds4_gpu_tensor *chunk_last = ds4_gpu_tensor_alloc(4096u * sizeof(float));
+    ds4_gpu_tensor *token_output = ds4_gpu_tensor_alloc(4096u * sizeof(float));
+    CHECK(input && chunk_output && chunk_last && token_output,
+          "allocate handoff tensors");
+    CHECK(ds4_gpu_tensor_write(input, 0, host_input.data(),
+                               (uint64_t)host_input.size() * sizeof(float)),
+          "upload handoff input");
+
+    ds4_glm5_layer_kind schedule = {.layer = 0u, .is_kda = true};
+    ds4_glm5_kda_slot chunk = {}, tokenwise = {};
+    ds4_glm5_kda_workspace chunk_workspace = {}, token_workspace = {};
+    CHECK(ds4_glm5_kda_slot_init(&chunk, &schedule, 1u, 1u, nullptr) &&
+          ds4_glm5_kda_slot_init(&tokenwise, &schedule, 1u, 1u, nullptr) &&
+          ds4_glm5_kda_workspace_init(&chunk_workspace, prefill) &&
+          ds4_glm5_kda_workspace_init(&token_workspace, 1u),
+          "allocate handoff states/workspaces");
+
+    ds4_gpu_tensor *prefill_input = ds4_gpu_tensor_view(
+        input, 0, (uint64_t)prefill * 4096u * sizeof(float));
+    ds4_gpu_tensor *decode_input = ds4_gpu_tensor_view(
+        input, (uint64_t)prefill * 4096u * sizeof(float),
+        4096u * sizeof(float));
+    CHECK(prefill_input && decode_input, "create handoff input views");
+    CHECK(ds4_glm5_kda_layer_forward(
+              &chunk.layer[0], &chunk_workspace, &weights,
+              gguf.map, gguf.size, prefill_input, chunk_output, prefill) &&
+          ds4_glm5_kda_layer_forward(
+              &chunk.layer[0], &token_workspace, &weights,
+              gguf.map, gguf.size, decode_input, chunk_last, 1u),
+          "execute prefill plus decode handoff");
+
+    for (uint32_t token = 0; token < total; ++token) {
+        ds4_gpu_tensor *one = ds4_gpu_tensor_view(
+            input, (uint64_t)token * 4096u * sizeof(float),
+            4096u * sizeof(float));
+        CHECK(one != nullptr, "create tokenwise input view");
+        const bool ok = ds4_glm5_kda_layer_forward(
+            &tokenwise.layer[0], &token_workspace, &weights,
+            gguf.map, gguf.size, one, token_output, 1u);
+        ds4_gpu_tensor_free(one);
+        CHECK(ok, "execute tokenwise comparison");
+    }
+    CHECK(ds4_gpu_synchronize(), "synchronize handoff case");
+    std::vector<float> chunk_out(4096u), token_out(4096u);
+    std::vector<float> chunk_state, token_state;
+    CHECK(ds4_gpu_tensor_read(chunk_last, 0, chunk_out.data(),
+                              4096u * sizeof(float)) &&
+          ds4_gpu_tensor_read(token_output, 0, token_out.data(),
+                              4096u * sizeof(float)) &&
+          read_state(chunk.layer[0], chunk_state) &&
+          read_state(tokenwise.layer[0], token_state),
+          "read handoff results");
+    const ErrorStats output_error = compare(token_out, chunk_out);
+    const ErrorStats state_error = compare(token_state, chunk_state);
+    CHECK(chunk.layer[0].token_count == total &&
+          tokenwise.layer[0].token_count == total,
+          "handoff token counts agree");
+    CHECK(output_error.finite && state_error.finite &&
+          output_error.max_abs <= 5.0e-4 && nmse(output_error) <= 1.0e-7 &&
+          state_error.max_abs <= 5.0e-5 && nmse(state_error) <= 1.0e-7,
+          "handoff numerical envelope");
+    std::fprintf(stderr,
+        "PASS GLM5 KDA handoff prefill=%u output_abs=%.9g output_nmse=%.9g "
+        "state_abs=%.9g state_nmse=%.9g\n",
+        prefill, output_error.max_abs, nmse(output_error),
+        state_error.max_abs, nmse(state_error));
+
+    ds4_gpu_tensor_free(decode_input);
+    ds4_gpu_tensor_free(prefill_input);
+    ds4_glm5_kda_workspace_free(&token_workspace);
+    ds4_glm5_kda_workspace_free(&chunk_workspace);
+    ds4_glm5_kda_slot_free(&tokenwise);
+    ds4_glm5_kda_slot_free(&chunk);
+    ds4_gpu_tensor_free(token_output);
+    ds4_gpu_tensor_free(chunk_last);
+    ds4_gpu_tensor_free(chunk_output);
+    ds4_gpu_tensor_free(input);
+    return true;
+}
+
 static uint64_t fnv64(const std::vector<float> &values) {
     const uint8_t *bytes = (const uint8_t *)values.data();
     const uint64_t count = (uint64_t)values.size() * sizeof(float);
@@ -367,6 +501,35 @@ static bool run_test(void) {
     CHECK(history_error.max_abs <= 5.0e-4 &&
           state_error.max_abs <= 5.0e-5,
           "complete layer resident-state numerical envelope");
+
+    ds4_glm5_kda_slot peer = {};
+    ds4_glm5_kda_workspace peer_workspace = {};
+    ds4_gpu_tensor *peer_output = ds4_gpu_tensor_alloc(
+        (uint64_t)output_ref.size() * sizeof(float));
+    CHECK(peer_output &&
+          ds4_glm5_kda_slot_init(&peer, &schedule, 1u, 1u, stderr) &&
+          ds4_glm5_kda_workspace_init(&peer_workspace, tokens) &&
+          ds4_glm5_kda_layer_forward(
+              &peer.layer[0], &peer_workspace, &weights,
+              gguf.map, gguf.size, input, peer_output, tokens) &&
+          ds4_gpu_synchronize(),
+          "execute independent replicated rank");
+    ds4_glm5_kda_digest local_digest = {}, peer_digest = {};
+    CHECK(ds4_glm5_kda_layer_digest(
+              &slot.layer[0], output, output_ref.size(), &local_digest) &&
+          ds4_glm5_kda_layer_digest(
+              &peer.layer[0], peer_output, output_ref.size(), &peer_digest) &&
+          ds4_glm5_kda_digest_equal(&local_digest, &peer_digest),
+          "independent ranks produce identical state/output digests");
+    ds4_glm5_kda_workspace_free(&peer_workspace);
+    ds4_glm5_kda_slot_free(&peer);
+    ds4_gpu_tensor_free(peer_output);
+
+    for (uint32_t length : {1u, 2u, 3u, 127u, 128u, 129u, 2048u})
+        CHECK(handoff_case(length, weights, gguf),
+              "prefill/decode handoff case");
+    CHECK(g_transport_calls == 0u,
+          "KDA execution invokes no TP exchange API");
     CHECK(failure_invalidation(slot, workspace, weights, gguf, input, output),
           "failure invalidation contract");
 

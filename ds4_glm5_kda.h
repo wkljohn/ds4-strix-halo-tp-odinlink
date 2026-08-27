@@ -64,6 +64,17 @@ typedef struct {
     uint32_t n_tokens;
 } ds4_glm5_kda_device_args;
 
+/* Test-only state comparison payload. Producing it performs device readback;
+ * ordinary inference must never call this path. */
+typedef struct {
+    uint64_t output_fnv64;
+    uint64_t q_history_fnv64;
+    uint64_t k_history_fnv64;
+    uint64_t v_history_fnv64;
+    uint64_t recurrent_fnv64;
+    uint64_t token_count;
+} ds4_glm5_kda_digest;
+
 int ds4_glm5_kda_state_bytes(uint64_t kda_count, uint32_t slot_count,
                              uint64_t *bytes);
 int ds4_glm5_kda_build_schedule(ds4_glm5_layer_kind *out,
@@ -91,6 +102,12 @@ int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
                                const ds4_gpu_tensor *input,
                                ds4_gpu_tensor *output,
                                uint32_t n_tokens);
+int ds4_glm5_kda_layer_digest(const ds4_glm5_kda_layer_state *state,
+                              const ds4_gpu_tensor *output,
+                              uint64_t output_floats,
+                              ds4_glm5_kda_digest *digest);
+int ds4_glm5_kda_digest_equal(const ds4_glm5_kda_digest *rank0,
+                              const ds4_glm5_kda_digest *rank1);
 
 /* Internal backend adapter. Non-ROCm builds resolve the weak fail-closed
  * implementation in ds4_glm5_kda.c. */
