@@ -90,6 +90,7 @@ test-moe-wave-plan:
 test-glm5-next-contract:
 	python3 scripts/check-glm5-next-gguf.py "$(DS4_GLM5_MODEL)"
 	python3 scripts/probe-glm5-next-weights.py . "$(DS4_GLM5_MODEL)"
+	python3 scripts/probe-glm5-next-kda-payload.py "$(DS4_GLM5_MODEL)"
 	python3 scripts/plan-glm5-next-residency.py . "$(DS4_GLM5_MODEL)"
 	python3 tests/test_glm5_next_oracles.py
 
