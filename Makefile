@@ -109,8 +109,11 @@ tests/test_rocm_glm5_kda_ref: tests/test_rocm_glm5_kda_ref.cu rocm/ds4_rocm_glm5
 test-rocm-glm5-kda-ref: tests/test_rocm_glm5_kda_ref
 	./tests/test_rocm_glm5_kda_ref
 
-tests/test_rocm_glm5_conv_ref: tests/test_rocm_glm5_conv_ref.cu rocm/ds4_rocm_glm5_conv_ref.cuh
-	$(HIPCC) $(ROCM_CFLAGS) -I. -o $@ $<
+tests/test_rocm_glm5_conv_ref.o: tests/test_rocm_glm5_conv_ref.cu ds4_gpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_conv_ref: tests/test_rocm_glm5_conv_ref.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-glm5-conv-ref: tests/test_rocm_glm5_conv_ref
 	./tests/test_rocm_glm5_conv_ref
@@ -461,7 +464,7 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc
 ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
-ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
+ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h rocm/ds4_rocm_glm5_kda.cuh
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_compat.cu
 
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu

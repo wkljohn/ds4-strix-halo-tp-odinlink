@@ -1149,6 +1149,17 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
+/* Fixed-shape GLM-5 KDA depthwise causal convolution. All tensors are F32:
+ * input/output [n_tokens, 8192], weight [8192, 4], and mutable history
+ * [8192, 3]. Unsupported sizes and aliases fail without launching. */
+int ds4_gpu_glm5_causal_conv4_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *history,
+        const ds4_gpu_tensor *input,
+        const ds4_gpu_tensor *weight,
+        uint32_t              n_tokens,
+        uint32_t              channels);
+
 int ds4_gpu_rms_norm_weight_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,

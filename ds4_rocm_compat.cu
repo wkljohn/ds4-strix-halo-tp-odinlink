@@ -8,12 +8,60 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_args.h"
 
+#include "rocm/ds4_rocm_glm5_kda.cuh"
+
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
 int g_n_gpus = 1;
 int g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
 
 static int rocm_tier_valid(int tier) {
     return tier == 0 && g_n_gpus == 1;
+}
+
+static int rocm_ranges_overlap(const ds4_gpu_tensor *a,
+                               const ds4_gpu_tensor *b) {
+    if (!a || !b || !a->ptr || !b->ptr) return 0;
+    const uintptr_t a0 = (uintptr_t)a->ptr;
+    const uintptr_t b0 = (uintptr_t)b->ptr;
+    if (a->bytes > UINTPTR_MAX - a0 || b->bytes > UINTPTR_MAX - b0) return 1;
+    return a0 < b0 + b->bytes && b0 < a0 + a->bytes;
+}
+
+extern "C" int ds4_gpu_glm5_causal_conv4_tensor(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *history,
+        const ds4_gpu_tensor *input,
+        const ds4_gpu_tensor *weight,
+        uint32_t n_tokens,
+        uint32_t channels) {
+    constexpr uint32_t expected_channels = 8192u;
+    if (!out || !history || !input || !weight || !out->ptr ||
+        !history->ptr || !input->ptr || !weight->ptr || n_tokens == 0u ||
+        channels != expected_channels) {
+        return 0;
+    }
+    const uint64_t row_bytes = (uint64_t)channels * sizeof(float);
+    const uint64_t io_bytes = (uint64_t)n_tokens * row_bytes;
+    const uint64_t history_bytes =
+        (uint64_t)channels * 3u * sizeof(float);
+    const uint64_t weight_bytes =
+        (uint64_t)channels * 4u * sizeof(float);
+    if (out->bytes < io_bytes || input->bytes < io_bytes ||
+        history->bytes < history_bytes || weight->bytes < weight_bytes ||
+        out->device_id != history->device_id ||
+        out->device_id != input->device_id ||
+        out->device_id != weight->device_id ||
+        rocm_ranges_overlap(out, history)) {
+        return 0;
+    }
+    constexpr uint32_t threads = 256u;
+    hipLaunchKernelGGL(ds4_glm5_causal_conv4_kernel,
+                       dim3((channels + threads - 1u) / threads),
+                       dim3(threads), 0, 0,
+                       (float *)out->ptr, (float *)history->ptr,
+                       (const float *)input->ptr,
+                       (const float *)weight->ptr, n_tokens, channels);
+    return hipGetLastError() == hipSuccess;
 }
 
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
