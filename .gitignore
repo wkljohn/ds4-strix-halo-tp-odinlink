@@ -45,6 +45,7 @@
 /tests/test_rocm_q4k_kshard_install
 /tests/test_rocm_q4k_kshard_prefill_realweight
 /tests/test_rocm_q4k_kshard_prefill_timing
+/tests/test_rocm_glm5_q4k_shard_compose
 /tests/test_rocm_q4k_packed_slice_registry
 /tests/test_rocm_shared_routed_overlap
 /tests/test_rocm_q4k_slot_balance_oracle
