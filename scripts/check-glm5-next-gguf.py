@@ -137,6 +137,24 @@ def main(argv):
         if got != expected:
             raise ValueError(f"tensor schedule {suffix}: expected {expected}, got {got}")
 
+    def layer_indices(suffix):
+        out = set()
+        for name in tensors:
+            if name.endswith(suffix) and name.startswith("blk."):
+                out.add(int(name.split(".")[1]))
+        return out
+
+    expected_kda = {i for i in range(45) if i % 4 != 3}
+    expected_mla = set(range(3, 44, 4)) | {45}
+    if layer_indices(".kda_q.weight") != expected_kda:
+        raise ValueError("KDA layer schedule does not match 3-dense/4th-sparse pattern")
+    if layer_indices(".attn_q_a.weight") != expected_mla:
+        raise ValueError("sparse MLA layer schedule does not match expected pattern")
+    for suffix in (".ffn_gate_exps.weight", ".ffn_up_exps.weight",
+                   ".ffn_down_exps.weight"):
+        if layer_indices(suffix) != set(range(3, 46)):
+            raise ValueError(f"routed expert schedule mismatch for {suffix}")
+
     if any(name.startswith("blk.45.hc_") for name in tensors):
         raise ValueError("block 45 unexpectedly contains mHC tensors")
 
