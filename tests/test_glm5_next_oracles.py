@@ -123,11 +123,35 @@ def nope_sparse_mla(query, keys, values, top_k):
             for j in range(len(values[0]))]
 
 
-def mhc_mix(branches, logits):
+def weighted_stream_mix(branches, logits):
+    """Simple stream average, retained as a pre/post projection helper."""
     assert len(branches) == 4 and len(logits) == 4
     w = softmax(logits)
     return [sum(w[i] * branches[i][j] for i in range(4))
             for j in range(len(branches[0]))]
+
+
+def sinkhorn(matrix, iterations=20, eps=1e-6):
+    """Project a positive 4x4 residual map toward doubly-stochastic form."""
+    out = [[math.exp(max(-20.0, min(20.0, x))) for x in row]
+           for row in matrix]
+    for _ in range(iterations):
+        for i in range(len(out)):
+            z = sum(out[i]) + eps
+            out[i] = [x / z for x in out[i]]
+        for j in range(len(out[0])):
+            z = sum(out[i][j] for i in range(len(out))) + eps
+            for i in range(len(out)):
+                out[i][j] /= z
+    return out
+
+
+def mhc_residual_mix(branches, raw_map):
+    assert len(branches) == 4 and len(raw_map) == 4
+    matrix = sinkhorn(raw_map)
+    return [[sum(matrix[i][j] * branches[i][k] for i in range(4))
+             for k in range(len(branches[0]))]
+            for j in range(4)]
 
 
 def close(a, b, eps=1e-12):
@@ -142,8 +166,22 @@ def test_routing_is_stable():
 
 def test_mhc_is_normalized_and_ordered():
     branches = [[float(i + j) for j in range(4)] for i in range(4)]
-    got = mhc_mix(branches, [0.0, 0.0, 0.0, 0.0])
+    got = weighted_stream_mix(branches, [0.0, 0.0, 0.0, 0.0])
     assert got == [1.5 + j for j in range(4)]
+
+
+def test_mhc_sinkhorn_preserves_stream_mass():
+    branches = [[float(10 * i + j) for j in range(3)] for i in range(4)]
+    mixed = mhc_residual_mix(
+        branches,
+        [[3.0, -1.0, 0.5, 2.0], [0.1, 4.0, -2.0, 0.3],
+         [1.0, 0.2, 2.5, -0.4], [-1.0, 0.7, 0.4, 3.5]])
+    assert len(mixed) == 4
+    # Sinkhorn's residual map preserves each feature's sum (up to the
+    # finite-iteration epsilon), unlike a per-row softmax.
+    for j in range(3):
+        assert abs(sum(mixed[i][j] for i in range(4)) -
+                   sum(branches[i][j] for i in range(4))) < 2e-2
 
 
 def test_nope_uses_selected_rows_only():
