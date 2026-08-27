@@ -106,6 +106,73 @@ def kda_reference(state, q, k, v, beta, gate):
             for j in range(value_dim)]
 
 
+def conv4_sequence(history, values, weights):
+    """Independent depthwise four-tap conv + SiLU sequence oracle."""
+    channels = len(history)
+    assert channels == len(weights)
+    assert all(len(row) == 3 for row in history)
+    assert all(len(row) == 4 for row in weights)
+    state = [row[:] for row in history]
+    output = []
+    for token in values:
+        assert len(token) == channels
+        out_row = []
+        for channel in range(channels):
+            h0, h1, h2 = state[channel]
+            x = token[channel]
+            w0, w1, w2, w3 = weights[channel]
+            raw = h0 * w0 + h1 * w1 + h2 * w2 + x * w3
+            out_row.append(raw / (1.0 + math.exp(-raw)))
+            state[channel] = [h1, h2, x]
+        output.append(out_row)
+    return output, state
+
+
+def run_conv_chunks(values, weights, initial_history, chunks):
+    assert sum(chunks) == len(values)
+    history = [row[:] for row in initial_history]
+    output = []
+    pos = 0
+    for count in chunks:
+        chunk_out, history = conv4_sequence(
+            history, values[pos:pos + count], weights)
+        output.extend(chunk_out)
+        pos += count
+    return output, history
+
+
+def _flatten(values):
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            yield from _flatten(value)
+        else:
+            yield value
+
+
+def max_abs_rel(reference, candidate):
+    ref = list(_flatten(reference))
+    got = list(_flatten(candidate))
+    assert len(ref) == len(got)
+    abs_err = max((abs(a - b) for a, b in zip(ref, got)), default=0.0)
+    rel_err = max((abs(a - b) / max(abs(a), 1e-30)
+                   for a, b in zip(ref, got)), default=0.0)
+    return abs_err, rel_err
+
+
+def kda_sequence(state, q, k, v, beta, gate):
+    """Sequential one-head KDA oracle returning output and copied state."""
+    assert len(q) == len(k) == len(v) == len(beta) == len(gate)
+    current = [row[:] for row in state]
+    output = []
+    for token in range(len(q)):
+        assert len(q[token]) == len(k[token]) == len(v[token]) == 1
+        assert len(beta[token]) == len(gate[token]) == 1
+        output.append(kda_reference(
+            current, q[token][0], k[token][0], v[token][0],
+            beta[token][0], gate[token][0]))
+    return output, current
+
+
 def kda_sharded_output(state, q, k, v, beta, gate, split):
     """Run KDA with key rows split across two ranks and compose the output."""
     full = kda_reference([row[:] for row in state], q, k, v, beta, gate)
@@ -226,6 +293,60 @@ def test_kda_update_is_deterministic():
             [1.0, -2.0, 0.5], 0.125, [-0.3, -0.1, -0.7, -0.2])
     assert close(kda_reference([row[:] for row in initial], *args),
                  kda_reference([row[:] for row in initial], *args))
+
+
+def test_conv4_sequence_keeps_the_last_three_samples():
+    out, history = conv4_sequence(
+        [[1.0, 2.0, 3.0]], [[4.0], [5.0]], [[0.1, 0.2, 0.3, 0.4]])
+    assert abs(out[0][0] - 2.8577223804672998) < 1e-15
+    assert abs(out[1][0] - 3.9280551601516338) < 1e-15
+    assert history == [[3.0, 4.0, 5.0]]
+
+
+def test_conv4_chunking_matches_one_call_at_boundaries():
+    values = [[math.sin(0.031 * (t * 4 + c + 1))
+               for c in range(4)] for t in range(129)]
+    weights = [[0.03 * (tap + 1) * (c + 1)
+                for tap in range(4)] for c in range(4)]
+    initial = [[0.01 * (c + tap + 1) for tap in range(3)]
+               for c in range(4)]
+    one_call_out, one_call_history = run_conv_chunks(
+        values, weights, initial, [129])
+    for chunks in ([1, 128], [2, 127], [3, 126], [127, 1, 1]):
+        got_out, got_history = run_conv_chunks(
+            values, weights, initial, chunks)
+        abs_err, rel_err = max_abs_rel(one_call_out, got_out)
+        assert abs_err <= 1e-15 and rel_err <= 1e-15
+        assert got_history == one_call_history
+
+
+def test_kda_sequence_applies_decay_before_prediction():
+    out, final = kda_sequence(
+        [[2.0]], [[[3.0]]], [[[0.5]]], [[[4.0]]],
+        [[0.25]], [[[math.log(0.5)]]])
+    assert abs(final[0][0] - 1.4375) < 1e-15
+    assert abs(out[0][0] - 4.3125) < 1e-15
+
+
+def test_kda_sequence_stays_finite_for_adversarial_gates():
+    q = [[[0.02 * (i + 1) for i in range(8)]] for _ in range(3)]
+    k = [[[0.01 * (8 - i) for i in range(8)]] for _ in range(3)]
+    v = [[[0.03 * (i - 2) for i in range(5)]] for _ in range(3)]
+    beta = [[1e-7], [0.5], [1.0 - 1e-7]]
+    initial = [[0.001 * (1 + i + 2 * j) for j in range(5)]
+               for i in range(8)]
+    cases = (
+        [[-1e-7] * 8 for _ in range(3)],
+        [[-5.0] * 8 for _ in range(3)],
+        [[-1e-7, -5.0, -0.2, -3.0, -0.9, -4.0, -0.01, -2.0]
+         for _ in range(3)],
+    )
+    for gate in cases:
+        out, final = kda_sequence(
+            [row[:] for row in initial], q, k, v, beta,
+            [[row] for row in gate])
+        assert all(math.isfinite(x) for row in final for x in row)
+        assert all(math.isfinite(x) for row in out for x in row)
 
 
 def test_kda_key_shards_require_global_prediction_reduction():

@@ -9,6 +9,9 @@ dependency.
 """
 from __future__ import annotations
 
+import argparse
+import hashlib
+import json
 import math
 import mmap
 import struct
@@ -96,11 +99,147 @@ def sigmoid(x):
     return e / (1.0 + e)
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as fp:
+        while chunk := fp.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_full_layer_oracle(path, blob, data_start, tensors, output_path):
+    """Write the two-token, complete layer-0 KDA FP32 oracle payload."""
+    import numpy as np
+
+    def addr(name, shape, typ):
+        dims, got_type, rel = tensors[name]
+        if dims != shape or got_type != typ:
+            raise ValueError(
+                f"{name}: expected {(shape, typ)}, got {(dims, got_type)}")
+        return data_start + rel
+
+    def bf16_matrix(base, rows, cols):
+        raw = np.frombuffer(blob, dtype="<u2", count=rows * cols, offset=base)
+        return (raw.astype(np.uint32) << 16).view(np.float32).reshape(rows, cols)
+
+    def f32_array(base, count, shape=None):
+        result = np.frombuffer(blob, dtype="<f4", count=count, offset=base)
+        return result if shape is None else result.reshape(shape)
+
+    def project(x, base, rows, cols):
+        matrix = bf16_matrix(base, rows, cols)
+        result = np.asarray(x @ matrix.T, dtype=np.float32)
+        del matrix
+        return result
+
+    offsets = {
+        "attn_norm": addr("blk.0.attn_norm.weight", (4096,), 0),
+        "q": addr("blk.0.kda_q.weight", (4096, 8192), 30),
+        "k": addr("blk.0.kda_k.weight", (4096, 8192), 30),
+        "v": addr("blk.0.kda_v.weight", (4096, 8192), 30),
+        "q_conv": addr("blk.0.kda_q_conv.weight", (4, 1, 8192), 0),
+        "k_conv": addr("blk.0.kda_k_conv.weight", (4, 1, 8192), 0),
+        "v_conv": addr("blk.0.kda_v_conv.weight", (4, 1, 8192), 0),
+        "f_a": addr("blk.0.kda_f_a.weight", (4096, 128), 30),
+        "f_b": addr("blk.0.kda_f_b.weight", (128, 8192), 30),
+        "g_a": addr("blk.0.kda_g_a.weight", (4096, 128), 30),
+        "g_b": addr("blk.0.kda_g_b.weight", (128, 8192), 30),
+        "beta": addr("blk.0.kda_beta.weight", (4096, 64), 30),
+        "o_norm": addr("blk.0.kda_o_norm.weight", (128,), 0),
+        "dt": addr("blk.0.kda_dt_bias.weight", (8192,), 0),
+        "a_log": addr("blk.0.kda_a_log.weight", (64,), 0),
+        "output": addr("blk.0.kda_output.weight", (8192, 4096), 30),
+    }
+
+    x = np.asarray([[math.sin(0.013 * (t * 4096 + i + 1)) * 0.25
+                     for i in range(4096)] for t in range(2)], dtype=np.float32)
+    attn_norm = f32_array(offsets["attn_norm"], 4096)
+    rms = np.sqrt(np.mean(x * x, axis=1, keepdims=True) + np.float32(1e-5))
+    normalized = np.asarray(x / rms * attn_norm[None, :], dtype=np.float32)
+
+    q = project(normalized, offsets["q"], 8192, 4096)
+    k = project(normalized, offsets["k"], 8192, 4096)
+    v = project(normalized, offsets["v"], 8192, 4096)
+    histories = []
+    for projected, key in ((q, "q_conv"), (k, "k_conv"), (v, "v_conv")):
+        weight = f32_array(offsets[key], 8192 * 4, (8192, 4))
+        history = np.zeros((8192, 3), dtype=np.float32)
+        for token in range(2):
+            current = projected[token].copy()
+            raw = (history[:, 0] * weight[:, 0] +
+                   history[:, 1] * weight[:, 1] +
+                   history[:, 2] * weight[:, 2] +
+                   current * weight[:, 3])
+            projected[token] = raw / (np.float32(1.0) + np.exp(-raw))
+            history[:, 0] = history[:, 1]
+            history[:, 1] = history[:, 2]
+            history[:, 2] = current
+        histories.append(history)
+
+    qh = q.reshape(2, 64, 128)
+    kh = k.reshape(2, 64, 128)
+    vh = v.reshape(2, 64, 128)
+    qh /= np.sqrt(np.sum(qh * qh, axis=2, keepdims=True) + np.float32(1e-6))
+    qh /= np.float32(math.sqrt(128.0))
+    kh /= np.sqrt(np.sum(kh * kh, axis=2, keepdims=True) + np.float32(1e-6))
+
+    f_low = project(normalized, offsets["f_a"], 128, 4096)
+    forget_projection = project(f_low, offsets["f_b"], 8192, 128).reshape(2, 64, 128)
+    g_low = project(normalized, offsets["g_a"], 128, 4096)
+    out_gate = project(g_low, offsets["g_b"], 8192, 128).reshape(2, 64, 128)
+    beta = project(normalized, offsets["beta"], 64, 4096)
+    beta = np.asarray(1.0 / (1.0 + np.exp(-beta)), dtype=np.float32)
+    dt = f32_array(offsets["dt"], 8192).reshape(64, 128)
+    a_log = f32_array(offsets["a_log"], 64)
+    forget = np.asarray(
+        -5.0 / (1.0 + np.exp(-np.exp(a_log)[None, :, None] *
+                              (forget_projection + dt[None, :, :]))),
+        dtype=np.float32)
+
+    state = np.zeros((64, 128, 128), dtype=np.float32)
+    core = np.zeros((2, 64, 128), dtype=np.float32)
+    for token in range(2):
+        for head in range(64):
+            state[head] *= np.exp(forget[token, head])[:, None]
+            prediction = kh[token, head] @ state[head]
+            state[head] += np.outer(
+                kh[token, head],
+                beta[token, head] * (vh[token, head] - prediction))
+            core[token, head] = qh[token, head] @ state[head]
+
+    o_norm = f32_array(offsets["o_norm"], 128)
+    core_rms = np.sqrt(np.mean(core * core, axis=2, keepdims=True) +
+                       np.float32(1e-6))
+    gated = np.asarray(
+        core / core_rms * o_norm[None, None, :] *
+        (1.0 / (1.0 + np.exp(-out_gate))), dtype=np.float32)
+    output = project(gated.reshape(2, 8192), offsets["output"], 4096, 8192)
+
+    history_bytes = b"".join(
+        np.asarray(history, dtype="<f4").tobytes() for history in histories)
+    output_bytes = np.asarray(output, dtype="<f4").tobytes()
+    state_bytes = np.asarray(state, dtype="<f4").tobytes()
+    document = {
+        "model_sha256": sha256_file(path),
+        "layer": 0,
+        "tokens": 2,
+        "output_f32_sha256": hashlib.sha256(output_bytes).hexdigest(),
+        "history_f32_sha256": hashlib.sha256(history_bytes).hexdigest(),
+        "state_f32_sha256": hashlib.sha256(state_bytes).hexdigest(),
+        "output_l2": float(np.linalg.norm(output.astype(np.float64))),
+        "state_l2": float(np.linalg.norm(state.astype(np.float64))),
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    return document
+
+
 def main(argv):
-    if len(argv) != 2:
-        print(f"usage: {argv[0]} MODEL.gguf", file=sys.stderr)
-        return 2
-    path = Path(argv[1])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("model", type=Path)
+    args = parser.parse_args(argv[1:])
+    path = args.model
     data_start, tensors = load_directory(path)
     required = [
         "blk.0.kda_q.weight", "blk.0.kda_k.weight", "blk.0.kda_v.weight",
@@ -169,6 +308,14 @@ def main(argv):
             h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     print("PASS GLM5-next KDA payload probe")
     print(f"sample_channels=8 beta={beta:.8g} output_fnv64={h:016x}")
+    if args.output is not None:
+        document = write_full_layer_oracle(
+            path, blob, data_start, tensors, args.output)
+        print(f"model_sha256={document['model_sha256']}")
+        print(f"output_f32_sha256={document['output_f32_sha256']}")
+        print(f"history_f32_sha256={document['history_f32_sha256']}")
+        print(f"state_f32_sha256={document['state_f32_sha256']}")
+        print(f"output_l2={document['output_l2']:.9g} state_l2={document['state_l2']:.9g}")
     blob.close()
     return 0
 
