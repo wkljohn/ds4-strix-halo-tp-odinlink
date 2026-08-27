@@ -75,3 +75,4 @@ __pycache__/
 /.rocprofv3/
 .*.swp
 .DS_Store
+tests/test_rocm_glm5_kda_ref
