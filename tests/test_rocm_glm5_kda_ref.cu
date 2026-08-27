@@ -13,11 +13,11 @@ static void check(hipError_t e, const char *what) {
 }
 
 int main() {
-    constexpr uint32_t T = 3, H = 2, C = 8;
+    constexpr uint32_t T = 3, H = 2, C = 128;
     const size_t tokens = (size_t) T * H * C;
     const size_t state_n = (size_t) H * C * C;
     std::vector<float> q(tokens), k(tokens), v(tokens), g(tokens), beta(T * H);
-    std::vector<float> state(state_n), ref_state, ref_out(tokens), got(tokens);
+    std::vector<float> state(state_n), ref_state, ref_out(tokens), got(tokens), got_warp(tokens);
     for (size_t i = 0; i < tokens; ++i) {
         q[i] = 0.01f * float(int(i % 13) - 6);
         k[i] = 0.02f * float(int(i % 11) - 5);
@@ -33,7 +33,7 @@ int main() {
             for (uint32_t j = 0; j < C; ++j) {
                 float pred = 0.0f;
                 for (uint32_t i = 0; i < C; ++i)
-                    pred += ref_state[((size_t)h * C + i) * C + j] * k[base + i];
+                    pred += std::exp(g[base + i]) * ref_state[((size_t)h * C + i) * C + j] * k[base + i];
                 for (uint32_t i = 0; i < C; ++i)
                     ref_state[((size_t)h * C + i) * C + j] =
                         std::exp(g[base + i]) * ref_state[((size_t)h * C + i) * C + j] +
@@ -43,33 +43,50 @@ int main() {
             }
         }
     }
-    float *dq, *dk, *dv, *dg, *db, *ds, *do_; 
+    float *dq, *dk, *dv, *dg, *db, *ds, *dsw, *do_, *dow;
     check(hipMalloc(&dq, q.size()*sizeof(float)), "q alloc");
     check(hipMalloc(&dk, k.size()*sizeof(float)), "k alloc");
     check(hipMalloc(&dv, v.size()*sizeof(float)), "v alloc");
     check(hipMalloc(&dg, g.size()*sizeof(float)), "g alloc");
     check(hipMalloc(&db, beta.size()*sizeof(float)), "beta alloc");
     check(hipMalloc(&ds, state.size()*sizeof(float)), "state alloc");
+    check(hipMalloc(&dsw, state.size()*sizeof(float)), "warp state alloc");
     check(hipMalloc(&do_, q.size()*sizeof(float)), "out alloc");
+    check(hipMalloc(&dow, q.size()*sizeof(float)), "warp out alloc");
     check(hipMemcpy(dq,q.data(),q.size()*sizeof(float),hipMemcpyHostToDevice), "q copy");
     check(hipMemcpy(dk,k.data(),k.size()*sizeof(float),hipMemcpyHostToDevice), "k copy");
     check(hipMemcpy(dv,v.data(),v.size()*sizeof(float),hipMemcpyHostToDevice), "v copy");
     check(hipMemcpy(dg,g.data(),g.size()*sizeof(float),hipMemcpyHostToDevice), "g copy");
     check(hipMemcpy(db,beta.data(),beta.size()*sizeof(float),hipMemcpyHostToDevice), "beta copy");
     check(hipMemcpy(ds,state.data(),state.size()*sizeof(float),hipMemcpyHostToDevice), "state copy");
+    check(hipMemcpy(dsw,state.data(),state.size()*sizeof(float),hipMemcpyHostToDevice), "warp state copy");
     check(hipMemset(do_, 0, q.size()*sizeof(float)), "out clear");
+    check(hipMemset(dow, 0, q.size()*sizeof(float)), "warp out clear");
     hipLaunchKernelGGL(ds4_glm5_kda_ref_kernel, dim3(H), dim3(C), 0, 0,
                        dq,dk,dv,dg,db,ds,do_,T,H,C);
     check(hipGetLastError(), "KDA launch");
+    hipLaunchKernelGGL(ds4_glm5_kda_warp128_kernel, dim3(1,H,32), dim3(32,4), 0, 0,
+                       dq,dk,dv,dg,db,dsw,dow,T,H);
+    check(hipGetLastError(), "warp KDA launch");
     check(hipDeviceSynchronize(), "KDA synchronize");
     check(hipMemcpy(got.data(),do_,got.size()*sizeof(float),hipMemcpyDeviceToHost), "out copy");
     check(hipMemcpy(state.data(),ds,state.size()*sizeof(float),hipMemcpyDeviceToHost), "state copy back");
-    float max_err = 0.0f;
-    for (size_t i = 0; i < got.size(); ++i) max_err = std::fmax(max_err, std::fabs(got[i]-ref_out[i]));
-    for (size_t i = 0; i < state.size(); ++i) max_err = std::fmax(max_err, std::fabs(state[i]-ref_state[i]));
-    hipFree(dq); hipFree(dk); hipFree(dv); hipFree(dg); hipFree(db); hipFree(ds); hipFree(do_);
+    std::vector<float> warp_state(state_n);
+    check(hipMemcpy(got_warp.data(),dow,got_warp.size()*sizeof(float),hipMemcpyDeviceToHost), "warp out copy");
+    check(hipMemcpy(warp_state.data(),dsw,state.size()*sizeof(float),hipMemcpyDeviceToHost), "warp state copy back");
+    float simple_err = 0.0f, warp_err = 0.0f;
+    for (size_t i = 0; i < got.size(); ++i) simple_err = std::fmax(simple_err, std::fabs(got[i]-ref_out[i]));
+    for (size_t i = 0; i < state.size(); ++i) simple_err = std::fmax(simple_err, std::fabs(state[i]-ref_state[i]));
+    for (size_t i = 0; i < got.size(); ++i) warp_err = std::fmax(warp_err, std::fabs(got_warp[i]-ref_out[i]));
+    for (size_t i = 0; i < state.size(); ++i) warp_err = std::fmax(warp_err, std::fabs(warp_state[i]-ref_state[i]));
+    float max_err = std::fmax(simple_err, warp_err);
+    check(hipFree(dq), "q free"); check(hipFree(dk), "k free");
+    check(hipFree(dv), "v free"); check(hipFree(dg), "g free");
+    check(hipFree(db), "beta free"); check(hipFree(ds), "state free");
+    check(hipFree(dsw), "warp state free"); check(hipFree(do_), "out free");
+    check(hipFree(dow), "warp out free");
     if (max_err > 2e-6f) {
-        std::fprintf(stderr, "FAIL GLM5 KDA reference max_err=%.9g\n", max_err);
+        std::fprintf(stderr, "FAIL GLM5 KDA reference simple_err=%.9g warp_err=%.9g\n", simple_err, warp_err);
         return 1;
     }
     std::printf("PASS GLM5 KDA ROCm reference max_err=%.9g\n", max_err);
