@@ -72,6 +72,16 @@ def main(argv):
     dtv = f32(blob, dt, 8192)
     alogv = f32(blob, alog, 64)
 
+    # GLM-5 invokes the KDA kernel with q/k L2 normalization enabled.  Keep
+    # this in FP32, then apply the recurrent query scale exactly once.
+    for t in range(2):
+        for h in range(64):
+            sl = slice(h * 128, (h + 1) * 128)
+            qn = math.sqrt(float(np.dot(q[t, sl], q[t, sl])) + 1.0e-6)
+            kn = math.sqrt(float(np.dot(k[t, sl], k[t, sl])) + 1.0e-6)
+            q[t, sl] = q[t, sl] / qn / math.sqrt(128.0)
+            k[t, sl] = k[t, sl] / kn
+
     # Reference recurrence, state shape [head,key,value].
     state = np.zeros((64, 128, 128), dtype=np.float32)
     out = np.zeros((2, 8192), dtype=np.float32)
