@@ -2,8 +2,8 @@
 """Read-only structural checker for the GLM-5.3-Flash GGUF contract.
 
 It reads only the GGUF header, metadata and tensor descriptors; tensor payloads
-are never mapped or allocated.  The checker intentionally accepts extension
-quantization type 30 as opaque until its codec is implemented.
+are never mapped or allocated.  Type 30 is GGML BF16; the checker still does
+not interpret tensor payloads.
 """
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ def main(argv):
         "blk.3.ffn_gate_exps.weight": ((4096, 2048, 288), 12),
         "blk.3.ffn_up_exps.weight": ((4096, 2048, 288), 12),
         "blk.3.ffn_down_exps.weight": ((2048, 4096, 288), 12),
-        "blk.0.kda_q.weight": ((4096, 8192), 30),
+        "blk.0.kda_q.weight": ((4096, 8192), 30),  # BF16
         "blk.3.attn_q_a.weight": ((4096, 1536), 8),
         "blk.3.hc_attn_fn.weight": ((16384, 24), 30),
     }
