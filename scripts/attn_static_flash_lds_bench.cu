@@ -358,10 +358,12 @@ static float median6(float values[6]) {
     return 0.5f * (values[2] + values[3]);
 }
 
-static void timing_shape(uint32_t n_q, CachePolluter &polluter) {
+static void timing_shape(uint32_t n_q, uint32_t n_comp,
+                         CachePolluter &polluter) {
     const uint32_t q_row0 = 2048u - n_q;
-    Bench b(n_q, q_row0, 640u, 128u, 4u, 64u, 9u + n_q);
-    launch_ref(b); launch_direct(b);
+    Bench b(n_q, q_row0, n_comp, 128u, 4u, 64u,
+            9u + n_q + n_comp);
+    launch_ref(b); launch_direct(b); launch_t2(b);
     check_hip(hipDeviceSynchronize(), "timing warmup");
     float refs[6], directs[6];
     for (int pair = 0; pair < 6; ++pair) {
@@ -372,15 +374,16 @@ static void timing_shape(uint32_t n_q, CachePolluter &polluter) {
             directs[pair] = time_kernel_cold(b, true, polluter, 4u * pair + 1u);
             refs[pair] = time_kernel_cold(b, false, polluter, 4u * pair + 2u);
         }
-        std::printf("attn_direct_cold pair=%d n_q=%u q_row0=%u "
+        std::printf("attn_direct_cold pair=%d n_q=%u n_comp=%u q_row0=%u "
                     "ref_ms=%.4f direct_ms=%.4f change=%+.1f%%\n",
-                    pair + 1, n_q, q_row0, refs[pair], directs[pair],
+                    pair + 1, n_q, n_comp, q_row0, refs[pair], directs[pair],
                     100.0f * (directs[pair] / refs[pair] - 1.0f));
     }
     const float ref_median = median6(refs);
     const float direct_median = median6(directs);
-    std::printf("attn_direct_cold_median n_q=%u q_row0=%u ref_ms=%.4f "
-                "direct_ms=%.4f change=%+.1f%%\n", n_q, q_row0,
+    std::printf("attn_direct_cold_median n_q=%u n_comp=%u q_row0=%u "
+                "ref_ms=%.4f direct_ms=%.4f change=%+.1f%%\n",
+                n_q, n_comp, q_row0,
                 ref_median, direct_median,
                 100.0f * (direct_median / ref_median - 1.0f));
     float direct_t2[6], t2s[6];
@@ -396,15 +399,16 @@ static void timing_shape(uint32_t n_q, CachePolluter &polluter) {
             direct_t2[pair] = time_kernel_cold(
                 b, true, polluter, 100u + 4u * pair + 2u);
         }
-        std::printf("attn_t2_cold pair=%d n_q=%u direct_ms=%.4f "
-                    "t2_ms=%.4f change=%+.1f%%\n", pair + 1, n_q,
+        std::printf("attn_t2_cold pair=%d n_q=%u n_comp=%u direct_ms=%.4f "
+                    "t2_ms=%.4f change=%+.1f%%\n", pair + 1, n_q, n_comp,
                     direct_t2[pair], t2s[pair],
                     100.0f * (t2s[pair] / direct_t2[pair] - 1.0f));
     }
     const float direct_t2_median = median6(direct_t2);
     const float t2_median = median6(t2s);
-    std::printf("attn_t2_cold_median n_q=%u direct_ms=%.4f t2_ms=%.4f "
-                "change=%+.1f%%\n", n_q, direct_t2_median, t2_median,
+    std::printf("attn_t2_cold_median n_q=%u n_comp=%u direct_ms=%.4f "
+                "t2_ms=%.4f change=%+.1f%%\n", n_q, n_comp,
+                direct_t2_median, t2_median,
                 100.0f * (t2_median / direct_t2_median - 1.0f));
 }
 
@@ -439,9 +443,14 @@ static int exact_shape(uint32_t n_q, uint32_t q_row0, uint32_t n_comp,
 
 int main(int argc, char **argv) {
     uint32_t timing_q = 512u;
-    if (argc == 2) timing_q = (uint32_t)std::strtoul(argv[1], nullptr, 10);
-    if (timing_q == 0u || timing_q > 2048u || (2048u % timing_q) != 0u) {
-        std::fprintf(stderr, "usage: %s [timing_q: divisor of 2048]\n", argv[0]);
+    uint32_t timing_comp = 640u;
+    if (argc >= 2) timing_q = (uint32_t)std::strtoul(argv[1], nullptr, 10);
+    if (argc >= 3) timing_comp = (uint32_t)std::strtoul(argv[2], nullptr, 10);
+    if (argc > 3 || timing_q == 0u || timing_q > 2048u ||
+        (2048u % timing_q) != 0u || timing_comp > 640u) {
+        std::fprintf(stderr,
+                     "usage: %s [timing_q: divisor of 2048] [n_comp: 0..640]\n",
+                     argv[0]);
         return 2;
     }
     int failed = 0;
@@ -451,13 +460,16 @@ int main(int argc, char **argv) {
      * original smoke set.  The q_row0=2048 case reaches the 768-row cap. */
     failed |= exact_shape(512u, 1536u, 640u, 128u, 4u, 64u);
     failed |= exact_shape(512u, 2048u, 640u, 128u, 4u, 64u);
+    failed |= exact_shape(2048u, 0u, 16u, 128u, 128u, 64u);
+    failed |= exact_shape(2048u, 0u, 512u, 128u, 4u, 64u);
     failed |= exact_shape(17u, 1536u, 512u, 256u, 4u, 128u);
     failed |= exact_shape(17u, 128u, 0u, 128u, 4u, 13u);
     if (failed) return 1;
 
     CachePolluter polluter;
-    for (uint32_t n_q : {8u, 32u, 64u}) timing_shape(n_q, polluter);
+    for (uint32_t n_q : {8u, 32u, 64u})
+        timing_shape(n_q, timing_comp, polluter);
     if (timing_q != 8u && timing_q != 32u && timing_q != 64u)
-        timing_shape(timing_q, polluter);
+        timing_shape(timing_q, timing_comp, polluter);
     return 0;
 }
