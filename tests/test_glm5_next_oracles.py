@@ -114,7 +114,9 @@ def kda_sharded_output(state, q, k, v, beta, gate, split):
     return full, composed
 
 
-def nope_sparse_mla(query, keys, values, scores, top_k):
+def nope_sparse_mla(query, keys, values, top_k):
+    """NoPE sparse attention: score keys from the query, then select top-k."""
+    scores = [dot(query, key) for key in keys]
     ids = stable_topk(scores, top_k)
     w = softmax([scores[i] for i in ids])
     return [sum(wj * values[i][j] for i, wj in zip(ids, w))
@@ -145,9 +147,10 @@ def test_mhc_is_normalized_and_ordered():
 
 
 def test_nope_uses_selected_rows_only():
-    keys = [[1.0, 0.0], [0.0, 1.0], [9.0, 9.0]]
+    query = [1.0, 2.0]
+    keys = [[1.0, 0.0], [0.0, 1.0], [-9.0, -9.0]]
     values = [[10.0, 0.0], [0.0, 20.0], [1000.0, 1000.0]]
-    got = nope_sparse_mla([0.0, 0.0], keys, values, [1.0, 2.0, -100.0], 2)
+    got = nope_sparse_mla(query, keys, values, 2)
     assert got[0] < 10.0 and got[1] > 10.0
 
 
