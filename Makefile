@@ -45,7 +45,22 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
+# Resolve the ROCm toolchain once.  A gfx1151 build must not silently pick an
+# older `hipcc` from PATH when the validated 7.14 toolchain is available.
+# DS4_ROCM_HOME is the explicit override; ROCM_HOME remains accepted for
+# compatibility with existing build scripts.
+DS4_ROCM_HOME_REQUESTED := $(strip $(or $(DS4_ROCM_HOME),$(ROCM_HOME)))
+DS4_ROCM_HOME_AUTO := $(firstword $(foreach p,\
+    $(abspath $(CURDIR)/../toolchains/rocm-7.14.0-gfx1151/install) \
+    /opt/rocm-7.14.0 /opt/rocm,\
+    $(if $(wildcard $(p)/bin/hipcc),$(p))))
+ifneq ($(DS4_ROCM_HOME_REQUESTED),)
+ROCM_HOME ?= $(DS4_ROCM_HOME_REQUESTED)
+HIPCC ?= $(ROCM_HOME)/bin/hipcc
+else
+ROCM_HOME ?= $(DS4_ROCM_HOME_AUTO)
+HIPCC ?= $(if $(ROCM_HOME),$(ROCM_HOME)/bin/hipcc,$(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc))
+endif
 HIPCC_PATH := $(shell command -v "$(HIPCC)" 2>/dev/null || printf '%s' "$(HIPCC)")
 ROCM_HOME ?= $(shell p=$$(readlink -f "$(HIPCC_PATH)"); dirname "$$(dirname "$$p")")
 ROCM_ARCH ?= gfx1151
@@ -57,7 +72,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
 	python3 tests/test_frontier_logits_gate.py
@@ -257,7 +272,31 @@ cuda:
 	fi
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH="$(CUDA_ARCH)"
 
-strix-halo:
+check-rocm-strix:
+	@set -eu; \
+	if [ "$(ROCM_ARCH)" != gfx1151 ]; then \
+		echo "ROCm toolchain: HIPCC=$(HIPCC) ROCM_HOME=$(ROCM_HOME) arch=$(ROCM_ARCH)"; \
+		exit 0; \
+	fi; \
+	if [ ! -x "$(HIPCC)" ]; then \
+		echo "error: gfx1151 requires executable hipcc at $(HIPCC)" >&2; \
+		echo "       set DS4_ROCM_HOME=/path/to/rocm-7.14 (or HIPCC=...)" >&2; \
+		exit 2; \
+	fi; \
+	version=$$("$(HIPCC)" --version 2>/dev/null | sed -n -e 's/^HIP version: \([0-9][0-9.]*\).*/\1/p' -e 's/.*release version \([0-9][0-9.]*\).*/\1/p' | head -n 1); \
+	[ -n "$$version" ] || version=unknown; \
+	echo "ROCm toolchain: HIPCC=$(HIPCC) ROCM_HOME=$(ROCM_HOME) arch=$(ROCM_ARCH) version=$$version"; \
+	if [ "$$version" = unknown ] || [ "$$(printf '%s\n' 7.14.0 "$$version" | sort -V | head -n 1)" != 7.14.0 ]; then \
+		if [ "$${DS4_ALLOW_ROCM_MISMATCH:-0}" = 1 ]; then \
+			echo "warning: gfx1151 build is using ROCm $$version; expected >= 7.14.0 (override acknowledged)" >&2; \
+		else \
+			echo "error: gfx1151 requires ROCm >= 7.14.0, detected $$version" >&2; \
+			echo "       set DS4_ROCM_HOME=/path/to/rocm-7.14 or DS4_ALLOW_ROCM_MISMATCH=1 for diagnostics" >&2; \
+			exit 2; \
+		fi; \
+	fi
+
+strix-halo: check-rocm-strix
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent \
 		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1" \
