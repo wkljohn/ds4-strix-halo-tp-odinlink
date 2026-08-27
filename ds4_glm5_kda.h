@@ -24,6 +24,8 @@ typedef struct {
     bool is_kda;
 } ds4_glm5_layer_kind;
 
+struct ds4_glm5_kda_slot;
+
 typedef struct {
     ds4_gpu_tensor *q_history;
     ds4_gpu_tensor *k_history;
@@ -31,9 +33,10 @@ typedef struct {
     ds4_gpu_tensor *recurrent;
     uint64_t token_count;
     bool valid;
+    struct ds4_glm5_kda_slot *owner_slot;
 } ds4_glm5_kda_layer_state;
 
-typedef struct {
+typedef struct ds4_glm5_kda_slot {
     ds4_glm5_kda_layer_state *layer;
     uint32_t layer_count;
     uint32_t kda_count;
@@ -49,8 +52,9 @@ typedef struct {
 
 typedef struct {
     ds4_gpu_tensor *norm, *q, *k, *v, *f_low, *forget;
-    ds4_gpu_tensor *g_low, *out_gate, *beta, *recurrent_out, *flat;
+    ds4_gpu_tensor *beta, *recurrent_out;
     uint32_t capacity_tokens;
+    uint64_t bytes;
 } ds4_glm5_kda_workspace;
 
 typedef struct {
@@ -93,6 +97,7 @@ void ds4_glm5_kda_slot_invalidate(ds4_glm5_kda_slot *slot);
 void ds4_glm5_kda_slot_free(ds4_glm5_kda_slot *slot);
 int ds4_glm5_kda_workspace_init(ds4_glm5_kda_workspace *workspace,
                                 uint32_t capacity_tokens);
+int ds4_glm5_kda_workspace_bytes(uint32_t capacity_tokens, uint64_t *bytes);
 void ds4_glm5_kda_workspace_free(ds4_glm5_kda_workspace *workspace);
 int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
                                ds4_glm5_kda_workspace *workspace,

@@ -7304,6 +7304,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->device_id = 0;
     return t;
 }
 
@@ -7317,6 +7318,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     }
     t->bytes = bytes;
     t->owner = 1;
+    t->device_id = 0;
     return t;
 }
 
@@ -7341,6 +7343,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_rdma_host(uint64_t bytes) {
     t->host_ptr = host;
     t->bytes = bytes;
     t->owner = 2;
+    t->device_id = 0;
     fprintf(stderr, DS4_GPU_LOG_PREFIX
             "using mapped host-pinned TP slab for generic RDMA (%.2f MiB)\n",
             (double)bytes / 1048576.0);
@@ -7392,6 +7395,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint6
         t->host_ptr = (char *)base->host_ptr + offset;
     t->bytes = bytes;
     t->owner = 0;
+    t->device_id = base->device_id;
     return t;
 }
 

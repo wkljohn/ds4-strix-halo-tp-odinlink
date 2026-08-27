@@ -24,27 +24,6 @@ extern "C" {
 #include <sys/stat.h>
 #include <unistd.h>
 
-typedef int (*ds4_tp_devcopy_fn)(void *, const void *, uint64_t);
-extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
-
-static uint64_t g_transport_calls;
-extern "C" int ds4_tp_gate_exchange(ds4_tp *, uint32_t, uint32_t, uint64_t) {
-    ++g_transport_calls; return 0;
-}
-extern "C" int ds4_tp_batch_gate_exchange(ds4_tp *, uint32_t, uint32_t,
-                                             uint64_t) {
-    ++g_transport_calls; return 0;
-}
-extern "C" int ds4_tp_big_gate_exchange(ds4_tp *, uint32_t, uint64_t,
-                                           const void *, void *, uint64_t) {
-    ++g_transport_calls; return 0;
-}
-extern "C" int ds4_tp_big_gate_exchange_waves(
-        ds4_tp *, uint32_t, uint64_t, const void *, void *, uint64_t,
-        uint64_t, uint32_t, ds4_tp_big_wave_ready_fn, void *) {
-    ++g_transport_calls; return 0;
-}
-
 #define CHECK(expr, message) do { \
     if (!(expr)) { \
         std::fprintf(stderr, "FAIL %s (line %d)\n", message, __LINE__); \
@@ -289,7 +268,8 @@ static bool handoff_case(uint32_t prefill,
     ds4_gpu_tensor *chunk_output = ds4_gpu_tensor_alloc(
         (uint64_t)prefill * 4096u * sizeof(float));
     ds4_gpu_tensor *chunk_last = ds4_gpu_tensor_alloc(4096u * sizeof(float));
-    ds4_gpu_tensor *token_output = ds4_gpu_tensor_alloc(4096u * sizeof(float));
+    ds4_gpu_tensor *token_output = ds4_gpu_tensor_alloc(
+        (uint64_t)total * 4096u * sizeof(float));
     CHECK(input && chunk_output && chunk_last && token_output,
           "allocate handoff tensors");
     CHECK(ds4_gpu_tensor_write(input, 0, host_input.data(),
@@ -323,20 +303,29 @@ static bool handoff_case(uint32_t prefill,
         ds4_gpu_tensor *one = ds4_gpu_tensor_view(
             input, (uint64_t)token * 4096u * sizeof(float),
             4096u * sizeof(float));
-        CHECK(one != nullptr, "create tokenwise input view");
+        ds4_gpu_tensor *one_output = ds4_gpu_tensor_view(
+            token_output, (uint64_t)token * 4096u * sizeof(float),
+            4096u * sizeof(float));
+        CHECK(one != nullptr && one_output != nullptr,
+              "create tokenwise input/output views");
         const bool ok = ds4_glm5_kda_layer_forward(
             &tokenwise.layer[0], &token_workspace, &weights,
-            gguf.map, gguf.size, one, token_output, 1u);
+            gguf.map, gguf.size, one, one_output, 1u);
+        ds4_gpu_tensor_free(one_output);
         ds4_gpu_tensor_free(one);
         CHECK(ok, "execute tokenwise comparison");
     }
     CHECK(ds4_gpu_synchronize(), "synchronize handoff case");
-    std::vector<float> chunk_out(4096u), token_out(4096u);
+    std::vector<float> chunk_out((size_t)total * 4096u);
+    std::vector<float> token_out((size_t)total * 4096u);
     std::vector<float> chunk_state, token_state;
-    CHECK(ds4_gpu_tensor_read(chunk_last, 0, chunk_out.data(),
+    CHECK(ds4_gpu_tensor_read(chunk_output, 0, chunk_out.data(),
+                              (uint64_t)prefill * 4096u * sizeof(float)) &&
+          ds4_gpu_tensor_read(chunk_last, 0,
+                              chunk_out.data() + (size_t)prefill * 4096u,
                               4096u * sizeof(float)) &&
           ds4_gpu_tensor_read(token_output, 0, token_out.data(),
-                              4096u * sizeof(float)) &&
+                              (uint64_t)total * 4096u * sizeof(float)) &&
           read_state(chunk.layer[0], chunk_state) &&
           read_state(tokenwise.layer[0], token_state),
           "read handoff results");
@@ -394,8 +383,9 @@ static bool failure_invalidation(
                   &slot.layer[0], &workspace, &weights,
                   gguf.map, gguf.size, input, output, 2u),
               "injected stage fails forward");
-        CHECK(!slot.layer[0].valid && slot.layer[0].token_count == 0u,
-              "failed forward invalidates state without advancing tokens");
+        CHECK(!slot.valid && !slot.layer[0].valid &&
+              slot.layer[0].token_count == 0u,
+              "failed forward invalidates slot without advancing tokens");
         ds4_glm5_kda_test_fail_after(DS4_GLM5_KDA_FAIL_NONE);
         CHECK(!ds4_glm5_kda_layer_forward(
                   &slot.layer[0], &workspace, &weights,
@@ -407,7 +397,46 @@ static bool failure_invalidation(
     return true;
 }
 
+static bool full_model_residency(const MappedGGUF &gguf) {
+    constexpr uint32_t layers = 46u;
+    ds4_glm5_layer_kind schedule[layers] = {};
+    uint32_t kda_count = 0;
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+        char kda_name[64], mla_name[64];
+        std::snprintf(kda_name, sizeof(kda_name),
+                      "blk.%u.kda_q.weight", layer);
+        std::snprintf(mla_name, sizeof(mla_name),
+                      "blk.%u.attn_q_a.weight", layer);
+        const bool has_kda = gguf.tensors.count(kda_name) == 1u;
+        const bool has_mla = gguf.tensors.count(mla_name) == 1u;
+        CHECK(has_kda != has_mla,
+              "same-GGUF layer has exactly one attention family");
+        schedule[layer] = {.layer = layer, .is_kda = has_kda};
+        if (has_kda) ++kda_count;
+    }
+    CHECK(kda_count == 34u, "same-GGUF schedule has 34 KDA layers");
+
+    ds4_glm5_kda_slot slot = {};
+    ds4_glm5_kda_workspace workspace = {};
+    CHECK(ds4_glm5_kda_slot_init(&slot, schedule, layers, 1u, stderr) &&
+          ds4_glm5_kda_workspace_init(&workspace, 2048u),
+          "allocate full same-GGUF KDA state and 2048-token workspace");
+    CHECK(slot.bytes == UINT64_C(152633344) &&
+          workspace.bytes == UINT64_C(370671616),
+          "full KDA residency byte accounting is exact");
+    std::fprintf(stderr,
+        "PASS GLM5 KDA full residency state_bytes=%llu workspace_bytes=%llu "
+        "total_bytes=%llu\n",
+        (unsigned long long)slot.bytes,
+        (unsigned long long)workspace.bytes,
+        (unsigned long long)(slot.bytes + workspace.bytes));
+    ds4_glm5_kda_workspace_free(&workspace);
+    ds4_glm5_kda_slot_free(&slot);
+    return true;
+}
+
 static bool run_test(void) {
+    ds4_tp_test_reset_exchange_calls();
     const char *model = std::getenv("DS4_GLM5_MODEL");
     const char *prefix = std::getenv("DS4_GLM5_KDA_ORACLE_PREFIX");
     CHECK(model && model[0] && prefix && prefix[0],
@@ -439,6 +468,8 @@ static bool run_test(void) {
     CHECK(ds4_gpu_set_model_fd_for_map(gguf.fd, gguf.map) &&
           ds4_gpu_set_model_map(gguf.map, gguf.size),
           "register GLM5 GGUF map");
+    CHECK(full_model_residency(gguf),
+          "full same-GGUF KDA residency allocation");
 
     ds4_glm5_layer_kind schedule = {.layer = 0u, .is_kda = true};
     ds4_glm5_kda_slot slot = {};
@@ -528,7 +559,7 @@ static bool run_test(void) {
     for (uint32_t length : {1u, 2u, 3u, 127u, 128u, 129u, 2048u})
         CHECK(handoff_case(length, weights, gguf),
               "prefill/decode handoff case");
-    CHECK(g_transport_calls == 0u,
+    CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "KDA execution invokes no TP exchange API");
     CHECK(failure_invalidation(slot, workspace, weights, gguf, input, output),
           "failure invalidation contract");

@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "ds4_gpu.h"
+#include "ds4_gpu_mgpu.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -62,12 +63,10 @@ enum {
     DS4_ROCM_ATTENTION_RAW_SCORE_CAP = 256u
 };
 
-struct ds4_gpu_tensor {
-    void *ptr;      /* GPU-visible address used by kernels. */
-    uint64_t bytes;
-    int owner;      /* 0=view, 1=hipMalloc, 2=hipHostMallocMapped. */
-    void *host_ptr; /* Optional host VA for mapped RDMA allocations. */
-};
+static_assert(sizeof(ds4_gpu_tensor) == 32,
+              "ROCm tensor ABI must include device_id and mapped host VA");
+static_assert(offsetof(ds4_gpu_tensor, host_ptr) == 24,
+              "ROCm tensor mapped-host field ABI changed");
 
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
@@ -171,6 +170,7 @@ extern "C" int ds4_rocm_model_range_view_tensor(
     view->ptr = (void *)ptr;
     view->bytes = bytes;
     view->owner = 0;
+    view->device_id = 0;
     view->host_ptr = NULL;
     return 1;
 }

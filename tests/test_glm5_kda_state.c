@@ -99,6 +99,33 @@ static int test_state_byte_contract(void) {
     return 1;
 }
 
+static int test_workspace_byte_contract_and_reuse(void) {
+    uint64_t bytes = 0;
+    CHECK(ds4_glm5_kda_workspace_bytes(1, &bytes),
+          "one-token workspace size accepted");
+    CHECK(bytes == UINT64_C(180992), "one-token workspace size exact");
+    CHECK(ds4_glm5_kda_workspace_bytes(2048, &bytes),
+          "2048-token workspace size accepted");
+    CHECK(bytes == UINT64_C(370671616), "2048-token workspace size exact");
+    CHECK(!ds4_glm5_kda_workspace_bytes(0, &bytes),
+          "zero-token workspace rejected");
+
+    reset_fakes();
+    ds4_glm5_kda_workspace workspace = {0};
+    CHECK(ds4_glm5_kda_workspace_init(&workspace, 2),
+          "two-token workspace initializes");
+    CHECK(workspace.capacity_tokens == 2 &&
+          workspace.bytes == UINT64_C(361984),
+          "workspace records exact physical bytes");
+    CHECK(alloc_calls == 8,
+          "workspace allocates only reusable physical buffers");
+    ds4_glm5_kda_workspace_free(&workspace);
+    CHECK(free_calls == 8 && workspace.capacity_tokens == 0 &&
+          workspace.bytes == 0,
+          "workspace frees each physical buffer once");
+    return 1;
+}
+
 static int test_one_layer_lifecycle(void) {
     reset_fakes();
     ds4_glm5_layer_kind schedule[3] = {
@@ -119,6 +146,8 @@ static int test_one_layer_lifecycle(void) {
           "accounting values exact");
     CHECK(slot.layer_count == 3 && slot.kda_count == 1,
           "derived schedule counts");
+    CHECK(slot.layer[1].owner_slot == &slot,
+          "resident layer records slot ownership");
     CHECK(slot.bytes == UINT64_C(4489216), "slot bytes exact");
     CHECK(slot.valid && slot.layer[1].valid, "slot starts valid");
     CHECK(alloc_calls == 4 && fill_calls == 4, "four tensors allocated and zeroed");
@@ -185,6 +214,7 @@ static int test_zero_kda_schedule_is_valid_and_empty(void) {
 int main(void) {
     int ok = 1;
     ok &= test_state_byte_contract();
+    ok &= test_workspace_byte_contract_and_reuse();
     ok &= test_one_layer_lifecycle();
     ok &= test_partial_allocation_failure_cleans_up();
     ok &= test_zero_kda_schedule_is_valid_and_empty();

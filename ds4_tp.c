@@ -30,6 +30,26 @@
 
 #include "ds4_tp.h"
 
+#ifdef DS4_TP_TEST_HOOKS
+static _Atomic uint64_t g_ds4_tp_test_exchange_calls;
+
+void ds4_tp_test_reset_exchange_calls(void) {
+    atomic_store_explicit(&g_ds4_tp_test_exchange_calls, 0,
+                          memory_order_release);
+}
+
+uint64_t ds4_tp_test_get_exchange_calls(void) {
+    return atomic_load_explicit(&g_ds4_tp_test_exchange_calls,
+                                memory_order_acquire);
+}
+
+#define DS4_TP_TEST_COUNT_EXCHANGE()                                      \
+    ((void)atomic_fetch_add_explicit(&g_ds4_tp_test_exchange_calls, 1,     \
+                                     memory_order_relaxed))
+#else
+#define DS4_TP_TEST_COUNT_EXCHANGE() ((void)0)
+#endif
+
 /* DS4-TP-gfx1151 (patch 1): the verbs path is not Apple-specific.
  * ds4 codes to standard libibverbs and dlsym's it at runtime; macOS just
  * happens to ship a verbs provider for Thunderbolt RDMA. On Linux the same
@@ -2233,6 +2253,7 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
  * --------------------------------------------------------------------- */
 
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    DS4_TP_TEST_COUNT_EXCHANGE();
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
 #endif
@@ -2280,6 +2301,7 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
  * TCP remains the symmetric write-then-read fallback. */
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq) {
+    DS4_TP_TEST_COUNT_EXCHANGE();
     if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
@@ -2360,6 +2382,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
+    DS4_TP_TEST_COUNT_EXCHANGE();
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
@@ -2405,6 +2428,7 @@ int ds4_tp_big_gate_exchange_waves(ds4_tp *tp, uint32_t layer, uint64_t seq,
                                    uint64_t wave_bytes, uint32_t waves,
                                    ds4_tp_big_wave_ready_fn ready,
                                    void *ready_ud) {
+    DS4_TP_TEST_COUNT_EXCHANGE();
     if (!tp || tp->data_fd < 0 || !out || !in || !bytes || !wave_bytes ||
         waves < 2u || bytes % wave_bytes != 0u ||
         bytes / wave_bytes != waves || !ready) {
@@ -2788,6 +2812,7 @@ int ds4_tp_recv_logits_top2(ds4_tp *tp, ds4_tp_logits_top2 *top2) {
 
 int ds4_tp_exchange_logits_halves(ds4_tp *tp, float *logits,
                                   uint32_t half_count) {
+    DS4_TP_TEST_COUNT_EXCHANGE();
     if (!tp || !logits || half_count == 0u ||
         (tp->runtime_features & DS4_TP_FEATURE_RDMA_LOGITS) == 0u) {
         return 0;

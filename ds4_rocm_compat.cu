@@ -11,6 +11,11 @@
 
 #include "rocm/ds4_rocm_glm5_kda.cuh"
 
+static_assert(sizeof(ds4_gpu_tensor) == 32,
+              "GLM5 adapter and ROCm backend tensor ABI disagree");
+static_assert(offsetof(ds4_gpu_tensor, host_ptr) == 24,
+              "GLM5 adapter mapped-host field ABI changed");
+
 extern "C" int ds4_rocm_model_range_view_tensor(
         ds4_gpu_tensor *view,
         const void *model_map,
@@ -162,15 +167,8 @@ extern "C" int ds4_gpu_glm5_kda_recurrent_tensor(
 #endif
 }
 
-typedef struct {
-    ds4_gpu_tensor tensor;
-    /* ds4_rocm.cu carries one backend-private pointer after the public
-     * multi-GPU descriptor. Keep stack views large enough for that field. */
-    void *backend_private;
-} rocm_glm5_model_view;
-
 static int rocm_glm5_model_view_init(
-        rocm_glm5_model_view *view,
+        ds4_gpu_tensor *view,
         const ds4_glm5_kda_device_args *args,
         uint64_t offset,
         uint64_t bytes,
@@ -178,7 +176,7 @@ static int rocm_glm5_model_view_init(
     if (!view || !args) return 0;
     memset(view, 0, sizeof(*view));
     return ds4_rocm_model_range_view_tensor(
-        &view->tensor, args->model_map, args->model_size,
+        view, args->model_map, args->model_size,
         offset, bytes, label);
 }
 
@@ -205,11 +203,8 @@ static int rocm_glm5_workspace_fits(
            w->v && w->v->bytes >= kda_bytes &&
            w->f_low && w->f_low->bytes >= low_bytes &&
            w->forget && w->forget->bytes >= kda_bytes &&
-           w->g_low && w->g_low->bytes >= low_bytes &&
-           w->out_gate && w->out_gate->bytes >= kda_bytes &&
            w->beta && w->beta->bytes >= beta_bytes &&
-           w->recurrent_out && w->recurrent_out->bytes >= kda_bytes &&
-           w->flat && w->flat->bytes >= kda_bytes;
+           w->recurrent_out && w->recurrent_out->bytes >= kda_bytes;
 }
 
 #if defined(DS4_GLM5_KDA_TEST_HOOKS)
@@ -255,23 +250,23 @@ extern "C" int ds4_rocm_glm5_kda_layer_execute(
 
     constexpr uint64_t conv_bytes =
         (uint64_t)DS4_GLM5_KDA_CHANNELS * 4u * sizeof(float);
-    rocm_glm5_model_view q_conv = {}, k_conv = {}, v_conv = {};
+    ds4_gpu_tensor q_conv = {}, k_conv = {}, v_conv = {};
     if (!rocm_glm5_model_view_init(&q_conv, args, weights->q_conv,
                                    conv_bytes, "glm5_kda_q_conv") ||
         !ds4_gpu_glm5_causal_conv4_tensor(
-            w->q, state->q_history, w->q, &q_conv.tensor,
+            w->q, state->q_history, w->q, &q_conv,
             tokens, DS4_GLM5_KDA_CHANNELS) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_Q_CONV)) return 0;
     if (!rocm_glm5_model_view_init(&k_conv, args, weights->k_conv,
                                    conv_bytes, "glm5_kda_k_conv") ||
         !ds4_gpu_glm5_causal_conv4_tensor(
-            w->k, state->k_history, w->k, &k_conv.tensor,
+            w->k, state->k_history, w->k, &k_conv,
             tokens, DS4_GLM5_KDA_CHANNELS) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_K_CONV)) return 0;
     if (!rocm_glm5_model_view_init(&v_conv, args, weights->v_conv,
                                    conv_bytes, "glm5_kda_v_conv") ||
         !ds4_gpu_glm5_causal_conv4_tensor(
-            w->v, state->v_history, w->v, &v_conv.tensor,
+            w->v, state->v_history, w->v, &v_conv,
             tokens, DS4_GLM5_KDA_CHANNELS) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_V_CONV)) return 0;
 
@@ -288,7 +283,7 @@ extern "C" int ds4_rocm_glm5_kda_layer_execute(
             w->beta, args->model_map, args->model_size, weights->beta,
             4096u, DS4_GLM5_KDA_HEADS, w->norm, tokens)) return 0;
 
-    rocm_glm5_model_view dt_bias = {}, a_log = {};
+    ds4_gpu_tensor dt_bias = {}, a_log = {};
     if (!rocm_glm5_model_view_init(
             &dt_bias, args, weights->dt_bias,
             (uint64_t)DS4_GLM5_KDA_CHANNELS * sizeof(float),
@@ -300,8 +295,8 @@ extern "C" int ds4_rocm_glm5_kda_layer_execute(
     ds4_glm5_kda_forget_kernel<<<
         (kda_values + 255u) / 256u, 256u>>>(
         (float *)w->forget->ptr,
-        (const float *)dt_bias.tensor.ptr,
-        (const float *)a_log.tensor.ptr, kda_values);
+        (const float *)dt_bias.ptr,
+        (const float *)a_log.ptr, kda_values);
     if (hipGetLastError() != hipSuccess) return 0;
     ds4_glm5_kda_beta_kernel<<<
         (beta_values + 255u) / 256u, 256u>>>(
@@ -316,33 +311,37 @@ extern "C" int ds4_rocm_glm5_kda_layer_execute(
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_RECURRENCE)) return 0;
 
     if (!ds4_gpu_matmul_bf16_tensor(
-            w->g_low, args->model_map, args->model_size, weights->g_a,
+            w->f_low, args->model_map, args->model_size, weights->g_a,
             4096u, 128u, w->norm, tokens) ||
         !ds4_gpu_matmul_bf16_tensor(
-            w->out_gate, args->model_map, args->model_size, weights->g_b,
-            128u, DS4_GLM5_KDA_CHANNELS, w->g_low, tokens)) return 0;
+            w->forget, args->model_map, args->model_size, weights->g_b,
+            128u, DS4_GLM5_KDA_CHANNELS, w->f_low, tokens)) return 0;
 
-    rocm_glm5_model_view o_norm = {};
+    ds4_gpu_tensor o_norm = {};
     if (!rocm_glm5_model_view_init(
             &o_norm, args, weights->o_norm,
             (uint64_t)DS4_GLM5_KDA_HEAD_DIM * sizeof(float),
             "glm5_kda_o_norm")) return 0;
     ds4_glm5_kda_gated_norm_kernel<<<
         tokens * DS4_GLM5_KDA_HEADS, 128u>>>(
-        (float *)w->flat->ptr,
+        (float *)w->recurrent_out->ptr,
         (const float *)w->recurrent_out->ptr,
-        (const float *)w->out_gate->ptr,
-        (const float *)o_norm.tensor.ptr, tokens);
+        (const float *)w->forget->ptr,
+        (const float *)o_norm.ptr, tokens);
     if (hipGetLastError() != hipSuccess ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_GATED_NORM)) return 0;
 
     if (!ds4_gpu_matmul_bf16_tensor(
             args->output, args->model_map, args->model_size,
             weights->output, DS4_GLM5_KDA_CHANNELS, 4096u,
-            w->flat, tokens) ||
+            w->recurrent_out, tokens) ||
         DS4_GLM5_KDA_INJECTED(
             DS4_GLM5_KDA_FAIL_OUTPUT_PROJECTION)) return 0;
-    return 1;
+    /* This component API commits recurrent state and token_count on return.
+     * Surface asynchronous execution faults before that commit. Full-graph
+     * integration may replace this with its normal command-completion event,
+     * but must preserve the same fail-closed ownership rule. */
+    return hipStreamSynchronize(0) == hipSuccess;
 #endif
 }
 

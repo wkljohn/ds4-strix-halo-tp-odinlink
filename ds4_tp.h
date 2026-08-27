@@ -374,6 +374,10 @@ int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count);
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
 int ds4_tp_exchange_logits_halves(ds4_tp *tp, float *logits,
                                   uint32_t half_count);
+#ifdef DS4_TP_TEST_HOOKS
+void ds4_tp_test_reset_exchange_calls(void);
+uint64_t ds4_tp_test_get_exchange_calls(void);
+#endif
 int ds4_tp_send_logits_top2(ds4_tp *tp, const ds4_tp_logits_top2 *top2);
 int ds4_tp_recv_logits_top2(ds4_tp *tp, ds4_tp_logits_top2 *top2);
 

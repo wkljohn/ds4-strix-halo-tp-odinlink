@@ -91,7 +91,7 @@ void ds4_glm5_kda_slot_free(ds4_glm5_kda_slot *slot) {
 }
 
 void ds4_glm5_kda_slot_invalidate(ds4_glm5_kda_slot *slot) {
-    if (!slot) return;
+    if (!slot || (slot->layer_count != 0u && !slot->layer)) return;
     slot->valid = false;
     for (uint32_t i = 0; i < slot->layer_count; ++i) {
         if (slot->layer[i].recurrent) slot->layer[i].valid = false;
@@ -160,6 +160,7 @@ int ds4_glm5_kda_slot_init(ds4_glm5_kda_slot *slot,
     for (uint32_t i = 0; i < layer_count; ++i) {
         if (!schedule[i].is_kda) continue;
         ds4_glm5_kda_layer_state *state = &slot->layer[i];
+        state->owner_slot = slot;
         state->q_history = ds4_gpu_tensor_alloc(history_bytes);
         if (!state->q_history) goto fail;
         state->k_history = ds4_gpu_tensor_alloc(history_bytes);
@@ -185,12 +186,22 @@ void ds4_glm5_kda_workspace_free(ds4_glm5_kda_workspace *workspace) {
     ds4_gpu_tensor_free(workspace->v);
     ds4_gpu_tensor_free(workspace->f_low);
     ds4_gpu_tensor_free(workspace->forget);
-    ds4_gpu_tensor_free(workspace->g_low);
-    ds4_gpu_tensor_free(workspace->out_gate);
     ds4_gpu_tensor_free(workspace->beta);
     ds4_gpu_tensor_free(workspace->recurrent_out);
-    ds4_gpu_tensor_free(workspace->flat);
     memset(workspace, 0, sizeof(*workspace));
+}
+
+int ds4_glm5_kda_workspace_bytes(uint32_t capacity_tokens, uint64_t *bytes) {
+    /* Physical rows only. f_low is reused for g_low after recurrence; forget
+     * is reused for out_gate; gated norm writes recurrent_out in place. */
+    const uint64_t floats_per_token =
+        4096u + 3u * DS4_GLM5_KDA_CHANNELS + 128u +
+        DS4_GLM5_KDA_CHANNELS + DS4_GLM5_KDA_HEADS +
+        DS4_GLM5_KDA_CHANNELS;
+    uint64_t values = 0;
+    return bytes && capacity_tokens != 0u &&
+           mul_u64(capacity_tokens, floats_per_token, &values) &&
+           mul_u64(values, sizeof(float), bytes);
 }
 
 static ds4_gpu_tensor *workspace_alloc_rows(uint32_t tokens,
@@ -206,8 +217,9 @@ static ds4_gpu_tensor *workspace_alloc_rows(uint32_t tokens,
 
 int ds4_glm5_kda_workspace_init(ds4_glm5_kda_workspace *workspace,
                                 uint32_t capacity_tokens) {
+    uint64_t expected_bytes = 0;
     if (!workspace || workspace->capacity_tokens != 0u ||
-        capacity_tokens == 0u) {
+        !ds4_glm5_kda_workspace_bytes(capacity_tokens, &expected_bytes)) {
         return 0;
     }
     workspace->norm = workspace_alloc_rows(capacity_tokens, 4096u);
@@ -220,23 +232,18 @@ int ds4_glm5_kda_workspace_init(ds4_glm5_kda_workspace *workspace,
     workspace->f_low = workspace_alloc_rows(capacity_tokens, 128u);
     workspace->forget = workspace_alloc_rows(capacity_tokens,
                                               DS4_GLM5_KDA_CHANNELS);
-    workspace->g_low = workspace_alloc_rows(capacity_tokens, 128u);
-    workspace->out_gate = workspace_alloc_rows(capacity_tokens,
-                                                DS4_GLM5_KDA_CHANNELS);
     workspace->beta = workspace_alloc_rows(capacity_tokens,
                                             DS4_GLM5_KDA_HEADS);
     workspace->recurrent_out = workspace_alloc_rows(
         capacity_tokens, DS4_GLM5_KDA_CHANNELS);
-    workspace->flat = workspace_alloc_rows(capacity_tokens,
-                                            DS4_GLM5_KDA_CHANNELS);
     if (!workspace->norm || !workspace->q || !workspace->k ||
         !workspace->v || !workspace->f_low || !workspace->forget ||
-        !workspace->g_low || !workspace->out_gate || !workspace->beta ||
-        !workspace->recurrent_out || !workspace->flat) {
+        !workspace->beta || !workspace->recurrent_out) {
         ds4_glm5_kda_workspace_free(workspace);
         return 0;
     }
     workspace->capacity_tokens = capacity_tokens;
+    workspace->bytes = expected_bytes;
     return 1;
 }
 
@@ -294,7 +301,8 @@ int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
         .n_tokens = n_tokens,
     };
     if (!ds4_rocm_glm5_kda_layer_execute(&args)) {
-        state->valid = false;
+        if (state->owner_slot) ds4_glm5_kda_slot_invalidate(state->owner_slot);
+        else state->valid = false;
         return 0;
     }
     state->token_count += n_tokens;
