@@ -5,6 +5,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -72,6 +73,10 @@ struct Glm5TestGGUF {
     uint64_t size = 0;
     uint64_t data_start = 0;
     std::unordered_map<std::string, Glm5TestTensorInfo> tensors;
+    std::unordered_map<std::string, uint32_t> metadata_u32;
+    std::unordered_map<std::string, float> metadata_f32;
+    std::unordered_map<std::string, bool> metadata_bool;
+    std::unordered_map<std::string, std::string> metadata_string;
 
     ~Glm5TestGGUF() { close_all(); }
     void close_all() {
@@ -82,6 +87,10 @@ struct Glm5TestGGUF {
         size = 0;
         data_start = 0;
         tensors.clear();
+        metadata_u32.clear();
+        metadata_f32.clear();
+        metadata_bool.clear();
+        metadata_string.clear();
     }
 
     bool open_file(const char *path) {
@@ -108,8 +117,27 @@ struct Glm5TestGGUF {
             std::string key;
             uint32_t type = 0;
             if (!cursor.string(key) || !cursor.u32(type)) return false;
-            if (key == "general.alignment" && type == 4u) {
-                if (!cursor.u32(alignment) || alignment == 0u) return false;
+            if (type == 4u) {
+                uint32_t value = 0;
+                if (!cursor.u32(value)) return false;
+                metadata_u32.emplace(key, value);
+                if (key == "general.alignment") {
+                    alignment = value;
+                    if (alignment == 0u) return false;
+                }
+            } else if (type == 6u) {
+                float value = 0.0f;
+                if (!cursor.take(&value, sizeof(value))) return false;
+                metadata_f32.emplace(key, value);
+            } else if (type == 7u) {
+                uint8_t value = 0;
+                if (!cursor.take(&value, sizeof(value)) || value > 1u)
+                    return false;
+                metadata_bool.emplace(key, value != 0u);
+            } else if (type == 8u) {
+                std::string value;
+                if (!cursor.string(value)) return false;
+                metadata_string.emplace(key, std::move(value));
             } else if (!glm5_test_skip_metadata(cursor, type)) {
                 return false;
             }
@@ -143,6 +171,25 @@ struct Glm5TestGGUF {
             return false;
         offset = data_start + found->second.relative_offset;
         return offset < size;
+    }
+
+    bool metadata(const std::string &key, float &value) const {
+        const auto found = metadata_f32.find(key);
+        if (found == metadata_f32.end()) return false;
+        value = found->second;
+        return true;
+    }
+    bool metadata(const std::string &key, bool &value) const {
+        const auto found = metadata_bool.find(key);
+        if (found == metadata_bool.end()) return false;
+        value = found->second;
+        return true;
+    }
+    bool metadata(const std::string &key, std::string &value) const {
+        const auto found = metadata_string.find(key);
+        if (found == metadata_string.end()) return false;
+        value = found->second;
+        return true;
     }
 };
 

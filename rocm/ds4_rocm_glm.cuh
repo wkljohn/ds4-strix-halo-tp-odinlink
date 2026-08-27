@@ -3770,6 +3770,11 @@ __device__ __forceinline__ static float glm_router_sigmoid_dev(float x) {
     return e / (1.0f + e);
 }
 
+// GLM-5.3-Flash has 288 routed experts. Keep this architecture-specific
+// geometry out of the DeepSeek router contract; 288 is divisible by one
+// wave32 and is therefore a valid specialization of the GLM warp selector.
+static constexpr uint32_t DS4_ROCM_GLM5_N_EXPERT = 288u;
+
 __device__ __forceinline__ static bool glm_router_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
     return av > bv || (av == bv && ai < bi);
 }
@@ -3878,7 +3883,9 @@ static int glm_router_select_launch(
     const uint32_t active_n_expert_used = n_expert_used != 0u ? n_expert_used : DS4_ROCM_N_EXPERT_USED;
     const float active_scale = expert_weight_scale != 0.0f ? expert_weight_scale : DS4_ROCM_EXPERT_WEIGHT_SCALE;
     if (!selected || !weights || !probs || !logits || !model_map || n_tokens == 0 ||
-        (active_n_expert != DS4_ROCM_N_EXPERT && active_n_expert != DS4_ROCM_MAX_N_EXPERT) ||
+        (active_n_expert != DS4_ROCM_N_EXPERT &&
+         active_n_expert != DS4_ROCM_GLM5_N_EXPERT &&
+         active_n_expert != DS4_ROCM_MAX_N_EXPERT) ||
         active_n_expert_used == 0u ||
         active_n_expert_used > active_n_expert ||
         active_n_expert_used > DS4_ROCM_N_EXPERT_USED ||
@@ -3909,7 +3916,17 @@ static int glm_router_select_launch(
                 n_tokens,
                 active_n_expert_used,
                 active_scale);
-    } else {
+    } else if (active_n_expert == DS4_ROCM_GLM5_N_EXPERT) {
+        glm_router_select_warp_topk_kernel<DS4_ROCM_GLM5_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
+                (int32_t *)selected->ptr,
+                (float *)weights->ptr,
+                (float *)probs->ptr,
+                bias,
+                (const float *)logits->ptr,
+                n_tokens,
+                active_n_expert_used,
+                active_scale);
+    } else if (active_n_expert == DS4_ROCM_N_EXPERT) {
         glm_router_select_warp_topk_kernel<DS4_ROCM_N_EXPERT><<<(n_tokens + 3u) / 4u, block>>>(
                 (int32_t *)selected->ptr,
                 (float *)weights->ptr,
@@ -3919,6 +3936,8 @@ static int glm_router_select_launch(
                 n_tokens,
                 active_n_expert_used,
                 active_scale);
+    } else {
+        return 0;
     }
     return cuda_ok(cudaGetLastError(), "glm_router_select launch");
 }

@@ -97,6 +97,8 @@ def main(argv):
         "glm5-next.expert_count": 288,
         "glm5-next.expert_used_count": 8,
         "glm5-next.expert_feed_forward_length": 2048,
+        "glm5-next.expert_weights_scale": 2.5,
+        "glm5-next.expert_weights_norm": True,
         "glm5-next.feed_forward_length": 12288,
         "glm5-next.attention.head_count": 64,
         "glm5-next.attention.key_length": 256,

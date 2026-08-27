@@ -6096,8 +6096,14 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
 
     const float rms_eps = required_f32(m, "glm5-next.attention.layer_norm_rms_epsilon");
     const float hc_eps = required_f32(m, "glm5-next.hyper_connection.epsilon");
+    const float expert_weight_scale =
+        required_f32(m, "glm5-next.expert_weights_scale");
+    const bool expert_weight_norm =
+        required_bool(m, "glm5-next.expert_weights_norm");
     config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, 1.0e-5f);
     config_expect_f32("hyper_connection.epsilon", hc_eps, 1.0e-6f);
+    config_expect_f32("expert_weights_scale", expert_weight_scale, 2.5f);
+    config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 
     /* Keep the metadata gate and tensor gate together.  This is intentionally
      * run before graph construction; the legacy GLM-5.2 binder has a
