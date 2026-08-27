@@ -107,7 +107,8 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def write_full_layer_oracle(path, blob, data_start, tensors, output_path):
+def write_full_layer_oracle(path, blob, data_start, tensors, output_path,
+                            dump_prefix=None):
     """Write the two-token, complete layer-0 KDA FP32 oracle payload."""
     import numpy as np
 
@@ -231,14 +232,28 @@ def write_full_layer_oracle(path, blob, data_start, tensors, output_path):
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    if dump_prefix is not None:
+        dump_prefix.parent.mkdir(parents=True, exist_ok=True)
+        dumps = {
+            ".input.f32": np.asarray(x, dtype="<f4").tobytes(),
+            ".output.f32": output_bytes,
+            ".history.f32": history_bytes,
+            ".state.f32": state_bytes,
+        }
+        for suffix, payload in dumps.items():
+            Path(str(dump_prefix) + suffix).write_bytes(payload)
     return document
 
 
 def main(argv):
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--dump-prefix", type=Path,
+                        help="optional prefix for input/output/history/state FP32 oracle dumps")
     parser.add_argument("model", type=Path)
     args = parser.parse_args(argv[1:])
+    if args.dump_prefix is not None and args.output is None:
+        parser.error("--dump-prefix requires --output")
     path = args.model
     data_start, tensors = load_directory(path)
     required = [
@@ -310,7 +325,8 @@ def main(argv):
     print(f"sample_channels=8 beta={beta:.8g} output_fnv64={h:016x}")
     if args.output is not None:
         document = write_full_layer_oracle(
-            path, blob, data_start, tensors, args.output)
+            path, blob, data_start, tensors, args.output,
+            args.dump_prefix)
         print(f"model_sha256={document['model_sha256']}")
         print(f"output_f32_sha256={document['output_f32_sha256']}")
         print(f"history_f32_sha256={document['history_f32_sha256']}")

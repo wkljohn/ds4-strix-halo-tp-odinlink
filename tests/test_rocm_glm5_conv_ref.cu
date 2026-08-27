@@ -140,7 +140,14 @@ static bool rejected_calls_preserve_history(void) {
         ((uint64_t)channels * 4u - 1u) * sizeof(float));
     ds4_gpu_tensor *short_h = ds4_gpu_tensor_alloc(
         ((uint64_t)channels * 3u - 1u) * sizeof(float));
-    CHECK(out && in && w && h && short_out && short_in && short_w && short_h,
+    ds4_gpu_tensor *overlap_base = ds4_gpu_tensor_alloc(
+        (uint64_t)channels * sizeof(float) + sizeof(float));
+    ds4_gpu_tensor *overlap_in = overlap_base ? ds4_gpu_tensor_view(
+        overlap_base, 0, (uint64_t)channels * sizeof(float)) : NULL;
+    ds4_gpu_tensor *overlap_out = overlap_base ? ds4_gpu_tensor_view(
+        overlap_base, sizeof(float), (uint64_t)channels * sizeof(float)) : NULL;
+    CHECK(out && in && w && h && short_out && short_in && short_w && short_h &&
+          overlap_base && overlap_in && overlap_out,
           "allocate rejection tensors");
     CHECK(ds4_gpu_tensor_write(in, 0, input.data(), input.size() * sizeof(float)) &&
           ds4_gpu_tensor_write(w, 0, weight.data(), weight.size() * sizeof(float)) &&
@@ -162,11 +169,23 @@ static bool rejected_calls_preserve_history(void) {
           "reject short history");
     CHECK(!ds4_gpu_glm5_causal_conv4_tensor(h, h, in, w, 1, channels),
           "reject output/history alias");
+    CHECK(!ds4_gpu_glm5_causal_conv4_tensor(
+              overlap_out, h, overlap_in, w, 1, channels),
+          "reject partial output/input overlap");
+    CHECK(!ds4_gpu_glm5_causal_conv4_tensor(w, h, in, w, 1, channels),
+          "reject output/weight alias");
+    CHECK(!ds4_gpu_glm5_causal_conv4_tensor(out, h, h, w, 1, channels),
+          "reject history/input alias");
+    CHECK(!ds4_gpu_glm5_causal_conv4_tensor(out, w, in, w, 1, channels),
+          "reject history/weight alias");
     CHECK(ds4_gpu_synchronize(), "synchronize rejected conv calls");
     std::vector<float> after(history.size());
     CHECK(ds4_gpu_tensor_read(h, 0, after.data(), after.size() * sizeof(float)),
           "read rejection history");
     const bool preserved = max_error(history, after) == 0.0f;
+    ds4_gpu_tensor_free(overlap_out);
+    ds4_gpu_tensor_free(overlap_in);
+    ds4_gpu_tensor_free(overlap_base);
     ds4_gpu_tensor_free(short_h);
     ds4_gpu_tensor_free(short_w);
     ds4_gpu_tensor_free(short_in);

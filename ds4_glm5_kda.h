@@ -7,6 +7,10 @@
 
 #include "ds4_gpu.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 enum {
     DS4_GLM5_KDA_CHANNELS = 8192,
     DS4_GLM5_KDA_HISTORY = 3,
@@ -37,6 +41,29 @@ typedef struct {
     bool valid;
 } ds4_glm5_kda_slot;
 
+typedef struct {
+    uint64_t attn_norm, q, k, v, output;
+    uint64_t q_conv, k_conv, v_conv;
+    uint64_t f_a, f_b, g_a, g_b, beta, o_norm, dt_bias, a_log;
+} ds4_glm5_kda_weight_offsets;
+
+typedef struct {
+    ds4_gpu_tensor *norm, *q, *k, *v, *f_low, *forget;
+    ds4_gpu_tensor *g_low, *out_gate, *beta, *recurrent_out, *flat;
+    uint32_t capacity_tokens;
+} ds4_glm5_kda_workspace;
+
+typedef struct {
+    const ds4_glm5_kda_weight_offsets *weights;
+    const void *model_map;
+    uint64_t model_size;
+    ds4_glm5_kda_layer_state *state;
+    ds4_glm5_kda_workspace *workspace;
+    const ds4_gpu_tensor *input;
+    ds4_gpu_tensor *output;
+    uint32_t n_tokens;
+} ds4_glm5_kda_device_args;
+
 int ds4_glm5_kda_state_bytes(uint64_t kda_count, uint32_t slot_count,
                              uint64_t *bytes);
 int ds4_glm5_kda_build_schedule(ds4_glm5_layer_kind *out,
@@ -53,5 +80,49 @@ int ds4_glm5_kda_slot_init(ds4_glm5_kda_slot *slot,
 int ds4_glm5_kda_slot_reset(ds4_glm5_kda_slot *slot);
 void ds4_glm5_kda_slot_invalidate(ds4_glm5_kda_slot *slot);
 void ds4_glm5_kda_slot_free(ds4_glm5_kda_slot *slot);
+int ds4_glm5_kda_workspace_init(ds4_glm5_kda_workspace *workspace,
+                                uint32_t capacity_tokens);
+void ds4_glm5_kda_workspace_free(ds4_glm5_kda_workspace *workspace);
+int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
+                               ds4_glm5_kda_workspace *workspace,
+                               const ds4_glm5_kda_weight_offsets *weights,
+                               const void *model_map,
+                               uint64_t model_size,
+                               const ds4_gpu_tensor *input,
+                               ds4_gpu_tensor *output,
+                               uint32_t n_tokens);
+
+/* Internal backend adapter. Non-ROCm builds resolve the weak fail-closed
+ * implementation in ds4_glm5_kda.c. */
+int ds4_rocm_glm5_kda_layer_execute(
+        const ds4_glm5_kda_device_args *args);
+
+#if defined(DS4_GLM5_KDA_TEST_HOOKS)
+enum {
+    DS4_GLM5_KDA_FAIL_NONE = 0,
+    DS4_GLM5_KDA_FAIL_INPUT_NORM,
+    DS4_GLM5_KDA_FAIL_Q_PROJECTION,
+    DS4_GLM5_KDA_FAIL_K_PROJECTION,
+    DS4_GLM5_KDA_FAIL_V_PROJECTION,
+    DS4_GLM5_KDA_FAIL_Q_CONV,
+    DS4_GLM5_KDA_FAIL_K_CONV,
+    DS4_GLM5_KDA_FAIL_V_CONV,
+    DS4_GLM5_KDA_FAIL_GATE_PREP,
+    DS4_GLM5_KDA_FAIL_RECURRENCE,
+    DS4_GLM5_KDA_FAIL_GATED_NORM,
+    DS4_GLM5_KDA_FAIL_OUTPUT_PROJECTION,
+};
+void ds4_glm5_kda_test_fail_after(uint32_t stage);
+int ds4_glm5_kda_test_should_fail(uint32_t stage);
+#else
+static inline int ds4_glm5_kda_test_should_fail(uint32_t stage) {
+    (void)stage;
+    return 0;
+}
+#endif
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -101,3 +101,90 @@ __global__ static void ds4_glm5_kda_wave32_kernel(
     state[state_base + (uint64_t)(lane + 96u) * channels] = s3;
 }
 #endif
+
+__device__ static inline float ds4_glm5_sigmoid(float value) {
+    if (value >= 0.0f) {
+        const float e = expf(-value);
+        return 1.0f / (1.0f + e);
+    }
+    const float e = expf(value);
+    return e / (1.0f + e);
+}
+
+/* One block owns one [head, token] pair so both norms have a fixed reduction
+ * order. q additionally carries GLM-5's 1/sqrt(128) attention scale. */
+__global__ static void ds4_glm5_kda_qk_norm_kernel(
+        float *q,
+        float *k,
+        uint32_t n_tokens) {
+    constexpr uint32_t heads = 64u;
+    constexpr uint32_t channels = 128u;
+    const uint32_t row = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (row >= n_tokens * heads || lane >= channels) return;
+    __shared__ float qsum[channels];
+    __shared__ float ksum[channels];
+    const uint64_t index = (uint64_t)row * channels + lane;
+    const float qv = q[index];
+    const float kv = k[index];
+    qsum[lane] = qv * qv;
+    ksum[lane] = kv * kv;
+    __syncthreads();
+    for (uint32_t stride = channels / 2u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) {
+            qsum[lane] += qsum[lane + stride];
+            ksum[lane] += ksum[lane + stride];
+        }
+        __syncthreads();
+    }
+    q[index] = qv * rsqrtf(qsum[0] + 1.0e-6f) *
+               0.08838834764831845f;
+    k[index] = kv * rsqrtf(ksum[0] + 1.0e-6f);
+}
+
+__global__ static void ds4_glm5_kda_forget_kernel(
+        float *forget,
+        const float *dt_bias,
+        const float *a_log,
+        uint64_t values) {
+    constexpr uint32_t channels = 128u;
+    const uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= values) return;
+    const uint32_t channel = (uint32_t)(index % channels);
+    const uint32_t head = (uint32_t)((index / channels) % 64u);
+    const float scaled = expf(a_log[head]) *
+                         (forget[index] + dt_bias[(uint64_t)head * channels +
+                                                  channel]);
+    forget[index] = -5.0f * ds4_glm5_sigmoid(scaled);
+}
+
+__global__ static void ds4_glm5_kda_beta_kernel(float *beta,
+                                                  uint64_t values) {
+    const uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < values) beta[index] = ds4_glm5_sigmoid(beta[index]);
+}
+
+__global__ static void ds4_glm5_kda_gated_norm_kernel(
+        float *output,
+        const float *input,
+        const float *gate,
+        const float *weight,
+        uint32_t n_tokens) {
+    constexpr uint32_t heads = 64u;
+    constexpr uint32_t channels = 128u;
+    const uint32_t row = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (row >= n_tokens * heads || lane >= channels) return;
+    __shared__ float squares[channels];
+    const uint64_t index = (uint64_t)row * channels + lane;
+    const float value = input[index];
+    squares[lane] = value * value;
+    __syncthreads();
+    for (uint32_t stride = channels / 2u; stride != 0u; stride >>= 1u) {
+        if (lane < stride) squares[lane] += squares[lane + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(squares[0] / (float)channels + 1.0e-6f);
+    output[index] = value * scale * weight[lane] *
+                    ds4_glm5_sigmoid(gate[index]);
+}

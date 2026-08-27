@@ -79,7 +79,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-tp-hello test-roce-v2-mr test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
 	python3 tests/test_frontier_logits_gate.py
@@ -126,6 +126,24 @@ tests/test_rocm_glm5_conv_ref: tests/test_rocm_glm5_conv_ref.o ds4_rocm.o ds4_ro
 
 test-rocm-glm5-conv-ref: tests/test_rocm_glm5_conv_ref
 	./tests/test_rocm_glm5_conv_ref
+
+tests/test_rocm_glm5_kda_layer.o: tests/test_rocm_glm5_kda_layer.cu ds4_glm5_kda.h ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_GLM5_KDA_TEST_HOOKS -I. -c -o $@ $<
+
+tests/ds4_glm5_kda_hooks.o: ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
+	$(CC) $(CFLAGS) -DDS4_GLM5_KDA_TEST_HOOKS -I. -c -o $@ $<
+
+tests/ds4_rocm_compat_glm5_hooks.o: ds4_rocm_compat.cu ds4_glm5_kda.h ds4_gpu.h ds4_gpu_mgpu.h rocm/ds4_rocm_glm5_kda.cuh
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_GLM5_KDA_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_rocm_glm5_kda_layer: tests/test_rocm_glm5_kda_layer.o tests/ds4_glm5_kda_hooks.o tests/ds4_rocm_compat_glm5_hooks.o ds4_rocm.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-kda-layer: tests/test_rocm_glm5_kda_layer
+	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "error: set DS4_RESEARCH_ROOT" >&2; exit 2; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+	DS4_GLM5_KDA_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/kda-layer0-oracle" \
+		./tests/test_rocm_glm5_kda_layer
 
 tests/test_glm5_kda_state: tests/test_glm5_kda_state.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_state.c ds4_glm5_kda.c $(LDLIBS)

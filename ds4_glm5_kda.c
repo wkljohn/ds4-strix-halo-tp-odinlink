@@ -176,3 +176,127 @@ fail:
     ds4_glm5_kda_slot_free(slot);
     return 0;
 }
+
+void ds4_glm5_kda_workspace_free(ds4_glm5_kda_workspace *workspace) {
+    if (!workspace) return;
+    ds4_gpu_tensor_free(workspace->norm);
+    ds4_gpu_tensor_free(workspace->q);
+    ds4_gpu_tensor_free(workspace->k);
+    ds4_gpu_tensor_free(workspace->v);
+    ds4_gpu_tensor_free(workspace->f_low);
+    ds4_gpu_tensor_free(workspace->forget);
+    ds4_gpu_tensor_free(workspace->g_low);
+    ds4_gpu_tensor_free(workspace->out_gate);
+    ds4_gpu_tensor_free(workspace->beta);
+    ds4_gpu_tensor_free(workspace->recurrent_out);
+    ds4_gpu_tensor_free(workspace->flat);
+    memset(workspace, 0, sizeof(*workspace));
+}
+
+static ds4_gpu_tensor *workspace_alloc_rows(uint32_t tokens,
+                                             uint32_t width) {
+    uint64_t values = 0;
+    uint64_t bytes = 0;
+    if (!mul_u64(tokens, width, &values) ||
+        !mul_u64(values, sizeof(float), &bytes)) {
+        return NULL;
+    }
+    return ds4_gpu_tensor_alloc(bytes);
+}
+
+int ds4_glm5_kda_workspace_init(ds4_glm5_kda_workspace *workspace,
+                                uint32_t capacity_tokens) {
+    if (!workspace || workspace->capacity_tokens != 0u ||
+        capacity_tokens == 0u) {
+        return 0;
+    }
+    workspace->norm = workspace_alloc_rows(capacity_tokens, 4096u);
+    workspace->q = workspace_alloc_rows(capacity_tokens,
+                                         DS4_GLM5_KDA_CHANNELS);
+    workspace->k = workspace_alloc_rows(capacity_tokens,
+                                         DS4_GLM5_KDA_CHANNELS);
+    workspace->v = workspace_alloc_rows(capacity_tokens,
+                                         DS4_GLM5_KDA_CHANNELS);
+    workspace->f_low = workspace_alloc_rows(capacity_tokens, 128u);
+    workspace->forget = workspace_alloc_rows(capacity_tokens,
+                                              DS4_GLM5_KDA_CHANNELS);
+    workspace->g_low = workspace_alloc_rows(capacity_tokens, 128u);
+    workspace->out_gate = workspace_alloc_rows(capacity_tokens,
+                                                DS4_GLM5_KDA_CHANNELS);
+    workspace->beta = workspace_alloc_rows(capacity_tokens,
+                                            DS4_GLM5_KDA_HEADS);
+    workspace->recurrent_out = workspace_alloc_rows(
+        capacity_tokens, DS4_GLM5_KDA_CHANNELS);
+    workspace->flat = workspace_alloc_rows(capacity_tokens,
+                                            DS4_GLM5_KDA_CHANNELS);
+    if (!workspace->norm || !workspace->q || !workspace->k ||
+        !workspace->v || !workspace->f_low || !workspace->forget ||
+        !workspace->g_low || !workspace->out_gate || !workspace->beta ||
+        !workspace->recurrent_out || !workspace->flat) {
+        ds4_glm5_kda_workspace_free(workspace);
+        return 0;
+    }
+    workspace->capacity_tokens = capacity_tokens;
+    return 1;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_glm5_kda_layer_execute(
+        const ds4_glm5_kda_device_args *args) {
+    (void)args;
+    return 0;
+}
+
+#if defined(DS4_GLM5_KDA_TEST_HOOKS)
+static uint32_t g_glm5_kda_test_fail_stage;
+
+void ds4_glm5_kda_test_fail_after(uint32_t stage) {
+    g_glm5_kda_test_fail_stage = stage;
+}
+
+int ds4_glm5_kda_test_should_fail(uint32_t stage) {
+    return stage != DS4_GLM5_KDA_FAIL_NONE &&
+           stage == g_glm5_kda_test_fail_stage;
+}
+#endif
+
+int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
+                               ds4_glm5_kda_workspace *workspace,
+                               const ds4_glm5_kda_weight_offsets *weights,
+                               const void *model_map,
+                               uint64_t model_size,
+                               const ds4_gpu_tensor *input,
+                               ds4_gpu_tensor *output,
+                               uint32_t n_tokens) {
+    if (!state || !state->valid || !state->q_history || !state->k_history ||
+        !state->v_history || !state->recurrent || !workspace || !weights ||
+        !model_map || model_size == 0u || !input || !output ||
+        n_tokens == 0u || n_tokens > workspace->capacity_tokens ||
+        state->token_count > UINT64_MAX - n_tokens) {
+        return 0;
+    }
+    const uint64_t input_bytes =
+        (uint64_t)n_tokens * 4096u * sizeof(float);
+    if (ds4_gpu_tensor_bytes(input) < input_bytes ||
+        ds4_gpu_tensor_bytes(output) < input_bytes) {
+        return 0;
+    }
+    const ds4_glm5_kda_device_args args = {
+        .weights = weights,
+        .model_map = model_map,
+        .model_size = model_size,
+        .state = state,
+        .workspace = workspace,
+        .input = input,
+        .output = output,
+        .n_tokens = n_tokens,
+    };
+    if (!ds4_rocm_glm5_kda_layer_execute(&args)) {
+        state->valid = false;
+        return 0;
+    }
+    state->token_count += n_tokens;
+    return 1;
+}

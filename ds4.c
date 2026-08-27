@@ -4425,6 +4425,7 @@ typedef struct {
     ds4_tensor *ffn_gate_shexp, *ffn_up_shexp, *ffn_down_shexp;
     ds4_tensor *hc_attn_fn, *hc_ffn_fn, *hc_attn_base, *hc_ffn_base;
     ds4_tensor *hc_attn_scale, *hc_ffn_scale;
+    ds4_glm5_kda_weight_offsets kda_offsets;
 } ds4_glm5_next_layer_weights;
 
 typedef struct {
@@ -4504,6 +4505,24 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
             l->kda_o_norm = required_tensorf(m, "blk.%u.kda_o_norm.weight", il);
             l->kda_dt_bias = required_tensorf(m, "blk.%u.kda_dt_bias.weight", il);
             l->kda_a_log = required_tensorf(m, "blk.%u.kda_a_log.weight", il);
+            l->kda_offsets = (ds4_glm5_kda_weight_offsets) {
+                .attn_norm = l->attn_norm->abs_offset,
+                .q = l->kda_q->abs_offset,
+                .k = l->kda_k->abs_offset,
+                .v = l->kda_v->abs_offset,
+                .output = l->kda_output->abs_offset,
+                .q_conv = l->kda_q_conv->abs_offset,
+                .k_conv = l->kda_k_conv->abs_offset,
+                .v_conv = l->kda_v_conv->abs_offset,
+                .f_a = l->kda_f_a->abs_offset,
+                .f_b = l->kda_f_b->abs_offset,
+                .g_a = l->kda_g_a->abs_offset,
+                .g_b = l->kda_g_b->abs_offset,
+                .beta = l->kda_beta->abs_offset,
+                .o_norm = l->kda_o_norm->abs_offset,
+                .dt_bias = l->kda_dt_bias->abs_offset,
+                .a_log = l->kda_a_log->abs_offset,
+            };
         }
         if (il < 3u) {
             l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);

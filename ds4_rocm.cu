@@ -152,6 +152,29 @@ extern "C" void ds4_gpu_rocm_mark_speculative_decode(void) {
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
 
+/* Narrow internal bridge used by the GLM-5 adapter.  It resolves the same
+ * mmap/range-cache address as every existing ROCm weight kernel and returns a
+ * non-owning descriptor; callers must never free the described range. */
+extern "C" int ds4_rocm_model_range_view_tensor(
+        ds4_gpu_tensor *view,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *label) {
+    if (!view || !model_map || !cuda_model_range_fits(model_size, offset, bytes)) {
+        return 0;
+    }
+    const char *ptr = cuda_model_range_ptr(model_map, offset, bytes,
+                                           label ? label : "glm5_kda");
+    if (!ptr) return 0;
+    view->ptr = (void *)ptr;
+    view->bytes = bytes;
+    view->owner = 0;
+    view->host_ptr = NULL;
+    return 1;
+}
+
 #define DS4_ROCM_TP_READY 1
 /* ------------------------------------------------------------------------
  * DS4-TP-gfx1151 (patch 4): ROCm tensor-parallel gate runtime.
