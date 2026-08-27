@@ -321,6 +321,7 @@ int main(void) {
           "upload tensors");
 
     std::vector<float> legacy(q.size()), flash1(q.size()), flash2(q.size());
+    std::vector<float> flash_direct(q.size());
     std::vector<float> chunked(q.size());
     setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH", "0", 1);
     CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
@@ -331,6 +332,7 @@ int main(void) {
           "run legacy two-pass attention");
 
     setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH", "1", 1);
+    unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT");
     CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
               &heads_dev, model.data(), model.size(), sinks_offset,
               &q_dev, &raw_dev, &comp_dev, 0, n_tokens, n_comp, window,
@@ -343,6 +345,19 @@ int main(void) {
               ratio, n_head, head_dim) &&
           ds4_gpu_tensor_read(&heads_dev, 0, flash2.data(), flash2.size() * sizeof(float)),
           "run flash attention second time");
+
+    setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT", "1", 1);
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              &heads_dev, model.data(), model.size(), sinks_offset,
+              &q_dev, &raw_dev, &comp_dev, 0, n_tokens, n_comp, window,
+              ratio, n_head, head_dim) &&
+          ds4_gpu_tensor_read(&heads_dev, 0, flash_direct.data(),
+                              flash_direct.size() * sizeof(float)),
+          "run LDS-free direct-KV flash attention");
+    CHECK(memcmp(flash1.data(), flash_direct.data(),
+                 flash1.size() * sizeof(float)) == 0,
+          "direct-KV flash attention must match staged flash bitwise");
+    unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT");
 
     /* A cross-layer token wavefront can only preserve the established
      * fingerprint if query-row chunks execute the exact same arithmetic as

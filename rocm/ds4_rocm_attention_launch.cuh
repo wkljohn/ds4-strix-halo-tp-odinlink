@@ -58,6 +58,13 @@ static int attention_prefill_static_flash_enabled(void) {
     return gfx1151;
 }
 
+/* Research gate for the arithmetic-identical, LDS-free static attention
+ * kernel.  Keep default-off until both TP RDMA providers pass the full gate. */
+static int attention_prefill_static_flash_direct_enabled(void) {
+    const char *value = getenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT");
+    return value != NULL && strcmp(value, "1") == 0;
+}
+
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
@@ -1055,7 +1062,14 @@ static int attention_prefill_mixed_launch(
         ((window != 0u ? window : n_tokens) + n_comp <= 768u)) {
         dim3 grid(n_q, (n_head + 7u) / 8u, 1);
         if (attention_prefill_static_flash_enabled()) {
-            attention_static_mixed_heads8_flash_kernel<<<grid, 256>>>((float *)heads->ptr,
+            if (attention_prefill_static_flash_direct_enabled()) {
+                static int logged;
+                if (!logged) {
+                    logged = 1;
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX
+                            "static flash direct-KV engaged (LDS-free)\n");
+                }
+                attention_static_mixed_heads8_flash_direct_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                       sinks,
                                                                       (const float *)q->ptr,
                                                                       (const float *)raw_kv->ptr,
@@ -1067,6 +1081,20 @@ static int attention_prefill_mixed_launch(
                                                                       ratio,
                                                                       n_head,
                                                                       head_dim);
+            } else {
+                attention_static_mixed_heads8_flash_kernel<<<grid, 256>>>((float *)heads->ptr,
+                                                                      sinks,
+                                                                      (const float *)q->ptr,
+                                                                      (const float *)raw_kv->ptr,
+                                                                      n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                      n_q,
+                                                                      q_row0,
+                                                                      n_comp,
+                                                                      window,
+                                                                      ratio,
+                                                                      n_head,
+                                                                      head_dim);
+            }
         } else {
             attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                    sinks,

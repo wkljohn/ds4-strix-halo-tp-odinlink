@@ -31,6 +31,7 @@
 /tests/test_tp_completion_ordering
 /tests/test_rocm_q4k_fused_mid
 /tests/test_rocm_attention_prefill_static_flash
+/tests/attn_static_flash_lds_bench
 /tests/test_rocm_attention_decode_mixed
 /tests/test_rocm_attention_decode_indexed_seqtile
 /tests/test_rocm_attention_output_tp

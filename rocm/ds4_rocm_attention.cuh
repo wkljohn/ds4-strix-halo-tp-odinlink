@@ -1438,6 +1438,116 @@ __global__ static void attention_static_mixed_heads8_flash_kernel(
     }
 }
 
+/* Arithmetic-identical counterpart of
+ * attention_static_mixed_heads8_flash_kernel that lets each head warp read
+ * KV rows directly.  This removes the four-row LDS stage and two block-wide
+ * barriers per chunk.  Keep edits to its arithmetic mirrored with the staged
+ * kernel; dispatch is guarded by an explicit default-off research switch. */
+__global__ static void attention_static_mixed_heads8_flash_direct_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t n_q,
+        uint32_t q_row0,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t t_local = blockIdx.x;
+    const uint32_t t_abs = q_row0 + t_local;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = blockIdx.y * 8u + warp;
+    if (t_local >= n_q || head_dim != 512u) return;
+    const bool valid_head = head < n_head;
+
+    const uint32_t raw_count =
+        window != 0u && t_abs + 1u > window ? window : t_abs + 1u;
+    const uint32_t raw_start = t_abs + 1u - raw_count;
+    uint32_t comp_count = 0u;
+    if (n_comp != 0u && ratio != 0u) {
+        comp_count = (t_abs + 1u) / ratio;
+        if (comp_count > n_comp) comp_count = n_comp;
+    }
+    const uint32_t n_score = raw_count + comp_count;
+    const float scale = rsqrtf((float)head_dim);
+
+    const float4 *q4 = valid_head
+        ? (const float4 *)(q +
+            ((uint64_t)t_local * n_head + head) * head_dim)
+        : NULL;
+    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 q1 = q0, q2 = q0, q3 = q0;
+    if (valid_head) {
+        q0 = q4[lane +  0u];
+        q1 = q4[lane + 32u];
+        q2 = q4[lane + 64u];
+        q3 = q4[lane + 96u];
+    }
+
+    float max_s = valid_head ? sinks[head] : -INFINITY;
+    float sum_s = valid_head ? 1.0f : 0.0f;
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+
+    for (uint32_t row0 = 0; row0 < n_score; row0 += 4u) {
+        const uint32_t nr = n_score - row0 < 4u ? n_score - row0 : 4u;
+        if (valid_head) {
+            for (uint32_t rr = 0; rr < nr; rr++) {
+                const uint32_t sr = row0 + rr;
+                const float4 *kv4 = sr < raw_count
+                    ? (const float4 *)(raw_kv +
+                        (uint64_t)(raw_start + sr) * head_dim)
+                    : (const float4 *)(comp_kv +
+                        (uint64_t)(sr - raw_count) * head_dim);
+                const float4 k0 = kv4[lane +  0u];
+                const float4 k1 = kv4[lane + 32u];
+                const float4 k2 = kv4[lane + 64u];
+                const float4 k3 = kv4[lane + 96u];
+                float score = dot4_f32(q0, k0) + dot4_f32(q1, k1) +
+                              dot4_f32(q2, k2) + dot4_f32(q3, k3);
+                score = warp_sum_f32(score) * scale;
+                score = __shfl_sync(FULL_WARP_MASK, score, 0);
+
+                const float new_m = fmaxf(max_s, score);
+                const float old_scale = expf(max_s - new_m);
+                const float row_scale = expf(score - new_m);
+                sum_s = sum_s * old_scale + row_scale;
+#define DS4_FLASH_DIRECT_ACCUM4(o, k) \
+                do { \
+                    (o).x = (o).x * old_scale + (k).x * row_scale; \
+                    (o).y = (o).y * old_scale + (k).y * row_scale; \
+                    (o).z = (o).z * old_scale + (k).z * row_scale; \
+                    (o).w = (o).w * old_scale + (k).w * row_scale; \
+                } while (0)
+                DS4_FLASH_DIRECT_ACCUM4(o0, k0);
+                DS4_FLASH_DIRECT_ACCUM4(o1, k1);
+                DS4_FLASH_DIRECT_ACCUM4(o2, k2);
+                DS4_FLASH_DIRECT_ACCUM4(o3, k3);
+#undef DS4_FLASH_DIRECT_ACCUM4
+                max_s = new_m;
+            }
+        }
+    }
+
+    if (valid_head) {
+        const float inv_s = sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
+        o0.x *= inv_s; o0.y *= inv_s; o0.z *= inv_s; o0.w *= inv_s;
+        o1.x *= inv_s; o1.y *= inv_s; o1.z *= inv_s; o1.w *= inv_s;
+        o2.x *= inv_s; o2.y *= inv_s; o2.z *= inv_s; o2.w *= inv_s;
+        o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
+        float4 *out4 = (float4 *)(heads +
+            ((uint64_t)t_local * n_head + head) * head_dim);
+        out4[lane +  0u] = o0;
+        out4[lane + 32u] = o1;
+        out4[lane + 64u] = o2;
+        out4[lane + 96u] = o3;
+    }
+}
+
 __global__ static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
