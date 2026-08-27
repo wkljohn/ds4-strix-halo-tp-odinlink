@@ -115,6 +115,9 @@ tests/test_rocm_glm5_conv_ref: tests/test_rocm_glm5_conv_ref.cu rocm/ds4_rocm_gl
 test-rocm-glm5-conv-ref: tests/test_rocm_glm5_conv_ref
 	./tests/test_rocm_glm5_conv_ref
 
+tests/test_glm5_kda_state: tests/test_glm5_kda_state.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_state.c ds4_glm5_kda.c $(LDLIBS)
+
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
 

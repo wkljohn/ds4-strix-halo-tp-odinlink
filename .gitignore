@@ -77,3 +77,4 @@ __pycache__/
 .DS_Store
 tests/test_rocm_glm5_kda_ref
 tests/test_rocm_glm5_conv_ref
+tests/test_glm5_kda_state
