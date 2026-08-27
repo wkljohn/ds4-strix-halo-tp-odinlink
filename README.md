@@ -21,7 +21,7 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **209.84 t/s** | **19.37 t/s** | three-run median, exact fingerprint |
+| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | — | — | revalidation pending on this branch; archived result is not a current gate |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **233.04 t/s** | **19.17 t/s** | three-run median, exact fingerprint |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **275.58 t/s** | **20.43 t/s** | three-run median, exact fingerprint |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
