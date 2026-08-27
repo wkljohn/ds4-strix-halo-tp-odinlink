@@ -99,6 +99,7 @@ test-glm5-next-contract:
 	python3 scripts/probe-glm5-next-kda-payload.py "$(DS4_GLM5_MODEL)"
 	python3 scripts/plan-glm5-next-residency.py . "$(DS4_GLM5_MODEL)"
 	python3 tests/test_glm5_next_oracles.py
+	python3 tests/test_glm5_kda_external_reference.py
 
 test-glm5-next-kda-projection:
 	python3 scripts/probe-glm5-next-kda-projection.py "$(DS4_GLM5_MODEL)"
