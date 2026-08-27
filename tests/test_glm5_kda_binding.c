@@ -22,6 +22,11 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     (void)tensor;
 }
 
+uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
+    (void)tensor;
+    return 0;
+}
+
 #define CHECK(expr, message) do { \
     if (!(expr)) { \
         fprintf(stderr, "FAIL %s\n", message); \

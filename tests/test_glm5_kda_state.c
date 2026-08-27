@@ -51,6 +51,10 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     free(tensor);
 }
 
+uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
+    return tensor ? tensor->bytes : 0;
+}
+
 static void reset_fakes(void) {
     alloc_calls = 0;
     free_calls = 0;
