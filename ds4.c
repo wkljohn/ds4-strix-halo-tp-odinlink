@@ -501,6 +501,9 @@ typedef enum {
     DS4_VARIANT_FLASH = 0,
     DS4_VARIANT_PRO   = 1,
     DS4_VARIANT_GLM52 = 2,
+    /* Metadata is recognized, but the GLM-5.3 graph is deliberately kept
+     * fail-closed until its KDA/NoPE/mHC graph and TP oracles are landed. */
+    DS4_VARIANT_GLM53 = 3,
 } ds4_variant;
 
 typedef struct {
@@ -5838,8 +5841,50 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
+/* GLM-5.3-Flash uses a different graph from the older glm-dsa profile.  Do
+ * not let its metadata fall through to the GLM-5.2 validator: accepting it
+ * there would bind tensors with the wrong layer schedule and could produce
+ * plausible-looking but invalid output.  This first-stage validator proves
+ * only the model contract and then stops before graph construction. */
+static void config_validate_glm5_next_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_GLM52;
+    g_ds4_shape.variant = DS4_VARIANT_GLM53;
+    g_ds4_shape.name = "GLM 5.3 Flash (metadata-only)";
+
+    const uint32_t layers = required_u32(m, "glm5-next.block_count");
+    const uint64_t context = required_u64_compat(m, "glm5-next.context_length");
+    const uint32_t embd = required_u32(m, "glm5-next.embedding_length");
+    const uint32_t vocab = required_u32(m, "glm5-next.vocab_size");
+    const uint32_t experts = required_u32(m, "glm5-next.expert_count");
+    const uint32_t used = required_u32(m, "glm5-next.expert_used_count");
+    const uint32_t ff = required_u32(m, "glm5-next.expert_feed_forward_length");
+    const uint32_t dense = required_u32(m, "glm5-next.feed_forward_length");
+    const uint32_t heads = required_u32(m, "glm5-next.attention.head_count");
+    const uint32_t head_dim = required_u32(m, "glm5-next.attention.key_length");
+    const uint32_t indexer_topk = required_u32(m, "glm5-next.attention.indexer.top_k");
+
+    config_expect_u32("block_count", layers, 46);
+    config_expect_u64("context_length", context, 1048576);
+    config_expect_u32("embedding_length", embd, 4096);
+    config_expect_u32("vocab_size", vocab, 154880);
+    config_expect_u32("expert_count", experts, 288);
+    config_expect_u32("expert_used_count", used, 8);
+    config_expect_u32("expert_feed_forward_length", ff, 2048);
+    config_expect_u32("feed_forward_length", dense, 12288);
+    config_expect_u32("attention.head_count", heads, 64);
+    config_expect_u32("attention.key_length", head_dim, 256);
+    config_expect_u32("attention.indexer.top_k", indexer_topk, 2048);
+
+    ds4_die("glm5-next metadata is recognized and validated, but its graph is not implemented yet; refusing to run");
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
+    if (model_get_string(m, "general.architecture", &arch) &&
+        ds4_streq(arch, "glm5-next")) {
+        config_validate_glm5_next_model(m);
+        return;
+    }
     if (model_get_string(m, "general.architecture", &arch) &&
         ds4_streq(arch, "glm-dsa")) {
         config_validate_glm_dsa_model(m);
