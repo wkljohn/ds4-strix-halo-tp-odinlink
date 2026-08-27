@@ -670,6 +670,50 @@ static const ds4_shape DS4_SHAPE_GLM52 = {
     .rope_orig_ctx = 1048576,
 };
 
+static const ds4_shape DS4_SHAPE_GLM53 = {
+    .name = "GLM 5.3 Flash",
+    .family = DS4_MODEL_FAMILY_GLM_DSA,
+    .variant = DS4_VARIANT_GLM53,
+    .n_layer = 46,
+    .n_embd = 4096,
+    .n_vocab = 154880,
+    .n_head = 64,
+    .n_head_kv = 1,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 0,
+    .n_out_group = 0,
+    .n_lora_q = 1536,
+    .n_lora_o = 0,
+    .n_expert = 288,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 2048,
+    .n_ff_dense = 12288,
+    .n_hash_layer = 0,
+    .n_swa = 0,
+    .n_indexer_head = 32,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 2048,
+    .n_hc = 4,
+    .n_hc_sinkhorn_iter = 20,
+    .n_nextn_predict = 1,
+    .n_leading_dense = 3,
+    .n_kv_lora = 512,
+    .n_key_mla = 256,
+    .n_value_mla = 256,
+    .rms_eps = 1.0e-5f,
+    .hc_eps = 1.0e-6f,
+    .expert_weight_scale = 2.5f,
+    .swiglu_clamp_exp = 10.0f,
+    .rope_freq_base = 0.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_yarn_beta_fast = 0.0f,
+    .rope_yarn_beta_slow = 0.0f,
+    .compress_rope_freq_base = 0.0f,
+    .rope_orig_ctx = 1048576,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -5847,9 +5891,7 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
  * plausible-looking but invalid output.  This first-stage validator proves
  * only the model contract and then stops before graph construction. */
 static void config_validate_glm5_next_model(const ds4_model *m) {
-    g_ds4_shape = DS4_SHAPE_GLM52;
-    g_ds4_shape.variant = DS4_VARIANT_GLM53;
-    g_ds4_shape.name = "GLM 5.3 Flash (metadata-only)";
+    g_ds4_shape = DS4_SHAPE_GLM53;
 
     const uint32_t layers = required_u32(m, "glm5-next.block_count");
     const uint64_t context = required_u64_compat(m, "glm5-next.context_length");
