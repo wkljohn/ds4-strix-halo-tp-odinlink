@@ -92,6 +92,15 @@ static void attention_prefill_static_flash_coverage_log(
 }
 #endif
 
+/* Research gate for the paired-query direct-KV kernel.  It deliberately
+ * requires the parent direct-KV gate and dispatches only where its isolated
+ * crossover is positive. */
+static int attention_prefill_static_flash_direct_t2_enabled(void) {
+    const char *value = getenv(
+        "DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2");
+    return value != NULL && strcmp(value, "1") == 0;
+}
+
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
         ds4_gpu_tensor *raw_cache,
@@ -1095,13 +1104,19 @@ static int attention_prefill_mixed_launch(
                 n_tokens, n_comp, window, ratio, n_head);
 #endif
             if (attention_prefill_static_flash_direct_enabled()) {
-                static int logged;
-                if (!logged) {
-                    logged = 1;
-                    fprintf(stderr, DS4_GPU_LOG_PREFIX
-                            "static flash direct-KV engaged (LDS-free)\n");
-                }
-                attention_static_mixed_heads8_flash_direct_kernel<<<grid, 256>>>((float *)heads->ptr,
+                if (attention_prefill_static_flash_direct_t2_enabled() &&
+                    n_q >= 32u) {
+                    static int t2_logged;
+                    if (!t2_logged) {
+                        t2_logged = 1;
+                        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                                "static flash direct-KV T=2 engaged "
+                                "(4 head warps, n_q >= 32)\n");
+                    }
+                    dim3 t2_grid((n_q + 1u) / 2u,
+                                 (n_head + 3u) / 4u, 1u);
+                    attention_static_mixed_heads4_flash_direct_t2_kernel<<<
+                        t2_grid, 128>>>((float *)heads->ptr,
                                                                       sinks,
                                                                       (const float *)q->ptr,
                                                                       (const float *)raw_kv->ptr,
@@ -1113,6 +1128,26 @@ static int attention_prefill_mixed_launch(
                                                                       ratio,
                                                                       n_head,
                                                                       head_dim);
+                } else {
+                    static int logged;
+                    if (!logged) {
+                        logged = 1;
+                        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                                "static flash direct-KV engaged (LDS-free)\n");
+                    }
+                    attention_static_mixed_heads8_flash_direct_kernel<<<grid, 256>>>((float *)heads->ptr,
+                                                                      sinks,
+                                                                      (const float *)q->ptr,
+                                                                      (const float *)raw_kv->ptr,
+                                                                      n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                      n_q,
+                                                                      q_row0,
+                                                                      n_comp,
+                                                                      window,
+                                                                      ratio,
+                                                                      n_head,
+                                                                      head_dim);
+                }
             } else {
                 attention_static_mixed_heads8_flash_kernel<<<grid, 256>>>((float *)heads->ptr,
                                                                       sinks,

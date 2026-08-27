@@ -321,7 +321,8 @@ int main(void) {
           "upload tensors");
 
     std::vector<float> legacy(q.size()), flash1(q.size()), flash2(q.size());
-    std::vector<float> flash_direct(q.size());
+    std::vector<float> flash_parent_off_t2(q.size());
+    std::vector<float> flash_direct(q.size()), flash_direct_t2(q.size());
     std::vector<float> chunked(q.size());
     setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH", "0", 1);
     CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
@@ -346,6 +347,20 @@ int main(void) {
           ds4_gpu_tensor_read(&heads_dev, 0, flash2.data(), flash2.size() * sizeof(float)),
           "run flash attention second time");
 
+    /* The child research gate must not bypass its parent direct-KV gate. */
+    setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2", "1", 1);
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              &heads_dev, model.data(), model.size(), sinks_offset,
+              &q_dev, &raw_dev, &comp_dev, 0, n_tokens, n_comp, window,
+              ratio, n_head, head_dim) &&
+          ds4_gpu_tensor_read(&heads_dev, 0, flash_parent_off_t2.data(),
+                              flash_parent_off_t2.size() * sizeof(float)),
+          "run parent-off T=2-gated flash attention");
+    CHECK(memcmp(flash1.data(), flash_parent_off_t2.data(),
+                 flash1.size() * sizeof(float)) == 0,
+          "T=2 gate must preserve staged flash when direct-KV parent is off");
+    unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2");
+
     setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT", "1", 1);
     CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
               &heads_dev, model.data(), model.size(), sinks_offset,
@@ -357,6 +372,44 @@ int main(void) {
     CHECK(memcmp(flash1.data(), flash_direct.data(),
                  flash1.size() * sizeof(float)) == 0,
           "direct-KV flash attention must match staged flash bitwise");
+    setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2", "1", 1);
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              &heads_dev, model.data(), model.size(), sinks_offset,
+              &q_dev, &raw_dev, &comp_dev, 0, n_tokens, n_comp, window,
+              ratio, n_head, head_dim) &&
+          ds4_gpu_tensor_read(&heads_dev, 0, flash_direct_t2.data(),
+                              flash_direct_t2.size() * sizeof(float)),
+          "run paired-query direct-KV flash attention");
+    CHECK(memcmp(flash_direct.data(), flash_direct_t2.data(),
+                 flash_direct.size() * sizeof(float)) == 0,
+          "paired-query direct-KV attention must match direct-KV bitwise");
+
+    /* The paired kernel loses at tiny query counts.  Prove the public range
+     * dispatch keeps n_q < 32 on the direct-KV rollback path. */
+    constexpr uint32_t small_rows = 17;
+    const size_t small_elems =
+        (size_t)small_rows * n_head * head_dim;
+    std::vector<float> direct_small(small_elems), t2_gated_small(small_elems);
+    unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2");
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+              &heads_dev, model.data(), model.size(), sinks_offset,
+              &q_dev, &raw_dev, &comp_dev, 0, 0, small_rows, n_tokens,
+              n_comp, window, ratio, n_head, head_dim) &&
+          ds4_gpu_tensor_read(&heads_dev, 0, direct_small.data(),
+                              direct_small.size() * sizeof(float)),
+          "run small direct-KV flash attention");
+    setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2", "1", 1);
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+              &heads_dev, model.data(), model.size(), sinks_offset,
+              &q_dev, &raw_dev, &comp_dev, 0, 0, small_rows, n_tokens,
+              n_comp, window, ratio, n_head, head_dim) &&
+          ds4_gpu_tensor_read(&heads_dev, 0, t2_gated_small.data(),
+                              t2_gated_small.size() * sizeof(float)),
+          "run small T=2-gated flash attention");
+    CHECK(memcmp(direct_small.data(), t2_gated_small.data(),
+                 direct_small.size() * sizeof(float)) == 0,
+          "T=2 gate must preserve direct-KV below its n_q threshold");
+    unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2");
     unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT");
 
     /* A cross-layer token wavefront can only preserve the established

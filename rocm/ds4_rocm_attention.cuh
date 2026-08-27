@@ -1548,6 +1548,194 @@ __global__ static void attention_static_mixed_heads8_flash_direct_kernel(
     }
 }
 
+/* Two adjacent query rows share each KV load.  Their online-softmax streams
+ * retain the direct-KV kernel's exact per-row visit and reduction order.  Four
+ * head warps per block avoid the small-tile scheduling loss of the original
+ * eight-warp prototype.  This remains behind an explicit research gate. */
+__launch_bounds__(128)
+__global__ static void attention_static_mixed_heads4_flash_direct_t2_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        const float *comp_kv,
+        uint32_t n_q,
+        uint32_t q_row0,
+        uint32_t n_comp,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t t0_local = blockIdx.x * 2u;
+    const uint32_t t1_local = t0_local + 1u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = blockIdx.y * 4u + warp;
+    if (t0_local >= n_q || head_dim != 512u || head >= n_head) return;
+    const bool valid0 = true;
+    const bool valid1 = t1_local < n_q;
+    const uint32_t t0_abs = q_row0 + t0_local;
+    const uint32_t t1_abs = q_row0 + t1_local;
+
+    const uint32_t raw0_count =
+        window != 0u && t0_abs + 1u > window ? window : t0_abs + 1u;
+    const uint32_t raw1_count = valid1
+        ? (window != 0u && t1_abs + 1u > window ? window : t1_abs + 1u)
+        : 0u;
+    const uint32_t raw0_start = t0_abs + 1u - raw0_count;
+    const uint32_t raw1_start = valid1 ? t1_abs + 1u - raw1_count : raw0_start;
+    const uint32_t raw_union_start = raw0_start < raw1_start
+        ? raw0_start : raw1_start;
+    const uint32_t raw0_end = raw0_start + raw0_count;
+    const uint32_t raw1_end = raw1_start + raw1_count;
+    const uint32_t raw_union_end = raw0_end > raw1_end
+        ? raw0_end : raw1_end;
+    uint32_t comp0_count = 0u, comp1_count = 0u;
+    if (n_comp != 0u && ratio != 0u) {
+        comp0_count = (t0_abs + 1u) / ratio;
+        if (comp0_count > n_comp) comp0_count = n_comp;
+        if (valid1) {
+            comp1_count = (t1_abs + 1u) / ratio;
+            if (comp1_count > n_comp) comp1_count = n_comp;
+        }
+    }
+    const uint32_t comp_union_count = comp0_count > comp1_count
+        ? comp0_count : comp1_count;
+    const float scale = rsqrtf((float)head_dim);
+
+    const float4 *q04 = (const float4 *)(q +
+        ((uint64_t)t0_local * n_head + head) * head_dim);
+    const float4 q00 = q04[lane +  0u];
+    const float4 q01 = q04[lane + 32u];
+    const float4 q02 = q04[lane + 64u];
+    const float4 q03 = q04[lane + 96u];
+    float4 q10 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 q11 = q10, q12 = q10, q13 = q10;
+    if (valid1) {
+        const float4 *q14 = (const float4 *)(q +
+            ((uint64_t)t1_local * n_head + head) * head_dim);
+        q10 = q14[lane +  0u]; q11 = q14[lane + 32u];
+        q12 = q14[lane + 64u]; q13 = q14[lane + 96u];
+    }
+
+    float max0 = sinks[head], sum0 = 1.0f;
+    float max1 = valid1 ? sinks[head] : -INFINITY;
+    float sum1 = valid1 ? 1.0f : 0.0f;
+    float4 o00 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o01 = o00, o02 = o00, o03 = o00;
+    float4 o10 = o00, o11 = o00, o12 = o00, o13 = o00;
+
+#define DS4_FLASH_T2_UPDATE(score, max_s, sum_s, o0, o1, o2, o3) \
+    do { \
+        const float new_m = fmaxf((max_s), score); \
+        const float old_scale = expf((max_s) - new_m); \
+        const float row_scale = expf(score - new_m); \
+        (sum_s) = (sum_s) * old_scale + row_scale; \
+        (o0).x = (o0).x * old_scale + k0.x * row_scale; \
+        (o0).y = (o0).y * old_scale + k0.y * row_scale; \
+        (o0).z = (o0).z * old_scale + k0.z * row_scale; \
+        (o0).w = (o0).w * old_scale + k0.w * row_scale; \
+        (o1).x = (o1).x * old_scale + k1.x * row_scale; \
+        (o1).y = (o1).y * old_scale + k1.y * row_scale; \
+        (o1).z = (o1).z * old_scale + k1.z * row_scale; \
+        (o1).w = (o1).w * old_scale + k1.w * row_scale; \
+        (o2).x = (o2).x * old_scale + k2.x * row_scale; \
+        (o2).y = (o2).y * old_scale + k2.y * row_scale; \
+        (o2).z = (o2).z * old_scale + k2.z * row_scale; \
+        (o2).w = (o2).w * old_scale + k2.w * row_scale; \
+        (o3).x = (o3).x * old_scale + k3.x * row_scale; \
+        (o3).y = (o3).y * old_scale + k3.y * row_scale; \
+        (o3).z = (o3).z * old_scale + k3.z * row_scale; \
+        (o3).w = (o3).w * old_scale + k3.w * row_scale; \
+        (max_s) = new_m; \
+    } while (0)
+
+#define DS4_FLASH_T2_PAIR_STEP(use0, use1) \
+    do { \
+        float score0 = dot4_f32(q00, k0) + dot4_f32(q01, k1) + \
+                       dot4_f32(q02, k2) + dot4_f32(q03, k3); \
+        float score1 = dot4_f32(q10, k0) + dot4_f32(q11, k1) + \
+                       dot4_f32(q12, k2) + dot4_f32(q13, k3); \
+        for (int offset = 16; offset > 0; offset >>= 1) { \
+            score0 += __shfl_down(score0, offset, 32); \
+            score1 += __shfl_down(score1, offset, 32); \
+        } \
+        score0 *= scale; score1 *= scale; \
+        score0 = __shfl_sync(FULL_WARP_MASK, score0, 0); \
+        score1 = __shfl_sync(FULL_WARP_MASK, score1, 0); \
+        if (use0) \
+            DS4_FLASH_T2_UPDATE(score0, max0, sum0, o00, o01, o02, o03); \
+        if (use1) \
+            DS4_FLASH_T2_UPDATE(score1, max1, sum1, o10, o11, o12, o13); \
+    } while (0)
+
+#define DS4_FLASH_T2_LOAD_STEP(kv_base, row, use0, use1) \
+    do { \
+        const float4 *kv4 = (const float4 *)((kv_base) + \
+            (uint64_t)(row) * head_dim); \
+        const float4 k0 = kv4[lane +  0u]; \
+        const float4 k1 = kv4[lane + 32u]; \
+        const float4 k2 = kv4[lane + 64u]; \
+        const float4 k3 = kv4[lane + 96u]; \
+        DS4_FLASH_T2_PAIR_STEP(use0, use1); \
+    } while (0)
+
+    const uint32_t raw_both_start = raw0_start > raw1_start
+        ? raw0_start : raw1_start;
+    const uint32_t raw_both_end = raw0_end < raw1_end
+        ? raw0_end : raw1_end;
+#pragma clang loop unroll(disable)
+    for (uint32_t row = raw_union_start; row < raw_both_start; row++) {
+        if (raw0_start < raw1_start)
+            DS4_FLASH_T2_LOAD_STEP(raw_kv, row, true, false);
+        else
+            DS4_FLASH_T2_LOAD_STEP(raw_kv, row, false, true);
+    }
+#pragma clang loop unroll(disable)
+    for (uint32_t row = raw_both_start; row < raw_both_end; row++) {
+        DS4_FLASH_T2_LOAD_STEP(raw_kv, row, true, true);
+    }
+#pragma clang loop unroll(disable)
+    for (uint32_t row = raw_both_end; row < raw_union_end; row++) {
+        if (raw0_end > raw1_end)
+            DS4_FLASH_T2_LOAD_STEP(raw_kv, row, true, false);
+        else
+            DS4_FLASH_T2_LOAD_STEP(raw_kv, row, false, true);
+    }
+    const uint32_t comp_both_end = comp0_count < comp1_count
+        ? comp0_count : comp1_count;
+#pragma clang loop unroll(disable)
+    for (uint32_t row = 0; row < comp_both_end; row++) {
+        DS4_FLASH_T2_LOAD_STEP(comp_kv, row, true, true);
+    }
+#pragma clang loop unroll(disable)
+    for (uint32_t row = comp_both_end; row < comp_union_count; row++) {
+        if (comp0_count > comp1_count)
+            DS4_FLASH_T2_LOAD_STEP(comp_kv, row, true, false);
+        else
+            DS4_FLASH_T2_LOAD_STEP(comp_kv, row, false, true);
+    }
+#undef DS4_FLASH_T2_LOAD_STEP
+#undef DS4_FLASH_T2_PAIR_STEP
+#undef DS4_FLASH_T2_UPDATE
+
+#define DS4_FLASH_T2_STORE(t, sum_s, o0, o1, o2, o3) \
+    do { \
+        const float inv_s = (sum_s) == 0.0f ? 0.0f : 1.0f / (sum_s); \
+        (o0).x *= inv_s; (o0).y *= inv_s; (o0).z *= inv_s; (o0).w *= inv_s; \
+        (o1).x *= inv_s; (o1).y *= inv_s; (o1).z *= inv_s; (o1).w *= inv_s; \
+        (o2).x *= inv_s; (o2).y *= inv_s; (o2).z *= inv_s; (o2).w *= inv_s; \
+        (o3).x *= inv_s; (o3).y *= inv_s; (o3).z *= inv_s; (o3).w *= inv_s; \
+        float4 *out4 = (float4 *)(heads + \
+            ((uint64_t)(t) * n_head + head) * head_dim); \
+        out4[lane +  0u] = (o0); out4[lane + 32u] = (o1); \
+        out4[lane + 64u] = (o2); out4[lane + 96u] = (o3); \
+    } while (0)
+    DS4_FLASH_T2_STORE(t0_local, sum0, o00, o01, o02, o03);
+    if (valid1) DS4_FLASH_T2_STORE(t1_local, sum1, o10, o11, o12, o13);
+#undef DS4_FLASH_T2_STORE
+}
+
 __global__ static void attention_decode_mixed_heads8_online_kernel(
         float *heads,
         const float *sinks,
