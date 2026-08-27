@@ -410,31 +410,34 @@ int main(void) {
                  direct_small.size() * sizeof(float)) == 0,
           "T=2 gate must preserve direct-KV below its n_q threshold");
 
-    /* Exercise the paired-query tail immediately above the dispatch threshold.
-     * The final block owns one query and must not read or write its absent
-     * partner. */
-    constexpr uint32_t odd_rows = 33;
-    const size_t odd_elems = (size_t)odd_rows * n_head * head_dim;
-    std::vector<float> direct_odd(odd_elems), t2_odd(odd_elems);
-    unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2");
-    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
-              &heads_dev, model.data(), model.size(), sinks_offset,
-              &q_dev, &raw_dev, &comp_dev, 0, 0, odd_rows, n_tokens,
-              n_comp, window, ratio, n_head, head_dim) &&
-          ds4_gpu_tensor_read(&heads_dev, 0, direct_odd.data(),
-                              direct_odd.size() * sizeof(float)),
-          "run odd direct-KV flash attention");
-    setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2", "1", 1);
-    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
-              &heads_dev, model.data(), model.size(), sinks_offset,
-              &q_dev, &raw_dev, &comp_dev, 0, 0, odd_rows, n_tokens,
-              n_comp, window, ratio, n_head, head_dim) &&
-          ds4_gpu_tensor_read(&heads_dev, 0, t2_odd.data(),
-                              t2_odd.size() * sizeof(float)),
-          "run odd paired-query direct-KV flash attention");
-    CHECK(memcmp(direct_odd.data(), t2_odd.data(),
-                 direct_odd.size() * sizeof(float)) == 0,
-          "paired-query direct-KV odd tail must match direct-KV bitwise");
+    /* Cover the rollback side, exact dispatch boundary, and first odd tail.
+     * For 33 rows the final block owns one query and must not read or write
+     * its absent partner. */
+    for (uint32_t boundary_rows : {31u, 32u, 33u}) {
+        const size_t boundary_elems =
+            (size_t)boundary_rows * n_head * head_dim;
+        std::vector<float> direct_boundary(boundary_elems);
+        std::vector<float> t2_boundary(boundary_elems);
+        unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2");
+        CHECK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+                  &heads_dev, model.data(), model.size(), sinks_offset,
+                  &q_dev, &raw_dev, &comp_dev, 0, 0, boundary_rows, n_tokens,
+                  n_comp, window, ratio, n_head, head_dim) &&
+              ds4_gpu_tensor_read(&heads_dev, 0, direct_boundary.data(),
+                                  boundary_elems * sizeof(float)),
+              "run boundary direct-KV flash attention");
+        setenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2", "1", 1);
+        CHECK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+                  &heads_dev, model.data(), model.size(), sinks_offset,
+                  &q_dev, &raw_dev, &comp_dev, 0, 0, boundary_rows, n_tokens,
+                  n_comp, window, ratio, n_head, head_dim) &&
+              ds4_gpu_tensor_read(&heads_dev, 0, t2_boundary.data(),
+                                  boundary_elems * sizeof(float)),
+              "run boundary paired-query direct-KV flash attention");
+        CHECK(memcmp(direct_boundary.data(), t2_boundary.data(),
+                     boundary_elems * sizeof(float)) == 0,
+              "paired-query boundary output must match direct-KV bitwise");
+    }
     unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT_T2");
     unsetenv("DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT");
 
