@@ -94,6 +94,9 @@ test-glm5-next-contract:
 	python3 scripts/plan-glm5-next-residency.py . "$(DS4_GLM5_MODEL)"
 	python3 tests/test_glm5_next_oracles.py
 
+test-glm5-next-kda-projection:
+	python3 scripts/probe-glm5-next-kda-projection.py "$(DS4_GLM5_MODEL)"
+
 tests/test_rocm_moe_wave_plan: tests/test_rocm_moe_wave_plan.cu
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $<
 
