@@ -1,0 +1,226 @@
+#include "ds4_glm5_next_runtime.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct ds4_gpu_tensor {
+    uint64_t bytes;
+};
+
+static int alloc_calls;
+static int free_calls;
+static int fill_calls;
+static int fail_alloc_call;
+static FILE *accounting_stream;
+static int accounting_seen_before_alloc;
+
+ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+    ++alloc_calls;
+    if (accounting_stream) {
+        fflush(accounting_stream);
+        accounting_seen_before_alloc = ftell(accounting_stream) > 0;
+    }
+    if (fail_alloc_call > 0 && alloc_calls == fail_alloc_call) return NULL;
+    ds4_gpu_tensor *tensor = calloc(1, sizeof(*tensor));
+    if (tensor) tensor->bytes = bytes;
+    return tensor;
+}
+
+void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
+    if (!tensor) return;
+    ++free_calls;
+    free(tensor);
+}
+
+int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
+                            uint64_t count) {
+    (void)value;
+    if (!tensor || count > tensor->bytes / sizeof(float)) return 0;
+    ++fill_calls;
+    return 1;
+}
+
+uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
+    return tensor ? tensor->bytes : 0u;
+}
+
+int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset,
+                        void *data, uint64_t bytes) {
+    (void)tensor;
+    (void)offset;
+    (void)data;
+    (void)bytes;
+    return 0;
+}
+
+#define CHECK(expr, message) do { \
+    if (!(expr)) { fprintf(stderr, "FAIL %s\n", message); return 0; } \
+} while (0)
+
+static void reset_fakes(void) {
+    alloc_calls = free_calls = fill_calls = 0;
+    fail_alloc_call = 0;
+    accounting_stream = NULL;
+    accounting_seen_before_alloc = 0;
+}
+
+static void fill_words(void *value, size_t bytes, uint64_t *next) {
+    uint64_t *word = value;
+    for (size_t i = 0u; i < bytes / sizeof(uint64_t); ++i)
+        word[i] = (*next)++;
+}
+
+static void make_valid(ds4_glm5_next_model_offsets *model) {
+    memset(model, 0, sizeof(*model));
+    uint64_t next = 1u;
+    model->token_embd = next++;
+    model->output_norm = next++;
+    model->output = next++;
+    model->nextn_eh_proj = next++;
+    model->layer_count = DS4_GLM5_NEXT_LAYER_COUNT;
+    model->trunk_count = DS4_GLM5_NEXT_TRUNK_COUNT;
+    model->nextn_count = 1u;
+    for (uint32_t il = 0u; il < model->layer_count; ++il) {
+        ds4_glm5_next_layer_offsets *layer = &model->layer[il];
+        layer->layer = il;
+        layer->is_trunk = il < model->trunk_count;
+        layer->attn_norm = next++;
+        layer->ffn_norm = next++;
+        const bool mla = il == DS4_GLM5_NEXT_TRUNK_COUNT ||
+                         (il & 3u) == 3u;
+        layer->attention = mla ? DS4_GLM5_NEXT_ATTN_MLA :
+                                 DS4_GLM5_NEXT_ATTN_KDA;
+        if (mla) fill_words(&layer->mla, sizeof(layer->mla), &next);
+        else fill_words(&layer->kda, sizeof(layer->kda), &next);
+        if (il < DS4_GLM5_NEXT_LEADING_DENSE) {
+            layer->ffn = DS4_GLM5_NEXT_FFN_DENSE;
+            layer->ffn_weight.gate = next++;
+            layer->ffn_weight.up = next++;
+            layer->ffn_weight.down = next++;
+        } else {
+            layer->ffn = DS4_GLM5_NEXT_FFN_ROUTED;
+            fill_words(&layer->ffn_weight.gate_exps,
+                       sizeof(layer->ffn_weight) - 3u * sizeof(uint64_t),
+                       &next);
+        }
+        if (layer->is_trunk)
+            fill_words(&layer->hc, sizeof(layer->hc), &next);
+    }
+}
+
+static int test_bytes(void) {
+    ds4_glm5_next_model_offsets model;
+    make_valid(&model);
+    uint64_t bytes = 0u;
+    CHECK(ds4_glm5_next_state_bytes(&model, 8u, &bytes),
+          "8-token state size accepted");
+    CHECK(bytes == UINT64_C(153083904), "8-token state size exact");
+    CHECK(ds4_glm5_next_state_bytes(&model, 262144u, &bytes),
+          "256K state size accepted");
+    CHECK(bytes == UINT64_C(14916583424), "256K state size exact");
+    CHECK(!ds4_glm5_next_state_bytes(&model, 0u, &bytes),
+          "zero context rejected");
+    model.layer[3].attention = DS4_GLM5_NEXT_ATTN_KDA;
+    CHECK(!ds4_glm5_next_state_bytes(&model, 8u, &bytes),
+          "invalid schedule rejected before accounting");
+    return 1;
+}
+
+static int test_lifecycle(void) {
+    reset_fakes();
+    ds4_glm5_next_model_offsets model;
+    make_valid(&model);
+    ds4_glm5_next_state state = {0};
+    char *text = NULL;
+    size_t text_size = 0u;
+    accounting_stream = open_memstream(&text, &text_size);
+    CHECK(accounting_stream, "open accounting stream");
+    CHECK(ds4_glm5_next_state_init(&state, &model, 8u,
+                                   accounting_stream),
+          "initialize complete mixed-attention state");
+    fflush(accounting_stream);
+    CHECK(accounting_seen_before_alloc, "accounting precedes allocation");
+    CHECK(strstr(text, "context=8 kda=34 mla=11 bytes=153083904") != NULL,
+          "combined accounting exact");
+    CHECK(state.valid && state.kda.valid && state.layer_count == 45u &&
+          state.mla_count == 11u && state.context_capacity == 8u,
+          "complete state starts valid");
+    CHECK(alloc_calls == 169 && fill_calls == 136,
+          "34 KDA and 11 three-buffer MLA states allocated once");
+    CHECK(state.mla[3].valid && state.mla[3].owner == &state &&
+          state.mla[3].capacity_tokens == 8u && !state.mla[45].compact_kv,
+          "trunk MLA owned and nextn MLA excluded");
+    CHECK(!ds4_glm5_next_state_init(&state, &model, 8u,
+                                    accounting_stream),
+          "live state cannot be initialized twice");
+    state.mla[3].token_count = 7u;
+    state.mla[3].first_valid = 5u;
+    ds4_glm5_next_state_invalidate(&state);
+    CHECK(!state.valid && !state.kda.valid && !state.mla[3].valid,
+          "mixed state invalidates atomically");
+    CHECK(ds4_glm5_next_state_reset(&state) && state.valid &&
+          state.kda.valid && state.mla[3].valid &&
+          state.mla[3].token_count == 0u &&
+          state.mla[3].first_valid == 0u && fill_calls == 272,
+          "mixed state resets atomically");
+    state.mla[3].owner = NULL;
+    CHECK(!ds4_glm5_next_state_reset(&state) && !state.valid,
+          "corrupt MLA ownership fails closed");
+    state.mla[3].owner = &state;
+    CHECK(ds4_glm5_next_state_reset(&state),
+          "restored MLA ownership resets");
+    ds4_gpu_tensor *saved_compact = state.mla[3].compact_kv;
+    state.mla[3].compact_kv = NULL;
+    CHECK(!ds4_glm5_next_state_reset(&state) && !state.valid,
+          "missing MLA buffer fails closed");
+    state.mla[3].compact_kv = saved_compact;
+    ds4_glm5_next_state_free(&state);
+    CHECK(free_calls == 169 && !state.valid && !state.kda.layer &&
+          !state.mla[3].compact_kv,
+          "complete mixed state freed exactly once");
+    ds4_glm5_next_state_free(&state);
+    CHECK(free_calls == 169 && !ds4_glm5_next_state_reset(&state),
+          "double free is harmless and reset-after-free fails closed");
+    fclose(accounting_stream);
+    accounting_stream = NULL;
+    free(text);
+    return 1;
+}
+
+static int test_partial_failure(void) {
+    reset_fakes();
+    ds4_glm5_next_model_offsets model;
+    make_valid(&model);
+    ds4_glm5_next_state state = {0};
+    fail_alloc_call = 150;
+    FILE *stream = tmpfile();
+    CHECK(stream, "open failure accounting stream");
+    CHECK(!ds4_glm5_next_state_init(&state, &model, 8u, stream),
+          "injected MLA allocation failure propagates");
+    CHECK(alloc_calls == 150 && free_calls == 149 && !state.valid &&
+          !state.kda.layer && state.bytes == 0u,
+          "partial KDA/MLA state is fully unwound");
+    fclose(stream);
+
+    reset_fakes();
+    make_valid(&model);
+    fail_alloc_call = 10;
+    stream = tmpfile();
+    CHECK(stream, "open KDA failure accounting stream");
+    CHECK(!ds4_glm5_next_state_init(&state, &model, 8u, stream),
+          "injected KDA allocation failure propagates");
+    CHECK(alloc_calls == 10 && free_calls == 9 && !state.valid &&
+          !state.kda.layer && state.bytes == 0u,
+          "partial KDA state is fully unwound");
+    fclose(stream);
+    return 1;
+}
+
+int main(void) {
+    int ok = test_bytes();
+    ok &= test_lifecycle();
+    ok &= test_partial_failure();
+    if (ok) fprintf(stderr, "PASS GLM5-next atomic resident state lifecycle\n");
+    return ok ? 0 : 1;
+}

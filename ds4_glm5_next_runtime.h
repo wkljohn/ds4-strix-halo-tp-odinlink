@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "ds4_glm5_kda.h"
 
@@ -14,6 +15,9 @@ enum {
     DS4_GLM5_NEXT_LAYER_COUNT = 46,
     DS4_GLM5_NEXT_TRUNK_COUNT = 45,
     DS4_GLM5_NEXT_LEADING_DENSE = 3,
+    DS4_GLM5_NEXT_MLA_COUNT = 11,
+    DS4_GLM5_NEXT_MLA_KV_WIDTH = 1024,
+    DS4_GLM5_NEXT_INDEX_WIDTH = 128,
 };
 
 typedef enum {
@@ -73,8 +77,43 @@ typedef struct {
     ds4_glm5_next_layer_offsets layer[DS4_GLM5_NEXT_LAYER_COUNT];
 } ds4_glm5_next_model_offsets;
 
+struct ds4_glm5_next_state;
+
+typedef struct {
+    ds4_gpu_tensor *compact_kv;
+    ds4_gpu_tensor *index_key;
+    ds4_gpu_tensor *pool_gate;
+    uint32_t capacity_tokens;
+    uint32_t token_count;
+    /* Pool alignment origin for this sequence. Raw key/gate caches are kept
+     * so IndexPool can be rebuilt when this value changes across requests. */
+    uint32_t first_valid;
+    bool valid;
+    struct ds4_glm5_next_state *owner;
+} ds4_glm5_next_mla_state;
+
+typedef struct ds4_glm5_next_state {
+    ds4_glm5_kda_slot kda;
+    ds4_glm5_next_mla_state mla[DS4_GLM5_NEXT_LAYER_COUNT];
+    uint32_t layer_count;
+    uint32_t context_capacity;
+    uint32_t mla_count;
+    uint64_t bytes;
+    bool valid;
+} ds4_glm5_next_state;
+
 int ds4_glm5_next_model_offsets_validate(
         const ds4_glm5_next_model_offsets *model);
+int ds4_glm5_next_state_bytes(const ds4_glm5_next_model_offsets *model,
+                              uint32_t context_capacity,
+                              uint64_t *bytes);
+int ds4_glm5_next_state_init(ds4_glm5_next_state *state,
+                             const ds4_glm5_next_model_offsets *model,
+                             uint32_t context_capacity,
+                             FILE *accounting);
+int ds4_glm5_next_state_reset(ds4_glm5_next_state *state);
+void ds4_glm5_next_state_invalidate(ds4_glm5_next_state *state);
+void ds4_glm5_next_state_free(ds4_glm5_next_state *state);
 
 #ifdef __cplusplus
 }
