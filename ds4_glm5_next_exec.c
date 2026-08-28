@@ -31,6 +31,7 @@ enum {
 };
 
 struct ds4_glm5_next_workspace {
+    uint32_t capacity_tokens;
     ds4_gpu_tensor *hc_mean_weights;
     ds4_gpu_tensor *output_hidden;
     ds4_gpu_tensor *output_norm;
@@ -79,7 +80,19 @@ struct ds4_glm5_next_workspace {
 };
 
 static ds4_gpu_tensor *f32(uint64_t count) {
+    if (count == 0u || count > UINT64_MAX / sizeof(float)) return NULL;
     return ds4_gpu_tensor_alloc(count * sizeof(float));
+}
+
+static ds4_gpu_tensor *f32_rows(uint32_t rows, uint64_t width) {
+    if (rows == 0u || width == 0u || width > UINT64_MAX / rows) return NULL;
+    return f32((uint64_t)rows * width);
+}
+
+static ds4_gpu_tensor *bytes_rows(uint32_t rows, uint64_t row_bytes) {
+    if (rows == 0u || row_bytes == 0u || row_bytes > UINT64_MAX / rows)
+        return NULL;
+    return ds4_gpu_tensor_alloc((uint64_t)rows * row_bytes);
 }
 
 void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *w) {
@@ -133,55 +146,68 @@ void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *w) {
     free(w);
 }
 
-ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
+ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity(
+        uint32_t capacity_tokens) {
+    if (capacity_tokens == 0u) return NULL;
     ds4_glm5_next_workspace *w = calloc(1u, sizeof(*w));
     if (!w) return NULL;
+    w->capacity_tokens = capacity_tokens;
     w->hc_mean_weights = f32(GLM5_HC);
     w->output_hidden = f32(GLM5_WIDTH);
     w->output_norm = f32(GLM5_WIDTH);
-    w->hc_flat = f32(GLM5_HC_WIDTH);
-    w->hc_mix = f32(GLM5_HC_MIX);
-    w->hc_split = f32(GLM5_HC_MIX);
-    w->collapsed = f32(GLM5_WIDTH);
-    w->attention = f32(GLM5_WIDTH);
-    w->after_attention = f32(GLM5_HC_WIDTH);
-    w->ffn_flat = f32(GLM5_HC_WIDTH);
-    w->ffn_mix = f32(GLM5_HC_MIX);
-    w->ffn_split = f32(GLM5_HC_MIX);
-    w->ffn_collapsed = f32(GLM5_WIDTH);
-    w->ffn_hidden = f32(GLM5_WIDTH);
-    w->gate = f32(GLM5_DENSE_MID);
-    w->up = f32(GLM5_DENSE_MID);
-    w->mid = f32(GLM5_DENSE_MID);
-    w->down = f32(GLM5_WIDTH);
-    w->mla_q_a = f32(GLM5_Q_RANK);
-    w->mla_q_resid = f32(GLM5_Q_RANK);
-    w->mla_query = f32((uint64_t)GLM5_HEADS * GLM5_HEAD_DIM);
-    w->mla_kv_raw = f32(GLM5_KV_LORA);
-    w->mla_kv_norm = f32(GLM5_KV_LORA);
-    w->mla_qk_low = f32((uint64_t)GLM5_HEADS * GLM5_KV_LORA);
-    w->mla_index_k_raw = f32(GLM5_INDEX_DIM);
-    w->mla_pool_gate_raw = f32(GLM5_INDEX_DIM);
-    w->mla_pool_indices = ds4_gpu_tensor_alloc(4u * sizeof(int32_t));
-    w->mla_pool_valid = ds4_gpu_tensor_alloc(sizeof(uint32_t));
-    w->mla_tail_valid = ds4_gpu_tensor_alloc(4u * sizeof(uint32_t));
-    w->mla_selected_token = ds4_gpu_tensor_alloc(
+    w->hc_flat = f32_rows(capacity_tokens, GLM5_HC_WIDTH);
+    w->hc_mix = f32_rows(capacity_tokens, GLM5_HC_MIX);
+    w->hc_split = f32_rows(capacity_tokens, GLM5_HC_MIX);
+    w->collapsed = f32_rows(capacity_tokens, GLM5_WIDTH);
+    w->attention = f32_rows(capacity_tokens, GLM5_WIDTH);
+    w->after_attention = f32_rows(capacity_tokens, GLM5_HC_WIDTH);
+    w->ffn_flat = f32_rows(capacity_tokens, GLM5_HC_WIDTH);
+    w->ffn_mix = f32_rows(capacity_tokens, GLM5_HC_MIX);
+    w->ffn_split = f32_rows(capacity_tokens, GLM5_HC_MIX);
+    w->ffn_collapsed = f32_rows(capacity_tokens, GLM5_WIDTH);
+    w->ffn_hidden = f32_rows(capacity_tokens, GLM5_WIDTH);
+    w->gate = f32_rows(capacity_tokens, GLM5_DENSE_MID);
+    w->up = f32_rows(capacity_tokens, GLM5_DENSE_MID);
+    w->mid = f32_rows(capacity_tokens, GLM5_DENSE_MID);
+    w->down = f32_rows(capacity_tokens, GLM5_WIDTH);
+    w->mla_q_a = f32_rows(capacity_tokens, GLM5_Q_RANK);
+    w->mla_q_resid = f32_rows(capacity_tokens, GLM5_Q_RANK);
+    w->mla_query = f32_rows(capacity_tokens,
+                            (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM);
+    w->mla_kv_raw = f32_rows(capacity_tokens, GLM5_KV_LORA);
+    w->mla_kv_norm = f32_rows(capacity_tokens, GLM5_KV_LORA);
+    w->mla_qk_low = f32_rows(capacity_tokens,
+                             (uint64_t)GLM5_HEADS * GLM5_KV_LORA);
+    w->mla_index_k_raw = f32_rows(capacity_tokens, GLM5_INDEX_DIM);
+    w->mla_pool_gate_raw = f32_rows(capacity_tokens, GLM5_INDEX_DIM);
+    w->mla_pool_indices = bytes_rows(capacity_tokens,
+                                     4u * sizeof(int32_t));
+    w->mla_pool_valid = bytes_rows(capacity_tokens, sizeof(uint32_t));
+    w->mla_tail_valid = bytes_rows(capacity_tokens,
+                                   4u * sizeof(uint32_t));
+    w->mla_selected_token = bytes_rows(
+        capacity_tokens,
         (DS4_GLM5_NEXT_INDEX_TOP_K + 3u) * sizeof(int32_t));
-    w->mla_heads = f32((uint64_t)GLM5_HEADS * GLM5_HEAD_DIM);
-    w->router_logits = f32(GLM5_EXPERTS);
-    w->router_probs = f32(GLM5_EXPERTS);
-    w->router_selected = ds4_gpu_tensor_alloc(
-        GLM5_EXPERTS_USED * sizeof(int32_t));
-    w->router_weights = f32(GLM5_EXPERTS_USED);
-    w->routed_gate = f32((uint64_t)GLM5_EXPERTS_USED * GLM5_RANK_MID);
-    w->routed_up = f32((uint64_t)GLM5_EXPERTS_USED * GLM5_RANK_MID);
-    w->routed_mid = f32((uint64_t)GLM5_EXPERTS_USED * GLM5_RANK_MID);
-    w->routed_experts = f32((uint64_t)GLM5_EXPERTS_USED * GLM5_WIDTH);
-    w->routed_out = f32(GLM5_WIDTH);
-    w->shared_gate = f32(GLM5_RANK_MID);
-    w->shared_up = f32(GLM5_RANK_MID);
-    w->shared_mid = f32(GLM5_RANK_MID);
-    w->shared_out = f32(GLM5_WIDTH);
+    w->mla_heads = f32_rows(capacity_tokens,
+                            (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM);
+    w->router_logits = f32_rows(capacity_tokens, GLM5_EXPERTS);
+    w->router_probs = f32_rows(capacity_tokens, GLM5_EXPERTS);
+    w->router_selected = bytes_rows(
+        capacity_tokens, GLM5_EXPERTS_USED * sizeof(int32_t));
+    w->router_weights = f32_rows(capacity_tokens, GLM5_EXPERTS_USED);
+    w->routed_gate = f32_rows(
+        capacity_tokens, (uint64_t)GLM5_EXPERTS_USED * GLM5_RANK_MID);
+    w->routed_up = f32_rows(
+        capacity_tokens, (uint64_t)GLM5_EXPERTS_USED * GLM5_RANK_MID);
+    w->routed_mid = f32_rows(
+        capacity_tokens, (uint64_t)GLM5_EXPERTS_USED * GLM5_RANK_MID);
+    w->routed_experts = f32_rows(
+        capacity_tokens, (uint64_t)GLM5_EXPERTS_USED * GLM5_WIDTH);
+    w->routed_out = f32_rows(capacity_tokens, GLM5_WIDTH);
+    w->shared_gate = f32_rows(capacity_tokens, GLM5_RANK_MID);
+    w->shared_up = f32_rows(capacity_tokens, GLM5_RANK_MID);
+    w->shared_mid = f32_rows(capacity_tokens, GLM5_RANK_MID);
+    w->shared_out = f32_rows(capacity_tokens, GLM5_WIDTH);
     if (!w->hc_mean_weights || !w->output_hidden || !w->output_norm ||
         !w->hc_flat || !w->hc_mix || !w->hc_split || !w->collapsed ||
         !w->attention || !w->after_attention || !w->ffn_flat ||
@@ -196,7 +222,7 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
         !w->routed_gate || !w->routed_up || !w->routed_mid ||
         !w->routed_experts || !w->routed_out || !w->shared_gate ||
         !w->shared_up || !w->shared_mid || !w->shared_out ||
-        !ds4_glm5_kda_workspace_init(&w->kda, 1u)) {
+        !ds4_glm5_kda_workspace_init(&w->kda, capacity_tokens)) {
         ds4_glm5_next_workspace_destroy(w);
         return NULL;
     }
@@ -210,6 +236,10 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
         return NULL;
     }
     return w;
+}
+
+ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
+    return ds4_glm5_next_workspace_create_capacity(1u);
 }
 
 static int context_valid(const ds4_glm5_next_exec_ctx *ctx) {
@@ -305,6 +335,22 @@ int ds4_glm5_next_embed_token(const ds4_glm5_next_exec_ctx *ctx,
                GLM5_WIDTH, GLM5_HC);
 }
 
+int ds4_glm5_next_embed_tokens(const ds4_glm5_next_exec_ctx *ctx,
+                               const ds4_gpu_tensor *tokens,
+                               uint32_t n_tokens,
+                               ds4_gpu_tensor *hc_out) {
+    const uint64_t row_bytes = (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    return context_valid(ctx) && tokens && hc_out && n_tokens != 0u &&
+           (uint64_t)n_tokens <= UINT64_MAX / row_bytes &&
+           ds4_gpu_tensor_bytes(tokens) >=
+               (uint64_t)n_tokens * sizeof(uint32_t) &&
+           ds4_gpu_tensor_bytes(hc_out) == (uint64_t)n_tokens * row_bytes &&
+           ds4_gpu_embed_tokens_hc_bf16_tensor(
+               hc_out, tokens, ctx->model_map, ctx->model_size,
+               ctx->model->token_embd, GLM5_VOCAB, n_tokens,
+               GLM5_WIDTH, GLM5_HC);
+}
+
 int ds4_glm5_next_output_logits(const ds4_glm5_next_exec_ctx *ctx,
                                 ds4_glm5_next_workspace *w,
                                 const ds4_gpu_tensor *hc_hidden,
@@ -329,21 +375,22 @@ int ds4_glm5_next_output_logits(const ds4_glm5_next_exec_ctx *ctx,
                w->output_norm, 1u);
 }
 
-static int kda_attention_one(const ds4_glm5_next_exec_ctx *ctx,
-                             uint32_t il,
-                             ds4_glm5_next_state *state,
-                             ds4_glm5_next_workspace *w,
-                             const ds4_gpu_tensor *hc_in) {
+static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
+                              uint32_t il,
+                              ds4_glm5_next_state *state,
+                              ds4_glm5_next_workspace *w,
+                              const ds4_gpu_tensor *hc_in,
+                              uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     ds4_glm5_kda_layer_state *kda = &state->kda.layer[il];
     return
         ds4_gpu_rms_norm_plain_rows_tensor(
-            w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u,
+            w->hc_flat, hc_in, GLM5_HC_WIDTH, n_tokens,
             ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_bf16_tensor(
             w->hc_mix, ctx->model_map, ctx->model_size,
             layer->hc.attn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
-            w->hc_flat, 1u) &&
+            w->hc_flat, n_tokens) &&
         ds4_gpu_hc_split_weighted_sum_tensor(
             w->collapsed, w->hc_split, w->hc_mix, hc_in,
             ctx->model_map, ctx->model_size,
@@ -351,11 +398,58 @@ static int kda_attention_one(const ds4_glm5_next_exec_ctx *ctx,
             GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps) &&
         ds4_glm5_kda_layer_forward(
             kda, &w->kda, &layer->kda, ctx->model_map, ctx->model_size,
-            w->collapsed, w->attention, 1u,
+            w->collapsed, w->attention, n_tokens,
             ctx->model->rms_norm_eps) &&
         ds4_gpu_hc_expand_split_tensor(
             w->after_attention, w->attention, hc_in, w->hc_split,
             GLM5_WIDTH, GLM5_HC);
+}
+
+static int kda_attention_one(const ds4_glm5_next_exec_ctx *ctx,
+                             uint32_t il,
+                             ds4_glm5_next_state *state,
+                             ds4_glm5_next_workspace *w,
+                             const ds4_gpu_tensor *hc_in) {
+    return kda_attention_rows(ctx, il, state, w, hc_in, 1u);
+}
+
+static int dense_kda_forward_rows(const ds4_glm5_next_exec_ctx *ctx,
+                                  uint32_t il,
+                                  ds4_glm5_next_state *state,
+                                  ds4_glm5_next_workspace *w,
+                                  const ds4_gpu_tensor *hc_in,
+                                  ds4_gpu_tensor *hc_out,
+                                  uint32_t n_tokens) {
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    const int ok =
+        kda_attention_rows(ctx, il, state, w, hc_in, n_tokens) &&
+        ds4_gpu_rms_norm_plain_rows_tensor(
+            w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, n_tokens,
+            ctx->model->rms_norm_eps) &&
+        ds4_gpu_matmul_bf16_tensor(
+            w->ffn_mix, ctx->model_map, ctx->model_size,
+            layer->hc.ffn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
+            w->ffn_flat, n_tokens) &&
+        ds4_gpu_hc_split_weighted_sum_norm_tensor(
+            w->ffn_collapsed, w->ffn_hidden, w->ffn_split, w->ffn_mix,
+            w->after_attention, ctx->model_map, ctx->model_size,
+            layer->hc.ffn_scale, layer->hc.ffn_base, layer->ffn_norm,
+            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
+            ctx->model->rms_norm_eps) &&
+        ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+            w->gate, w->up, w->mid, ctx->model_map, ctx->model_size,
+            layer->ffn_weight.gate, layer->ffn_weight.up,
+            GLM5_WIDTH, GLM5_DENSE_MID, w->ffn_hidden, n_tokens, 10.0f) &&
+        ds4_gpu_matmul_q8_0_tensor(
+            w->down, ctx->model_map, ctx->model_size,
+            layer->ffn_weight.down, GLM5_DENSE_MID, GLM5_WIDTH,
+            w->mid, n_tokens) &&
+        ds4_gpu_hc_expand_split_tensor(
+            hc_out, w->down, w->after_attention, w->ffn_split,
+            GLM5_WIDTH, GLM5_HC) &&
+        ds4_gpu_synchronize();
+    if (!ok) ds4_glm5_next_state_invalidate(state);
+    return ok;
 }
 
 static int dense_kda_forward(const ds4_glm5_next_exec_ctx *ctx,
@@ -364,36 +458,7 @@ static int dense_kda_forward(const ds4_glm5_next_exec_ctx *ctx,
                              ds4_glm5_next_workspace *w,
                              const ds4_gpu_tensor *hc_in,
                              ds4_gpu_tensor *hc_out) {
-    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const int ok =
-        kda_attention_one(ctx, il, state, w, hc_in) &&
-        ds4_gpu_rms_norm_plain_rows_tensor(
-            w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u,
-            ctx->model->rms_norm_eps) &&
-        ds4_gpu_matmul_bf16_tensor(
-            w->ffn_mix, ctx->model_map, ctx->model_size,
-            layer->hc.ffn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
-            w->ffn_flat, 1u) &&
-        ds4_gpu_hc_split_weighted_sum_norm_tensor(
-            w->ffn_collapsed, w->ffn_hidden, w->ffn_split, w->ffn_mix,
-            w->after_attention, ctx->model_map, ctx->model_size,
-            layer->hc.ffn_scale, layer->hc.ffn_base, layer->ffn_norm,
-            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
-            ctx->model->rms_norm_eps) &&
-        ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
-            w->gate, w->up, w->mid, ctx->model_map, ctx->model_size,
-            layer->ffn_weight.gate, layer->ffn_weight.up,
-            GLM5_WIDTH, GLM5_DENSE_MID, w->ffn_hidden, 10.0f) &&
-        ds4_gpu_matmul_q8_0_tensor(
-            w->down, ctx->model_map, ctx->model_size,
-            layer->ffn_weight.down, GLM5_DENSE_MID, GLM5_WIDTH,
-            w->mid, 1u) &&
-        ds4_gpu_hc_expand_split_tensor(
-            hc_out, w->down, w->after_attention, w->ffn_split,
-            GLM5_WIDTH, GLM5_HC) &&
-        ds4_gpu_synchronize();
-    if (!ok) ds4_glm5_next_state_invalidate(state);
-    return ok;
+    return dense_kda_forward_rows(ctx, il, state, w, hc_in, hc_out, 1u);
 }
 
 static int tp_context_valid(const ds4_glm5_next_exec_ctx *ctx) {
@@ -791,4 +856,33 @@ int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
         return kda_routed_one_forward(ctx, il, state, w, hc_in, hc_out);
     }
     return 0;
+}
+
+int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
+                                      uint32_t il,
+                                      ds4_glm5_next_state *state,
+                                      ds4_glm5_next_workspace *w,
+                                      const ds4_gpu_tensor *hc_in,
+                                      ds4_gpu_tensor *hc_out,
+                                      uint32_t n_tokens) {
+    const uint64_t hc_row_bytes =
+        (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+        !hc_out || hc_in == hc_out || n_tokens == 0u ||
+        w->capacity_tokens != n_tokens ||
+        (uint64_t)n_tokens > UINT64_MAX / hc_row_bytes ||
+        ds4_gpu_tensor_bytes(hc_in) != (uint64_t)n_tokens * hc_row_bytes ||
+        ds4_gpu_tensor_bytes(hc_out) != (uint64_t)n_tokens * hc_row_bytes ||
+        il >= ctx->model->trunk_count ||
+        state->layer_count != ctx->model->trunk_count ||
+        state->kda.layer_count != ctx->model->trunk_count ||
+        (n_tokens > 1u && ctx->trace_prefix)) return 0;
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    if (layer->attention != DS4_GLM5_NEXT_ATTN_KDA ||
+        layer->ffn != DS4_GLM5_NEXT_FFN_DENSE ||
+        !state->kda.layer[il].recurrent || state->mla[il].compact_kv) {
+        return 0;
+    }
+    return dense_kda_forward_rows(
+        ctx, il, state, w, hc_in, hc_out, n_tokens);
 }

@@ -255,11 +255,16 @@ test-glm5-dense-block0-external-reference: tests/test_rocm_glm5_dense_block0
 	DS4_GLM5_DENSE_TOKEN="$${DS4_GLM5_DENSE_TOKEN:-42}" \
 	DS4_GLM5_DENSE_TRACE_LAYER="$${DS4_GLM5_DENSE_TRACE_LAYER:-0}" \
 	DS4_GLM5_DENSE_TRACE_PREFIX="$$trace_dir/block0" \
+	DS4_GLM5_DENSE_BATCH_OUTPUT="$$trace_dir/batch3.f32" \
 		./tests/test_rocm_glm5_dense_block0; \
 	python3 tests/test_glm5_dense_block0_external_reference.py \
 		"$(DS4_GLM5_MODEL)" "$$trace_dir/block0" \
 		--tokens "$${DS4_GLM5_DENSE_TOKEN:-42}$${DS4_GLM5_DENSE_TOKEN2:+,$$DS4_GLM5_DENSE_TOKEN2}" \
-		--layer "$${DS4_GLM5_DENSE_TRACE_LAYER:-0}"
+		--layer "$${DS4_GLM5_DENSE_TRACE_LAYER:-0}"; \
+	python3 tests/test_glm5_dense_block0_external_reference.py \
+		"$(DS4_GLM5_MODEL)" "$$trace_dir/block0" \
+		--tokens "42,154822,154824" --layer 2 \
+		--batch-output "$$trace_dir/batch3.f32"
 
 .PHONY: test-rocm-glm5-prefix-layer3-tp test-glm5-next-text-codec
 tests/test_rocm_glm5_prefix_layer3_tp.o: tests/test_rocm_glm5_prefix_layer3_tp.cu tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp ds4.h ds4_glm5_kda.h ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h

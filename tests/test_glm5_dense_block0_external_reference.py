@@ -230,9 +230,10 @@ def main():
     parser.add_argument("trace_prefix", type=Path)
     parser.add_argument("--tokens", default="42")
     parser.add_argument("--layer", type=int, default=0)
+    parser.add_argument("--batch-output", type=Path)
     args = parser.parse_args()
     tokens = [int(value) for value in args.tokens.split(",") if value]
-    if not tokens or len(tokens) > 8 or any(
+    if not tokens or len(tokens) > 33 or any(
             token < 0 or token >= 154880 for token in tokens):
         raise ValueError(f"invalid token sequence {args.tokens!r}")
     if args.layer < 0 or args.layer > 2:
@@ -272,7 +273,7 @@ def main():
             return fn, base, scale
 
         for layer in range(args.layer + 1):
-            if layer == args.layer:
+            if layer == args.layer and not args.batch_output:
                 compare("layer_input_hc", read_trace(
                     args.trace_prefix, "input_hc", (1, 4, 4096)),
                     input_hc[last], 0.0 if layer == 0 else 3.0e-4,
@@ -323,7 +324,7 @@ def main():
             output_hc = (ffn_post[..., None] * down[:, None, :] +
                          np.matmul(ffn_comb.transpose(0, 2, 1), after_attn))
             output_hc = np.asarray(output_hc, dtype=np.float32)
-            if layer == args.layer:
+            if layer == args.layer and not args.batch_output:
                 compare("attn_split", read_trace(
                     args.trace_prefix, "attn_split", (1, 24)),
                     attn_split[last])
@@ -350,6 +351,15 @@ def main():
                     args.trace_prefix, "output_hc", (1, 4, 4096)),
                     output_hc[last])
             input_hc = output_hc
+        if args.batch_output:
+            got = np.fromfile(args.batch_output, dtype="<f4")
+            expected_shape = (len(tokens), 4, 4096)
+            if got.size != int(np.prod(expected_shape)):
+                raise ValueError(
+                    f"{args.batch_output}: expected {expected_shape}, "
+                    f"got {got.size} values")
+            compare("batch_output_hc", got.reshape(expected_shape), input_hc,
+                    rtol=3.0e-4, atol=3.0e-5)
         del embedding, input_hc
         blob.close()
     print("PASS independent same-GGUF GLM5 dense block-0 composition oracle")

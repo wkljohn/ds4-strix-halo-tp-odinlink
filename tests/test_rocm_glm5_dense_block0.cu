@@ -9,6 +9,7 @@ extern "C" {
 #include "tests/glm5_next_real_offsets.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -119,6 +120,46 @@ uint64_t fnv64(const std::vector<float> &values) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+bool close_vectors(const std::vector<float> &reference,
+                   const std::vector<float> &candidate,
+                   const char *label) {
+    if (reference.size() != candidate.size() || reference.empty()) return false;
+    double ref2 = 0.0, err2 = 0.0, dot = 0.0, cand2 = 0.0;
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < reference.size(); ++i) {
+        if (!std::isfinite(reference[i]) || !std::isfinite(candidate[i]))
+            return false;
+        const double r = reference[i];
+        const double c = candidate[i];
+        const double e = c - r;
+        ref2 += r * r;
+        cand2 += c * c;
+        dot += r * c;
+        err2 += e * e;
+        max_abs = std::fmax(max_abs, std::fabs(candidate[i] - reference[i]));
+    }
+    const double nrmse = std::sqrt(err2 / std::fmax(ref2, 1.0e-30));
+    const double cosine = dot / std::sqrt(
+        std::fmax(ref2 * cand2, 1.0e-30));
+    std::fprintf(stderr,
+                 "GLM5 dense batch compare %s n=%zu nrmse=%.9g "
+                 "cosine=%.12g max_abs=%.9g\n",
+                 label, reference.size(), nrmse, cosine, max_abs);
+    /* This is a Lane-C arithmetic comparison: batched GEMMs may associate
+     * FP32 terms differently, but the complete state must remain tightly
+     * bounded and directionally indistinguishable. */
+    return nrmse <= 1.0e-5 && cosine >= 0.999999 && max_abs <= 1.0e-5f;
+}
+
+bool write_f32_file(const char *path, const std::vector<float> &values) {
+    if (!path || !path[0] || values.empty()) return false;
+    FILE *fp = std::fopen(path, "wb");
+    if (!fp) return false;
+    const size_t written = std::fwrite(
+        values.data(), sizeof(float), values.size(), fp);
+    return std::fclose(fp) == 0 && written == values.size();
 }
 
 struct Tensors {
@@ -393,6 +434,155 @@ static bool run_test(void) {
               tensors.cur, tensors.out) && resident.valid &&
           resident.mla[3].token_count == 0u,
           "unimplemented MLA+routed kind fails before resident mutation");
+
+    /* Stateful batch gate: compare three batched prompt rows with the same
+     * independent one-row harness, then consume a fourth token through the
+     * ordinary production decode API to prove recurrent-state continuity. */
+    const uint32_t batch_tokens[] = {42u, 154822u, 154824u, 17u};
+    std::vector<float> sequential_rows;
+    std::vector<float> sequential_continue;
+    CHECK(ds4_glm5_kda_slot_reset(&slot),
+          "reset independent dense-prefix oracle for batch sequence");
+    for (size_t i = 0u; i < 4u; ++i) {
+        std::vector<float> row;
+        CHECK(execute_prefix(batch_tokens[i], row, false),
+              "execute independent sequential batch oracle row");
+        if (i < 3u) {
+            sequential_rows.insert(sequential_rows.end(), row.begin(), row.end());
+        } else {
+            sequential_continue = std::move(row);
+        }
+    }
+
+    ds4_glm5_next_workspace *batch_workspace =
+        ds4_glm5_next_workspace_create_capacity(3u);
+    ds4_gpu_tensor *batch_ids =
+        ds4_gpu_tensor_alloc(3u * sizeof(uint32_t));
+    ds4_gpu_tensor *batch_cur =
+        ds4_gpu_tensor_alloc(3ull * kHcWidth * sizeof(float));
+    ds4_gpu_tensor *batch_out =
+        ds4_gpu_tensor_alloc(3ull * kHcWidth * sizeof(float));
+    CHECK(batch_workspace && batch_ids && batch_cur && batch_out &&
+          ds4_gpu_tensor_write(batch_ids, 0u, batch_tokens,
+                               3u * sizeof(uint32_t)) &&
+          ds4_glm5_next_state_reset(&resident) &&
+          ds4_glm5_next_embed_tokens(&exec, batch_ids, 3u, batch_cur),
+          "allocate and embed production dense-prefix batch");
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(ds4_glm5_next_layer_forward_batch(
+                  &exec, il, &resident, batch_workspace,
+                  batch_cur, batch_out, 3u),
+              "execute production dense-prefix batch layer");
+        if (il + 1u < 3u) std::swap(batch_cur, batch_out);
+    }
+    std::vector<float> batch_rows(3ull * kHcWidth);
+    CHECK(ds4_gpu_tensor_read(batch_out, 0u, batch_rows.data(),
+                              batch_rows.size() * sizeof(float)) &&
+          close_vectors(sequential_rows, batch_rows, "three-row output"),
+          "batched dense-prefix output matches sequential same-GGUF oracle");
+    const char *batch_trace = std::getenv("DS4_GLM5_DENSE_BATCH_OUTPUT");
+    CHECK(!batch_trace || write_f32_file(batch_trace, batch_rows),
+          "write three-row dense-prefix batch for external oracle");
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(resident.kda.layer[il].token_count == 3u,
+              "batched dense-prefix KDA state advances all rows");
+    }
+    std::vector<float> batch_continue;
+    CHECK(execute_runtime_prefix(batch_tokens[3], batch_continue) &&
+          close_vectors(sequential_continue, batch_continue,
+                        "post-batch continuation"),
+          "ordinary decode continues from batched KDA recurrent state");
+    ds4_gpu_tensor_free(batch_out);
+    ds4_gpu_tensor_free(batch_cur);
+    ds4_gpu_tensor_free(batch_ids);
+    ds4_glm5_next_workspace_destroy(batch_workspace);
+
+    const uint32_t prompt33[] = {
+        154822u, 154824u, 154826u, 25062u, 287u, 29905u, 371u, 25u,
+        7487u, 154827u, 675u, 279u, 11478u, 7735u, 369u, 6623u, 323u,
+        279u, 3150u, 315u, 41907u, 323u, 4968u, 18110u, 558u, 13u,
+        21754u, 304u, 825u, 11646u, 13u, 154828u, 154841u,
+    };
+    constexpr uint32_t kPromptRows =
+        (uint32_t)(sizeof(prompt33) / sizeof(prompt33[0]));
+    using Clock = std::chrono::steady_clock;
+    std::vector<float> prompt_reference;
+    std::vector<float> prompt_reference_continue;
+    CHECK(ds4_glm5_kda_slot_reset(&slot) && ds4_gpu_synchronize(),
+          "reset independent 33-token dense-prefix oracle");
+    const auto sequential_begin = Clock::now();
+    for (uint32_t i = 0u; i <= kPromptRows; ++i) {
+        std::vector<float> row;
+        const uint32_t input_token = i < kPromptRows ? prompt33[i] : 17u;
+        CHECK(execute_prefix(input_token, row, false),
+              "execute independent 33-token dense-prefix oracle row");
+        if (i < kPromptRows) {
+            prompt_reference.insert(prompt_reference.end(),
+                                    row.begin(), row.end());
+        } else {
+            prompt_reference_continue = std::move(row);
+        }
+    }
+    CHECK(ds4_gpu_synchronize(), "finish sequential dense-prefix timing");
+    const auto sequential_end = Clock::now();
+
+    ds4_glm5_next_workspace *prompt_workspace =
+        ds4_glm5_next_workspace_create_capacity(kPromptRows);
+    ds4_gpu_tensor *prompt_ids = ds4_gpu_tensor_alloc(sizeof(prompt33));
+    ds4_gpu_tensor *prompt_cur = ds4_gpu_tensor_alloc(
+        (uint64_t)kPromptRows * kHcWidth * sizeof(float));
+    ds4_gpu_tensor *prompt_out = ds4_gpu_tensor_alloc(
+        (uint64_t)kPromptRows * kHcWidth * sizeof(float));
+    CHECK(prompt_workspace && prompt_ids && prompt_cur && prompt_out &&
+          ds4_gpu_tensor_write(prompt_ids, 0u, prompt33, sizeof(prompt33)) &&
+          ds4_glm5_next_state_reset(&resident) &&
+          ds4_glm5_next_embed_tokens(
+              &exec, prompt_ids, kPromptRows, prompt_cur) &&
+          ds4_gpu_synchronize(),
+          "allocate and embed real 33-token dense-prefix batch");
+    const auto batch_begin = Clock::now();
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(ds4_glm5_next_layer_forward_batch(
+                  &exec, il, &resident, prompt_workspace,
+                  prompt_cur, prompt_out, kPromptRows),
+              "execute real 33-token dense-prefix batch layer");
+        if (il + 1u < 3u) std::swap(prompt_cur, prompt_out);
+    }
+    CHECK(ds4_gpu_synchronize(), "finish batched dense-prefix timing");
+    const auto batch_end = Clock::now();
+    std::vector<float> prompt_batch((uint64_t)kPromptRows * kHcWidth);
+    CHECK(ds4_gpu_tensor_read(prompt_out, 0u, prompt_batch.data(),
+                              prompt_batch.size() * sizeof(float)) &&
+          close_vectors(prompt_reference, prompt_batch,
+                        "real 33-row prompt output"),
+          "real prompt batch matches sequential same-GGUF oracle");
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(resident.kda.layer[il].token_count == kPromptRows,
+              "real prompt batch advances every dense-prefix KDA row");
+    }
+    std::vector<float> prompt_batch_continue;
+    CHECK(execute_runtime_prefix(17u, prompt_batch_continue) &&
+          close_vectors(prompt_reference_continue, prompt_batch_continue,
+                        "real-prompt post-batch continuation"),
+          "decode continues from real 33-token batched KDA state");
+    const double sequential_ms =
+        std::chrono::duration<double, std::milli>(
+            sequential_end - sequential_begin).count();
+    const double batch_ms =
+        std::chrono::duration<double, std::milli>(
+            batch_end - batch_begin).count();
+    std::fprintf(stderr,
+                 "GLM5 dense-prefix timing rows=%u sequential_ms=%.3f "
+                 "batch_ms=%.3f sequential_tps=%.3f batch_tps=%.3f "
+                 "speedup=%.3fx\n",
+                 kPromptRows, sequential_ms, batch_ms,
+                 kPromptRows * 1000.0 / sequential_ms,
+                 kPromptRows * 1000.0 / batch_ms,
+                 sequential_ms / batch_ms);
+    ds4_gpu_tensor_free(prompt_out);
+    ds4_gpu_tensor_free(prompt_cur);
+    ds4_gpu_tensor_free(prompt_ids);
+    ds4_glm5_next_workspace_destroy(prompt_workspace);
     if (has_token2) {
         std::fprintf(stderr,
                      "PASS same-GGUF GLM5 dense prefix tokens=%u,%u block0=%016llx prefix=%016llx\n",

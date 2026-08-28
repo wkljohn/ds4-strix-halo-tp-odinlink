@@ -32,14 +32,22 @@ typedef struct {
     uint64_t *tp_sequence;
 } ds4_glm5_next_exec_ctx;
 
-/* The initial production slice is a one-token decode workspace.  A later
- * prefill slice must parameterize capacity instead of silently reusing it. */
+/* The default workspace preserves the one-token decode ABI.  Prefill callers
+ * must request their exact row capacity and pass tensors with that exact row
+ * count; this prevents byte-sized scratch buffers from silently selecting a
+ * different number of mHC rows. */
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void);
+ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity(
+        uint32_t capacity_tokens);
 void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *workspace);
 
 int ds4_glm5_next_embed_token(const ds4_glm5_next_exec_ctx *ctx,
                               uint32_t token,
                               ds4_gpu_tensor *hc_out);
+int ds4_glm5_next_embed_tokens(const ds4_glm5_next_exec_ctx *ctx,
+                               const ds4_gpu_tensor *tokens,
+                               uint32_t n_tokens,
+                               ds4_gpu_tensor *hc_out);
 
 /* One-token output head. GLM-5.3 has no learned mHC output combiner: collapse
  * the four streams by their arithmetic mean, apply the model's F32 RMS norm,
@@ -60,6 +68,17 @@ int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
                                 ds4_glm5_next_workspace *workspace,
                                 const ds4_gpu_tensor *hc_in,
                                 ds4_gpu_tensor *hc_out);
+
+/* Exact-capacity multi-row execution.  The first independently validated
+ * slice supports the replicated dense KDA prefix only; every other layer kind
+ * fails before mutating resident state. */
+int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
+                                      uint32_t layer,
+                                      ds4_glm5_next_state *state,
+                                      ds4_glm5_next_workspace *workspace,
+                                      const ds4_gpu_tensor *hc_in,
+                                      ds4_gpu_tensor *hc_out,
+                                      uint32_t n_tokens);
 
 #ifdef __cplusplus
 }

@@ -738,7 +738,8 @@ __global__ static void shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel(
         uint32_t out_dim,
         uint32_t n_tok,
         uint64_t row_bytes,
-        int store_gate_up) {
+        int store_gate_up,
+        float clamp) {
     extern __shared__ float shx[];
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -808,7 +809,10 @@ __global__ static void shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel(
                     gate[off] = g;
                     up[off] = uv;
                 }
-                mid[off] = (g / (1.0f + expf(-g))) * uv;
+                const float sg = clamp > 1.0e-6f ? fminf(g, clamp) : g;
+                const float su = clamp > 1.0e-6f ?
+                    fminf(fmaxf(uv, -clamp), clamp) : uv;
+                mid[off] = (sg / (1.0f + expf(-sg))) * su;
             }
         }
     }
