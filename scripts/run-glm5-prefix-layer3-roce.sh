@@ -34,6 +34,7 @@ LOCAL_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
 PEER_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
 TIMEOUT=${DS4_GLM5_TP_CONNECT_TIMEOUT_SEC:-180}
 FULL_TRUNK=${DS4_GLM5_FULL_TRUNK:-0}
+FULL_TOKENS=${DS4_GLM5_FULL_TOKENS:-1}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
 PEER_BINARY=$PEER_DIR/test_rocm_glm5_prefix_layer3_tp
@@ -58,6 +59,14 @@ done
 }
 [[ $FULL_TRUNK == 0 || $FULL_TRUNK == 1 ]] || {
   echo "error: DS4_GLM5_FULL_TRUNK must be 0 or 1" >&2
+  exit 2
+}
+[[ $FULL_TOKENS == 1 || $FULL_TOKENS == 2 ]] || {
+  echo "error: DS4_GLM5_FULL_TOKENS must be 1 or 2" >&2
+  exit 2
+}
+[[ $FULL_TRUNK == 1 || $FULL_TOKENS == 1 ]] || {
+  echo "error: DS4_GLM5_FULL_TOKENS=2 requires DS4_GLM5_FULL_TRUNK=1" >&2
   exit 2
 }
 
@@ -170,6 +179,7 @@ printf '%s\n' \
   "peer_device=$PEER_DEVICE" \
   "timeout_sec=$TIMEOUT" >"$OUT/run.env"
 printf 'full_trunk=%s\n' "$FULL_TRUNK" >>"$OUT/run.env"
+printf 'full_tokens=%s\n' "$FULL_TOKENS" >>"$OUT/run.env"
 if [[ $FULL_TRUNK == 1 ]]; then
   printf '%s\n' \
     "local_mem_kib=$LOCAL_MEM_KIB" \
@@ -189,10 +199,11 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_TP_RDMA_DEVICE="$LOCAL_DEVICE" \
   DS4_GLM5_TP_CONNECT_TIMEOUT_SEC="$TIMEOUT" \
   DS4_GLM5_FULL_TRUNK="$FULL_TRUNK" \
+  DS4_GLM5_FULL_TOKENS="$FULL_TOKENS" \
   "$BINARY" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 
@@ -235,6 +246,17 @@ if [[ $FULL_TRUNK == 1 ]]; then
     echo "error: all-rank full-trunk or logit hashes differ" >&2
     exit 1
   }
+  if [[ $FULL_TOKENS == 2 ]]; then
+    LEADER_TRUNK2=$(sed -n 's/.* greedy2_trunk=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+    WORKER_TRUNK2=$(sed -n 's/.* greedy2_trunk=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+    LEADER_LOGITS2=$(sed -n 's/.* greedy2_logits=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+    WORKER_LOGITS2=$(sed -n 's/.* greedy2_logits=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+    [[ -n $LEADER_TRUNK2 && $LEADER_TRUNK2 == "$WORKER_TRUNK2" &&
+       -n $LEADER_LOGITS2 && $LEADER_LOGITS2 == "$WORKER_LOGITS2" ]] || {
+      echo "error: all-rank greedy token-2 trunk or logit hashes differ" >&2
+      exit 1
+    }
+  fi
 fi
 
 printf 'PASS GLM5 prefix-layer3 RoCE tag=%s binary_sha256=%s output_fnv=%s\n' \

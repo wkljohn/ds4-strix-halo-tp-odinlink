@@ -161,6 +161,13 @@ bool run() {
     const char *full_trunk_env = std::getenv("DS4_GLM5_FULL_TRUNK");
     const bool full_trunk = full_trunk_env &&
                             std::strcmp(full_trunk_env, "1") == 0;
+    const char *full_tokens_env = std::getenv("DS4_GLM5_FULL_TOKENS");
+    const uint32_t full_tokens = !full_tokens_env ? 1u :
+        std::strcmp(full_tokens_env, "1") == 0 ? 1u :
+        std::strcmp(full_tokens_env, "2") == 0 ? 2u : 0u;
+    CHECK(full_tokens != 0u &&
+              (full_trunk || full_tokens == 1u),
+          "full-token count is bounded and requires full-trunk mode");
     Glm5NextKShardPlan kshard;
     CHECK(!full_trunk || glm5_next_build_kshard_plan(gguf, offsets, kshard),
           "build exact full-trunk compact residency plan");
@@ -201,6 +208,12 @@ bool run() {
               UINT64_C(0x52414e4b00000000) ^ exec.tp_rank,
               rank_error, sizeof(rank_error)) == -1,
           "TP roles must prove distinct rank identities");
+    char mode_error[256] = {};
+    const uint64_t mode_hash = UINT64_C(0x474c4d354d4f4400) ^
+        ((uint64_t)full_trunk << 8u) ^ full_tokens;
+    CHECK(ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d354d4f4445),
+                            mode_hash, mode_error, sizeof(mode_error)) == 1,
+          "TP roles must negotiate the same full-trunk token count");
     if (full_trunk) {
         constexpr uint64_t install_headroom = UINT64_C(2) << 30u;
         size_t free_before_install = 0u, total_before_install = 0u;
@@ -354,6 +367,83 @@ bool run() {
             role, (unsigned long long)trunk_hash,
             (unsigned long long)logits_hash, argmax,
             (unsigned long long)sequence, (unsigned long long)packed);
+        if (full_tokens == 2u) {
+            CHECK(argmax == 154822u,
+                  "first greedy token matches the frozen two-token fixture");
+            CHECK(ds4_glm5_next_embed_token(&exec, argmax, current.value),
+                  "embed first greedy argmax for second full token");
+            for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+                CHECK(ds4_glm5_next_layer_forward(
+                          &exec, il, &state.value, workspace.value,
+                          current.value, output.value),
+                      "execute second greedy token through complete trunk");
+                std::swap(current.value, output.value);
+            }
+            CHECK(state.value.valid && sequence == 106u,
+                  "two full tokens emit two exact 53-gate schedules");
+            for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+                if (ds4_glm5_next_layer_is_mla(il)) {
+                    CHECK(state.value.mla[il].token_count == 2u,
+                          "second token commits every MLA layer state");
+                } else {
+                    CHECK(state.value.kda.layer[il].token_count == 2u,
+                          "second token commits every KDA layer state");
+                }
+            }
+            std::vector<float> trunk2(kHcWidth);
+            CHECK(ds4_gpu_tensor_read(current.value, 0u, trunk2.data(),
+                                      trunk2.size() * sizeof(float)),
+                  "read second greedy full-trunk output");
+            const uint64_t trunk2_hash = fnv64(
+                trunk2.data(), trunk2.size() * sizeof(float));
+            char trunk2_error[256] = {};
+            CHECK(ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d3547325452),
+                                    trunk2_hash, trunk2_error,
+                                    sizeof(trunk2_error)) == 1,
+                  trunk2_error);
+            CHECK(ds4_glm5_next_output_logits(
+                      &exec, workspace.value, current.value, logits.value) &&
+                  ds4_gpu_synchronize(),
+                  "execute second greedy vocabulary projection");
+            CHECK(ds4_gpu_tensor_read(
+                      logits.value, 0u, full_logits.data(),
+                      full_logits.size() * sizeof(float)),
+                  "read second greedy vocabulary logits");
+            const uint64_t logits2_hash = fnv64(
+                full_logits.data(), full_logits.size() * sizeof(float));
+            char logits2_error[256] = {};
+            CHECK(ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d3547324c47),
+                                    logits2_hash, logits2_error,
+                                    sizeof(logits2_error)) == 1,
+                  logits2_error);
+            uint32_t argmax2 = 0u;
+            float logit2_min = full_logits[0], logit2_max = full_logits[0];
+            CHECK(std::isfinite(full_logits[0]),
+                  "second-token logits start finite");
+            for (uint32_t token = 1u; token < full_logits.size(); ++token) {
+                CHECK(std::isfinite(full_logits[token]),
+                      "all second-token logits are finite");
+                logit2_min = std::min(logit2_min, full_logits[token]);
+                logit2_max = std::max(logit2_max, full_logits[token]);
+                if (full_logits[token] > full_logits[argmax2]) argmax2 = token;
+            }
+            CHECK(logit2_max > logit2_min &&
+                      trunk2_hash != trunk_hash &&
+                      trunk2_hash == UINT64_C(0x53f8b3cef301d00c) &&
+                      logits2_hash == UINT64_C(0xb3fa54df32db51ec) &&
+                      argmax2 == 20u &&
+                      ds4_gpu_q4k_packed_slice_bytes() == expected_packed,
+                  "second-token frozen fixture is stateful and cache-free");
+            std::fprintf(stderr,
+                "PASS GLM5 prefix->layer3 greedy2 role=%s "
+                "greedy1=%u greedy2_trunk=%016llx "
+                "greedy2_logits=%016llx greedy2=%u tp_seq=%llu "
+                "packed_q4_bytes=%llu rdma=1\n",
+                role, argmax, (unsigned long long)trunk2_hash,
+                (unsigned long long)logits2_hash, argmax2,
+                (unsigned long long)sequence,
+                (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
+        }
         ds4_glm5_next_state_free(&state.value);
         std::memset(&state.value, 0, sizeof(state.value));
         sequence = 0u;
