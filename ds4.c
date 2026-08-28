@@ -43,6 +43,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_glm5_kda.h"
+#include "ds4_glm5_next_runtime.h"
 #include "ds4_tp.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
@@ -4433,23 +4434,44 @@ typedef struct {
     ds4_tensor *token_embd;
     ds4_tensor *output_norm;
     ds4_tensor *output;
+    ds4_tensor *nextn_eh_proj;
     ds4_glm5_next_layer_weights layer[DS4_MAX_LAYER];
     ds4_glm5_layer_kind schedule[DS4_MAX_LAYER];
     uint32_t layer_count;
+    uint32_t trunk_count;
+    uint32_t nextn_count;
     uint32_t kda_count;
     bool schedule_valid;
+    ds4_glm5_next_model_offsets offsets;
 } ds4_glm5_next_weights;
 
 static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
                                    const ds4_model *m,
-                                   uint32_t layer_count) {
+                                   uint32_t layer_count,
+                                   uint32_t trunk_count,
+                                   uint32_t nextn_count) {
     memset(w, 0, sizeof(*w));
-    if (layer_count == 0u || layer_count > DS4_MAX_LAYER) {
-        ds4_die("glm5-next layer count is outside the binding capacity");
+    if (layer_count != DS4_GLM5_NEXT_LAYER_COUNT) {
+        ds4_die("glm5-next layer count does not match the runtime contract");
     }
     w->token_embd = required_tensor(m, "token_embd.weight");
     w->output_norm = required_tensor(m, "output_norm.weight");
     w->output = required_tensor(m, "output.weight");
+    if (trunk_count >= layer_count || nextn_count != 1u ||
+        trunk_count + nextn_count != layer_count) {
+        ds4_die("glm5-next trunk/nextn layer split is invalid");
+    }
+    w->nextn_eh_proj = required_tensorf(
+        m, "blk.%u.nextn.eh_proj.weight", trunk_count);
+    w->trunk_count = trunk_count;
+    w->nextn_count = nextn_count;
+    w->offsets.token_embd = w->token_embd->abs_offset;
+    w->offsets.output_norm = w->output_norm->abs_offset;
+    w->offsets.output = w->output->abs_offset;
+    w->offsets.nextn_eh_proj = w->nextn_eh_proj->abs_offset;
+    w->offsets.layer_count = layer_count;
+    w->offsets.trunk_count = trunk_count;
+    w->offsets.nextn_count = nextn_count;
 
     bool has_kda_q[DS4_MAX_LAYER] = {false};
     bool has_mla_q[DS4_MAX_LAYER] = {false};
@@ -4526,7 +4548,7 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
                 .a_log = l->kda_a_log->abs_offset,
             };
         }
-        if (il < 3u) {
+        if (il < DS4_GLM5_NEXT_LEADING_DENSE) {
             l->ffn_gate = required_tensorf(m, "blk.%u.ffn_gate.weight", il);
             l->ffn_up = required_tensorf(m, "blk.%u.ffn_up.weight", il);
             l->ffn_down = required_tensorf(m, "blk.%u.ffn_down.weight", il);
@@ -4540,7 +4562,7 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
             l->ffn_up_shexp = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
             l->ffn_down_shexp = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
         }
-        if (il < 45u) {
+        if (il < trunk_count) {
             l->hc_attn_fn = required_tensorf(m, "blk.%u.hc_attn_fn.weight", il);
             l->hc_ffn_fn = required_tensorf(m, "blk.%u.hc_ffn_fn.weight", il);
             l->hc_attn_base = required_tensorf(m, "blk.%u.hc_attn_base.weight", il);
@@ -4548,7 +4570,65 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
             l->hc_attn_scale = required_tensorf(m, "blk.%u.hc_attn_scale.weight", il);
             l->hc_ffn_scale = required_tensorf(m, "blk.%u.hc_ffn_scale.weight", il);
         }
+        ds4_glm5_next_layer_offsets *offset = &w->offsets.layer[il];
+        offset->layer = il;
+        offset->is_trunk = il < trunk_count;
+        offset->attention = w->schedule[il].is_kda ?
+            DS4_GLM5_NEXT_ATTN_KDA : DS4_GLM5_NEXT_ATTN_MLA;
+        offset->ffn = il < DS4_GLM5_NEXT_LEADING_DENSE ?
+            DS4_GLM5_NEXT_FFN_DENSE : DS4_GLM5_NEXT_FFN_ROUTED;
+        offset->attn_norm = l->attn_norm->abs_offset;
+        offset->ffn_norm = l->ffn_norm->abs_offset;
+        if (w->schedule[il].is_kda) {
+            offset->kda = l->kda_offsets;
+        } else {
+            offset->mla = (ds4_glm5_next_mla_offsets) {
+                .q_a = l->mla_q_a->abs_offset,
+                .q_a_norm = l->mla_q_a_norm->abs_offset,
+                .q_b = l->mla_q_b->abs_offset,
+                .kv_a_mqa = l->mla_kv_a_mqa->abs_offset,
+                .kv_a_norm = l->mla_kv_a_norm->abs_offset,
+                .k_b = l->mla_k_b->abs_offset,
+                .v_b = l->mla_v_b->abs_offset,
+                .output = l->mla_output->abs_offset,
+                .index_q_b = l->indexer_q_b->abs_offset,
+                .index_k = l->indexer_k->abs_offset,
+                .index_proj = l->indexer_proj->abs_offset,
+                .index_pool_ape = l->indexer_pool_ape->abs_offset,
+                .index_pool_gate = l->indexer_pool_gate->abs_offset,
+                .index_k_norm = l->indexer_k_norm->abs_offset,
+                .index_k_norm_b = l->indexer_k_norm_b->abs_offset,
+            };
+        }
+        if (il < DS4_GLM5_NEXT_LEADING_DENSE) {
+            offset->ffn_weight.gate = l->ffn_gate->abs_offset;
+            offset->ffn_weight.up = l->ffn_up->abs_offset;
+            offset->ffn_weight.down = l->ffn_down->abs_offset;
+        } else {
+            offset->ffn_weight.gate_exps = l->ffn_gate_exps->abs_offset;
+            offset->ffn_weight.up_exps = l->ffn_up_exps->abs_offset;
+            offset->ffn_weight.down_exps = l->ffn_down_exps->abs_offset;
+            offset->ffn_weight.gate_inp = l->ffn_gate_inp->abs_offset;
+            offset->ffn_weight.exp_probs_b = l->exp_probs_b->abs_offset;
+            offset->ffn_weight.gate_shexp =
+                l->ffn_gate_shexp->abs_offset;
+            offset->ffn_weight.up_shexp = l->ffn_up_shexp->abs_offset;
+            offset->ffn_weight.down_shexp =
+                l->ffn_down_shexp->abs_offset;
+        }
+        if (offset->is_trunk) {
+            offset->hc = (ds4_glm5_next_hc_offsets) {
+                .attn_fn = l->hc_attn_fn->abs_offset,
+                .ffn_fn = l->hc_ffn_fn->abs_offset,
+                .attn_base = l->hc_attn_base->abs_offset,
+                .ffn_base = l->hc_ffn_base->abs_offset,
+                .attn_scale = l->hc_attn_scale->abs_offset,
+                .ffn_scale = l->hc_ffn_scale->abs_offset,
+            };
+        }
     }
+    if (!ds4_glm5_next_model_offsets_validate(&w->offsets))
+        ds4_die("glm5-next runtime offset contract is invalid");
 }
 
 static bool tensor_type_is_glm_dense_quant(uint32_t type) {
@@ -6112,13 +6192,15 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
      * run before graph construction; the legacy GLM-5.2 binder has a
      * different KDA/MLA schedule and must never see this model. */
     ds4_glm5_next_weights bound = {0};
-    glm5_next_weights_bind(&bound, m, layers);
+    glm5_next_weights_bind(&bound, m, layers, trunk_layers, nextn);
     tensor_expect_layout(bound.token_embd,
                          DS4_TENSOR_BF16, 2, 4096, 154880, 0);
     tensor_expect_layout(bound.output_norm,
                          DS4_TENSOR_F32, 1, 4096, 0, 0);
     tensor_expect_layout(bound.output,
                          DS4_TENSOR_BF16, 2, 4096, 154880, 0);
+    tensor_expect_layout(bound.nextn_eh_proj,
+                         DS4_TENSOR_BF16, 2, 8192, 4096, 0);
     for (uint32_t il = 0; il < layers; ++il) {
         tensor_expect_layout(required_tensorf(m, "blk.%u.attn_norm.weight", il),
                              DS4_TENSOR_F32, 1, 4096, 0, 0);
