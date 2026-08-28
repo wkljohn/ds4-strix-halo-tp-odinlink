@@ -33,6 +33,7 @@ PORT=${DS4_GLM5_PREFIX_TP_PORT:-15883}
 LOCAL_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
 PEER_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
 TIMEOUT=${DS4_GLM5_TP_CONNECT_TIMEOUT_SEC:-180}
+FULL_TRUNK=${DS4_GLM5_FULL_TRUNK:-0}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
 PEER_BINARY=$PEER_DIR/test_rocm_glm5_prefix_layer3_tp
@@ -55,6 +56,50 @@ done
   echo "error: invalid timeout" >&2
   exit 2
 }
+[[ $FULL_TRUNK == 0 || $FULL_TRUNK == 1 ]] || {
+  echo "error: DS4_GLM5_FULL_TRUNK must be 0 or 1" >&2
+  exit 2
+}
+
+read_local_memory_layout() {
+  local mem_kib gtt_bytes carveout
+  mem_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+  gtt_bytes=$(cat /sys/class/drm/card0/device/mem_info_gtt_total)
+  carveout=$(cat /sys/class/drm/card0/device/uma/carveout)
+  [[ $mem_kib =~ ^[0-9]+$ && $gtt_bytes =~ ^[0-9]+$ &&
+     $carveout =~ ^[0-9]+$ ]] || return 1
+  printf '%s %s %s\n' "$mem_kib" "$gtt_bytes" "$carveout"
+}
+
+read_peer_memory_layout() {
+  ssh -o BatchMode=yes "$PEER" \
+    "mem_kib=\$(awk '/^MemTotal:/ { print \$2; exit }' /proc/meminfo); gtt_bytes=\$(cat /sys/class/drm/card0/device/mem_info_gtt_total); carveout=\$(cat /sys/class/drm/card0/device/uma/carveout); test -n \"\$mem_kib\" -a -n \"\$gtt_bytes\" -a -n \"\$carveout\" || exit 1; case \"\$mem_kib \$gtt_bytes \$carveout\" in *[!0-9\ ]*) exit 1;; esac; printf '%s %s %s\\n' \"\$mem_kib\" \"\$gtt_bytes\" \"\$carveout\""
+}
+
+LOCAL_MEM_KIB=0 LOCAL_GTT_BYTES=0 LOCAL_CARVEOUT=-1
+PEER_MEM_KIB=0 PEER_GTT_BYTES=0 PEER_CARVEOUT=-1
+if [[ $FULL_TRUNK == 1 ]]; then
+  read -r LOCAL_MEM_KIB LOCAL_GTT_BYTES LOCAL_CARVEOUT \
+    < <(read_local_memory_layout)
+  read -r PEER_MEM_KIB PEER_GTT_BYTES PEER_CARVEOUT \
+    < <(read_peer_memory_layout)
+  min_mem_kib=$((112 * 1024 * 1024))
+  min_gtt_bytes=$((112 * 1024 * 1024 * 1024))
+  (( LOCAL_MEM_KIB >= min_mem_kib && PEER_MEM_KIB >= min_mem_kib &&
+     LOCAL_GTT_BYTES >= min_gtt_bytes && PEER_GTT_BYTES >= min_gtt_bytes )) || {
+    echo "error: full GLM5 trunk requires >=112 GiB real RAM and GTT on both hosts" >&2
+    printf 'local mem_kib=%s gtt_bytes=%s carveout=%s; peer mem_kib=%s gtt_bytes=%s carveout=%s\n' \
+      "$LOCAL_MEM_KIB" "$LOCAL_GTT_BYTES" "$LOCAL_CARVEOUT" \
+      "$PEER_MEM_KIB" "$PEER_GTT_BYTES" "$PEER_CARVEOUT" >&2
+    exit 1
+  }
+  (( LOCAL_CARVEOUT == 0 && PEER_CARVEOUT == 0 )) || {
+    echo "error: full GLM5 trunk requires firmware UMA carveout option 0 (512 MiB) on both hosts" >&2
+    printf 'local carveout=%s; peer carveout=%s\n' \
+      "$LOCAL_CARVEOUT" "$PEER_CARVEOUT" >&2
+    exit 1
+  }
+fi
 
 sample_fingerprint() {
   python3 - "$1" <<'PY'
@@ -124,6 +169,16 @@ printf '%s\n' \
   "local_device=$LOCAL_DEVICE" \
   "peer_device=$PEER_DEVICE" \
   "timeout_sec=$TIMEOUT" >"$OUT/run.env"
+printf 'full_trunk=%s\n' "$FULL_TRUNK" >>"$OUT/run.env"
+if [[ $FULL_TRUNK == 1 ]]; then
+  printf '%s\n' \
+    "local_mem_kib=$LOCAL_MEM_KIB" \
+    "local_gtt_bytes=$LOCAL_GTT_BYTES" \
+    "local_carveout_index=$LOCAL_CARVEOUT" \
+    "peer_mem_kib=$PEER_MEM_KIB" \
+    "peer_gtt_bytes=$PEER_GTT_BYTES" \
+    "peer_carveout_index=$PEER_CARVEOUT" >>"$OUT/run.env"
+fi
 
 common_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 env -i PATH="$common_path" HOME="$LOCAL_HOME" \
@@ -133,10 +188,11 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_TP_PORT="$PORT" \
   DS4_GLM5_TP_RDMA_DEVICE="$LOCAL_DEVICE" \
   DS4_GLM5_TP_CONNECT_TIMEOUT_SEC="$TIMEOUT" \
+  DS4_GLM5_FULL_TRUNK="$FULL_TRUNK" \
   "$BINARY" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 
@@ -156,14 +212,30 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
   grep -q 'mlx5 queue pair uses RC' "$log"
   grep -q 'registered host slab as 3 MRs' "$log"
   grep -q 'PASS GLM5 prefix->layer3' "$log"
-  grep -q 'window_cache_bytes=0 rdma=1' "$log"
+  if [[ $FULL_TRUNK == 1 ]]; then
+    grep -q 'packed_q4_bytes=85614133248 rdma=1' "$log"
+    grep -q 'GLM5 full-trunk post-install' "$log"
+  else
+    grep -q 'window_cache_bytes=0 rdma=1' "$log"
+  fi
 done
-LEADER_OUTPUT=$(sed -n 's/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
-WORKER_OUTPUT=$(sed -n 's/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+LEADER_OUTPUT=$(sed -n 's/.* token0 role=.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+WORKER_OUTPUT=$(sed -n 's/.* token0 role=.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
 [[ -n $LEADER_OUTPUT && $LEADER_OUTPUT == "$WORKER_OUTPUT" ]] || {
   echo "error: all-rank layer3 output hashes differ" >&2
   exit 1
 }
+if [[ $FULL_TRUNK == 1 ]]; then
+  LEADER_TRUNK=$(sed -n 's/.* trunk_output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+  WORKER_TRUNK=$(sed -n 's/.* trunk_output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  LEADER_LOGITS=$(sed -n 's/.* logits=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+  WORKER_LOGITS=$(sed -n 's/.* logits=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  [[ -n $LEADER_TRUNK && $LEADER_TRUNK == "$WORKER_TRUNK" &&
+     -n $LEADER_LOGITS && $LEADER_LOGITS == "$WORKER_LOGITS" ]] || {
+    echo "error: all-rank full-trunk or logit hashes differ" >&2
+    exit 1
+  }
+fi
 
 printf 'PASS GLM5 prefix-layer3 RoCE tag=%s binary_sha256=%s output_fnv=%s\n' \
   "$TAG" "$LOCAL_SHA" "$LEADER_OUTPUT"

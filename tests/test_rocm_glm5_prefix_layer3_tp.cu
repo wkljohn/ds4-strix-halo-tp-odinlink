@@ -7,6 +7,10 @@ extern "C" {
 #include "tests/glm5_gguf_test.hpp"
 #include "tests/glm5_next_real_offsets.hpp"
 
+#include <hip/hip_runtime.h>
+
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -154,23 +158,32 @@ bool run() {
     ds4_glm5_next_model_offsets offsets = {};
     CHECK(glm5_next_bind_real_offsets(gguf, offsets),
           "bind complete real GLM5 offsets");
+    const char *full_trunk_env = std::getenv("DS4_GLM5_FULL_TRUNK");
+    const bool full_trunk = full_trunk_env &&
+                            std::strcmp(full_trunk_env, "1") == 0;
+    Glm5NextKShardPlan kshard;
+    CHECK(!full_trunk || glm5_next_build_kshard_plan(gguf, offsets, kshard),
+          "build exact full-trunk compact residency plan");
     ds4_gpu_config config = {};
     config.n_gpus = 1u;
     config.device_indices[0] = 0u;
     CHECK(ds4_gpu_init_multi(&config) &&
           ds4_gpu_set_model_fd_for_map(gguf.fd, gguf.map) &&
-          ds4_gpu_set_model_map(gguf.map, gguf.size),
-          "initialize gfx1151 and register model map");
+          (full_trunk || ds4_gpu_set_model_map(gguf.map, gguf.size)),
+          "initialize gfx1151 without broad full-trunk mmap registration");
 
     StateGuard state;
     WorkspaceGuard workspace;
-    TensorGuard current, output;
+    TensorGuard current, output, logits;
     CHECK(ds4_glm5_next_state_init(&state.value, &offsets, 2u, nullptr) &&
           (workspace.value = ds4_glm5_next_workspace_create()) != nullptr &&
           (current.value = ds4_gpu_tensor_alloc(
               (uint64_t)kHcWidth * sizeof(float))) != nullptr &&
           (output.value = ds4_gpu_tensor_alloc(
-              (uint64_t)kHcWidth * sizeof(float))) != nullptr,
+              (uint64_t)kHcWidth * sizeof(float))) != nullptr &&
+          (!full_trunk ||
+           (logits.value = ds4_gpu_tensor_alloc(
+               UINT64_C(154880) * sizeof(float))) != nullptr),
           "allocate resident state and production workspace");
 
     ds4_glm5_next_exec_ctx exec = {};
@@ -182,6 +195,81 @@ bool run() {
     CHECK(create_tp(gguf, leader, host, device, (int)port_long,
                     tp, exec, sequence),
           "create persistent GLM5 layer3 RoCE transport");
+    char rank_error[256] = {};
+    CHECK(ds4_tp_hash_check(
+              tp.tp, UINT64_C(0x474c4d3552414e4b),
+              UINT64_C(0x52414e4b00000000) ^ exec.tp_rank,
+              rank_error, sizeof(rank_error)) == -1,
+          "TP roles must prove distinct rank identities");
+    if (full_trunk) {
+        constexpr uint64_t install_headroom = UINT64_C(2) << 30u;
+        size_t free_before_install = 0u, total_before_install = 0u;
+        CHECK(hipMemGetInfo(&free_before_install, &total_before_install) ==
+                  hipSuccess,
+              "query bounded residency budget before install");
+        const uint64_t packed_required = kshard.packed_total_bytes;
+        const uint64_t residency_required =
+            kshard.dense_total_bytes + packed_required;
+        std::fprintf(stderr,
+            "GLM5 full-trunk plan rank=%u dense_spans=%zu "
+            "dense_bytes=%llu packed_bytes=%llu required_bytes=%llu "
+            "headroom_bytes=%llu hip_free=%llu hip_total=%llu\n",
+            exec.tp_rank, kshard.dense_offsets.size(),
+            (unsigned long long)kshard.dense_total_bytes,
+            (unsigned long long)packed_required,
+            (unsigned long long)residency_required,
+            (unsigned long long)install_headroom,
+            (unsigned long long)free_before_install,
+            (unsigned long long)total_before_install);
+        CHECK(residency_required <= free_before_install &&
+                  install_headroom <= free_before_install - residency_required,
+              "full-trunk residency exceeds HIP-free GTT; reduce BIOS UMA "
+              "carveout and retain at least 2 GiB install headroom");
+        CHECK(ds4_gpu_q4k_kshard_install(
+                  gguf.map, gguf.size, gguf.fd, exec.tp_rank,
+                  kshard.dense_offsets.data(), kshard.dense_sizes.data(),
+                  (uint32_t)kshard.dense_offsets.size(),
+                  kshard.dense_max_tensor_bytes, kshard.layers.data(),
+                  (uint32_t)kshard.layers.size()),
+              "install bounded all-layer Q4 K-shard before model access");
+        ds4_gpu_q4k_kshard_windows windows = {};
+        CHECK(ds4_gpu_q4k_kshard_windows_get(&windows) &&
+                  windows.rank == exec.tp_rank && windows.n_layers == 42u &&
+                  windows.n_expert == 288u &&
+                  windows.expert_in_dim == 4096u &&
+                  windows.expert_mid_dim == 1024u &&
+                  windows.out_dim == 4096u &&
+                  windows.row_base == exec.tp_rank * 1024u &&
+                  windows.row_count == 1024u &&
+                  windows.down_column_byte_base ==
+                      (uint64_t)exec.tp_rank * 4u * 144u &&
+                  windows.down_column_byte_count == 4u * 144u,
+              "installed Q4 shard geometry matches the negotiated rank");
+        const uint64_t packed_from_windows =
+            (uint64_t)windows.n_layers * windows.n_expert *
+            (2u * windows.packed_gate_expert_bytes +
+             windows.packed_down_expert_bytes);
+        CHECK(packed_from_windows == packed_required &&
+                  ds4_gpu_q4k_packed_slice_bytes() == packed_from_windows,
+              "installed Q4 bytes derive exactly from published windows");
+        size_t free_after_install = 0u, total_after_install = 0u;
+        CHECK(hipMemGetInfo(&free_after_install, &total_after_install) ==
+                  hipSuccess && total_after_install == total_before_install &&
+                  free_after_install >= install_headroom,
+              "full-trunk install must retain measured 2 GiB HIP headroom");
+        std::fprintf(stderr,
+            "GLM5 full-trunk residency rank=%u dense_spans=%zu "
+            "dense_bytes=%llu packed_q4_bytes=%llu\n",
+            exec.tp_rank, kshard.dense_offsets.size(),
+            (unsigned long long)kshard.dense_total_bytes,
+            (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
+        std::fprintf(stderr,
+            "GLM5 full-trunk post-install rank=%u hip_free=%llu "
+            "hip_total=%llu installed_delta=%llu\n",
+            exec.tp_rank, (unsigned long long)free_after_install,
+            (unsigned long long)total_after_install,
+            (unsigned long long)(free_before_install - free_after_install));
+    }
 
     CHECK(ds4_glm5_next_embed_token(&exec, 42u, current.value),
           "embed token 42");
@@ -197,6 +285,95 @@ bool run() {
                               prefix.size() * sizeof(float)) &&
           fnv64(prefix.data(), prefix.size() * sizeof(float)) == kPrefixFNV,
           "production prefix matches frozen real-GGUF fixture");
+
+    if (full_trunk) {
+        for (uint32_t il = 3u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+            CHECK(ds4_glm5_next_layer_forward(
+                      &exec, il, &state.value, workspace.value,
+                      current.value, output.value),
+                  "execute complete GLM5.3 trunk layer over RoCE");
+            std::swap(current.value, output.value);
+        }
+        CHECK(state.value.valid && sequence == 53u,
+              "complete trunk emits the exact hybrid 53-gate schedule");
+        for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+            if (ds4_glm5_next_layer_is_mla(il)) {
+                CHECK(state.value.mla[il].token_count == 1u,
+                      "full trunk commits one MLA cache row per MLA layer");
+            } else {
+                CHECK(state.value.kda.layer[il].token_count == 1u,
+                      "full trunk commits one recurrent KDA step per KDA layer");
+            }
+        }
+        std::vector<float> trunk(kHcWidth);
+        CHECK(ds4_gpu_tensor_read(current.value, 0u, trunk.data(),
+                                  trunk.size() * sizeof(float)),
+              "read complete trunk output");
+        const uint64_t trunk_hash = fnv64(
+            trunk.data(), trunk.size() * sizeof(float));
+        char trunk_error[256] = {};
+        CHECK(ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d3546554c4c),
+                                trunk_hash, trunk_error,
+                                sizeof(trunk_error)) == 1,
+              trunk_error);
+        CHECK(ds4_glm5_next_output_logits(
+                  &exec, workspace.value, current.value, logits.value) &&
+              ds4_gpu_synchronize(),
+              "execute replicated GLM5.3 output head");
+        std::vector<float> full_logits(154880u);
+        CHECK(ds4_gpu_tensor_read(
+                  logits.value, 0u, full_logits.data(),
+                  full_logits.size() * sizeof(float)),
+              "read complete GLM5.3 vocabulary logits");
+        const uint64_t logits_hash = fnv64(
+            full_logits.data(), full_logits.size() * sizeof(float));
+        char logits_error[256] = {};
+        CHECK(ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d354c4f4749),
+                                logits_hash, logits_error,
+                                sizeof(logits_error)) == 1,
+              logits_error);
+        uint32_t argmax = 0u;
+        float logit_min = full_logits[0], logit_max = full_logits[0];
+        CHECK(std::isfinite(full_logits[0]), "all logits are finite");
+        for (uint32_t token = 1u; token < full_logits.size(); ++token) {
+            CHECK(std::isfinite(full_logits[token]), "all logits are finite");
+            logit_min = std::min(logit_min, full_logits[token]);
+            logit_max = std::max(logit_max, full_logits[token]);
+            if (full_logits[token] > full_logits[argmax]) argmax = token;
+        }
+        CHECK(logit_max > logit_min,
+              "complete vocabulary logits are nonconstant");
+        const uint64_t packed = ds4_gpu_q4k_packed_slice_bytes();
+        const uint64_t expected_packed = kshard.packed_total_bytes;
+        CHECK(packed == expected_packed,
+              "full trunk owns one compact Q4 shard per routed layer");
+        std::fprintf(stderr,
+            "PASS GLM5 prefix->layer3 full-trunk role=%s "
+            "trunk_output=%016llx logits=%016llx argmax=%u "
+            "tp_seq=%llu packed_q4_bytes=%llu rdma=1\n",
+            role, (unsigned long long)trunk_hash,
+            (unsigned long long)logits_hash, argmax,
+            (unsigned long long)sequence, (unsigned long long)packed);
+        ds4_glm5_next_state_free(&state.value);
+        std::memset(&state.value, 0, sizeof(state.value));
+        sequence = 0u;
+        CHECK(ds4_glm5_next_state_init(&state.value, &offsets, 2u, nullptr) &&
+                  ds4_glm5_next_embed_token(&exec, 42u, current.value),
+              "reset state and re-embed token 42 for multi-token coverage");
+        for (uint32_t il = 0u; il < 3u; ++il) {
+            CHECK(ds4_glm5_next_layer_forward(
+                      &exec, il, &state.value, workspace.value,
+                      current.value, output.value),
+                  "rebuild token-0 dense-prefix KDA state after full trunk");
+            std::swap(current.value, output.value);
+        }
+        std::vector<float> replay_prefix(kHcWidth);
+        CHECK(ds4_gpu_tensor_read(current.value, 0u, replay_prefix.data(),
+                                  replay_prefix.size() * sizeof(float)) &&
+                  fnv64(replay_prefix.data(),
+                        replay_prefix.size() * sizeof(float)) == kPrefixFNV,
+              "rebuilt token-0 prefix and KDA state match frozen fixture");
+    }
 
     CHECK(ds4_glm5_next_layer_forward(
               &exec, 3u, &state.value, workspace.value,
@@ -242,7 +419,8 @@ bool run() {
                                     kHcWidth, &kda4_token0),
           "layer4 commits one recurrent KDA step and one FFN exchange");
     const uint64_t packed_q4_bytes = ds4_gpu_q4k_packed_slice_bytes();
-    CHECK(packed_q4_bytes > layer3_packed_q4_bytes &&
+    CHECK((full_trunk ? packed_q4_bytes == layer3_packed_q4_bytes
+                      : packed_q4_bytes > layer3_packed_q4_bytes) &&
           ds4_tp_hash_check(
               tp.tp, UINT64_C(0x474c4d35344b4430),
               fnv64(&kda4_token0, sizeof(kda4_token0)),
