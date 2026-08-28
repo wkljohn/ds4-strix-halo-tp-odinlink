@@ -16,6 +16,7 @@ enum {
     DS4_GLM5_NEXT_TRUNK_COUNT = 45,
     DS4_GLM5_NEXT_LEADING_DENSE = 3,
     DS4_GLM5_NEXT_MLA_COUNT = 11,
+    DS4_GLM5_NEXT_TP_GATE_MASK_WORDS = 3,
     /* GLM-5.3 NoPE stores only the normalized 512-wide KV-LoRA row. */
     DS4_GLM5_NEXT_MLA_KV_WIDTH = 512,
     DS4_GLM5_NEXT_INDEX_WIDTH = 128,
@@ -102,6 +103,11 @@ typedef struct ds4_glm5_next_state {
     uint64_t bytes;
     bool valid;
 } ds4_glm5_next_state;
+
+bool ds4_glm5_next_layer_is_mla(uint32_t layer);
+int ds4_glm5_next_build_tp_gate_mask(
+        uint64_t mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS],
+        uint32_t *gate_count);
 
 int ds4_glm5_next_model_offsets_validate(
         const ds4_glm5_next_model_offsets *model);

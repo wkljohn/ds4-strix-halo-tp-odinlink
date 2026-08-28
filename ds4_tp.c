@@ -67,7 +67,7 @@ uint64_t ds4_tp_test_get_exchange_calls(void) {
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 9u
+#define DS4_TP_PROTOCOL_VERSION 10u
 
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
@@ -100,8 +100,11 @@ typedef struct {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint32_t pad;
+    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_hello_fixed;
+
+_Static_assert(sizeof(ds4_tp_hello_fixed) == 88,
+               "ds4_tp_hello_fixed wire layout changed");
 
 typedef struct {
     uint64_t slab_base;
@@ -301,6 +304,7 @@ struct ds4_tp {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
+    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
     uint8_t *slab;
     uint64_t slab_bytes;
     /* Slab regions, see ds4_tp.h layout comment. */
@@ -1326,15 +1330,95 @@ static const char *tp_wc_status_str(int status) {
     return buf;
 }
 
-/* Slab slot a given gate seq lands in.  DS4 fires every slot in order
- * (identity mapping); GLM's schedule from the hello skips dense layers
- * and the ATTN slots. */
-static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
-    if (tp->gates_per_token == 0)
-        return (uint32_t)((seq - 1) % tp->n_slots);
-    return tp->gate_slot_start +
-           (uint32_t)((seq - 1) % tp->gates_per_token) * tp->gate_slot_step;
+static uint32_t tp_gate_mask_count(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS]) {
+    uint32_t count = 0;
+    for (uint32_t word = 0; word < DS4_TP_GATE_MASK_WORDS; word++)
+        count += (uint32_t)__builtin_popcountll(mask[word]);
+    return count;
 }
+
+static int tp_gate_mask_fits(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS], uint32_t n_slots) {
+    const uint32_t full_words = n_slots / 64u;
+    const uint32_t tail_bits = n_slots % 64u;
+    for (uint32_t word = full_words + (tail_bits != 0u);
+         word < DS4_TP_GATE_MASK_WORDS; word++) {
+        if (mask[word] != 0u) return 0;
+    }
+    if (tail_bits != 0u && full_words < DS4_TP_GATE_MASK_WORDS) {
+        const uint64_t valid = (UINT64_C(1) << tail_bits) - 1u;
+        if ((mask[full_words] & ~valid) != 0u) return 0;
+    }
+    return 1;
+}
+
+static int tp_gate_schedule_validate(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+        uint32_t gates_per_token, uint32_t n_slots,
+        char *err, size_t errlen) {
+    const uint32_t mask_count = tp_gate_mask_count(mask);
+    if ((mask_count != 0u && mask_count != gates_per_token) ||
+        !tp_gate_mask_fits(mask, n_slots)) {
+        tp_set_err(err, errlen,
+                   "tp hello: invalid gate schedule mask (%u bits, %u gates, %u slots)",
+                   mask_count, gates_per_token, n_slots);
+        return 0;
+    }
+    return 1;
+}
+
+/* Slab slot a given gate sequence lands in. The mask represents irregular
+ * schedules such as GLM-5.3's MLA+FFN/FFN hybrid. */
+static uint32_t tp_gate_slot_raw(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+        uint32_t start, uint32_t step, uint32_t per_token,
+        uint32_t n_slots, uint64_t seq) {
+    if (tp_gate_mask_count(mask) != 0u) {
+        if (per_token == 0u) return n_slots;
+        uint32_t ordinal = (uint32_t)((seq - 1u) % per_token);
+        for (uint32_t word = 0; word < DS4_TP_GATE_MASK_WORDS; word++) {
+            uint64_t bits = mask[word];
+            const uint32_t count = (uint32_t)__builtin_popcountll(bits);
+            if (ordinal >= count) {
+                ordinal -= count;
+                continue;
+            }
+            while (ordinal > 0u) {
+                bits &= bits - 1u;
+                ordinal--;
+            }
+            return word * 64u + (uint32_t)__builtin_ctzll(bits);
+        }
+        return n_slots;
+    }
+    if (per_token == 0u)
+        return (uint32_t)((seq - 1u) % n_slots);
+    return start + (uint32_t)((seq - 1u) % per_token) * step;
+}
+
+static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
+    return tp_gate_slot_raw(tp->gate_slot_mask,
+                            tp->gate_slot_start, tp->gate_slot_step,
+                            tp->gates_per_token, tp->n_slots, seq);
+}
+
+#ifdef DS4_TP_TEST_HOOKS
+int ds4_tp_test_gate_schedule_validate(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+        uint32_t gates_per_token, uint32_t n_slots,
+        char *err, size_t errlen) {
+    return tp_gate_schedule_validate(mask, gates_per_token, n_slots,
+                                     err, errlen);
+}
+
+uint32_t ds4_tp_test_gate_slot(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+        uint32_t start, uint32_t step, uint32_t per_token,
+        uint32_t n_slots, uint64_t seq) {
+    return tp_gate_slot_raw(mask, start, step, per_token, n_slots, seq);
+}
+#endif
 
 /* Reap completions: send CQEs free send-queue slots, recv CQEs advance the
  * arrival watermark (UC is in-order, so gate seq recv completions arrive
@@ -2102,6 +2186,8 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
     };
+    memcpy(mine.gate_slot_mask, id->gate_slot_mask,
+           sizeof(mine.gate_slot_mask));
     ds4_tp_hello_fixed theirs;
     if (!tp_write_full(tp->control_fd, &mine, sizeof(mine)) ||
         !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
@@ -2131,7 +2217,9 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         theirs.n_vocab != mine.n_vocab || theirs.quant_bits != mine.quant_bits ||
         theirs.gate_slot_start != mine.gate_slot_start ||
         theirs.gate_slot_step != mine.gate_slot_step ||
-        theirs.gates_per_token != mine.gates_per_token) {
+        theirs.gates_per_token != mine.gates_per_token ||
+        memcmp(theirs.gate_slot_mask, mine.gate_slot_mask,
+               sizeof(mine.gate_slot_mask)) != 0) {
         tp_set_err(err, errlen,
                    "tp hello: model mismatch (peer gguf=%llu id=%u layers=%u embd=%u "
                    "vocab=%u qbits=%u)",
@@ -2139,15 +2227,23 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                    theirs.n_layer, theirs.n_embd, theirs.n_vocab, theirs.quant_bits);
         return 0;
     }
+    const uint32_t n_slots = mine.n_layer * DS4_TP_GATES_PER_LAYER;
+    if (!tp_gate_schedule_validate(mine.gate_slot_mask,
+                                   mine.gates_per_token, n_slots,
+                                   err, errlen)) {
+        return 0;
+    }
     tp->peer_ctx = theirs.ctx_size;
     tp->runtime_features = mine.runtime_features;
     tp->n_layer = id->n_layer;
     tp->n_embd = id->n_embd;
     tp->vec_bytes = (uint64_t)id->n_embd * sizeof(float);
-    tp->n_slots = id->n_layer * DS4_TP_GATES_PER_LAYER;
+    tp->n_slots = n_slots;
     tp->gate_slot_start = id->gate_slot_start;
     tp->gate_slot_step = id->gate_slot_step;
     tp->gates_per_token = id->gates_per_token;
+    memcpy(tp->gate_slot_mask, id->gate_slot_mask,
+           sizeof(tp->gate_slot_mask));
     tp_slab_layout(tp);
     return tp_select_transport(tp->opt.transport, rdma_ok, theirs.rdma_ok,
                                &tp->rdma_active, err, errlen);
@@ -3039,7 +3135,8 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     ds4_engine_tp_gate_schedule(engine,
                                 &id.gate_slot_start,
                                 &id.gate_slot_step,
-                                &id.gates_per_token);
+                                &id.gates_per_token,
+                                id.gate_slot_mask);
 
     ds4_tp *tp = NULL;
     if (!ds4_tp_create(&tp, opt, &id, err, sizeof(err))) {

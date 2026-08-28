@@ -96,8 +96,10 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
     identity.runtime_features =
         DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD;
     identity.gate_slot_start = 3u * DS4_TP_GATES_PER_LAYER;
-    identity.gate_slot_step = DS4_TP_GATES_PER_LAYER;
-    identity.gates_per_token = 2u;
+    identity.gate_slot_step = 1u;
+    CHECK(ds4_glm5_next_build_tp_gate_mask(identity.gate_slot_mask,
+                                            &identity.gates_per_token),
+          "GLM5.3 hybrid TP gate schedule");
 
     char error[256] = {};
     CHECK(ds4_tp_create(&guard.tp, &options, &identity,

@@ -473,8 +473,11 @@ tests/test_glm5_next_state: tests/test_glm5_next_state.c ds4_glm5_next_runtime.c
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4_tp.c
 
-tests/test_tp_hello: tests/test_tp_hello.c tests/ds4_tp_hello_test.o ds4_tp.h ds4.h
-	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_tp_hello.c tests/ds4_tp_hello_test.o $(LDLIBS)
+tests/ds4_glm5_next_runtime_gate_test.o: ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h
+	$(CC) $(CFLAGS) -ffunction-sections -fdata-sections -c -o $@ ds4_glm5_next_runtime.c
+
+tests/test_tp_hello: tests/test_tp_hello.c tests/ds4_tp_hello_test.o tests/ds4_glm5_next_runtime_gate_test.o ds4_tp.h ds4.h
+	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -ffunction-sections -Wl,--gc-sections -I. -o $@ tests/test_tp_hello.c tests/ds4_tp_hello_test.o tests/ds4_glm5_next_runtime_gate_test.o $(LDLIBS)
 
 test-tp-hello: tests/test_tp_hello
 	./tests/test_tp_hello

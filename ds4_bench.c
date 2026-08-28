@@ -1447,7 +1447,8 @@ int main(int argc, char **argv) {
         ds4_engine_tp_gate_schedule(engine,
                                     &tp_id.gate_slot_start,
                                     &tp_id.gate_slot_step,
-                                    &tp_id.gates_per_token);
+                                    &tp_id.gates_per_token,
+                                    tp_id.gate_slot_mask);
         if (!ds4_tp_create(&tp_leader, &cfg.tp, &tp_id,
                            tp_err, sizeof(tp_err))) {
             fprintf(stderr, "ds4-bench-tp: %s\n", tp_err);

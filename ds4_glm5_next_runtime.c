@@ -1,5 +1,33 @@
 #include "ds4_glm5_next_runtime.h"
 
+#include <string.h>
+
+bool ds4_glm5_next_layer_is_mla(uint32_t layer) {
+    return layer == DS4_GLM5_NEXT_TRUNK_COUNT || (layer & 3u) == 3u;
+}
+
+int ds4_glm5_next_build_tp_gate_mask(
+        uint64_t mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS],
+        uint32_t *gate_count) {
+    if (!mask || !gate_count) return 0;
+    memset(mask, 0,
+           sizeof(uint64_t) * DS4_GLM5_NEXT_TP_GATE_MASK_WORDS);
+    uint32_t count = 0;
+    for (uint32_t il = DS4_GLM5_NEXT_LEADING_DENSE;
+         il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        if (ds4_glm5_next_layer_is_mla(il)) {
+            const uint32_t slot = il * 2u;
+            mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
+            count++;
+        }
+        const uint32_t slot = il * 2u + 1u;
+        mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
+        count++;
+    }
+    *gate_count = count;
+    return count == 53u;
+}
+
 static int kda_complete(const ds4_glm5_kda_weight_offsets *w) {
     return w->attn_norm && w->q && w->k && w->v && w->output &&
            w->q_conv && w->k_conv && w->v_conv && w->f_a && w->f_b &&
@@ -64,8 +92,7 @@ int ds4_glm5_next_model_offsets_validate(
         const bool trunk = il < model->trunk_count;
         if (layer->layer != il || layer->is_trunk != trunk ||
             !layer->attn_norm || !layer->ffn_norm) return 0;
-        const bool want_mla = il == DS4_GLM5_NEXT_TRUNK_COUNT ||
-                              (il & 3u) == 3u;
+        const bool want_mla = ds4_glm5_next_layer_is_mla(il);
         if (layer->attention != (want_mla ? DS4_GLM5_NEXT_ATTN_MLA :
                                            DS4_GLM5_NEXT_ATTN_KDA)) return 0;
         if (want_mla ? (!mla_complete(&layer->mla) || !kda_empty(&layer->kda))

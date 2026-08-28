@@ -6139,7 +6139,7 @@ static void config_validate_glm5_next_layer_types(const ds4_model *m) {
         }
 
         const uint32_t expected =
-            (il == DS4_GLM5_NEXT_TRUNK_COUNT || (il & 3u) == 3u) ? 1u : 0u;
+            ds4_glm5_next_layer_is_mla(il) ? 1u : 0u;
         if (got != expected) {
             fprintf(stderr,
                     "ds4: unexpected GLM 5.3 attention type at layer %u: "
@@ -60115,21 +60115,35 @@ int ds4_engine_model_id(ds4_engine *e) {
     return (int)DS4_MODEL_VARIANT;
 }
 
-/* Decode gate firing schedule for the TP transport (see ds4_tp_identity):
- * DS4 fires ATTN+FFN gates on every layer (identity mapping); GLM fires a
- * single FFN gate per sparse layer, skipping the leading dense blocks. */
+/* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
+ * GLM-5.3 KDA attention is rank-local, while MLA attention and every sparse
+ * FFN require an exchange. That hybrid schedule needs an explicit slot mask. */
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,
                                  uint32_t *step,
-                                 uint32_t *per_token) {
+                                 uint32_t *per_token,
+                                 uint64_t mask[DS4_TP_GATE_MASK_WORDS]) {
     (void)e;
+    memset(mask, 0, sizeof(uint64_t) * DS4_TP_GATE_MASK_WORDS);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        /* One FFN gate per sparse layer of the NORMAL pass: the leading
-         * dense blocks fire nothing and the trailing nextn/MTP block is
-         * not part of the decode pass at all. */
-        *start = DS4_N_LEADING_DENSE * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
-        *step = DS4_TP_GATES_PER_LAYER;
-        *per_token = DS4_N_LAYER - DS4_N_NEXTN_PREDICT - DS4_N_LEADING_DENSE;
+        if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
+            _Static_assert((int)DS4_TP_GATE_MASK_WORDS ==
+                           (int)DS4_GLM5_NEXT_TP_GATE_MASK_WORDS,
+                           "GLM5.3 TP mask width mismatch");
+            uint32_t count = 0;
+            if (!ds4_glm5_next_build_tp_gate_mask(mask, &count))
+                ds4_die("glm5-next TP gate schedule is invalid");
+            *start = DS4_N_LEADING_DENSE * DS4_TP_GATES_PER_LAYER;
+            *step = 1;
+            *per_token = count;
+        } else {
+            /* GLM-5.2 exchanges one FFN partial per sparse normal layer. */
+            *start = DS4_N_LEADING_DENSE * DS4_TP_GATES_PER_LAYER +
+                     DS4_TP_GATE_FFN;
+            *step = DS4_TP_GATES_PER_LAYER;
+            *per_token = DS4_N_LAYER - DS4_N_NEXTN_PREDICT -
+                         DS4_N_LEADING_DENSE;
+        }
     } else {
         *start = 0;
         *step = 1;

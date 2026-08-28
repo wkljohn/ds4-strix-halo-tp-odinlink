@@ -213,6 +213,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
  * include separately. We forward-declare it here so this header can be
  * used as-is (callers passing NULL don't need the struct definition). */
 struct ds4_gpu_config;
+enum { DS4_TP_GATE_MASK_WORDS = 3 };
 int ds4_engine_create_with_gpu_config(ds4_engine **out,
                                        const ds4_engine_options *opt,
                                        const struct ds4_gpu_config *gpu_cfg);
@@ -228,7 +229,8 @@ int ds4_engine_layer_count(ds4_engine *e);
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,
                                  uint32_t *step,
-                                 uint32_t *per_token);
+                                 uint32_t *per_token,
+                                 uint64_t mask[DS4_TP_GATE_MASK_WORDS]);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);

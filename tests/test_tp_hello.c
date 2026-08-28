@@ -1,4 +1,5 @@
 #include "ds4_tp.h"
+#include "ds4_glm5_next_runtime.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,8 +77,75 @@ static int check_connect_timeout(const char *name, const char *value,
     return 1;
 }
 
+static void build_glm53_mask(uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+                             uint32_t *count) {
+    if (!ds4_glm5_next_build_tp_gate_mask(mask, count)) *count = 0;
+}
+
+static int check_glm53_gate_schedule(void) {
+    uint64_t mask[DS4_TP_GATE_MASK_WORDS];
+    uint32_t count = 0;
+    build_glm53_mask(mask, &count);
+    char err[160] = "";
+    if (count != 53u ||
+        !ds4_tp_test_gate_schedule_validate(mask, count, 92u,
+                                            err, sizeof(err))) {
+        fprintf(stderr, "FAIL GLM53 gate mask: count=%u error='%s'\n",
+                count, err);
+        return 0;
+    }
+    static const uint32_t want[] = {6u, 7u, 9u, 11u, 13u, 14u, 15u};
+    for (uint32_t i = 0; i < sizeof(want) / sizeof(want[0]); ++i) {
+        const uint32_t got = ds4_tp_test_gate_slot(
+            mask, 6u, 1u, count, 92u, (uint64_t)i + 1u);
+        if (got != want[i]) {
+            fprintf(stderr,
+                    "FAIL GLM53 gate order seq=%u got=%u want=%u\n",
+                    i + 1u, got, want[i]);
+            return 0;
+        }
+    }
+    const uint32_t wrap = ds4_tp_test_gate_slot(
+        mask, 6u, 1u, count, 92u, (uint64_t)count + 1u);
+    if (wrap != 6u) {
+        fprintf(stderr, "FAIL GLM53 gate wrap got=%u want=6\n", wrap);
+        return 0;
+    }
+    fprintf(stderr, "PASS GLM53 53-gate hybrid schedule\n");
+    return 1;
+}
+
+static int check_invalid_gate_schedules(void) {
+    uint64_t mask[DS4_TP_GATE_MASK_WORDS];
+    uint32_t count = 0;
+    build_glm53_mask(mask, &count);
+    char err[160] = "";
+    int ok = !ds4_tp_test_gate_schedule_validate(mask, count - 1u, 92u,
+                                                  err, sizeof(err));
+    if (!ok || strstr(err, "53 bits, 52 gates, 92 slots") == NULL) {
+        fprintf(stderr, "FAIL gate mask count refusal: '%s'\n", err);
+        return 0;
+    }
+    if (ds4_tp_test_gate_slot(mask, 6u, 1u, 0u, 92u, 1u) != 92u) {
+        fprintf(stderr, "FAIL zero-count masked gate did not fail closed\n");
+        return 0;
+    }
+    mask[1] |= UINT64_C(1) << 40u; /* slot 104, beyond the 92-slot slab */
+    err[0] = '\0';
+    ok = !ds4_tp_test_gate_schedule_validate(mask, count + 1u, 92u,
+                                              err, sizeof(err));
+    if (!ok || strstr(err, "54 bits, 54 gates, 92 slots") == NULL) {
+        fprintf(stderr, "FAIL out-of-range gate mask refusal: '%s'\n", err);
+        return 0;
+    }
+    fprintf(stderr, "PASS malformed gate schedules fail closed\n");
+    return 1;
+}
+
 int main(void) {
     int ok = 1;
+    ok &= check_glm53_gate_schedule();
+    ok &= check_invalid_gate_schedules();
     ok &= check("hello equal-enabled",
                 DS4_TP_FEATURE_Q4K_WMMA, DS4_TP_FEATURE_Q4K_WMMA, 1, NULL);
     ok &= check("hello equal-disabled", 0, 0, 1, NULL);

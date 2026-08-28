@@ -172,7 +172,8 @@ int main(void) {
         ds4_engine_tp_gate_schedule(engine,
                                     &identity.gate_slot_start,
                                     &identity.gate_slot_step,
-                                    &identity.gates_per_token);
+                                    &identity.gates_per_token,
+                                    identity.gate_slot_mask);
         if (!ds4_tp_create(&tp, &opt.tp, &identity,
                            tp_err, sizeof(tp_err)) ||
             !ds4_engine_tp_bind(engine, tp, tp_err, sizeof(tp_err))) {

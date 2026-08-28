@@ -142,14 +142,17 @@ typedef struct {
     uint32_t ctx_size;
     uint32_t runtime_features;
     /* Decode gate schedule, used to place RDMA recvs into the right slab
-     * slot: slot(seq) = start + ((seq-1) % per_token) * step.
+     * slot. A non-empty mask lists the slots in sequence order. Otherwise
+     * slot(seq) = start + ((seq-1) % per_token) * step.
      * per_token 0 falls back to the identity mapping over all slots
-     * (DS4: every layer fires ATTN then FFN). GLM fires one FFN gate per
-     * sparse layer only, so its schedule skips the dense prefix and the
-     * ATTN slots. Exchanged in the hello; both sides must agree. */
+     * (DS4: every layer fires ATTN then FFN). GLM-5.2 uses the arithmetic
+     * schedule for sparse FFN gates; GLM-5.3 uses the mask because MLA
+     * layers also exchange attention. Exchanged in the hello; both sides
+     * must agree. */
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
+    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_identity;
 
 /* DS4-TP-gfx1151 (patch 21): device-copy hook for big-gate staging.
@@ -232,6 +235,14 @@ int ds4_tp_test_select_transport(ds4_tp_transport requested,
                                  int *rdma_active,
                                  char *err,
                                  size_t errlen);
+int ds4_tp_test_gate_schedule_validate(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+        uint32_t gates_per_token, uint32_t n_slots,
+        char *err, size_t errlen);
+uint32_t ds4_tp_test_gate_slot(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+        uint32_t start, uint32_t step, uint32_t per_token,
+        uint32_t n_slots, uint64_t seq);
 uint32_t ds4_tp_test_rdma_provider_decode_max_msg(const char *device_name);
 uint32_t ds4_tp_test_rdma_negotiate_decode_max_msg(uint32_t local,
                                                    uint32_t peer);

@@ -51,6 +51,16 @@ static void make_valid(ds4_glm5_next_model_offsets *model) {
 }
 
 static int test_contract(void) {
+    uint64_t gate_mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS] = {0};
+    uint32_t gate_count = 0;
+    CHECK(ds4_glm5_next_build_tp_gate_mask(gate_mask, &gate_count) &&
+          gate_count == 53u,
+          "shared GLM5.3 53-gate TP schedule");
+    CHECK((gate_mask[0] & (UINT64_C(1) << 6u)) != 0u &&
+          (gate_mask[0] & (UINT64_C(1) << 7u)) != 0u &&
+          (gate_mask[0] & (UINT64_C(1) << 8u)) == 0u &&
+          (gate_mask[1] & (UINT64_C(1) << (89u - 64u))) != 0u,
+          "GLM5.3 TP mask covers MLA+FFN and final trunk FFN");
     ds4_glm5_next_model_offsets model;
     make_valid(&model);
     CHECK(ds4_glm5_next_model_offsets_validate(&model),
