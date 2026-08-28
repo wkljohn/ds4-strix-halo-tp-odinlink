@@ -14,6 +14,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,7 @@ extern "C" int ds4_gpu_q8k_quantize_research_control(
 namespace {
 
 constexpr uint32_t kInput = 4096;
+constexpr uint32_t kHc = 4;
 constexpr uint32_t kFullMid = 2048;
 constexpr uint32_t kHalfMid = 1024;
 constexpr uint32_t kOutput = 4096;
@@ -101,6 +103,17 @@ struct TpGuard {
     }
 };
 
+struct WindowCacheGuard {
+    ds4_gpu_q4k_window_cache *cache = nullptr;
+    ~WindowCacheGuard() { reset(); }
+    void reset() {
+        if (cache) {
+            ds4_gpu_q4k_window_cache_destroy(cache);
+            cache = nullptr;
+        }
+    }
+};
+
 struct DeviceWeights {
     void *gate_full = nullptr;
     void *up_full = nullptr;
@@ -162,6 +175,17 @@ struct RouterTensors {
     }
 };
 
+struct SharedTensors {
+    ds4_gpu_tensor input = {}, gate = {}, up = {}, mid = {}, output = {};
+    ~SharedTensors() {
+        ds4_gpu_tensor_free_in_place(&output);
+        ds4_gpu_tensor_free_in_place(&mid);
+        ds4_gpu_tensor_free_in_place(&up);
+        ds4_gpu_tensor_free_in_place(&gate);
+        ds4_gpu_tensor_free_in_place(&input);
+    }
+};
+
 bool alloc_tensor(ds4_gpu_tensor &tensor, uint64_t bytes) {
     std::memset(&tensor, 0, sizeof(tensor));
     return ds4_gpu_tensor_alloc_on(&tensor, 0, bytes) == 0;
@@ -180,6 +204,30 @@ uint64_t fnv1a64(const void *data, uint64_t bytes) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+bool read_exact_f32(const char *path, size_t count, std::vector<float> &out) {
+    if (!path || !path[0]) return false;
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) return false;
+    const std::streamoff size = input.tellg();
+    if (size < 0 || (uint64_t)size != (uint64_t)count * sizeof(float))
+        return false;
+    input.seekg(0);
+    out.resize(count);
+    return (bool)input.read((char *)out.data(), size);
+}
+
+bool read_exact_i32(const char *path, size_t count, std::vector<int32_t> &out) {
+    if (!path || !path[0]) return false;
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) return false;
+    const std::streamoff size = input.tellg();
+    if (size < 0 || (uint64_t)size != (uint64_t)count * sizeof(int32_t))
+        return false;
+    input.seekg(0);
+    out.resize(count);
+    return (bool)input.read((char *)out.data(), size);
 }
 
 float half_round(float value) {
@@ -606,6 +654,115 @@ bool launch(ds4_gpu_tensor &out, ds4_gpu_tensor &gate,
     return hipGetLastError() == hipSuccess;
 }
 
+bool run_shared_half(const Glm5TestGGUF &gguf, uint64_t gate_offset,
+                     uint64_t up_offset, uint64_t down_offset,
+                     const std::vector<float> &input, uint32_t half,
+                     std::vector<float> &output) {
+    CHECK(input.size() == kInput && half < 2u,
+          "shared half input geometry");
+    constexpr uint64_t q8_block_bytes = 34u;
+    constexpr uint64_t q8_qk = 32u;
+    const uint64_t gate_row_bytes = (kInput / q8_qk) * q8_block_bytes;
+    const uint64_t row_offset = (uint64_t)half * kHalfMid * gate_row_bytes;
+    SharedTensors tensors;
+    CHECK(upload(tensors.input, input.data(),
+                 (uint64_t)input.size() * sizeof(float)) &&
+          alloc_tensor(tensors.gate,
+                       (uint64_t)kHalfMid * sizeof(float)) &&
+          alloc_tensor(tensors.up,
+                       (uint64_t)kHalfMid * sizeof(float)) &&
+          alloc_tensor(tensors.mid,
+                       (uint64_t)kHalfMid * sizeof(float)) &&
+          alloc_tensor(tensors.output,
+                       (uint64_t)kOutput * sizeof(float)),
+          "allocate shared-expert half tensors");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(
+              &tensors.gate, gguf.map, gguf.size, gate_offset + row_offset,
+              kInput, kHalfMid, &tensors.input, 1u) &&
+          ds4_gpu_matmul_q8_0_tensor(
+              &tensors.up, gguf.map, gguf.size, up_offset + row_offset,
+              kInput, kHalfMid, &tensors.input, 1u) &&
+          ds4_gpu_swiglu_tensor(&tensors.mid, &tensors.gate, &tensors.up,
+                                kHalfMid, kClamp, 1.0f) &&
+          ds4_gpu_matmul_q8_0_kslice_tensor(
+              &tensors.output, gguf.map, gguf.size, down_offset, kFullMid,
+              (uint64_t)half * kHalfMid, kHalfMid, kOutput, &tensors.mid,
+              0u) &&
+          ds4_gpu_synchronize(),
+          "execute shared-expert rank half");
+    output.resize(kOutput);
+    CHECK(ds4_gpu_tensor_read(&tensors.output, 0u, output.data(),
+                              (uint64_t)kOutput * sizeof(float)),
+          "read shared-expert rank half");
+    return true;
+}
+
+bool run_hc_block_carry(const std::vector<float> &residual,
+                        const std::vector<float> &split,
+                        const std::vector<float> &branch,
+                        std::vector<float> &carried) {
+    CHECK(residual.size() == (size_t)kHc * kInput && split.size() == 24u &&
+          branch.size() == kOutput,
+          "FFN final mHC carry geometry");
+    ds4_gpu_tensor residual_t = {}, split_t = {}, branch_t = {}, carried_t = {};
+    const auto release = [&]() {
+        ds4_gpu_tensor_free_in_place(&carried_t);
+        ds4_gpu_tensor_free_in_place(&branch_t);
+        ds4_gpu_tensor_free_in_place(&split_t);
+        ds4_gpu_tensor_free_in_place(&residual_t);
+    };
+    bool ok = upload(residual_t, residual.data(),
+                     (uint64_t)residual.size() * sizeof(float)) &&
+              upload(split_t, split.data(),
+                     (uint64_t)split.size() * sizeof(float)) &&
+              upload(branch_t, branch.data(),
+                     (uint64_t)branch.size() * sizeof(float)) &&
+              alloc_tensor(carried_t,
+                           (uint64_t)residual.size() * sizeof(float));
+    if (ok) {
+        ok = ds4_gpu_hc_expand_split_tensor(
+                 &carried_t, &branch_t, &residual_t, &split_t,
+                 kInput, kHc) &&
+             ds4_gpu_synchronize();
+    }
+    if (ok) {
+        carried.resize(residual.size());
+        ok = ds4_gpu_tensor_read(
+            &carried_t, 0u, carried.data(),
+            (uint64_t)carried.size() * sizeof(float));
+    }
+    release();
+    CHECK(ok, "execute/read final FFN mHC carry");
+    return true;
+}
+
+bool run_add2(const std::vector<float> &a, const std::vector<float> &b,
+              std::vector<float> &sum) {
+    CHECK(a.size() == kOutput && b.size() == kOutput,
+          "FFN two-vector sum geometry");
+    ds4_gpu_tensor at = {}, bt = {}, out = {};
+    const auto release = [&]() {
+        ds4_gpu_tensor_free_in_place(&out);
+        ds4_gpu_tensor_free_in_place(&bt);
+        ds4_gpu_tensor_free_in_place(&at);
+    };
+    bool ok = upload(at, a.data(), (uint64_t)a.size() * sizeof(float)) &&
+              upload(bt, b.data(), (uint64_t)b.size() * sizeof(float)) &&
+              alloc_tensor(out, (uint64_t)kOutput * sizeof(float));
+    if (ok) {
+        ok = ds4_gpu_add_tensor(&out, &at, &bt, kOutput) &&
+             ds4_gpu_synchronize();
+    }
+    if (ok) {
+        sum.resize(kOutput);
+        ok = ds4_gpu_tensor_read(&out, 0u, sum.data(),
+                                 (uint64_t)kOutput * sizeof(float));
+    }
+    release();
+    CHECK(ok, "execute/read FFN two-vector sum");
+    return true;
+}
+
 bool run_roce_composition(const Glm5TestGGUF &gguf,
                           const std::vector<float> &reference,
                           const std::vector<float> &half0,
@@ -613,7 +770,8 @@ bool run_roce_composition(const Glm5TestGGUF &gguf,
                           uint64_t route_contract_hash,
                           bool exclusive_rank_local = false,
                           uint64_t expected_composed_fnv = 0,
-                          uint32_t token_count = kTokens) {
+                          uint32_t token_count = kTokens,
+                          std::vector<float> *composed_output = nullptr) {
     const char *role_value = std::getenv("DS4_GLM5_TP_ROLE");
     if (!role_value) return true;
     CHECK(std::strcmp(role_value, "leader") == 0 ||
@@ -735,6 +893,7 @@ bool run_roce_composition(const Glm5TestGGUF &gguf,
     }
     const uint64_t composed_fnv =
         fnv1a64(composed.data(), bytes);
+    if (composed_output) *composed_output = composed;
     CHECK(ds4_tp_hash_check(transport.tp, UINT64_C(0x474c4d5200000002),
                             composed_fnv,
                             error, sizeof(error)) == 1,
@@ -780,12 +939,20 @@ bool run_test() {
     CHECK(gguf.open_file(model), "open GLM5 GGUF file");
 
     uint64_t gate_offset = 0, up_offset = 0, down_offset = 0;
+    uint64_t shared_gate_offset = 0, shared_up_offset = 0;
+    uint64_t shared_down_offset = 0;
     CHECK(gguf.tensor("blk.3.ffn_gate_exps.weight",
                       {kInput, kFullMid, kTotalExperts}, 12u, gate_offset) &&
           gguf.tensor("blk.3.ffn_up_exps.weight",
                       {kInput, kFullMid, kTotalExperts}, 12u, up_offset) &&
           gguf.tensor("blk.3.ffn_down_exps.weight",
-                      {kFullMid, kOutput, kTotalExperts}, 12u, down_offset),
+                      {kFullMid, kOutput, kTotalExperts}, 12u, down_offset) &&
+          gguf.tensor("blk.3.ffn_gate_shexp.weight",
+                      {kInput, kFullMid}, 8u, shared_gate_offset) &&
+          gguf.tensor("blk.3.ffn_up_shexp.weight",
+                      {kInput, kFullMid}, 8u, shared_up_offset) &&
+          gguf.tensor("blk.3.ffn_down_shexp.weight",
+                      {kFullMid, kOutput}, 8u, shared_down_offset),
           "bind same-GGUF layer-3 routed Q4_K tensors");
 
     const uint64_t gate_row_bytes = (kInput / kQk) * kQ4Block;
@@ -830,9 +997,55 @@ bool run_test() {
     std::vector<float> route_weights((size_t)kTokens * kUsed);
     std::vector<uint32_t> real_route_ids((size_t)kTokens * kUsed);
     std::vector<float> input((size_t)kTokens * kInput);
+    const char *ffn_input_path = std::getenv("DS4_GLM5_FFN_INPUT_F32");
+    const char *ffn_split_path = std::getenv("DS4_GLM5_FFN_SPLIT_F32");
+    const char *ffn_residual_path =
+        std::getenv("DS4_GLM5_FFN_RESIDUAL_F32");
+    const char *ffn_router_ids_path =
+        std::getenv("DS4_GLM5_FFN_ROUTER_IDS_I32");
+    const char *ffn_router_weights_path =
+        std::getenv("DS4_GLM5_FFN_ROUTER_WEIGHTS_F32");
+    const char *ffn_shared_output_path =
+        std::getenv("DS4_GLM5_FFN_SHARED_OUTPUT_F32");
+    const bool real_ffn_input = ffn_input_path != nullptr;
+    CHECK((ffn_input_path == nullptr) == (ffn_split_path == nullptr) &&
+          (ffn_input_path == nullptr) == (ffn_residual_path == nullptr) &&
+          (ffn_input_path == nullptr) == (ffn_router_ids_path == nullptr) &&
+          (ffn_input_path == nullptr) ==
+              (ffn_router_weights_path == nullptr) &&
+          (ffn_input_path == nullptr) ==
+              (ffn_shared_output_path == nullptr),
+          "real FFN input, mHC split, and router oracle travel together");
+    std::vector<float> ffn_input, ffn_split, ffn_residual;
+    std::vector<int32_t> ffn_router_ids;
+    std::vector<float> ffn_router_weights;
+    std::vector<float> ffn_shared_output;
+    uint64_t ffn_split_hash = 0u;
+    if (real_ffn_input) {
+        CHECK(router_dynamic,
+              "real FFN input requires production dynamic router mode");
+        CHECK(read_exact_f32(ffn_input_path, kInput, ffn_input) &&
+              read_exact_f32(ffn_split_path, 24u, ffn_split) &&
+              read_exact_f32(ffn_residual_path, (size_t)kHc * kInput,
+                             ffn_residual) &&
+              read_exact_i32(ffn_router_ids_path, kUsed, ffn_router_ids) &&
+              read_exact_f32(ffn_router_weights_path, kUsed,
+                             ffn_router_weights) &&
+              read_exact_f32(ffn_shared_output_path, kOutput,
+                             ffn_shared_output),
+              "read block-3 FFN state and independent router oracle");
+        ffn_split_hash = fnv1a64(ffn_split.data(),
+                                 ffn_split.size() * sizeof(float));
+    }
     for (uint32_t token = 0; token < kTokens; ++token) {
         for (uint32_t i = 0; i < kInput; ++i) {
-            if (router_mode) {
+            if (real_ffn_input) {
+                // The bounded decode gate needs one real route. Replicating
+                // it across the batch keeps the existing hot-expert window
+                // and scalar arithmetic controls while token zero remains the
+                // exact attention-carried block-3 FFN state.
+                input[(size_t)token * kInput + i] = ffn_input[i];
+            } else if (router_mode) {
                 input[(size_t)token * kInput + i] =
                     glm5_test_router_input(token, i, jitter_seed);
             } else {
@@ -971,6 +1184,23 @@ bool run_test() {
               "production GPU and independent CPU router IDs agree");
         CHECK(gpu_router_weight_oracle.pass(),
               "production GPU router weights satisfy independent oracle");
+        if (real_ffn_input) {
+            OracleStats python_weight_oracle;
+            for (uint32_t slot = 0; slot < kUsed; ++slot) {
+                CHECK(gpu_route_ids[slot] == ffn_router_ids[slot],
+                      "GPU route IDs match independent Python oracle");
+                python_weight_oracle.add(
+                    gpu_route_weights[slot], ffn_router_weights[slot],
+                    2.0e-6, 2.0e-5);
+            }
+            CHECK(python_weight_oracle.pass(),
+                  "GPU route weights match independent Python oracle");
+            std::fprintf(stderr,
+                "GLM5 real-state Python router oracle ids_exact=1 "
+                "weights_bad=%llu max_abs=%.9g\n",
+                (unsigned long long)python_weight_oracle.bad,
+                python_weight_oracle.max_abs);
+        }
 
         expert_ids.clear();
         for (uint32_t token = 0; token < kTokens; ++token) {
@@ -1061,9 +1291,15 @@ bool run_test() {
             std::strcmp(role, "leader") == 0 ? 0u : 1u;
         const char *expected_value =
             std::getenv("DS4_GLM5_TP_EXPECT_COMPOSED_FNV");
+        const char *expected_block_value =
+            std::getenv("DS4_GLM5_TP_EXPECT_BLOCK_FNV");
         uint64_t expected_composed = 0;
+        uint64_t expected_block = 0;
         CHECK(parse_fnv64(expected_value, expected_composed),
               "exclusive rank-local mode requires a 16-digit control FNV");
+        CHECK(!real_ffn_input ||
+                  parse_fnv64(expected_block_value, expected_block),
+              "real FFN mode requires a 16-digit final block FNV");
 
         if (window_value) {
             CHECK(ds4_gpu_set_model_map(gguf.map, gguf.size) &&
@@ -1076,9 +1312,10 @@ bool run_test() {
                   "window declaration creates no packed table residency");
             ds4_gpu_q4k_window_cache_config cache_cfg = window_cache_config(
                 gguf, gate_offset, up_offset, down_offset, local_half);
-            ds4_gpu_q4k_window_cache *cache =
-                ds4_gpu_q4k_window_cache_create(&cache_cfg);
-            CHECK(cache, "create bounded local rank-half window cache");
+            WindowCacheGuard cache_guard;
+            cache_guard.cache = ds4_gpu_q4k_window_cache_create(&cache_cfg);
+            CHECK(cache_guard.cache,
+                  "create bounded local rank-half window cache");
 
             std::vector<int32_t> token_ids(kUsed);
             std::vector<float> token_weights(kUsed);
@@ -1086,6 +1323,13 @@ bool run_test() {
                 token_ids[slot] = (int32_t)real_route_ids[slot];
                 token_weights[slot] = route_weights[slot];
             }
+            const uint64_t routed_ids_fnv = fnv1a64(
+                token_ids.data(), token_ids.size() * sizeof(int32_t));
+            const uint64_t route_weights_fnv = fnv1a64(
+                token_weights.data(), token_weights.size() * sizeof(float));
+            const uint64_t route_contract_hash = routed_ids_fnv ^
+                ((route_weights_fnv << 1u) | (route_weights_fnv >> 63u)) ^
+                ((ffn_split_hash << 7u) | (ffn_split_hash >> 57u));
             ComponentTensors tensors;
             const uint64_t pair_count = kUsed;
             const uint64_t mid_bytes = pair_count * kHalfMid * sizeof(float);
@@ -1105,7 +1349,7 @@ bool run_test() {
                   "allocate one-token cache-backed MoE tensors");
             CHECK(ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
                       &tensors.out_full, &tensors.gate, &tensors.up,
-                      &tensors.mid, &tensors.down, cache,
+                      &tensors.mid, &tensors.down, cache_guard.cache,
                       &tensors.selected, &tensors.weights, kUsed, kClamp,
                       &tensors.input, nullptr, 3u) &&
                   ds4_gpu_synchronize(),
@@ -1114,8 +1358,19 @@ bool run_test() {
             CHECK(ds4_gpu_tensor_read(&tensors.out_full, 0u,
                                       local_output.data(), out_bytes),
                   "read one-token cache-backed rank output");
+            std::vector<float> shared_local, local_combined;
+            CHECK(!real_ffn_input ||
+                      (run_shared_half(
+                           gguf, shared_gate_offset, shared_up_offset,
+                           shared_down_offset, ffn_input, local_half,
+                           shared_local) &&
+                       run_add2(local_output, shared_local,
+                                local_combined)),
+                  "fold rank-local shared expert into routed output");
+            const std::vector<float> &exchange_output =
+                real_ffn_input ? local_combined : local_output;
             ds4_gpu_q4k_window_cache_stats stats = {};
-            CHECK(ds4_gpu_q4k_window_cache_get_stats(cache, &stats) &&
+            CHECK(ds4_gpu_q4k_window_cache_get_stats(cache_guard.cache, &stats) &&
                   stats.slot_count == kUsed &&
                   stats.resident_count == kUsed &&
                   stats.prepares == 1u && stats.hits == 0u &&
@@ -1124,28 +1379,41 @@ bool run_test() {
                   stats.capacity_bytes == 56623104u &&
                   ds4_gpu_q4k_packed_slice_bytes() == 0u,
                   "bounded cache accounting and zero full-table residency");
-            const uint64_t routed_ids_fnv = fnv1a64(
-                token_ids.data(), token_ids.size() * sizeof(int32_t));
-            const uint64_t route_weights_fnv = fnv1a64(
-                token_weights.data(), token_weights.size() * sizeof(float));
-            const uint64_t route_contract_hash = routed_ids_fnv ^
-                ((route_weights_fnv << 1u) | (route_weights_fnv >> 63u));
             const std::vector<float> empty;
+            std::vector<float> roce_composed;
             CHECK(run_roce_composition(
-                      gguf, empty, local_output, empty, route_contract_hash,
-                      true, expected_composed, 1u),
+                      gguf, empty, exchange_output, empty,
+                      route_contract_hash, true, expected_composed, 1u,
+                      &roce_composed),
                   "cache-backed one-token RoCE composition");
+            uint64_t block_fnv = 0u;
+            if (real_ffn_input) {
+                std::vector<float> carried;
+                CHECK(run_hc_block_carry(ffn_residual, ffn_split,
+                                         roce_composed, carried),
+                      "carry combined RoCE FFN output through final mHC");
+                block_fnv = fnv1a64(
+                    carried.data(),
+                    (uint64_t)carried.size() * sizeof(float));
+                CHECK(block_fnv == expected_block,
+                      "RoCE-composed final block matches local control");
+            }
             std::fprintf(stderr,
                 "PASS same-GGUF GLM5 Q4_K window_cache=1 "
                 "exclusive_rank_local=1 role=%s local_half=%u tokens=1 "
                 "cache_bytes=%llu fills=%llu evictions=%llu "
-                "packed_table_bytes=%llu tp_roce=1\n",
+                "packed_table_bytes=%llu shared_fold=%d "
+                "block_carried_fnv=%016llx tp_roce=1\n",
                 role, local_half,
                 (unsigned long long)stats.capacity_bytes,
                 (unsigned long long)stats.fills,
                 (unsigned long long)stats.evictions,
-                (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
-            ds4_gpu_q4k_window_cache_destroy(cache);
+                (unsigned long long)ds4_gpu_q4k_packed_slice_bytes(),
+                real_ffn_input,
+                (unsigned long long)block_fnv);
+            cache_guard.reset();
+            CHECK(ds4_gpu_q4k_packed_slice_bytes() == 0u,
+                  "window destroy releases every packed slice byte");
             return true;
         }
 
@@ -1165,8 +1433,9 @@ bool run_test() {
             hot_experts += count >= kWmmaMinCount;
             cold_experts += count != 0 && count < kWmmaMinCount;
         }
-        CHECK(distinct_route_sets == kTokens && expert_ids.size() > kUsed &&
-              hot_experts != 0 && cold_experts != 0,
+        CHECK((real_ffn_input ||
+               (distinct_route_sets == kTokens && expert_ids.size() > kUsed &&
+                hot_experts != 0 && cold_experts != 0)),
               "exclusive rank-local route diversity and hot/cold coverage");
 
         std::vector<uint8_t> local_gate, local_up, local_down;
@@ -1239,7 +1508,8 @@ bool run_test() {
             route_weights.data(), route_weights.size() * sizeof(float));
         const uint64_t route_contract_hash =
             routed_ids_fnv ^
-            ((route_weights_fnv << 1u) | (route_weights_fnv >> 63u));
+            ((route_weights_fnv << 1u) | (route_weights_fnv >> 63u)) ^
+            ((ffn_split_hash << 7u) | (ffn_split_hash >> 57u));
         const std::vector<float> empty;
         CHECK(run_roce_composition(
                   gguf, empty, local_output, empty, route_contract_hash,
@@ -1408,13 +1678,7 @@ bool run_test() {
     // is not equivalent because expert hot/cold dispatch counts are batch
     // scoped. This direct-table composition is the independent oracle for the
     // bounded cache-backed RoCE decode gate.
-    CHECK(launch(out_full, gate, up, mid, down,
-                 device.gate_full, device.up_full, device.down_full,
-                 full_gate_expert, gate_row_bytes,
-                 full_down_expert, full_down_row,
-                 selected_gpu, weights_gpu, input_gpu,
-                 compact_expert_count, kFullMid, 1u) &&
-          launch(out_half0, gate, up, mid, down,
+    CHECK(launch(out_half0, gate, up, mid, down,
                  device.gate_half[0], device.up_half[0], device.down_half[0],
                  half_gate_expert, gate_row_bytes,
                  half_down_expert, half_down_row,
@@ -1426,16 +1690,37 @@ bool run_test() {
                  half_down_expert, half_down_row,
                  selected_gpu, weights_gpu, input_gpu,
                  compact_expert_count, kHalfMid, 1u) &&
+          launch(out_full, gate, up, mid, down,
+                 device.gate_full, device.up_full, device.down_full,
+                 full_gate_expert, gate_row_bytes,
+                 full_down_expert, full_down_row,
+                 selected_gpu, weights_gpu, input_gpu,
+                 compact_expert_count, kFullMid, 1u) &&
           ds4_gpu_add_tensor(&out_sum, &out_half0, &out_half1, kOutput) &&
           ds4_gpu_synchronize(),
           "execute independent one-token direct-table shard oracle");
     std::vector<float> one_token_full(kOutput);
     std::vector<float> one_token_candidate(kOutput);
+    std::vector<float> one_token_half0(kOutput), one_token_half1(kOutput);
+    std::vector<float> one_token_mid((size_t)kUsed * kFullMid);
+    std::vector<Q8KBlock> one_token_mid_q8(
+        (size_t)kUsed * (kFullMid / kQk));
     CHECK(ds4_gpu_tensor_read(&out_full, 0, one_token_full.data(),
                               (uint64_t)kOutput * sizeof(float)) &&
           ds4_gpu_tensor_read(&out_sum, 0, one_token_candidate.data(),
-                              (uint64_t)kOutput * sizeof(float)),
+                              (uint64_t)kOutput * sizeof(float)) &&
+          ds4_gpu_tensor_read(&out_half0, 0, one_token_half0.data(),
+                              (uint64_t)kOutput * sizeof(float)) &&
+          ds4_gpu_tensor_read(&out_half1, 0, one_token_half1.data(),
+                              (uint64_t)kOutput * sizeof(float)) &&
+          ds4_gpu_tensor_read(&mid, 0, one_token_mid.data(),
+                              (uint64_t)one_token_mid.size() * sizeof(float)) &&
+          ds4_gpu_tensor_read(
+              &gate, 0, one_token_mid_q8.data(),
+              (uint64_t)one_token_mid_q8.size() * sizeof(Q8KBlock)),
           "read full and split one-token direct-table oracles");
+    CHECK(valid_q8k_capture(one_token_mid_q8),
+          "one-token intermediate Q8_K scratch invariants");
     OracleStats one_token_composition;
     long double one_token_error_sq = 0.0L;
     long double one_token_reference_sq = 0.0L;
@@ -1475,6 +1760,128 @@ bool run_test() {
           one_token_scaled_rel <= 3.0e-7 &&
           one_token_nmse <= 1.0e-11,
           "one-token 1024+1024 shards match full-2048 direct-table oracle");
+    if (real_ffn_input) {
+        constexpr uint32_t mid_rows[] =
+            {0u, 1u, 255u, 511u, 1023u, 1024u, 1535u, 2047u};
+        constexpr uint32_t out_rows[] =
+            {0u, 1u, 127u, 1023u, 2047u, 3071u, 4095u};
+        const Q8KBlock *token_q8 = production_input_q8.data();
+        OracleStats cold_mid_oracle, cold_out_oracle;
+        for (uint32_t slot = 0; slot < kUsed; ++slot) {
+            const uint32_t compact = (uint32_t)selected[slot];
+            const uint32_t real_expert = expert_ids[compact];
+            for (uint32_t row : mid_rows) {
+                const auto *gate_row = reinterpret_cast<const Q4KBlock *>(
+                    gguf.map + gate_offset +
+                    (uint64_t)real_expert * full_gate_expert +
+                    (uint64_t)row * gate_row_bytes);
+                const auto *up_row = reinterpret_cast<const Q4KBlock *>(
+                    gguf.map + up_offset +
+                    (uint64_t)real_expert * full_gate_expert +
+                    (uint64_t)row * gate_row_bytes);
+                float gate_ref = q4k_q8k_cold_reference(
+                    gate_row, token_q8, kInput / kQk);
+                float up_ref = q4k_q8k_cold_reference(
+                    up_row, token_q8, kInput / kQk);
+                gate_ref = std::min(gate_ref, kClamp);
+                up_ref = std::max(-kClamp, std::min(up_ref, kClamp));
+                const float expected =
+                    (gate_ref / (1.0f + std::exp(-gate_ref))) * up_ref *
+                    route_weights[slot];
+                cold_mid_oracle.add(
+                    one_token_mid[(size_t)slot * kFullMid + row], expected,
+                    2.0e-6, 2.0e-5);
+            }
+        }
+        for (uint32_t row : out_rows) {
+            float expected = 0.0f;
+            for (uint32_t slot = 0; slot < kUsed; ++slot) {
+                const uint32_t compact = (uint32_t)selected[slot];
+                const uint32_t real_expert = expert_ids[compact];
+                const auto *down_row = reinterpret_cast<const Q4KBlock *>(
+                    gguf.map + down_offset +
+                    (uint64_t)real_expert * full_down_expert +
+                    (uint64_t)row * full_down_row);
+                expected += q4k_q81_reference(
+                    down_row,
+                    one_token_mid_q8.data() +
+                        (size_t)slot * (kFullMid / kQk),
+                    kFullMid / kQk);
+            }
+            // The one-token down leg uses a different integer-WMMA reduction
+            // order than this scalar reconstruction. Its deliberately wider
+            // envelope is a real-magnitude expert/row/sign/layout guard, not
+            // a close-parity claim. Tight down arithmetic parity remains in
+            // the diverse synthetic control below (1e-6 / 1e-5).
+            cold_out_oracle.add(one_token_full[row], expected,
+                                5.0e-4, 2.0e-3);
+        }
+        std::fprintf(stderr,
+            "GLM5 real-state one-token cold scalar oracle mid=%llu "
+            "mid_bad=%llu mid_max_abs=%.9g output=%llu output_bad=%llu "
+            "output_max_abs=%.9g output_max_rel=%.9g "
+            "output_gate_ratio=%.9g output_max_expected=%.9g\n",
+            (unsigned long long)cold_mid_oracle.count,
+            (unsigned long long)cold_mid_oracle.bad,
+            cold_mid_oracle.max_abs,
+            (unsigned long long)cold_out_oracle.count,
+            (unsigned long long)cold_out_oracle.bad,
+            cold_out_oracle.max_abs, cold_out_oracle.max_rel,
+            cold_out_oracle.max_gate_ratio,
+            cold_out_oracle.max_abs_expected);
+        CHECK(cold_mid_oracle.pass(),
+              "real-state one-token cold Q4_K scalar mid parity");
+        CHECK(cold_out_oracle.pass(),
+              "real-state one-token down layout/sign envelope");
+    }
+    uint64_t token0_ffn_combined_fnv = 0u;
+    uint64_t token0_block_fnv = 0u;
+    if (real_ffn_input) {
+        std::vector<float> shared_half0, shared_half1, shared_sum;
+        std::vector<float> partial0, partial1, combined, carried;
+        CHECK(run_shared_half(gguf, shared_gate_offset, shared_up_offset,
+                              shared_down_offset, ffn_input, 0u,
+                              shared_half0) &&
+              run_shared_half(gguf, shared_gate_offset, shared_up_offset,
+                              shared_down_offset, ffn_input, 1u,
+                              shared_half1) &&
+              run_add2(shared_half0, shared_half1, shared_sum) &&
+              run_add2(one_token_half0, shared_half0, partial0) &&
+              run_add2(one_token_half1, shared_half1, partial1) &&
+              run_add2(partial0, partial1, combined) &&
+              run_hc_block_carry(ffn_residual, ffn_split, combined, carried),
+              "compose real shared+routed FFN and final mHC carry");
+        OracleStats shared_python_oracle;
+        for (uint32_t row = 0; row < kOutput; ++row) {
+            shared_python_oracle.add(shared_sum[row], ffn_shared_output[row],
+                                     2.0e-5, 2.0e-5);
+        }
+        CHECK(shared_python_oracle.pass(),
+              "shared rank halves match independent Python full output");
+        token0_ffn_combined_fnv = fnv1a64(
+            combined.data(), (uint64_t)combined.size() * sizeof(float));
+        token0_block_fnv = fnv1a64(
+            carried.data(), (uint64_t)carried.size() * sizeof(float));
+        std::fprintf(stderr,
+            "GLM5 real-state block-3 local control "
+            "ffn_combined_fnv=%016llx block_carried_fnv=%016llx "
+            "shared0_fnv=%016llx shared1_fnv=%016llx "
+            "shared_sum_fnv=%016llx shared_python_bad=%llu "
+            "shared_python_max_abs=%.9g\n",
+            (unsigned long long)token0_ffn_combined_fnv,
+            (unsigned long long)token0_block_fnv,
+            (unsigned long long)fnv1a64(
+                shared_half0.data(),
+                (uint64_t)shared_half0.size() * sizeof(float)),
+            (unsigned long long)fnv1a64(
+                shared_half1.data(),
+                (uint64_t)shared_half1.size() * sizeof(float)),
+            (unsigned long long)fnv1a64(
+                shared_sum.data(),
+                (uint64_t)shared_sum.size() * sizeof(float)),
+            (unsigned long long)shared_python_oracle.bad,
+            shared_python_oracle.max_abs);
+    }
 
     std::vector<Q8KBlock> input_q8((size_t)kTokens * (kInput / kQk));
     for (uint32_t token = 0; token < kTokens; ++token) {
@@ -1761,11 +2168,12 @@ bool run_test() {
         (unsigned long long)token0_shard_fnv,
         one_token_composition.max_abs, one_token_scaled_rel,
         one_token_nmse);
-    CHECK(!router_dynamic || distinct_route_sets == kTokens,
+    CHECK(!router_dynamic || real_ffn_input || distinct_route_sets == kTokens,
           "dynamic mode requires a distinct real route set per token");
-    CHECK(!router_dynamic || compact_expert_count > kUsed,
+    CHECK(!router_dynamic || real_ffn_input || compact_expert_count > kUsed,
           "dynamic mode requires a real multi-token expert union");
-    CHECK(!router_dynamic || (mid_oracle_hot != 0 && mid_oracle_cold != 0),
+    CHECK(!router_dynamic || real_ffn_input ||
+              (mid_oracle_hot != 0 && mid_oracle_cold != 0),
           "dynamic mode samples both hot-WMMA and cold-DP4A experts");
     CHECK(pass, "same-GGUF 1024/1024 top-8 numerical envelope");
     CHECK(oracle_pass,
@@ -1774,7 +2182,8 @@ bool run_test() {
           "bounded TP RoCE composition requires dynamic GPU routing");
     const uint64_t route_contract_hash =
         routed_ids_fnv ^
-        ((route_weights_fnv << 1u) | (route_weights_fnv >> 63u));
+        ((route_weights_fnv << 1u) | (route_weights_fnv >> 63u)) ^
+        ((ffn_split_hash << 7u) | (ffn_split_hash >> 57u));
     CHECK(run_roce_composition(gguf, reference, half0, half1,
                                route_contract_hash),
           "bounded TP RoCE composition");

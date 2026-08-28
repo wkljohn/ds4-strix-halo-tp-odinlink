@@ -229,6 +229,89 @@ def main() -> int:
         hc_carried = mhc.compose_carry(
             hc_residual[-1:], attn_output.detach().float().numpy(),
             hc_post[-1:], hc_comb[-1:])
+
+        # Continue the exact block-3 state into the FFN pre-stage.  This is
+        # deliberately part of the same oracle: a standalone MoE test fed by
+        # synthetic hidden states cannot catch a stream-order or BF16-boundary
+        # defect between attention mHC post and FFN mHC pre.
+        hc_ffn_fn = mhc.tensor_view(
+            blob, data_start, tensors, f"{prefix}.hc_ffn_fn.weight",
+            (16384, 24), 30).copy()
+        hc_ffn_base = mhc.tensor_view(
+            blob, data_start, tensors, f"{prefix}.hc_ffn_base.weight",
+            (24,), 0).copy()
+        hc_ffn_scale = mhc.tensor_view(
+            blob, data_start, tensors, f"{prefix}.hc_ffn_scale.weight",
+            (3,), 0).copy()
+        for name, shape, typ in (
+                (f"{prefix}.hc_ffn_fn.weight", (16384, 24), 30),
+                (f"{prefix}.hc_ffn_base.weight", (24,), 0),
+                (f"{prefix}.hc_ffn_scale.weight", (3,), 0)):
+            payload_hash.update(nope.tensor_raw(
+                blob, data_start, tensors, name, shape, typ))
+        ffn_post, ffn_comb, ffn_collapsed = mhc.mhc_reference(
+            np.asarray(hc_carried, dtype=np.float32), hc_ffn_fn,
+            hc_ffn_base, hc_ffn_scale)
+        ffn_flat = np.asarray(hc_carried, dtype=np.float32).reshape(1, -1)
+        ffn_denominator = np.sqrt(
+            np.mean(ffn_flat * ffn_flat, axis=-1, keepdims=True) +
+            np.float32(1.0e-5))
+        ffn_mixed = np.asarray(
+            (ffn_flat / ffn_denominator) @ hc_ffn_fn.astype(np.float32).T,
+            dtype=np.float32)
+        ffn_pre = (
+            mhc.sigmoid(
+                ffn_mixed[:, :4] * hc_ffn_scale[0] + hc_ffn_base[:4]) +
+            np.float32(1.0e-6))
+        ffn_split = np.concatenate(
+            (ffn_pre, ffn_post, ffn_comb.reshape(1, -1)), axis=-1)
+        ffn_norm_w, payload = qkv.f32_vector(
+            blob, data_start, tensors, f"{prefix}.ffn_norm.weight", 4096)
+        payload_hash.update(payload)
+        ffn_hidden = qkv.rms_norm_f32(
+            torch.from_numpy(ffn_collapsed.copy()), ffn_norm_w)
+
+        router_w = mhc.tensor_view(
+            blob, data_start, tensors, f"{prefix}.ffn_gate_inp.weight",
+            (4096, 288), 0).copy().reshape(288, 4096)
+        router_bias = mhc.tensor_view(
+            blob, data_start, tensors, f"{prefix}.exp_probs_b.bias",
+            (288,), 0).copy()
+        for name, shape in (
+                (f"{prefix}.ffn_gate_inp.weight", (4096, 288)),
+                (f"{prefix}.exp_probs_b.bias", (288,))):
+            payload_hash.update(nope.tensor_raw(
+                blob, data_start, tensors, name, shape, 0))
+        router_logits = F.linear(
+            ffn_hidden, torch.from_numpy(router_w.copy()))
+        router_probs = torch.sigmoid(router_logits)
+        router_order = torch.argsort(
+            router_probs + torch.from_numpy(router_bias.copy()), dim=-1,
+            descending=True, stable=True)
+        router_ids = router_order[:, :8].to(torch.int32)
+        router_weights = torch.gather(router_probs, 1, router_ids.long())
+        router_weights = (router_weights /
+                          router_weights.sum(dim=-1, keepdim=True).clamp_min(
+                              6.103515625e-5)) * 2.5
+
+        shared_gate_w, payload = qkv.q8_matrix(
+            blob, data_start, tensors, f"{prefix}.ffn_gate_shexp.weight",
+            (4096, 2048))
+        payload_hash.update(payload)
+        shared_up_w, payload = qkv.q8_matrix(
+            blob, data_start, tensors, f"{prefix}.ffn_up_shexp.weight",
+            (4096, 2048))
+        payload_hash.update(payload)
+        shared_gate = F.linear(ffn_hidden, shared_gate_w).clamp(max=10.0)
+        shared_up = F.linear(ffn_hidden, shared_up_w).clamp(-10.0, 10.0)
+        shared_mid = F.silu(shared_gate) * shared_up
+        del shared_gate_w, shared_up_w
+        shared_down_w, payload = qkv.q8_matrix(
+            blob, data_start, tensors, f"{prefix}.ffn_down_shexp.weight",
+            (2048, 4096))
+        payload_hash.update(payload)
+        shared_output = F.linear(shared_mid, shared_down_w)
+        del shared_down_w
         blob.close()
 
     arrays = {
@@ -237,6 +320,19 @@ def main() -> int:
         ".hc_comb.f32": np.asarray(hc_comb, dtype="<f4").tobytes(),
         ".hc_collapsed.f32": np.asarray(hc_collapsed, dtype="<f4").tobytes(),
         ".hc_carried.f32": np.asarray(hc_carried, dtype="<f4").tobytes(),
+        ".ffn_post.f32": np.asarray(ffn_post, dtype="<f4").tobytes(),
+        ".ffn_comb.f32": np.asarray(ffn_comb, dtype="<f4").tobytes(),
+        ".ffn_split.f32": np.asarray(ffn_split, dtype="<f4").tobytes(),
+        ".ffn_collapsed.f32": np.asarray(ffn_collapsed, dtype="<f4").tobytes(),
+        ".ffn_hidden.f32": f32_bytes(ffn_hidden),
+        ".router_logits.f32": f32_bytes(router_logits),
+        ".router_probs.f32": f32_bytes(router_probs),
+        ".router_ids.i32": i32_bytes(router_ids),
+        ".router_weights.f32": f32_bytes(router_weights),
+        ".shared_gate.f32": f32_bytes(shared_gate),
+        ".shared_up.f32": f32_bytes(shared_up),
+        ".shared_mid.f32": f32_bytes(shared_mid),
+        ".shared_output.f32": f32_bytes(shared_output),
         ".hidden.f32": f32_bytes(hidden),
         ".q_a.f32": f32_bytes(q_a),
         ".q_resid.f32": f32_bytes(q_resid),

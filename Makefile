@@ -364,6 +364,29 @@ test-rocm-glm5-mla-compose: tests/test_rocm_glm5_mla_compose
 	DS4_GLM5_MLA_COMPOSE_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/mla-compose-layer3" \
 		./tests/test_rocm_glm5_mla_compose
 
+.PHONY: test-rocm-glm5-ffn-shared-compose
+tests/test_rocm_glm5_ffn_shared_compose.o: tests/test_rocm_glm5_ffn_shared_compose.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_ffn_shared_compose: tests/test_rocm_glm5_ffn_shared_compose.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-ffn-shared-compose: tests/test_rocm_glm5_ffn_shared_compose
+	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "DS4_RESEARCH_ROOT is required" >&2; exit 1; }
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
+	@test -n "$(DS4_GLM5_FFN_SHARED_TAG)" || { echo "DS4_GLM5_FFN_SHARED_TAG is required" >&2; exit 1; }
+	@case "$(DS4_GLM5_FFN_SHARED_TAG)" in *[!A-Za-z0-9._-]*|'') echo "invalid DS4_GLM5_FFN_SHARED_TAG" >&2; exit 1;; esac
+	@test ! -e "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/$(DS4_GLM5_FFN_SHARED_TAG)" || { echo "refusing to overwrite evidence tag" >&2; exit 1; }
+	mkdir -p "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/$(DS4_GLM5_FFN_SHARED_TAG)/raw"
+	python3 scripts/probe-glm5-next-mla-compose.py \
+		--layer 3 --rows 10 --first-valid 1 \
+		--output "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/$(DS4_GLM5_FFN_SHARED_TAG)/oracle.json" \
+		--dump-prefix "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/$(DS4_GLM5_FFN_SHARED_TAG)/raw/mla-ffn-layer3" \
+		"$(DS4_GLM5_MODEL)" >/dev/null
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+	DS4_GLM5_MLA_COMPOSE_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/$(DS4_GLM5_FFN_SHARED_TAG)/raw/mla-ffn-layer3" \
+		./tests/test_rocm_glm5_ffn_shared_compose
+
 .PHONY: test-glm5-kda-tp-digest
 tests/test_glm5_kda_tp_digest: tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c $(LDLIBS)
