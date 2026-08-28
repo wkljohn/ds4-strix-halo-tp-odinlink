@@ -7,6 +7,8 @@
 #include <initializer_list>
 #include <vector>
 
+#include <sys/mman.h>
+
 #include "ds4_gpu.h"
 
 typedef int (*ds4_tp_devcopy_fn)(void *, const void *, uint64_t);
@@ -25,6 +27,98 @@ struct Inputs {
     uint32_t tokens;
     std::vector<float> q, k, v, gate, beta, state;
 };
+
+static uint16_t f32_to_bf16(float value) {
+    union { float f; uint32_t u; } bits = {value};
+    const uint32_t rounding = 0x7fffu + ((bits.u >> 16u) & 1u);
+    return (uint16_t)((bits.u + rounding) >> 16u);
+}
+
+static float bf16_to_f32(uint16_t value) {
+    union { uint32_t u; float f; } bits = {(uint32_t)value << 16u};
+    return bits.f;
+}
+
+/* Synthetic BF16 case copied from official DS4 test_glm53_kda.c.  Keep the
+ * official decode/prefill tolerances: the two paths are allowed to group the
+ * same FP32 products differently, but both are checked against an independent
+ * host accumulation over the exact BF16 weights. */
+static bool run_official_bf16_reference(void) {
+    constexpr uint32_t in_dim = 64u;
+    constexpr uint32_t out_dim = 64u;
+    constexpr uint32_t rows = 16u;
+    constexpr uint64_t model_bytes = 16384u;
+    uint8_t *model = (uint8_t *)mmap(nullptr, model_bytes,
+                                     PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(model != MAP_FAILED, "allocate official BF16 synthetic model");
+    uint16_t *weights = (uint16_t *)model;
+    for (uint32_t o = 0; o < out_dim; ++o) {
+        for (uint32_t i = 0; i < in_dim; ++i) {
+            const float value =
+                0.002f * float(int(o % 11u) - 5) +
+                0.001f * float(int(i % 13u) - 6);
+            weights[(uint64_t)o * in_dim + i] = f32_to_bf16(value);
+        }
+    }
+    std::vector<float> input((size_t)rows * in_dim);
+    std::vector<float> expected((size_t)rows * out_dim);
+    for (uint32_t row = 0; row < rows; ++row) {
+        for (uint32_t i = 0; i < in_dim; ++i) {
+            input[(uint64_t)row * in_dim + i] =
+                0.02f * float(int(i % 17u) - 8) + 0.005f * float(row);
+        }
+        for (uint32_t o = 0; o < out_dim; ++o) {
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < in_dim; ++i) {
+                sum += bf16_to_f32(weights[(uint64_t)o * in_dim + i]) *
+                       input[(uint64_t)row * in_dim + i];
+            }
+            expected[(uint64_t)row * out_dim + o] = sum;
+        }
+    }
+
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(input.size() * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(expected.size() * sizeof(float));
+    CHECK(x && out && ds4_gpu_set_model_map(model, model_bytes) &&
+          ds4_gpu_tensor_write(x, 0, input.data(), input.size() * sizeof(float)),
+          "prepare official BF16 reference");
+    std::vector<float> got(expected.size());
+    CHECK(ds4_gpu_matmul_bf16_tensor(
+              out, model, model_bytes, 0u, in_dim, out_dim, x, 1u) &&
+          ds4_gpu_tensor_read(out, 0, got.data(), out_dim * sizeof(float)),
+          "execute official BF16 decode reference");
+    float decode_error = 0.0f;
+    for (uint32_t i = 0; i < out_dim; ++i) {
+        decode_error = std::max(
+            decode_error, std::fabs(got[i] - expected[i]));
+    }
+    CHECK(decode_error <= 2.0e-6f,
+          "official BF16 decode reference tolerance");
+
+    CHECK(ds4_gpu_matmul_bf16_tensor(
+              out, model, model_bytes, 0u, in_dim, out_dim, x, rows) &&
+          ds4_gpu_tensor_read(out, 0, got.data(), got.size() * sizeof(float)),
+          "execute official BF16 prefill reference");
+    float prefill_error = 0.0f;
+    for (size_t i = 0; i < got.size(); ++i) {
+        prefill_error = std::max(
+            prefill_error, std::fabs(got[i] - expected[i]));
+    }
+    CHECK(prefill_error <= 2.0e-4f,
+          "official BF16 prefill reference tolerance");
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_cleanup();
+    CHECK(munmap(model, model_bytes) == 0,
+          "release official BF16 synthetic model");
+    CHECK(ds4_gpu_init(), "reinitialize after official BF16 reference");
+    std::fprintf(stderr,
+                 "PASS official GLM53 BF16 reference decode_err=%.9g "
+                 "prefill_err=%.9g\n",
+                 decode_error, prefill_error);
+    return true;
+}
 
 static Inputs make_inputs(uint32_t tokens, int gate_mode,
                           bool nonzero_state) {
@@ -286,6 +380,7 @@ int main(void) {
         return 1;
     }
     bool ok = true;
+    ok &= run_official_bf16_reference();
     for (uint32_t length : {1u, 2u, 3u, 127u, 128u, 129u})
         ok &= run_oracle_case(length, 2, length != 1u);
     ok &= run_oracle_case(3, 0, true);

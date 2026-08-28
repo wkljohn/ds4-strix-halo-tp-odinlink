@@ -63,6 +63,19 @@ def read(path: Path):
                 meta[key] = bool(r.u8())
             elif typ == 10:
                 meta[key] = r.u64()
+            elif typ == 9:
+                elem = r.u32()
+                count = r.u64()
+                if elem == 4:
+                    meta[key] = tuple(r.u32() for _ in range(count))
+                elif elem == 5:
+                    meta[key] = tuple(
+                        struct.unpack("<i", fp.read(4))[0]
+                        for _ in range(count)
+                    )
+                else:
+                    for _ in range(count):
+                        r.skip_value(elem)
             else:
                 r.skip_value(typ)
         tensors = {}
@@ -96,9 +109,11 @@ def main(argv):
         "glm5-next.vocab_size": 154880,
         "glm5-next.expert_count": 288,
         "glm5-next.expert_used_count": 8,
+        "glm5-next.expert_shared_count": 1,
         "glm5-next.expert_feed_forward_length": 2048,
         "glm5-next.expert_weights_scale": 2.5,
         "glm5-next.expert_weights_norm": True,
+        "glm5-next.swiglu_limit": 10.0,
         "glm5-next.feed_forward_length": 12288,
         "glm5-next.attention.head_count": 64,
         "glm5-next.attention.key_length": 256,
@@ -106,8 +121,15 @@ def main(argv):
         "glm5-next.attention.indexer.pool_size": 4,
         "glm5-next.attention.indexer.top_k": 2048,
         "glm5-next.linear_attention.conv_kernel": 4,
+        "glm5-next.linear_attention.gate_lower_bound": -5.0,
     }.items():
         require(meta, key, value)
+
+    expected_layer_types = tuple(
+        1 if layer == 45 or layer % 4 == 3 else 0
+        for layer in range(46)
+    )
+    require(meta, "glm5-next.layer_types", expected_layer_types)
 
     required = {
         "blk.3.ffn_gate_exps.weight": ((4096, 2048, 288), 12),

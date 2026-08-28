@@ -6115,6 +6115,41 @@ static void config_validate_glm_dsa_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
+static void config_validate_glm5_next_layer_types(const ds4_model *m) {
+    const char *key = "glm5-next.layer_types";
+    ds4_array_ref arr;
+    if (!model_get_array(m, key, &arr) ||
+        (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32) ||
+        arr.len != DS4_GLM5_NEXT_LAYER_COUNT) {
+        ds4_die("glm5-next.layer_types must be an int32/uint32 array with one entry per layer");
+    }
+
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint32_t il = 0; il < DS4_GLM5_NEXT_LAYER_COUNT; ++il) {
+        uint32_t got = 0;
+        if (arr.type == GGUF_VALUE_UINT32) {
+            if (!cursor_u32(&c, &got)) ds4_die(c.error);
+        } else {
+            int32_t value = 0;
+            if (!cursor_read(&c, &value, sizeof(value))) ds4_die(c.error);
+            if (value < 0) {
+                ds4_die("glm5-next.layer_types contains a negative value");
+            }
+            got = (uint32_t)value;
+        }
+
+        const uint32_t expected =
+            (il == DS4_GLM5_NEXT_TRUNK_COUNT || (il & 3u) == 3u) ? 1u : 0u;
+        if (got != expected) {
+            fprintf(stderr,
+                    "ds4: unexpected GLM 5.3 attention type at layer %u: "
+                    "got %u, expected %u\n",
+                    il, got, expected);
+            exit(1);
+        }
+    }
+}
+
 /* GLM-5.3-Flash uses a different graph from the older glm-dsa profile.  Do
  * not let its metadata fall through to the GLM-5.2 validator: accepting it
  * there would bind tensors with the wrong layer schedule and could produce
@@ -6129,6 +6164,7 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
     const uint32_t vocab = required_u32(m, "glm5-next.vocab_size");
     const uint32_t experts = required_u32(m, "glm5-next.expert_count");
     const uint32_t used = required_u32(m, "glm5-next.expert_used_count");
+    const uint32_t shared = required_u32(m, "glm5-next.expert_shared_count");
     const uint32_t ff = required_u32(m, "glm5-next.expert_feed_forward_length");
     const uint32_t dense = required_u32(m, "glm5-next.feed_forward_length");
     const uint32_t heads = required_u32(m, "glm5-next.attention.head_count");
@@ -6156,6 +6192,7 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
     config_expect_u32("vocab_size", vocab, 154880);
     config_expect_u32("expert_count", experts, 288);
     config_expect_u32("expert_used_count", used, 8);
+    config_expect_u32("expert_shared_count", shared, 1);
     config_expect_u32("expert_feed_forward_length", ff, 2048);
     config_expect_u32("feed_forward_length", dense, 12288);
     config_expect_u32("attention.head_count", heads, 64);
@@ -6181,12 +6218,19 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
     const float hc_eps = required_f32(m, "glm5-next.hyper_connection.epsilon");
     const float expert_weight_scale =
         required_f32(m, "glm5-next.expert_weights_scale");
+    const float swiglu_limit = required_f32(m, "glm5-next.swiglu_limit");
+    const float gate_lower_bound =
+        required_f32(m, "glm5-next.linear_attention.gate_lower_bound");
     const bool expert_weight_norm =
         required_bool(m, "glm5-next.expert_weights_norm");
     config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, 1.0e-5f);
     config_expect_f32("hyper_connection.epsilon", hc_eps, 1.0e-6f);
     config_expect_f32("expert_weights_scale", expert_weight_scale, 2.5f);
+    config_expect_f32("swiglu_limit", swiglu_limit, 10.0f);
+    config_expect_f32("linear_attention.gate_lower_bound",
+                      gate_lower_bound, -5.0f);
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
+    config_validate_glm5_next_layer_types(m);
 
     /* Keep the metadata gate and tensor gate together.  This is intentionally
      * run before graph construction; the legacy GLM-5.2 binder has a
