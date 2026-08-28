@@ -6,6 +6,15 @@ bool ds4_glm5_next_layer_is_mla(uint32_t layer) {
     return layer == DS4_GLM5_NEXT_TRUNK_COUNT || (layer & 3u) == 3u;
 }
 
+int ds4_glm5_next_mla_dense_selection_visible(
+        uint64_t token_count, uint32_t capacity_tokens, uint32_t *visible) {
+    if (!visible || capacity_tokens == 0u ||
+        token_count >= capacity_tokens ||
+        token_count >= DS4_GLM5_NEXT_INDEX_TOP_K) return 0;
+    *visible = (uint32_t)token_count + 1u;
+    return 1;
+}
+
 int ds4_glm5_next_build_tp_gate_mask(
         uint64_t mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS],
         uint32_t *gate_count) {

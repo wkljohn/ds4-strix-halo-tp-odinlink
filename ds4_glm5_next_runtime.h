@@ -20,6 +20,7 @@ enum {
     /* GLM-5.3 NoPE stores only the normalized 512-wide KV-LoRA row. */
     DS4_GLM5_NEXT_MLA_KV_WIDTH = 512,
     DS4_GLM5_NEXT_INDEX_WIDTH = 128,
+    DS4_GLM5_NEXT_INDEX_TOP_K = 2048,
 };
 
 typedef enum {
@@ -105,6 +106,11 @@ typedef struct ds4_glm5_next_state {
 } ds4_glm5_next_state;
 
 bool ds4_glm5_next_layer_is_mla(uint32_t layer);
+/* Official GLM-5.3 decode uses every visible row until the sparse indexer's
+ * top-k width is exceeded. Returns zero at the capacity boundary and at the
+ * first token that requires pooled selection. */
+int ds4_glm5_next_mla_dense_selection_visible(
+        uint64_t token_count, uint32_t capacity_tokens, uint32_t *visible);
 int ds4_glm5_next_build_tp_gate_mask(
         uint64_t mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS],
         uint32_t *gate_count);

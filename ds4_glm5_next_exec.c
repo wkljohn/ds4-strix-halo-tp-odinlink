@@ -20,7 +20,6 @@ enum {
     GLM5_HEAD_DIM = 256,
     GLM5_KV_LORA = 512,
     GLM5_INDEX_DIM = 128,
-    GLM5_INDEX_TOP_K = 2048,
     GLM5_EXPERTS = 288,
     GLM5_EXPERTS_USED = 8,
     GLM5_ROUTED_MID = 2048,
@@ -158,7 +157,7 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
     w->mla_index_k_raw = f32(GLM5_INDEX_DIM);
     w->mla_pool_gate_raw = f32(GLM5_INDEX_DIM);
     w->mla_selected_token = ds4_gpu_tensor_alloc(
-        (GLM5_INDEX_TOP_K + 3u) * sizeof(int32_t));
+        (DS4_GLM5_NEXT_INDEX_TOP_K + 3u) * sizeof(int32_t));
     w->mla_heads = f32((uint64_t)GLM5_HEADS * GLM5_HEAD_DIM);
     w->router_logits = f32(GLM5_EXPERTS);
     w->router_probs = f32(GLM5_EXPERTS);
@@ -409,19 +408,18 @@ static int declare_local_q4k_half(const ds4_glm5_next_exec_ctx *ctx,
                0u, GLM5_WIDTH, column_base, down_half_bytes);
 }
 
-/* Before the first complete pool-4 group exists, the official selection is
- * exactly the visible tail. Exercise that cache-read path independently before
- * adding the pooled long-context selector. */
-static int mla_short_context_attention(const ds4_glm5_next_exec_ctx *ctx,
+/* The official selector uses the full visible range through top-k. Pooled
+ * selection begins only when visible exceeds 2048 and is a separate path. */
+static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
                                        uint32_t il,
                                        ds4_glm5_next_state *state,
                                        ds4_glm5_next_workspace *w,
-                                       const ds4_gpu_tensor *hc_in) {
+                                       const ds4_gpu_tensor *hc_in,
+                                       uint32_t visible) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     const ds4_glm5_next_mla_offsets *m = &layer->mla;
     ds4_glm5_next_mla_state *mla = &state->mla[il];
     const uint32_t pos = mla->token_count;
-    const uint32_t visible = pos + 1u;
     const uint64_t half_heads =
         ((uint64_t)GLM5_HEADS * GLM5_HEAD_DIM) / 2u;
     return
@@ -596,19 +594,20 @@ static int kda_routed_one_forward(const ds4_glm5_next_exec_ctx *ctx,
     return ok;
 }
 
-static int mla_routed_short_forward(const ds4_glm5_next_exec_ctx *ctx,
+static int mla_routed_dense_selection_forward(const ds4_glm5_next_exec_ctx *ctx,
                                     uint32_t il,
                                     ds4_glm5_next_state *state,
                                     ds4_glm5_next_workspace *w,
                                     const ds4_gpu_tensor *hc_in,
                                     ds4_gpu_tensor *hc_out) {
     ds4_glm5_next_mla_state *mla = &state->mla[il];
+    uint32_t visible = 0u;
     if (!tp_context_valid(ctx) || !mla->valid || !mla->compact_kv ||
         !mla->index_key || !mla->pool_gate || mla->owner != state ||
-        mla->capacity_tokens == 0u ||
-        mla->token_count >= mla->capacity_tokens ||
-        mla->token_count >= 4u) return 0;
-    const int ok = mla_short_context_attention(ctx, il, state, w, hc_in) &&
+        !ds4_glm5_next_mla_dense_selection_visible(
+            mla->token_count, mla->capacity_tokens, &visible)) return 0;
+    const int ok = mla_dense_selection_attention(
+                       ctx, il, state, w, hc_in, visible) &&
                    routed_ffn_one(ctx, il, mla->token_count, w, hc_out);
     if (!ok) {
         ds4_glm5_next_state_invalidate(state);
@@ -642,7 +641,8 @@ int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
     if (layer->attention == DS4_GLM5_NEXT_ATTN_MLA &&
         layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&
         state->mla[il].compact_kv && !state->kda.layer[il].recurrent) {
-        return mla_routed_short_forward(ctx, il, state, w, hc_in, hc_out);
+        return mla_routed_dense_selection_forward(
+            ctx, il, state, w, hc_in, hc_out);
     }
     if (layer->attention == DS4_GLM5_NEXT_ATTN_KDA &&
         layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&

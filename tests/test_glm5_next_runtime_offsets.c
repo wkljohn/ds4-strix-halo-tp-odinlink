@@ -51,6 +51,22 @@ static void make_valid(ds4_glm5_next_model_offsets *model) {
 }
 
 static int test_contract(void) {
+    uint32_t visible = 0u;
+    CHECK(!ds4_glm5_next_mla_dense_selection_visible(0u, 1u, NULL),
+          "dense-selection policy rejects a missing result");
+    CHECK(ds4_glm5_next_mla_dense_selection_visible(0u, 1u, &visible) &&
+              visible == 1u,
+          "dense-selection policy accepts the first visible row");
+    CHECK(ds4_glm5_next_mla_dense_selection_visible(7u, 8u, &visible) &&
+              visible == 8u,
+          "dense-selection policy crosses the former four-token limit");
+    CHECK(ds4_glm5_next_mla_dense_selection_visible(2047u, 4096u, &visible) &&
+              visible == DS4_GLM5_NEXT_INDEX_TOP_K,
+          "dense-selection policy covers the official top-k boundary");
+    CHECK(!ds4_glm5_next_mla_dense_selection_visible(2048u, 4096u, &visible),
+          "token 2049 fails closed until pooled selection is implemented");
+    CHECK(!ds4_glm5_next_mla_dense_selection_visible(8u, 8u, &visible),
+          "dense-selection policy enforces state capacity");
     uint64_t gate_mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS] = {0};
     uint32_t gate_count = 0;
     CHECK(ds4_glm5_next_build_tp_gate_mask(gate_mask, &gate_count) &&
