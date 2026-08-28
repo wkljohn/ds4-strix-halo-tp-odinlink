@@ -115,6 +115,8 @@ def main(argv):
         "blk.3.ffn_down_exps.weight": ((2048, 4096, 288), 12),
         "blk.0.kda_q.weight": ((4096, 8192), 30),  # BF16
         "blk.3.attn_q_a.weight": ((4096, 1536), 8),
+        "blk.3.attn_q_a_norm.weight": ((1536,), 0),
+        "blk.3.attn_kv_a_norm.weight": ((512,), 0),
         "blk.3.hc_attn_fn.weight": ((16384, 24), 30),
     }
     for name, (shape, typ) in required.items():
@@ -131,6 +133,8 @@ def main(argv):
     for suffix, expected in {
         ".kda_q.weight": 34,
         ".attn_q_a.weight": 12,
+        ".attn_q_a_norm.weight": 12,
+        ".attn_kv_a_norm.weight": 12,
         ".ffn_gate_exps.weight": 43,
         ".hc_attn_fn.weight": 45,
         ".hc_ffn_fn.weight": 45,
@@ -176,8 +180,10 @@ def main(argv):
         ".indexer.k_norm.weight": ((128,), 0),
         ".indexer.k_norm.bias": ((128,), 0),
         ".attn_q_a.weight": ((4096, 1536), 8),
+        ".attn_q_a_norm.weight": ((1536,), 0),
         ".attn_q_b.weight": ((1536, 16384), 8),
         ".attn_kv_a_mqa.weight": ((4096, 512), 8),
+        ".attn_kv_a_norm.weight": ((512,), 0),
         ".attn_k_b.weight": ((256, 512, 64), 8),
         ".attn_v_b.weight": ((512, 256, 64), 8),
         ".attn_output.weight": ((16384, 4096), 8),

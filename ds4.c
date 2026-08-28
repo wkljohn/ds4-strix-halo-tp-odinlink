@@ -4414,7 +4414,8 @@ typedef struct {
     ds4_tensor *kda_q_conv, *kda_k_conv, *kda_v_conv;
     ds4_tensor *kda_f_a, *kda_f_b, *kda_g_a, *kda_g_b, *kda_beta;
     ds4_tensor *kda_o_norm, *kda_dt_bias, *kda_a_log;
-    ds4_tensor *mla_q_a, *mla_q_b, *mla_kv_a_mqa, *mla_k_b, *mla_v_b;
+    ds4_tensor *mla_q_a, *mla_q_a_norm, *mla_q_b;
+    ds4_tensor *mla_kv_a_mqa, *mla_kv_a_norm, *mla_k_b, *mla_v_b;
     ds4_tensor *mla_output;
     ds4_tensor *indexer_q_b, *indexer_k, *indexer_proj;
     ds4_tensor *indexer_pool_ape, *indexer_pool_gate;
@@ -4476,8 +4477,10 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
         l->ffn_norm = required_tensorf(m, "blk.%u.ffn_norm.weight", il);
         if (!w->schedule[il].is_kda) {
             l->mla_q_a = required_tensorf(m, "blk.%u.attn_q_a.weight", il);
+            l->mla_q_a_norm = required_tensorf(m, "blk.%u.attn_q_a_norm.weight", il);
             l->mla_q_b = required_tensorf(m, "blk.%u.attn_q_b.weight", il);
             l->mla_kv_a_mqa = required_tensorf(m, "blk.%u.attn_kv_a_mqa.weight", il);
+            l->mla_kv_a_norm = required_tensorf(m, "blk.%u.attn_kv_a_norm.weight", il);
             l->mla_k_b = required_tensorf(m, "blk.%u.attn_k_b.weight", il);
             l->mla_v_b = required_tensorf(m, "blk.%u.attn_v_b.weight", il);
             l->mla_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
@@ -6123,8 +6126,10 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
                              DS4_TENSOR_F32, 1, 4096, 0, 0);
         if (!bound.schedule[il].is_kda) {
             tensor_expect_layout(required_tensorf(m, "blk.%u.attn_q_a.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 1536, 0);
+            tensor_expect_layout(bound.layer[il].mla_q_a_norm, DS4_TENSOR_F32, 1, 1536, 0, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.attn_q_b.weight", il), DS4_TENSOR_Q8_0, 2, 1536, 16384, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.attn_kv_a_mqa.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 512, 0);
+            tensor_expect_layout(bound.layer[il].mla_kv_a_norm, DS4_TENSOR_F32, 1, 512, 0, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.attn_k_b.weight", il), DS4_TENSOR_Q8_0, 3, 256, 512, 64);
             tensor_expect_layout(required_tensorf(m, "blk.%u.attn_v_b.weight", il), DS4_TENSOR_Q8_0, 3, 512, 256, 64);
             tensor_expect_layout(required_tensorf(m, "blk.%u.attn_output.weight", il), DS4_TENSOR_Q8_0, 2, 16384, 4096, 0);
