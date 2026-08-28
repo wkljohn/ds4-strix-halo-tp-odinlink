@@ -7,8 +7,10 @@ extern "C" {
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #define CHECK(expr, message) do {                                           \
@@ -28,20 +30,49 @@ float bf16_to_f32(uint16_t value) {
     return bits.f;
 }
 
-float deterministic_key(uint32_t row, uint32_t channel) {
+float round_bf16(float value) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint32_t magnitude = bits & 0x7fffffffu;
+    uint16_t rounded;
+    if (magnitude > 0x7f800000u) {
+        rounded = (uint16_t)((bits >> 16u) | 0x0040u);
+    } else {
+        rounded = (uint16_t)((bits + 0x7fffu + ((bits >> 16u) & 1u)) >> 16u);
+    }
+    return bf16_to_f32(rounded);
+}
+
+uint32_t float_bits(float value) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+float deterministic_key(uint32_t row, uint32_t channel, uint32_t pattern) {
+    if (pattern != 0u) {
+        const uint32_t mixed = row * 2246822519u + channel * 3266489917u +
+                               pattern * 668265263u;
+        return (float)((int)(mixed % 4093u) - 2046) / 1024.0f;
+    }
     return std::sin((float)(row * 131u + channel * 17u + 3u) * 0.00031f) *
         0.3f + std::cos((float)(row * 7u + channel * 29u + 11u) * 0.00017f) *
         0.05f;
 }
 
-float deterministic_gate(uint32_t row, uint32_t channel) {
+float deterministic_gate(uint32_t row, uint32_t channel, uint32_t pattern) {
+    if (pattern != 0u) {
+        const uint32_t mixed = row * 2654435761u + channel * 2246822519u +
+                               pattern * 3266489917u;
+        return (float)((int)(mixed % 2047u) - 1023) / 128.0f;
+    }
     return std::sin((float)(row * 19u + channel * 23u + 5u) * 0.00043f) *
         0.7f + (float)((row + 3u * channel) % 11u) * 0.013f;
 }
 
 bool run_case(const Glm5TestGGUF &gguf, uint64_t ape_offset,
               uint32_t n_rows, uint32_t first_valid,
-              bool invalidate_middle) {
+              bool invalidate_middle, uint32_t pattern = 0u) {
     const uint32_t n_pools = (n_rows + 3u) / 4u;
     std::vector<float> keys((size_t)n_rows * kDim);
     std::vector<float> gates((size_t)n_rows * kDim);
@@ -49,8 +80,10 @@ bool run_case(const Glm5TestGGUF &gguf, uint64_t ape_offset,
     for (uint32_t row = 0; row < n_rows; ++row) {
         if (row < first_valid) valid[row] = 0u;
         for (uint32_t d = 0; d < kDim; ++d) {
-            keys[(uint64_t)row * kDim + d] = deterministic_key(row, d);
-            gates[(uint64_t)row * kDim + d] = deterministic_gate(row, d);
+            keys[(uint64_t)row * kDim + d] =
+                deterministic_key(row, d, pattern);
+            gates[(uint64_t)row * kDim + d] =
+                deterministic_gate(row, d, pattern);
         }
     }
     if (invalidate_middle && n_rows >= first_valid + 8u)
@@ -80,7 +113,7 @@ bool run_case(const Glm5TestGGUF &gguf, uint64_t ape_offset,
             float logits[kPool], maximum = -INFINITY, denominator = 0.0f;
             for (uint32_t j = 0; j < kPool; ++j) {
                 logits[j] = member_valid[j]
-                    ? gates[(uint64_t)(start + j) * kDim + d] +
+                    ? round_bf16(gates[(uint64_t)(start + j) * kDim + d]) +
                         bf16_to_f32(ape[(uint64_t)j * kDim + d])
                     : -INFINITY;
                 maximum = std::max(maximum, logits[j]);
@@ -91,11 +124,16 @@ bool run_case(const Glm5TestGGUF &gguf, uint64_t ape_offset,
             }
             for (uint32_t j = 0; j < kPool; ++j) {
                 if (member_valid[j]) {
+                    const float probability =
+                        round_bf16(logits[j] / denominator);
+                    const float key = round_bf16(
+                        keys[(uint64_t)(start + j) * kDim + d]);
                     expected[(uint64_t)pool * kDim + d] +=
-                        logits[j] / denominator *
-                        keys[(uint64_t)(start + j) * kDim + d];
+                        round_bf16(probability * key);
                 }
             }
+            expected[(uint64_t)pool * kDim + d] =
+                round_bf16(expected[(uint64_t)pool * kDim + d]);
         }
     }
 
@@ -129,17 +167,23 @@ bool run_case(const Glm5TestGGUF &gguf, uint64_t ape_offset,
                               got_valid.size() * sizeof(uint32_t)),
           "read GLM5 learned pool-4 outputs");
     double max_abs = 0.0;
+    uint64_t mismatches = 0u;
     for (size_t i = 0; i < got.size(); ++i) {
         CHECK(std::isfinite(got[i]), "finite GLM5 pooled key");
+        CHECK((float_bits(got[i]) & 0xffffu) == 0u,
+              "GLM5 pooled key preserves upstream BF16 boundary");
+        mismatches += float_bits(got[i]) != float_bits(expected[i]);
         max_abs = std::max(max_abs,
                            std::fabs((double)got[i] - expected[i]));
     }
     CHECK(got_indices == expected_indices && got_valid == expected_valid &&
-          max_abs <= 2.0e-6,
+          max_abs <= 1.0e-2 && mismatches <= got.size() / 10000u,
           "GLM5 pool indices, validity and numerical envelope");
     std::fprintf(stderr,
-        "GLM5 kpool rows=%u first=%u middle_invalid=%d pools=%u max_abs=%.9g\n",
-        n_rows, first_valid, invalidate_middle ? 1 : 0, n_pools, max_abs);
+        "GLM5 kpool rows=%u first=%u middle_invalid=%d pattern=%u pools=%u "
+        "mismatches=%llu max_abs=%.9g\n",
+        n_rows, first_valid, invalidate_middle ? 1 : 0, pattern, n_pools,
+        (unsigned long long)mismatches, max_abs);
 
     ds4_gpu_tensor_free(d_pool_valid);
     ds4_gpu_tensor_free(d_indices);
@@ -179,6 +223,10 @@ bool run_test() {
           "GLM5 kpool upstream raw-axis count with left padding");
     CHECK(run_case(gguf, ape_offset, 20u, 0u, true),
           "GLM5 kpool invalid middle pool");
+    for (uint32_t pattern = 1u; pattern <= 8u; ++pattern)
+        CHECK(run_case(gguf, ape_offset, 8192u, pattern & 3u, false,
+                       pattern),
+              "GLM5 kpool wide-logit numerical stress");
     CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "GLM5 kpool invokes no TP exchange API");
 

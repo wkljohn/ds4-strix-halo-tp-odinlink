@@ -1649,7 +1649,15 @@ int ds4_gpu_glm_indexer_scores_batch_tensor(
         float                 scale,
         bool                  cache_f16);
 
-/* GLM-5.3 NoPE indexer learned pool-4 compression.  pool_ape is BF16 in
+/* GLM-5.3 NoPE indexer learned pool-4 compression.  On the target ROCm path,
+ * inputs are interpreted at the upstream BF16 key/gate boundary. Softmax uses
+ * the production F32 exp/div implementation and is numerically gated against
+ * a precise reference; probabilities, products, and the final pooled key are
+ * rounded at the corresponding BF16 tensor boundaries. The current component
+ * envelope is one BF16 ULP (1e-2) only for test keys in [-2,2] and gates in
+ * [-8,8]; it is not a production-promotion threshold. The CUDA implementation
+ * retains its prior fast-math pooling until it has an independent device gate.
+ * pool_ape is BF16 in
  * GGUF layout [head_dim, 4], equivalent to the upstream [4, head_dim]
  * parameter. The raw pool axis matches upstream ceil(n_rows/4): invalid
  * members carry index -1, survivor members still form the diagnostic pooled

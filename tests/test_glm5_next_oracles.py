@@ -8,6 +8,7 @@ against a full reference implementation is attempted.
 from __future__ import annotations
 
 import math
+import struct
 
 
 def dot(a, b):
@@ -19,6 +20,31 @@ def softmax(values):
     e = [math.exp(x - m) for x in values]
     z = sum(e)
     return [x / z for x in e]
+
+
+def bf16(value):
+    """IEEE RNE F32 -> BF16 -> widened F32 for model-dtype contracts."""
+    bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    magnitude = bits & 0x7FFFFFFF
+    if magnitude > 0x7F800000:
+        rounded = (bits >> 16) | 0x0040
+    else:
+        rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+    return struct.unpack("<f", struct.pack("<I", (rounded & 0xFFFF) << 16))[0]
+
+
+def f32(value):
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def softmax_f32(values):
+    values = [f32(value) for value in values]
+    maximum = max(values)
+    exponent = [f32(math.exp(f32(value - maximum))) for value in values]
+    denominator = 0.0
+    for value in exponent:
+        denominator = f32(denominator + value)
+    return [f32(value / denominator) for value in exponent]
 
 
 def sigmoid(value):
@@ -294,11 +320,17 @@ def glm5_kpool(keys, gate_scores, valid, ape, pool_size=4):
             continue
         pooled = []
         for channel in range(width):
-            probability = softmax([
-                gate_scores[token][channel] + ape[offset][channel]
+            probability = softmax_f32([
+                f32(bf16(gate_scores[token][channel]) +
+                    bf16(ape[offset][channel]))
                 for offset, token in enumerate(idx)])
-            pooled.append(sum(probability[offset] * keys[token][channel]
-                              for offset, token in enumerate(idx)))
+            products = [bf16(bf16(probability[offset]) *
+                             bf16(keys[token][channel]))
+                        for offset, token in enumerate(idx)]
+            total = 0.0
+            for product in products:
+                total = f32(total + product)
+            pooled.append(bf16(total))
         pools.append(pooled)
         indices.append(idx)
     return pools, indices

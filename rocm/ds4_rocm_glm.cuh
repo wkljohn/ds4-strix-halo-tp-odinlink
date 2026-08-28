@@ -805,7 +805,8 @@ __global__ static void glm5_kpool4_kernel(
             float maximum = -INFINITY;
             for (uint32_t j = 0; j < 4u; ++j) {
                 logits[j] = member_valid[j]
-                    ? gate_scores[(uint64_t)(start + j) * head_dim + d] +
+                    ? f32_round_bf16_rne(
+                          gate_scores[(uint64_t)(start + j) * head_dim + d]) +
                         __uint_as_float((uint32_t)pool_ape[(uint64_t)j * head_dim + d] << 16)
                     : -INFINITY;
                 maximum = fmaxf(maximum, logits[j]);
@@ -815,15 +816,18 @@ __global__ static void glm5_kpool4_kernel(
                 logits[j] = expf(logits[j] - maximum);
                 denominator += logits[j];
             }
-            const float inverse = 1.0f / denominator;
             for (uint32_t j = 0; j < 4u; ++j) {
                 if (member_valid[j]) {
-                    result += logits[j] * inverse *
-                        keys[(uint64_t)(start + j) * head_dim + d];
+                    const float probability =
+                        f32_round_bf16_rne(logits[j] / denominator);
+                    const float key = f32_round_bf16_rne(
+                        keys[(uint64_t)(start + j) * head_dim + d]);
+                    result += f32_round_bf16_rne(probability * key);
                 }
             }
         }
-        pooled_keys[(uint64_t)pool * head_dim + d] = result;
+        pooled_keys[(uint64_t)pool * head_dim + d] =
+            f32_round_bf16_rne(result);
     }
 }
 

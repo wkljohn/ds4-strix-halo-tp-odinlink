@@ -729,12 +729,15 @@ __device__ static uint16_t f32_to_bf16_bits_rne(float value) {
     return (uint16_t)((bits + 0x00007fffu + tie_to_even) >> 16u);
 }
 
+__device__ static float f32_round_bf16_rne(float value) {
+    return __uint_as_float((uint32_t)f32_to_bf16_bits_rne(value) << 16u);
+}
+
 __global__ static void round_bf16_inplace_kernel(
         float *values, uint64_t count, float post_scale) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    const uint32_t widened = (uint32_t)f32_to_bf16_bits_rne(values[i]) << 16u;
-    values[i] = __uint_as_float(widened) * post_scale;
+    values[i] = f32_round_bf16_rne(values[i]) * post_scale;
 }
 
 __device__ static float warp_sum_f32(float v) {
