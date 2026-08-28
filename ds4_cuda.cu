@@ -4274,6 +4274,27 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
     if (i < n) out[i] = __float2half(x[i]);
 }
 
+__device__ static uint16_t f32_to_bf16_bits_rne(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t magnitude = bits & 0x7fffffffu;
+    if (magnitude > 0x7f800000u) {
+        /* Preserve sign/payload high bits while forcing a quiet BF16 NaN.
+         * This also keeps a NaN whose payload lives only in the discarded
+         * F32 mantissa bits from becoming infinity. */
+        return (uint16_t)((bits >> 16u) | 0x0040u);
+    }
+    const uint32_t tie_to_even = (bits >> 16u) & 1u;
+    return (uint16_t)((bits + 0x00007fffu + tie_to_even) >> 16u);
+}
+
+__global__ static void round_bf16_inplace_kernel(
+        float *values, uint64_t count, float post_scale) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t widened = (uint32_t)f32_to_bf16_bits_rne(values[i]) << 16u;
+    values[i] = __uint_as_float(widened) * post_scale;
+}
+
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(0xffffffffu, v, offset);
@@ -13796,7 +13817,7 @@ extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_
         return 0;
     }
     const uint64_t blocks = (out_elems + 255u) / 256u;
-    if (blocks > UINT32_MAX) return 0;
+    if (blocks > INT32_MAX) return 0;
     repeat_hc_rows_kernel<<<(unsigned)blocks, 256>>>((float *)out->ptr, (const float *)rows->ptr, n_tokens, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "repeat_hc_rows launch");
 }
@@ -27665,6 +27686,21 @@ extern "C" int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_
             (const float *)((const char *)src->ptr + src_offset),
             count);
     return cuda_ok(cudaGetLastError(), "tensor f32-to-f16 copy launch");
+}
+
+extern "C" int ds4_gpu_round_bf16_inplace_tensor(
+        ds4_gpu_tensor *tensor, uint64_t count, float post_scale) {
+    if (!tensor || !tensor->ptr || !isfinite(post_scale) ||
+        count > UINT64_MAX / sizeof(float) ||
+        count * sizeof(float) > tensor->bytes) return 0;
+    if (count == 0u) return 1;
+    const int tier = ds4_tensor_device_idx(tensor);
+    if (ds4_gpu_set_current_device(tier) != 0) return 0;
+    const uint64_t blocks = (count + 255u) / 256u;
+    if (blocks > UINT32_MAX) return 0;
+    round_bf16_inplace_kernel<<<(unsigned)blocks, 256>>>(
+        (float *)tensor->ptr, count, post_scale);
+    return cuda_ok(cudaGetLastError(), "round bf16 inplace launch");
 }
 
 extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,

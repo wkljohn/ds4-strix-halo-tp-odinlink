@@ -716,6 +716,27 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
     if (i < n) out[i] = __float2half(x[i]);
 }
 
+__device__ static uint16_t f32_to_bf16_bits_rne(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t magnitude = bits & 0x7fffffffu;
+    if (magnitude > 0x7f800000u) {
+        /* Preserve sign/payload high bits while forcing a quiet BF16 NaN.
+         * This also keeps a NaN whose payload lives only in the discarded
+         * F32 mantissa bits from becoming infinity. */
+        return (uint16_t)((bits >> 16u) | 0x0040u);
+    }
+    const uint32_t tie_to_even = (bits >> 16u) & 1u;
+    return (uint16_t)((bits + 0x00007fffu + tie_to_even) >> 16u);
+}
+
+__global__ static void round_bf16_inplace_kernel(
+        float *values, uint64_t count, float post_scale) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t widened = (uint32_t)f32_to_bf16_bits_rne(values[i]) << 16u;
+    values[i] = __uint_as_float(widened) * post_scale;
+}
+
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)

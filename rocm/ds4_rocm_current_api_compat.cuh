@@ -92,6 +92,19 @@ extern "C" int ds4_gpu_tensor_copy_f32_to_f16(
     return cuda_ok(cudaGetLastError(), "tensor copy f32 to f16 launch");
 }
 
+extern "C" int ds4_gpu_round_bf16_inplace_tensor(
+        ds4_gpu_tensor *tensor, uint64_t count, float post_scale) {
+    if (!tensor || !tensor->ptr || !isfinite(post_scale) ||
+        count > UINT64_MAX / sizeof(float) ||
+        count * sizeof(float) > tensor->bytes) return 0;
+    if (count == 0u) return 1;
+    const uint64_t blocks = (count + 255u) / 256u;
+    if (blocks > INT32_MAX) return 0;
+    round_bf16_inplace_kernel<<<(uint32_t)blocks, 256>>>(
+        (float *)tensor->ptr, count, post_scale);
+    return cuda_ok(cudaGetLastError(), "round bf16 inplace launch");
+}
+
 extern "C" int ds4_gpu_pro_q4_expert_table_auto_available(void) {
     return 0;
 }

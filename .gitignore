@@ -52,6 +52,7 @@
 /tests/test_rocm_glm5_mhc_carry
 /tests/test_rocm_glm5_kpool
 /tests/test_rocm_glm5_indexer_select
+/tests/test_rocm_glm5_bf16_round
 /tests/test_rocm_q4k_packed_slice_registry
 /tests/test_rocm_shared_routed_overlap
 /tests/test_rocm_q4k_slot_balance_oracle

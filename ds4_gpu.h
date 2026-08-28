@@ -64,6 +64,14 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
+/* Round F32 elements to BF16 with IEEE round-to-nearest-even, widen them back
+ * to F32 in place, then apply post_scale in F32.  A post_scale other than 1
+ * deliberately means the final F32 value is no longer BF16-representable.
+ * This pins model-dtype boundaries without allocating an expanded or
+ * persistent weight cache. */
+int ds4_gpu_round_bf16_inplace_tensor(ds4_gpu_tensor *tensor,
+                                      uint64_t count,
+                                      float post_scale);
 int ds4_gpu_moe_handoff_pack_tensor(
         ds4_gpu_tensor       *packed,
         const ds4_gpu_tensor *ffn_norm,
