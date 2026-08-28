@@ -277,6 +277,56 @@ bool run_roce_output(const Glm5TestGGUF &gguf,
     return true;
 }
 
+bool run_second_gate_probe(TpGuard &transport, bool leader) {
+    CHECK(transport.tp && transport.slab,
+          "block-session probe has live TP transport and slab");
+    constexpr uint64_t bytes = (uint64_t)kHidden * sizeof(float);
+    auto *base = static_cast<uint8_t *>(transport.slab);
+    float *out = reinterpret_cast<float *>(
+        base + ds4_tp_slab_big_out_offset(transport.tp));
+    float *in = reinterpret_cast<float *>(
+        base + ds4_tp_slab_big_in_offset(transport.tp));
+    std::vector<float> local(kHidden), expected_peer(kHidden), composed(kHidden);
+    for (uint32_t i = 0u; i < kHidden; ++i) {
+        const float leader_value =
+            (float)((int)(i % 97u) - 48) * (1.0f / 128.0f);
+        const float worker_value =
+            (float)((int)(i % 89u) - 44) * (1.0f / 256.0f);
+        local[i] = leader ? leader_value : worker_value;
+        expected_peer[i] = leader ? worker_value : leader_value;
+    }
+    std::memcpy(out, local.data(), bytes);
+    std::memset(in, 0xa5, bytes);
+    CHECK(ds4_tp_big_gate_is_direct(transport.tp, out, in, bytes),
+          "second block-stage payload reuses direct registered regions");
+    char error[256] = {};
+    const uint64_t contract =
+        fnv1a64(local.data(), bytes) ^ fnv1a64(expected_peer.data(), bytes);
+    CHECK(ds4_tp_hash_check(transport.tp, UINT64_C(0x474c4d3533420001),
+                            contract, error, sizeof(error)) == 1,
+          error);
+    CHECK(ds4_tp_big_gate_exchange(transport.tp, 3u, 2u,
+                                   out, in, bytes),
+          "exchange second block-stage payload over same RoCE session");
+    CHECK(std::memcmp(out, local.data(), bytes) == 0 &&
+          std::memcmp(in, expected_peer.data(), bytes) == 0,
+          "second exchange overwrites poison without corrupting local payload");
+    for (uint32_t i = 0u; i < kHidden; ++i)
+        composed[i] = out[i] + in[i];
+    const uint64_t composed_hash = fnv1a64(composed.data(), bytes);
+    CHECK(ds4_tp_hash_check(transport.tp, UINT64_C(0x474c4d3533420002),
+                            composed_hash, error, sizeof(error)) == 1,
+          error);
+    std::fprintf(stderr,
+        "GLM5 block-session RoCE role=%s layer=3 seq=2 bytes=%llu "
+        "direct=1 local_fnv=%016llx peer_fnv=%016llx composed_fnv=%016llx\n",
+        leader ? "leader" : "worker", (unsigned long long)bytes,
+        (unsigned long long)fnv1a64(out, bytes),
+        (unsigned long long)fnv1a64(in, bytes),
+        (unsigned long long)composed_hash);
+    return true;
+}
+
 bool run_test() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     const char *oracle_prefix =
@@ -681,6 +731,13 @@ bool run_test() {
                           &block_tp),
           "mandatory-RDMA MLA output composition");
     const char *tp_role = std::getenv("DS4_GLM5_TP_ROLE");
+    const char *block_probe =
+        std::getenv("DS4_GLM5_BLOCK_SESSION_PROBE");
+    CHECK(!block_probe ||
+              (block_probe[0] == '1' && block_probe[1] == '\0'),
+          "block-session probe must be exactly 1 when set");
+    CHECK(!block_probe || tp_role,
+          "block-session probe requires a TP role");
     if (tp_role) {
         const bool leader = std::strcmp(tp_role, "leader") == 0;
         ds4_gpu_tensor *d_owned_partial =
@@ -737,13 +794,18 @@ bool run_test() {
               compare_values("hc_carried_roce", got_hc_carried_roce,
                              expected_hc_carried, 1.0e-5, 1.0e-10),
               "RoCE attention output reaches correct mHC carry");
+        if (block_probe) {
+            CHECK(run_second_gate_probe(
+                      block_tp, std::strcmp(tp_role, "leader") == 0),
+                  "reuse persistent RoCE session for second block stage");
+        }
     }
     if (!std::getenv("DS4_GLM5_TP_ROLE")) {
         CHECK(ds4_tp_test_get_exchange_calls() == 0u,
               "rank-local sparse-MLA heads invokes no TP exchange");
     } else {
-        CHECK(ds4_tp_test_get_exchange_calls() == 1u,
-              "RoCE sparse-MLA output invokes exactly one TP exchange");
+        CHECK(ds4_tp_test_get_exchange_calls() == (block_probe ? 2u : 1u),
+              "RoCE block invokes the expected TP exchange count");
     }
 
     ds4_gpu_tensor_free(d_last_hc_comb);
