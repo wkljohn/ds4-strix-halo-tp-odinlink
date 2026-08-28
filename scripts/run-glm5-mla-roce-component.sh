@@ -36,6 +36,7 @@ TIMEOUT=${DS4_GLM5_TP_CONNECT_TIMEOUT_SEC:-120}
 BLOCK_SESSION_PROBE=${DS4_GLM5_BLOCK_SESSION_PROBE:-0}
 FFN_PREROUTER=${DS4_GLM5_BLOCK_FFN_PREROUTER:-0}
 FFN_SHARED=${DS4_GLM5_BLOCK_FFN_SHARED:-0}
+FFN_FULL=${DS4_GLM5_BLOCK_FFN_FULL:-0}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/mla-compose}
 OUT=$DS4_RESEARCH_ROOT/glm5-next-tp2/$TAG
 BINARY=$REPO/tests/test_rocm_glm5_mla_compose
@@ -74,6 +75,15 @@ done
 }
 [[ $FFN_SHARED == 0 || $FFN_PREROUTER == 1 ]] || {
   echo "error: FFN shared mode requires FFN prerouter mode" >&2
+  exit 2
+}
+[[ $FFN_FULL == 0 || $FFN_FULL == 1 ]] || {
+  echo "error: DS4_GLM5_BLOCK_FFN_FULL must be 0 or 1" >&2
+  exit 2
+}
+[[ $FFN_FULL == 0 ||
+   ( $FFN_SHARED == 1 && $BLOCK_SESSION_PROBE == 0 ) ]] || {
+  echo "error: FFN full mode requires shared mode and owns sequence 2" >&2
   exit 2
 }
 [[ -f $MODEL ]] || { echo "error: missing local model" >&2; exit 2; }
@@ -174,6 +184,7 @@ timeout_sec=$TIMEOUT
 block_session_probe=$BLOCK_SESSION_PROBE
 ffn_prerouter=$FFN_PREROUTER
 ffn_shared=$FFN_SHARED
+ffn_full=$FFN_FULL
 EOF
 
 env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -188,10 +199,11 @@ env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   DS4_GLM5_BLOCK_SESSION_PROBE="$BLOCK_SESSION_PROBE" \
   DS4_GLM5_BLOCK_FFN_PREROUTER="$FFN_PREROUTER" \
   DS4_GLM5_BLOCK_FFN_SHARED="$FFN_SHARED" \
+  DS4_GLM5_BLOCK_FFN_FULL="$FFN_FULL" \
   "$BINARY" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_MLA_COMPOSE_ORACLE_PREFIX='$PEER_ORACLE' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_BLOCK_SESSION_PROBE='$BLOCK_SESSION_PROBE' DS4_GLM5_BLOCK_FFN_PREROUTER='$FFN_PREROUTER' DS4_GLM5_BLOCK_FFN_SHARED='$FFN_SHARED' '$PEER_BINARY'" \
+  "env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_MLA_COMPOSE_ORACLE_PREFIX='$PEER_ORACLE' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_BLOCK_SESSION_PROBE='$BLOCK_SESSION_PROBE' DS4_GLM5_BLOCK_FFN_PREROUTER='$FFN_PREROUTER' DS4_GLM5_BLOCK_FFN_SHARED='$FFN_SHARED' DS4_GLM5_BLOCK_FFN_FULL='$FFN_FULL' '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 set +e
@@ -255,6 +267,43 @@ if [[ $FFN_SHARED == 1 ]]; then
     'GLM5 block FFN shared' full_fnv)
   [[ $LEADER_SHARED == "$WORKER_SHARED" ]] || {
     echo "error: serial full shared-expert hashes differ across ranks" >&2
+    exit 1
+  }
+fi
+if [[ $FFN_FULL == 1 ]]; then
+  for log in "$OUT/leader.log" "$OUT/worker.log"; do
+    require_log "$log" 'GLM5 block FFN RoCE .*layer=3 seq=2 .*direct=1' \
+      'real combined FFN sequence-2 exchange'
+    require_log "$log" 'GLM5 complete block .*packed_table_bytes=0 .*tp_roce=1' \
+      'complete cache-free block carry'
+  done
+  LEADER_FINAL=$(line_field "$OUT/leader.log" \
+    'GLM5 complete block' final_fnv)
+  WORKER_FINAL=$(line_field "$OUT/worker.log" \
+    'GLM5 complete block' final_fnv)
+  LEADER_FFN_LOCAL=$(line_field "$OUT/leader.log" \
+    'GLM5 block FFN RoCE' local_fnv)
+  LEADER_FFN_PEER=$(line_field "$OUT/leader.log" \
+    'GLM5 block FFN RoCE' peer_fnv)
+  WORKER_FFN_LOCAL=$(line_field "$OUT/worker.log" \
+    'GLM5 block FFN RoCE' local_fnv)
+  WORKER_FFN_PEER=$(line_field "$OUT/worker.log" \
+    'GLM5 block FFN RoCE' peer_fnv)
+  LEADER_FFN_SUM=$(line_field "$OUT/leader.log" \
+    'GLM5 block FFN RoCE' composed_fnv)
+  LEADER_FFN_SERIAL=$(line_field "$OUT/leader.log" \
+    'GLM5 block FFN RoCE' serial_fnv)
+  WORKER_FFN_SUM=$(line_field "$OUT/worker.log" \
+    'GLM5 block FFN RoCE' composed_fnv)
+  WORKER_FFN_SERIAL=$(line_field "$OUT/worker.log" \
+    'GLM5 block FFN RoCE' serial_fnv)
+  [[ $LEADER_FINAL == "$WORKER_FINAL" &&
+     $LEADER_FFN_LOCAL == "$WORKER_FFN_PEER" &&
+     $WORKER_FFN_LOCAL == "$LEADER_FFN_PEER" &&
+     $LEADER_FFN_SUM == "$LEADER_FFN_SERIAL" &&
+     $WORKER_FFN_SUM == "$WORKER_FFN_SERIAL" &&
+     $LEADER_FFN_SUM == "$WORKER_FFN_SUM" ]] || {
+    echo "error: complete GLM5 block FFN hash chain did not close" >&2
     exit 1
   }
 fi
