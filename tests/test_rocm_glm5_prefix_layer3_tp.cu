@@ -224,19 +224,76 @@ bool run() {
         index_key.data(), index_key.size() * sizeof(float));
     const uint64_t gate_hash = fnv64(
         pool_gate.data(), pool_gate.size() * sizeof(float));
+    const uint64_t packed_q4_bytes = ds4_gpu_q4k_packed_slice_bytes();
     char error[256] = {};
     CHECK(ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d35334f5554),
                             output_hash, error, sizeof(error)) == 1, error);
-    CHECK(ds4_gpu_q4k_packed_slice_bytes() != 0u,
+    CHECK(packed_q4_bytes != 0u,
           "layer3 owns compact Q4 rank residency");
+
+    CHECK(ds4_glm5_next_embed_token(&exec, 43u, current.value),
+          "embed token 43");
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(ds4_glm5_next_layer_forward(
+                  &exec, il, &state.value, workspace.value,
+                  current.value, output.value),
+              "execute second-token dense prefix");
+        std::swap(current.value, output.value);
+    }
+    CHECK(ds4_glm5_next_layer_forward(
+              &exec, 3u, &state.value, workspace.value,
+              current.value, output.value),
+          "execute second-token MLA cache-read layer3 over RoCE");
+    CHECK(state.value.valid && state.value.mla[3].token_count == 2u &&
+          sequence == 4u &&
+          ds4_gpu_q4k_packed_slice_bytes() == packed_q4_bytes,
+          "second token commits after two exchanges without Q4 duplication");
+
+    std::vector<float> result1(kHcWidth), kv2(1024u), index2(256u),
+        pool2(256u);
+    CHECK(ds4_gpu_tensor_read(output.value, 0u, result1.data(),
+                              result1.size() * sizeof(float)) &&
+          ds4_gpu_tensor_read(state.value.mla[3].compact_kv, 0u,
+                              kv2.data(), kv2.size() * sizeof(float)) &&
+          ds4_gpu_tensor_read(state.value.mla[3].index_key, 0u,
+                              index2.data(), index2.size() * sizeof(float)) &&
+          ds4_gpu_tensor_read(state.value.mla[3].pool_gate, 0u,
+                              pool2.data(), pool2.size() * sizeof(float)),
+          "read second-token output and two resident cache rows");
+    CHECK(std::memcmp(kv2.data(), kv.data(), kv.size() * sizeof(float)) == 0 &&
+          std::memcmp(index2.data(), index_key.data(),
+                      index_key.size() * sizeof(float)) == 0 &&
+          std::memcmp(pool2.data(), pool_gate.data(),
+                      pool_gate.size() * sizeof(float)) == 0,
+          "second token preserves the committed token0 cache rows exactly");
+    const uint64_t output1_hash = fnv64(
+        result1.data(), result1.size() * sizeof(float));
+    const uint64_t kv2_hash = fnv64(kv2.data(), kv2.size() * sizeof(float));
+    const uint64_t index2_hash = fnv64(
+        index2.data(), index2.size() * sizeof(float));
+    const uint64_t gate2_hash = fnv64(
+        pool2.data(), pool2.size() * sizeof(float));
+    uint64_t state_hash = fnv64(&output1_hash, sizeof(output1_hash));
+    state_hash ^= kv2_hash;
+    state_hash ^= index2_hash;
+    state_hash ^= gate2_hash;
+    CHECK(output1_hash != output_hash &&
+          std::memcmp(kv2.data(), kv2.data() + kv.size(),
+                      kv.size() * sizeof(float)) != 0 &&
+          ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d3533544f4b),
+                            state_hash, error, sizeof(error)) == 1,
+          "second-token output/state are nontrivial and rank-identical");
     std::fprintf(stderr,
-        "PASS GLM5 prefix->layer3 role=%s output=%016llx kv=%016llx "
-        "index=%016llx pool_gate=%016llx tp_seq=%llu "
+        "PASS GLM5 prefix->layer3 token0 role=%s output=%016llx kv=%016llx "
+        "index=%016llx pool_gate=%016llx token1_output=%016llx "
+        "kv2=%016llx index2=%016llx pool2=%016llx tp_seq=%llu "
         "packed_q4_bytes=%llu window_cache_bytes=0 rdma=1\n",
         role, (unsigned long long)output_hash,
         (unsigned long long)kv_hash, (unsigned long long)index_hash,
-        (unsigned long long)gate_hash, (unsigned long long)sequence,
-        (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
+        (unsigned long long)gate_hash, (unsigned long long)output1_hash,
+        (unsigned long long)kv2_hash, (unsigned long long)index2_hash,
+        (unsigned long long)gate2_hash, (unsigned long long)sequence,
+        (unsigned long long)packed_q4_bytes);
     return true;
 }
 
