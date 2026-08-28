@@ -70,6 +70,8 @@ FULL_TOKENS=${DS4_GLM5_FULL_TOKENS:-1}
 TEXT_PROMPT=${DS4_GLM5_TEXT_PROMPT:-}
 TEXT_GENERATE=${DS4_GLM5_TEXT_GENERATE:-4}
 TEXT_TEACHER_IDS=${DS4_GLM5_TEXT_TEACHER_IDS:-}
+PERF_MODE=${DS4_GLM5_PERF_MODE:-0}
+EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
 PEER_BINARY=$PEER_DIR/test_rocm_glm5_prefix_layer3_tp
@@ -117,6 +119,21 @@ done
 }
 [[ $TEXT_GENERATE =~ ^[1-9][0-9]*$ ]] && (( TEXT_GENERATE <= 128 )) || {
   echo "error: DS4_GLM5_TEXT_GENERATE must be 1..128" >&2
+  exit 2
+}
+[[ $PERF_MODE == 0 || $PERF_MODE == 1 ]] || {
+  echo "error: DS4_GLM5_PERF_MODE must be 0 or 1" >&2
+  exit 2
+}
+[[ -z $EXPECTED_GENERATED_FNV ||
+   $EXPECTED_GENERATED_FNV =~ ^[0-9a-f]{16}$ ]] || {
+  echo "error: DS4_GLM5_EXPECT_GENERATED_FNV must be a 16-digit lowercase FNV64" >&2
+  exit 2
+}
+[[ $PERF_MODE == 0 ||
+   (-n $TEXT_PROMPT && -z $TEXT_TEACHER_IDS &&
+    -n $EXPECTED_GENERATED_FNV) ]] || {
+  echo "error: performance mode requires greedy text and an expected generated FNV" >&2
   exit 2
 }
 [[ -z $EXPECTED_MODEL_SHA || $EXPECTED_MODEL_SHA =~ ^[0-9a-f]{64}$ ]] || {
@@ -318,6 +335,8 @@ printf 'full_tokens=%s\n' "$FULL_TOKENS" >>"$OUT/run.env"
 printf 'text_mode=%s\n' "$([[ -n $TEXT_PROMPT ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
 printf 'text_generate=%s\n' "$TEXT_GENERATE" >>"$OUT/run.env"
+printf 'perf_mode=%s\n' "$PERF_MODE" >>"$OUT/run.env"
+printf 'expected_generated_fnv=%s\n' "$EXPECTED_GENERATED_FNV" >>"$OUT/run.env"
 if [[ -n $TEXT_PROMPT ]]; then
   printf 'text_prompt=%s\n' "$TEXT_PROMPT" >>"$OUT/run.env"
   printf 'text_prompt_sha256=%s\n' \
@@ -356,7 +375,8 @@ fi
 if [[ -n $TEXT_PROMPT ]]; then
   text_env+=(DS4_GLM5_TEXT_PROMPT="$TEXT_PROMPT")
   text_env+=(DS4_GLM5_TEXT_GENERATE="$TEXT_GENERATE")
-  remote_text_env=" DS4_GLM5_TEXT_PROMPT='$TEXT_PROMPT' DS4_GLM5_TEXT_GENERATE='$TEXT_GENERATE'"
+  text_env+=(DS4_GLM5_PERF_MODE="$PERF_MODE")
+  remote_text_env=" DS4_GLM5_TEXT_PROMPT='$TEXT_PROMPT' DS4_GLM5_TEXT_GENERATE='$TEXT_GENERATE' DS4_GLM5_PERF_MODE='$PERF_MODE'"
   if [[ -n $TEXT_TEACHER_IDS ]]; then
     text_env+=(DS4_GLM5_TEXT_TEACHER_IDS="$TEXT_TEACHER_IDS")
     remote_text_env+=" DS4_GLM5_TEXT_TEACHER_IDS='$TEXT_TEACHER_IDS'"
@@ -407,6 +427,10 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
   if [[ -n $TEXT_PROMPT ]]; then
     grep -q 'GLM5 text prompt role=' "$log"
     grep -q 'PASS GLM5 real-text role=' "$log"
+    if [[ $PERF_MODE == 1 ]]; then
+      grep -q 'GLM5 staged timing role=' "$log"
+      grep -q 'full_logit_validation=0' "$log"
+    fi
     if [[ -n $TEXT_TEACHER_IDS ]]; then
       grep -q 'PASS GLM5 teacher-forced role=' "$log"
     fi
@@ -428,6 +452,11 @@ if [[ -n $TEXT_PROMPT ]]; then
   [[ -n $LEADER_OUTPUT && $LEADER_OUTPUT == "$WORKER_OUTPUT" &&
      -n $LEADER_IDS && $LEADER_IDS == "$WORKER_IDS" ]] || {
     echo "error: all-rank prompt/generated hashes differ" >&2
+    exit 1
+  }
+  [[ -z $EXPECTED_GENERATED_FNV ||
+     $LEADER_OUTPUT == "$EXPECTED_GENERATED_FNV" ]] || {
+    echo "error: generated fingerprint does not match the required reference" >&2
     exit 1
   }
 else

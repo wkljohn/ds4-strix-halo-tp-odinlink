@@ -12,6 +12,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -179,12 +180,27 @@ bool read_argmax(ds4_glm5_next_exec_ctx &exec,
                  ds4_glm5_next_workspace *workspace,
                  ds4_gpu_tensor *current,
                  ds4_gpu_tensor *logits,
+                 ds4_gpu_tensor *gpu_argmax,
+                 bool validate_full_logits,
                  std::vector<float> &host_logits,
                  uint32_t &argmax,
                  uint64_t &logits_hash) {
-    CHECK(ds4_glm5_next_output_logits(&exec, workspace, current, logits) &&
-              ds4_gpu_synchronize(),
+    CHECK(ds4_glm5_next_output_logits(&exec, workspace, current, logits),
           "execute text vocabulary projection");
+    if (!validate_full_logits) {
+        int32_t gpu_token = -1;
+        CHECK(gpu_argmax &&
+                  ds4_gpu_argmax_tensor(gpu_argmax, logits, 154880u) &&
+                  ds4_gpu_synchronize() &&
+                  ds4_gpu_tensor_read(gpu_argmax, 0u, &gpu_token,
+                                      sizeof(gpu_token)) &&
+                  gpu_token >= 0 && gpu_token < 154880,
+              "select text vocabulary argmax on GPU");
+        argmax = (uint32_t)gpu_token;
+        logits_hash = fnv64(&gpu_token, sizeof(gpu_token));
+        return true;
+    }
+    CHECK(ds4_gpu_synchronize(), "synchronize text vocabulary projection");
     CHECK(ds4_gpu_tensor_read(logits, 0u, host_logits.data(),
                               host_logits.size() * sizeof(float)),
           "read text vocabulary logits");
@@ -232,6 +248,11 @@ bool run() {
           "full-token count is bounded and requires full-trunk mode");
     const char *text_prompt = std::getenv("DS4_GLM5_TEXT_PROMPT");
     const bool text_mode = text_prompt != nullptr;
+    const char *perf_mode_env = std::getenv("DS4_GLM5_PERF_MODE");
+    const bool perf_mode = perf_mode_env &&
+                           std::strcmp(perf_mode_env, "1") == 0;
+    CHECK(!perf_mode_env || perf_mode || std::strcmp(perf_mode_env, "0") == 0,
+          "performance mode is exactly 0 or 1");
     const char *text_generate_env = std::getenv("DS4_GLM5_TEXT_GENERATE");
     char *text_generate_end = nullptr;
     const unsigned long text_generate_long = text_generate_env ?
@@ -263,6 +284,8 @@ bool run() {
         CHECK(text_mode && teacher_ids.size() == text_generate,
               "teacher token count must equal generated-token bound");
     }
+    CHECK(!perf_mode || (text_mode && teacher_ids.empty()),
+          "performance mode requires greedy text generation");
     CodecGuard codec;
     TokensGuard prompt_tokens;
     if (text_mode) {
@@ -290,7 +313,7 @@ bool run() {
 
     StateGuard state;
     WorkspaceGuard workspace;
-    TensorGuard current, output, logits;
+    TensorGuard current, output, logits, gpu_argmax;
     CHECK(ds4_glm5_next_state_init(&state.value, &offsets,
                                    context_capacity, nullptr) &&
           (workspace.value = ds4_glm5_next_workspace_create()) != nullptr &&
@@ -300,7 +323,9 @@ bool run() {
               (uint64_t)kHcWidth * sizeof(float))) != nullptr &&
           (!full_trunk ||
            (logits.value = ds4_gpu_tensor_alloc(
-               UINT64_C(154880) * sizeof(float))) != nullptr),
+               UINT64_C(154880) * sizeof(float))) != nullptr) &&
+          (!perf_mode ||
+           (gpu_argmax.value = ds4_gpu_tensor_alloc(sizeof(int32_t))) != nullptr),
           "allocate resident state and production workspace");
 
     ds4_glm5_next_exec_ctx exec = {};
@@ -347,6 +372,7 @@ bool run() {
     const uint64_t mode_hash = UINT64_C(0x474c4d354d4f4400) ^
         ((uint64_t)full_trunk << 8u) ^ full_tokens ^
         ((uint64_t)text_mode << 16u) ^ ((uint64_t)text_generate << 24u) ^
+        ((uint64_t)perf_mode << 56u) ^
         prompt_hash ^ teacher_hash;
     if (text_mode) {
         std::fprintf(stderr,
@@ -433,6 +459,19 @@ bool run() {
     }
 
     if (text_mode) {
+        char ready_error[256] = {};
+        CHECK(ds4_gpu_synchronize() &&
+                  ds4_tp_hash_check(
+                      tp.tp, UINT64_C(0x474c4d3552454144),
+                      UINT64_C(0x46554c4c5452554e), ready_error,
+                      sizeof(ready_error)) == 1,
+              ready_error[0] ? ready_error :
+                  "both ranks ready after full-trunk residency");
+    }
+
+    if (text_mode) {
+        using Clock = std::chrono::steady_clock;
+        const auto prompt_begin = Clock::now();
         uint32_t executed = 0u;
         for (int i = 0; i < prompt_tokens.value.len; ++i) {
             CHECK(execute_full_token(
@@ -445,17 +484,26 @@ bool run() {
         CHECK(state.value.valid &&
                   sequence == (uint64_t)executed * 53u,
               "chat prompt commits one complete TP schedule per token");
+        const auto prompt_end = Clock::now();
 
-        std::vector<float> host_logits(154880u);
+        std::vector<float> host_logits(perf_mode ? 0u : 154880u);
         std::vector<uint32_t> generated;
         std::string text;
         double teacher_nll_sum = 0.0;
+        double projection_ms = 0.0;
+        double recurrent_ms = 0.0;
+        const auto decode_begin = Clock::now();
         for (uint32_t step = 0u; step < text_generate; ++step) {
             uint32_t top1 = 0u;
             uint64_t logits_hash = 0u;
+            const auto projection_begin = Clock::now();
             CHECK(read_argmax(exec, workspace.value, current.value,
-                              logits.value, host_logits, top1, logits_hash),
+                              logits.value, gpu_argmax.value, !perf_mode,
+                              host_logits, top1, logits_hash),
                   "select real-text greedy token");
+            const auto projection_end = Clock::now();
+            projection_ms += std::chrono::duration<double, std::milli>(
+                projection_end - projection_begin).count();
             char logits_error[256] = {};
             CHECK(ds4_tp_hash_check(
                       tp.tp,
@@ -508,14 +556,19 @@ bool run() {
                 break;
             }
             if (step + 1u < text_generate) {
+                const auto recurrent_begin = Clock::now();
                 CHECK(execute_full_token(exec, state.value, workspace.value,
                                          token, current.value, output.value),
                       "feed generated token into recurrent GLM5 state");
+                const auto recurrent_end = Clock::now();
+                recurrent_ms += std::chrono::duration<double, std::milli>(
+                    recurrent_end - recurrent_begin).count();
                 executed++;
                 CHECK(sequence == (uint64_t)executed * 53u,
                       "generated token commits one complete TP schedule");
             }
         }
+        const auto decode_end = Clock::now();
         CHECK(!generated.empty(), "real-text generation produced a token");
         CHECK(teacher_ids.empty() || generated.size() == teacher_ids.size(),
               "teacher-forced run consumed every prescribed token");
@@ -526,6 +579,22 @@ bool run() {
                                 generated_hash, generated_error,
                                 sizeof(generated_error)) == 1,
               generated_error);
+        const double prompt_ms =
+            std::chrono::duration<double, std::milli>(
+                prompt_end - prompt_begin).count();
+        const double decode_ms =
+            std::chrono::duration<double, std::milli>(
+                decode_end - decode_begin).count();
+        std::fprintf(stderr,
+            "GLM5 staged timing role=%s prompt_tokens=%d "
+            "prompt_ms=%.3f prefill_tps=%.6f generated=%zu "
+            "decode_ms=%.3f decode_tps=%.6f projection_ms=%.3f "
+            "recurrent_ms=%.3f full_logit_validation=%d\n",
+            role, prompt_tokens.value.len, prompt_ms,
+            prompt_tokens.value.len * 1000.0 / prompt_ms,
+            generated.size(), decode_ms,
+            generated.size() * 1000.0 / decode_ms,
+            projection_ms, recurrent_ms, perf_mode ? 0 : 1);
         if (!teacher_ids.empty()) {
             const uint64_t teacher_nll_hash =
                 fnv64(&teacher_nll_sum, sizeof(teacher_nll_sum));
