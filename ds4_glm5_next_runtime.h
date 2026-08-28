@@ -16,7 +16,8 @@ enum {
     DS4_GLM5_NEXT_TRUNK_COUNT = 45,
     DS4_GLM5_NEXT_LEADING_DENSE = 3,
     DS4_GLM5_NEXT_MLA_COUNT = 11,
-    DS4_GLM5_NEXT_MLA_KV_WIDTH = 1024,
+    /* GLM-5.3 NoPE stores only the normalized 512-wide KV-LoRA row. */
+    DS4_GLM5_NEXT_MLA_KV_WIDTH = 512,
     DS4_GLM5_NEXT_INDEX_WIDTH = 128,
 };
 

@@ -115,10 +115,10 @@ static int test_bytes(void) {
     uint64_t bytes = 0u;
     CHECK(ds4_glm5_next_state_bytes(&model, 8u, &bytes),
           "8-token state size accepted");
-    CHECK(bytes == UINT64_C(153083904), "8-token state size exact");
+    CHECK(bytes == UINT64_C(152903680), "8-token state size exact");
     CHECK(ds4_glm5_next_state_bytes(&model, 262144u, &bytes),
           "256K state size accepted");
-    CHECK(bytes == UINT64_C(14916583424), "256K state size exact");
+    CHECK(bytes == UINT64_C(9011003392), "256K state size exact");
     CHECK(!ds4_glm5_next_state_bytes(&model, 0u, &bytes),
           "zero context rejected");
     model.layer[3].attention = DS4_GLM5_NEXT_ATTN_KDA;
@@ -141,7 +141,7 @@ static int test_lifecycle(void) {
           "initialize complete mixed-attention state");
     fflush(accounting_stream);
     CHECK(accounting_seen_before_alloc, "accounting precedes allocation");
-    CHECK(strstr(text, "context=8 kda=34 mla=11 bytes=153083904") != NULL,
+    CHECK(strstr(text, "context=8 kda=34 mla=11 bytes=152903680") != NULL,
           "combined accounting exact");
     CHECK(state.valid && state.kda.valid && state.layer_count == 45u &&
           state.mla_count == 11u && state.context_capacity == 8u,
