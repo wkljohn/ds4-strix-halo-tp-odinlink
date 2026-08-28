@@ -215,6 +215,38 @@ test-rocm-glm5-mhc-layer: tests/test_rocm_glm5_mhc_layer
 	DS4_GLM5_MHC_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/mhc-layer0-attn" \
 		./tests/test_rocm_glm5_mhc_layer
 
+.PHONY: test-rocm-glm5-mhc-carry
+tests/test_rocm_glm5_mhc_carry.o: tests/test_rocm_glm5_mhc_carry.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_rocm_glm5_mhc_carry: tests/test_rocm_glm5_mhc_carry.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-mhc-carry: tests/test_rocm_glm5_mhc_carry
+	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "error: set DS4_RESEARCH_ROOT" >&2; exit 2; }
+	python3 scripts/probe-glm5-next-mhc-payload.py --layer 0 --site attn \
+		--tokens 3 --carry-sites 3 \
+		--output "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/mhc-carry-3site-oracle.json" \
+		--dump-prefix "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/mhc-carry-3site" \
+		"$(DS4_GLM5_MODEL)" >/dev/null
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+	DS4_GLM5_MHC_CARRY_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/mhc-carry-3site" \
+		./tests/test_rocm_glm5_mhc_carry
+	python3 scripts/probe-glm5-next-mhc-payload.py --layer 0 --site attn \
+		--tokens 1 --carry-sites 3 \
+		--output "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/mhc-carry-decode-3site-oracle.json" \
+		--dump-prefix "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/mhc-carry-decode-3site" \
+		"$(DS4_GLM5_MODEL)" >/dev/null
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+	DS4_GLM5_MHC_CARRY_TOKENS=1 \
+	DS4_GLM5_MHC_CARRY_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/mhc-carry-decode-3site" \
+		./tests/test_rocm_glm5_mhc_carry
+	DS4_CUDA_DISABLE_HC_SPLIT_NORM_FUSED=1 \
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+	DS4_GLM5_MHC_CARRY_TOKENS=1 \
+	DS4_GLM5_MHC_CARRY_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/mhc-carry-decode-3site" \
+		./tests/test_rocm_glm5_mhc_carry
+
 .PHONY: test-glm5-kda-tp-digest
 tests/test_glm5_kda_tp_digest: tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c $(LDLIBS)

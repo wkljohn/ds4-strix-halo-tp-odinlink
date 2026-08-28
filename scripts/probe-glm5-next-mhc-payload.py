@@ -96,12 +96,54 @@ def digest_array(value):
     return hashlib.sha256(np.asarray(value, dtype="<f4").tobytes()).hexdigest()
 
 
+def deterministic_hidden(tokens):
+    hidden = np.empty((tokens, 4, 4096), dtype=np.float32)
+    indices = np.arange(4096, dtype=np.float32)
+    for token in range(tokens):
+        for stream in range(4):
+            hidden[token, stream] = (
+                np.sin(np.float32(0.0031) *
+                       (indices + np.float32(1 + 17 * token + 31 * stream))) *
+                np.float32(0.2) + np.float32(0.01 * (stream - 1.5)))
+    return hidden
+
+
+def carry_branch(collapsed, ordinal):
+    """Deterministic nontrivial stand-in for the attention/FFN branch.
+
+    The carry oracle isolates hyper-connection ordering. Real branch operators
+    have their own same-GGUF gates and are composed only in the modal-block
+    stage; this function prevents an identity/zero branch from hiding a post
+    weight or stream-order defect.
+    """
+    width = collapsed.shape[-1]
+    phase = np.sin(np.arange(width, dtype=np.float32) * np.float32(0.0017) +
+                   np.float32(ordinal + 1) * np.float32(0.13))
+    return np.asarray(
+        collapsed * np.float32(0.375 + 0.125 * ordinal) +
+        phase[None, :] * np.float32(0.01), dtype=np.float32)
+
+
+def compose_carry(hidden, branch, post, comb):
+    # comb is [token][source][destination], matching the official model and
+    # ds4's hc_expand kernel. Keep the transpose explicit in the einsum.
+    residual = np.einsum("tsd,tsw->tdw", comb, hidden, dtype=np.float32)
+    return np.asarray(
+        residual + post[:, :, None] * branch[:, None, :], dtype=np.float32)
+
+
+def next_site(layer, site):
+    return (layer, "ffn") if site == "attn" else (layer + 1, "attn")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model", type=Path)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--site", choices=("attn", "ffn"), default="attn")
     parser.add_argument("--tokens", type=int, default=3)
+    parser.add_argument("--carry-sites", type=int, default=0,
+                        help="chain this many consecutive attn/ffn mHC sites")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--dump-prefix", type=Path)
     args = parser.parse_args()
@@ -109,32 +151,56 @@ def main():
         parser.error("--layer must identify an mHC-bearing trunk layer (0..44)")
     if args.tokens < 1:
         parser.error("--tokens must be positive")
+    if args.carry_sites < 0:
+        parser.error("--carry-sites must be nonnegative")
 
     helpers = load_gguf_helpers()
     data_start, tensors = helpers.load_directory(args.model)
-    prefix = f"blk.{args.layer}.hc_{args.site}"
     with args.model.open("rb") as fp:
         blob = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
-        fn = tensor_view(blob, data_start, tensors, prefix + "_fn.weight",
-                         (16384, 24), 30)
-        base = tensor_view(blob, data_start, tensors, prefix + "_base.weight",
-                           (24,), 0).copy()
-        scale = tensor_view(blob, data_start, tensors, prefix + "_scale.weight",
-                            (3,), 0).copy()
-        tensor_payload = (
-            np.asarray(fn, dtype="<f4").tobytes() +
-            np.asarray(base, dtype="<f4").tobytes() +
-            np.asarray(scale, dtype="<f4").tobytes())
-
-        hidden = np.empty((args.tokens, 4, 4096), dtype=np.float32)
-        for token in range(args.tokens):
-            for stream in range(4):
-                indices = np.arange(4096, dtype=np.float32)
-                hidden[token, stream] = (
-                    np.sin(np.float32(0.0031) *
-                           (indices + np.float32(1 + 17 * token + 31 * stream))) *
-                    np.float32(0.2) + np.float32(0.01 * (stream - 1.5)))
-        post, comb, collapsed = mhc_reference(hidden, fn, base, scale)
+        hidden = deterministic_hidden(args.tokens)
+        initial_hidden = hidden.copy()
+        site_count = args.carry_sites if args.carry_sites else 1
+        layer, site = args.layer, args.site
+        site_documents = []
+        site_arrays = []
+        tensor_payload = bytearray()
+        for ordinal in range(site_count):
+            if layer >= 45:
+                raise ValueError(
+                    "mHC carry crosses beyond the 45 trunk mHC blocks; "
+                    "MTP mHC tensors use a separate namespace")
+            prefix = f"blk.{layer}.hc_{site}"
+            fn = tensor_view(blob, data_start, tensors, prefix + "_fn.weight",
+                             (16384, 24), 30)
+            base = tensor_view(blob, data_start, tensors,
+                               prefix + "_base.weight", (24,), 0).copy()
+            scale = tensor_view(blob, data_start, tensors,
+                                prefix + "_scale.weight", (3,), 0).copy()
+            tensor_payload.extend(np.asarray(fn, dtype="<f4").tobytes())
+            tensor_payload.extend(np.asarray(base, dtype="<f4").tobytes())
+            tensor_payload.extend(np.asarray(scale, dtype="<f4").tobytes())
+            post, comb, collapsed = mhc_reference(hidden, fn, base, scale)
+            branch = carry_branch(collapsed, ordinal)
+            carried = compose_carry(hidden, branch, post, comb)
+            site_documents.append({
+                "ordinal": ordinal,
+                "layer": layer,
+                "site": site,
+                "post_f32_sha256": digest_array(post),
+                "comb_f32_sha256": digest_array(comb),
+                "collapsed_f32_sha256": digest_array(collapsed),
+                "branch_f32_sha256": digest_array(branch),
+                "carried_f32_sha256": digest_array(carried),
+                "carried_l2": float(np.linalg.norm(carried.astype(np.float64))),
+                "comb_row_sum_max_error": float(
+                    np.max(np.abs(np.sum(comb, axis=-1) - np.float32(1.0)))),
+                "comb_column_sum_max_error": float(
+                    np.max(np.abs(np.sum(comb, axis=-2) - np.float32(1.0)))),
+            })
+            site_arrays.append((post, comb, collapsed, branch, carried))
+            hidden = carried
+            layer, site = next_site(layer, site)
 
     document = {
         "status": "component oracle; not a canonical or promoted baseline",
@@ -143,26 +209,42 @@ def main():
         "layer": args.layer,
         "site": args.site,
         "tokens": args.tokens,
+        "carry_sites": args.carry_sites,
         "tensor_payload_f32_sha256": hashlib.sha256(tensor_payload).hexdigest(),
-        "input_f32_sha256": digest_array(hidden),
-        "post_f32_sha256": digest_array(post),
-        "comb_f32_sha256": digest_array(comb),
-        "collapsed_f32_sha256": digest_array(collapsed),
-        "collapsed_l2": float(np.linalg.norm(collapsed.astype(np.float64))),
-        "comb_row_sum_max_error": float(
-            np.max(np.abs(np.sum(comb, axis=-1) - np.float32(1.0)))),
-        "comb_column_sum_max_error": float(
-            np.max(np.abs(np.sum(comb, axis=-2) - np.float32(1.0)))),
+        "input_f32_sha256": digest_array(initial_hidden),
+        "post_f32_sha256": site_documents[0]["post_f32_sha256"],
+        "comb_f32_sha256": site_documents[0]["comb_f32_sha256"],
+        "collapsed_f32_sha256": site_documents[0]["collapsed_f32_sha256"],
+        "collapsed_l2": float(
+            np.linalg.norm(site_arrays[0][2].astype(np.float64))),
+        "comb_row_sum_max_error": site_documents[0]["comb_row_sum_max_error"],
+        "comb_column_sum_max_error":
+            site_documents[0]["comb_column_sum_max_error"],
+        "sites": site_documents,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
     if args.dump_prefix is not None:
         args.dump_prefix.parent.mkdir(parents=True, exist_ok=True)
-        for suffix, value in {
-                ".input.f32": hidden,
+        dumps = {".input.f32": initial_hidden}
+        if args.carry_sites:
+            for ordinal, arrays in enumerate(site_arrays):
+                post, comb, collapsed, branch, carried = arrays
+                dumps.update({
+                    f".site{ordinal}.post.f32": post,
+                    f".site{ordinal}.comb.f32": comb,
+                    f".site{ordinal}.collapsed.f32": collapsed,
+                    f".site{ordinal}.branch.f32": branch,
+                    f".site{ordinal}.carried.f32": carried,
+                })
+        else:
+            post, comb, collapsed, _, _ = site_arrays[0]
+            dumps.update({
                 ".post.f32": post,
                 ".comb.f32": comb,
-                ".collapsed.f32": collapsed}.items():
+                ".collapsed.f32": collapsed,
+            })
+        for suffix, value in dumps.items():
             Path(str(args.dump_prefix) + suffix).write_bytes(
                 np.asarray(value, dtype="<f4").tobytes())
     print(json.dumps(document, indent=2, sort_keys=True))
