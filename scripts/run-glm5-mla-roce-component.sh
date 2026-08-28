@@ -34,6 +34,7 @@ HOST=${DS4_COORDINATOR_ADDR:-192.168.99.1}
 PORT=${DS4_GLM5_MLA_TP_PORT:-15880}
 TIMEOUT=${DS4_GLM5_TP_CONNECT_TIMEOUT_SEC:-120}
 BLOCK_SESSION_PROBE=${DS4_GLM5_BLOCK_SESSION_PROBE:-0}
+FFN_PREROUTER=${DS4_GLM5_BLOCK_FFN_PREROUTER:-0}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/mla-compose}
 OUT=$DS4_RESEARCH_ROOT/glm5-next-tp2/$TAG
 BINARY=$REPO/tests/test_rocm_glm5_mla_compose
@@ -60,6 +61,10 @@ done
 }
 [[ $BLOCK_SESSION_PROBE == 0 || $BLOCK_SESSION_PROBE == 1 ]] || {
   echo "error: DS4_GLM5_BLOCK_SESSION_PROBE must be 0 or 1" >&2
+  exit 2
+}
+[[ $FFN_PREROUTER == 0 || $FFN_PREROUTER == 1 ]] || {
+  echo "error: DS4_GLM5_BLOCK_FFN_PREROUTER must be 0 or 1" >&2
   exit 2
 }
 [[ -f $MODEL ]] || { echo "error: missing local model" >&2; exit 2; }
@@ -158,6 +163,7 @@ local_device=$LOCAL_DEVICE
 peer_device=$PEER_DEVICE
 timeout_sec=$TIMEOUT
 block_session_probe=$BLOCK_SESSION_PROBE
+ffn_prerouter=$FFN_PREROUTER
 EOF
 
 env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -170,10 +176,11 @@ env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   DS4_GLM5_TP_RDMA_DEVICE="$LOCAL_DEVICE" \
   DS4_GLM5_TP_CONNECT_TIMEOUT_SEC="$TIMEOUT" \
   DS4_GLM5_BLOCK_SESSION_PROBE="$BLOCK_SESSION_PROBE" \
+  DS4_GLM5_BLOCK_FFN_PREROUTER="$FFN_PREROUTER" \
   "$BINARY" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_MLA_COMPOSE_ORACLE_PREFIX='$PEER_ORACLE' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_BLOCK_SESSION_PROBE='$BLOCK_SESSION_PROBE' '$PEER_BINARY'" \
+  "env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_MLA_COMPOSE_ORACLE_PREFIX='$PEER_ORACLE' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_BLOCK_SESSION_PROBE='$BLOCK_SESSION_PROBE' DS4_GLM5_BLOCK_FFN_PREROUTER='$FFN_PREROUTER' '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 set +e
@@ -203,6 +210,28 @@ if [[ $BLOCK_SESSION_PROBE == 1 ]]; then
     require_log "$log" 'GLM5 block-session RoCE .*layer=3 seq=2 .*direct=1' \
       'second direct block-stage exchange'
   done
+fi
+if [[ $FFN_PREROUTER == 1 ]]; then
+  for log in "$OUT/leader.log" "$OUT/worker.log"; do
+    require_log "$log" 'GLM5 block FFN prerouter source=serial' \
+      'serial FFN prerouter control'
+    require_log "$log" 'GLM5 block FFN prerouter source=roce' \
+      'RoCE-carried FFN prerouter path'
+  done
+  LEADER_SERIAL_ROUTE=$(line_field "$OUT/leader.log" \
+    'GLM5 block FFN prerouter source=serial' route_fnv)
+  LEADER_ROCE_ROUTE=$(line_field "$OUT/leader.log" \
+    'GLM5 block FFN prerouter source=roce' route_fnv)
+  WORKER_SERIAL_ROUTE=$(line_field "$OUT/worker.log" \
+    'GLM5 block FFN prerouter source=serial' route_fnv)
+  WORKER_ROCE_ROUTE=$(line_field "$OUT/worker.log" \
+    'GLM5 block FFN prerouter source=roce' route_fnv)
+  [[ $LEADER_SERIAL_ROUTE == "$LEADER_ROCE_ROUTE" &&
+     $WORKER_SERIAL_ROUTE == "$WORKER_ROCE_ROUTE" &&
+     $LEADER_ROCE_ROUTE == "$WORKER_ROCE_ROUTE" ]] || {
+    echo "error: serial/RoCE FFN prerouter hash chain did not close" >&2
+    exit 1
+  }
 fi
 require_log "$OUT/leader.log" "role=leader device=$LOCAL_DEVICE" \
   'leader ownership'

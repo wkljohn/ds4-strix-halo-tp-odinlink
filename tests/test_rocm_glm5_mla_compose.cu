@@ -69,6 +69,15 @@ uint64_t fnv1a64(const void *data, uint64_t bytes) {
     return hash;
 }
 
+uint64_t fnv1a64_continue(uint64_t hash, const void *data, uint64_t bytes) {
+    const auto *p = static_cast<const uint8_t *>(data);
+    for (uint64_t i = 0u; i < bytes; ++i) {
+        hash ^= p[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 template <typename T>
 bool read_array(const std::string &path, size_t count, std::vector<T> &out) {
     std::ifstream input(path, std::ios::binary | std::ios::ate);
@@ -327,6 +336,108 @@ bool run_second_gate_probe(TpGuard &transport, bool leader) {
     return true;
 }
 
+bool run_ffn_prerouter(
+        const Glm5TestGGUF &gguf, const ds4_gpu_tensor *carried,
+        uint64_t hc_fn, uint64_t hc_scale, uint64_t hc_base,
+        uint64_t ffn_norm, uint64_t router_weight, uint64_t router_bias,
+        const std::vector<float> &expected_split,
+        const std::vector<float> &expected_hidden,
+        const std::vector<int32_t> &expected_ids,
+        const std::vector<float> &expected_weights,
+        const char *label, uint64_t &route_hash) {
+    ds4_gpu_tensor *flat = ds4_gpu_tensor_alloc(
+        (uint64_t)kHc * kHidden * sizeof(float));
+    ds4_gpu_tensor *mix = ds4_gpu_tensor_alloc(
+        (uint64_t)kHcMix * sizeof(float));
+    ds4_gpu_tensor *split = ds4_gpu_tensor_alloc(
+        (uint64_t)kHcMix * sizeof(float));
+    ds4_gpu_tensor *collapsed = ds4_gpu_tensor_alloc(
+        (uint64_t)kHidden * sizeof(float));
+    ds4_gpu_tensor *hidden = ds4_gpu_tensor_alloc(
+        (uint64_t)kHidden * sizeof(float));
+    ds4_gpu_tensor *logits = ds4_gpu_tensor_alloc(288u * sizeof(float));
+    ds4_gpu_tensor *probs = ds4_gpu_tensor_alloc(288u * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(8u * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(8u * sizeof(float));
+    const auto release = [&]() {
+        ds4_gpu_tensor_free(weights);
+        ds4_gpu_tensor_free(selected);
+        ds4_gpu_tensor_free(probs);
+        ds4_gpu_tensor_free(logits);
+        ds4_gpu_tensor_free(hidden);
+        ds4_gpu_tensor_free(collapsed);
+        ds4_gpu_tensor_free(split);
+        ds4_gpu_tensor_free(mix);
+        ds4_gpu_tensor_free(flat);
+    };
+    bool ok = flat && mix && split && collapsed && hidden && logits && probs &&
+              selected && weights;
+    if (ok) {
+        ok = ds4_gpu_rms_norm_plain_rows_tensor(
+                 flat, carried, kHc * kHidden, 1u, 1.0e-5f) &&
+             ds4_gpu_matmul_bf16_tensor(
+                 mix, gguf.map, gguf.size, hc_fn,
+                 kHc * kHidden, kHcMix, flat, 1u) &&
+             ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                 collapsed, hidden, split, mix, carried,
+                 gguf.map, gguf.size, hc_scale, hc_base, ffn_norm,
+                 kHidden, kHc, 20u, 1.0e-6f, 1.0e-5f) &&
+             ds4_gpu_matmul_f32_tensor(
+                 logits, gguf.map, gguf.size, router_weight,
+                 kHidden, 288u, hidden, 1u) &&
+             ds4_gpu_glm_router_select_batch_tensor(
+                 selected, weights, probs, gguf.map, gguf.size,
+                 router_bias, logits, 288u, 8u, 2.5f, 1u) &&
+             ds4_gpu_synchronize();
+    }
+    std::vector<float> got_split, got_hidden, got_weights;
+    std::vector<int32_t> got_ids;
+    if (ok) {
+        ok = read_tensor(split, kHcMix, got_split) &&
+             read_tensor(hidden, kHidden, got_hidden) &&
+             read_tensor(selected, 8u, got_ids) &&
+             read_tensor(weights, 8u, got_weights);
+    }
+    if (ok) {
+        ok = compare_values("ffn_split", got_split, expected_split,
+                            2.0e-6, 1.0e-10) &&
+             compare_values("ffn_hidden", got_hidden, expected_hidden,
+                            3.0e-6, 1.0e-10) &&
+             got_ids == expected_ids &&
+             compare_values("router_weight", got_weights,
+                            expected_weights, 2.0e-6, 1.0e-10);
+    }
+    if (ok) {
+        const uint64_t split_hash = fnv1a64(
+            got_split.data(), got_split.size() * sizeof(float));
+        const uint64_t ids_hash = fnv1a64(
+            got_ids.data(), got_ids.size() * sizeof(int32_t));
+        const uint64_t weights_hash = fnv1a64(
+            got_weights.data(), got_weights.size() * sizeof(float));
+        route_hash = UINT64_C(1469598103934665603);
+        route_hash = fnv1a64_continue(
+            route_hash, got_split.data(),
+            got_split.size() * sizeof(float));
+        route_hash = fnv1a64_continue(
+            route_hash, got_ids.data(),
+            got_ids.size() * sizeof(int32_t));
+        route_hash = fnv1a64_continue(
+            route_hash, got_weights.data(),
+            got_weights.size() * sizeof(float));
+        std::fprintf(stderr,
+            "GLM5 block FFN prerouter source=%s split_fnv=%016llx "
+            "ids_fnv=%016llx weights_fnv=%016llx route_fnv=%016llx\n",
+            label, (unsigned long long)split_hash,
+            (unsigned long long)ids_hash,
+            (unsigned long long)weights_hash,
+            (unsigned long long)route_hash);
+    }
+    if (!ok) (void)ds4_gpu_synchronize();
+    release();
+    CHECK(ok, "execute and validate FFN mHC/router boundary");
+    return true;
+}
+
 bool run_test() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     const char *oracle_prefix =
@@ -341,9 +452,11 @@ bool run_test() {
         expected_kv_norm, expected_qk_low, expected_index_q,
         expected_index_key, expected_pool_gate, expected_head_weights,
         expected_pooled, expected_pool_scores, expected_heads,
-        expected_attn_output;
+        expected_attn_output, expected_ffn_split, expected_ffn_hidden,
+        expected_router_weights;
     std::vector<uint32_t> valid, expected_pool_valid, expected_selected_pools;
-    std::vector<int32_t> expected_pool_indices, expected_selected_tokens;
+    std::vector<int32_t> expected_pool_indices, expected_selected_tokens,
+        expected_router_ids;
     CHECK(read_array(base + ".hc_residual.f32",
                      (uint64_t)kRows * kHc * kHidden, hc_residual) &&
           read_array(base + ".hc_post.f32", kRows * kHc,
@@ -386,7 +499,15 @@ bool run_test() {
           read_array(base + ".heads.f32", kHeads * kHeadDim,
                      expected_heads) &&
           read_array(base + ".attn_output.f32", kHidden,
-                     expected_attn_output),
+                     expected_attn_output) &&
+          read_array(base + ".ffn_split.f32", kHcMix,
+                     expected_ffn_split) &&
+          read_array(base + ".ffn_hidden.f32", kHidden,
+                     expected_ffn_hidden) &&
+          read_array(base + ".router_ids.i32", 8u,
+                     expected_router_ids) &&
+          read_array(base + ".router_weights.f32", 8u,
+                     expected_router_weights),
           "read sparse-MLA heads composition oracle dumps");
 
     Glm5TestGGUF gguf;
@@ -396,7 +517,9 @@ bool run_test() {
              kv_norm_w = 0u, k_b = 0u, v_b = 0u, index_q_w = 0u,
              index_k_w = 0u, index_weight_w = 0u, pool_gate_w = 0u,
              pool_ape = 0u, index_norm_w = 0u, index_norm_b = 0u,
-             attn_output_w = 0u;
+             attn_output_w = 0u, hc_ffn_fn = 0u, hc_ffn_base = 0u,
+             hc_ffn_scale = 0u, ffn_norm = 0u, router_weight = 0u,
+             router_bias = 0u;
     CHECK(gguf.tensor("blk.3.hc_attn_fn.weight", {16384u, 24u}, 30u,
                       hc_fn) &&
           gguf.tensor("blk.3.hc_attn_base.weight", {24u}, 0u, hc_base) &&
@@ -417,7 +540,17 @@ bool run_test() {
           gguf.tensor("blk.3.indexer.k_norm.weight", {128u}, 0u, index_norm_w) &&
           gguf.tensor("blk.3.indexer.k_norm.bias", {128u}, 0u, index_norm_b) &&
           gguf.tensor("blk.3.attn_output.weight", {16384u, 4096u}, 8u,
-                      attn_output_w),
+                      attn_output_w) &&
+          gguf.tensor("blk.3.hc_ffn_fn.weight", {16384u, 24u}, 30u,
+                      hc_ffn_fn) &&
+          gguf.tensor("blk.3.hc_ffn_base.weight", {24u}, 0u,
+                      hc_ffn_base) &&
+          gguf.tensor("blk.3.hc_ffn_scale.weight", {3u}, 0u,
+                      hc_ffn_scale) &&
+          gguf.tensor("blk.3.ffn_norm.weight", {4096u}, 0u, ffn_norm) &&
+          gguf.tensor("blk.3.ffn_gate_inp.weight", {4096u, 288u}, 0u,
+                      router_weight) &&
+          gguf.tensor("blk.3.exp_probs_b.bias", {288u}, 0u, router_bias),
           "bind real block-3 mHC and sparse-MLA tensors");
 
     ds4_gpu_config config = {};
@@ -733,11 +866,32 @@ bool run_test() {
     const char *tp_role = std::getenv("DS4_GLM5_TP_ROLE");
     const char *block_probe =
         std::getenv("DS4_GLM5_BLOCK_SESSION_PROBE");
+    const char *ffn_prerouter =
+        std::getenv("DS4_GLM5_BLOCK_FFN_PREROUTER");
     CHECK(!block_probe ||
-              (block_probe[0] == '1' && block_probe[1] == '\0'),
-          "block-session probe must be exactly 1 when set");
-    CHECK(!block_probe || tp_role,
+              ((block_probe[0] == '0' || block_probe[0] == '1') &&
+               block_probe[1] == '\0'),
+          "block-session probe must be exactly 0 or 1 when set");
+    CHECK(!ffn_prerouter ||
+              ((ffn_prerouter[0] == '0' || ffn_prerouter[0] == '1') &&
+               ffn_prerouter[1] == '\0'),
+          "FFN prerouter mode must be exactly 0 or 1 when set");
+    const bool block_probe_enabled =
+        block_probe && block_probe[0] == '1';
+    const bool ffn_prerouter_enabled =
+        ffn_prerouter && ffn_prerouter[0] == '1';
+    CHECK(!block_probe_enabled || tp_role,
           "block-session probe requires a TP role");
+    uint64_t serial_route_hash = 0u;
+    if (ffn_prerouter_enabled) {
+        CHECK(run_ffn_prerouter(
+                  gguf, d_hc_carried_add, hc_ffn_fn, hc_ffn_scale,
+                  hc_ffn_base, ffn_norm, router_weight, router_bias,
+                  expected_ffn_split, expected_ffn_hidden,
+                  expected_router_ids, expected_router_weights,
+                  "serial", serial_route_hash),
+              "serial attention carry reaches FFN prerouter");
+    }
     if (tp_role) {
         const bool leader = std::strcmp(tp_role, "leader") == 0;
         ds4_gpu_tensor *d_owned_partial =
@@ -794,7 +948,23 @@ bool run_test() {
               compare_values("hc_carried_roce", got_hc_carried_roce,
                              expected_hc_carried, 1.0e-5, 1.0e-10),
               "RoCE attention output reaches correct mHC carry");
-        if (block_probe) {
+        if (ffn_prerouter_enabled) {
+            uint64_t roce_route_hash = 0u;
+            CHECK(run_ffn_prerouter(
+                      gguf, d_hc_carried_roce, hc_ffn_fn, hc_ffn_scale,
+                      hc_ffn_base, ffn_norm, router_weight, router_bias,
+                      expected_ffn_split, expected_ffn_hidden,
+                      expected_router_ids, expected_router_weights,
+                      "roce", roce_route_hash) &&
+                  serial_route_hash == roce_route_hash,
+                  "serial and RoCE FFN route states are identical");
+            char error[256] = {};
+            CHECK(ds4_tp_hash_check(
+                      block_tp.tp, UINT64_C(0x474c4d3533420010),
+                      roce_route_hash, error, sizeof(error)) == 1,
+                  error);
+        }
+        if (block_probe_enabled) {
             CHECK(run_second_gate_probe(
                       block_tp, std::strcmp(tp_role, "leader") == 0),
                   "reuse persistent RoCE session for second block stage");
@@ -804,7 +974,8 @@ bool run_test() {
         CHECK(ds4_tp_test_get_exchange_calls() == 0u,
               "rank-local sparse-MLA heads invokes no TP exchange");
     } else {
-        CHECK(ds4_tp_test_get_exchange_calls() == (block_probe ? 2u : 1u),
+        CHECK(ds4_tp_test_get_exchange_calls() ==
+                  (block_probe_enabled ? 2u : 1u),
               "RoCE block invokes the expected TP exchange count");
     }
 
