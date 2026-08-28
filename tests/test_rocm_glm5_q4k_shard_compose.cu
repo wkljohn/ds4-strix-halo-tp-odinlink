@@ -486,6 +486,63 @@ void pack_down_half(const std::vector<uint8_t> &full,
     }
 }
 
+bool gather_gate_half_direct(const Glm5TestGGUF &gguf, uint64_t offset,
+                             const std::vector<uint32_t> &expert_ids,
+                             uint64_t full_expert_bytes,
+                             uint64_t half_expert_bytes, uint32_t half,
+                             std::vector<uint8_t> &packed) {
+    packed.resize(expert_ids.size() * half_expert_bytes);
+    for (size_t compact = 0; compact < expert_ids.size(); ++compact) {
+        const uint64_t source = offset +
+            (uint64_t)expert_ids[compact] * full_expert_bytes +
+            (uint64_t)half * half_expert_bytes;
+        CHECK(tensor_range(gguf, source, half_expert_bytes),
+              "rank-local gate/up expert range");
+        std::memcpy(packed.data() + compact * half_expert_bytes,
+                    gguf.map + source, (size_t)half_expert_bytes);
+    }
+    return true;
+}
+
+bool gather_down_half_direct(const Glm5TestGGUF &gguf, uint64_t offset,
+                             const std::vector<uint32_t> &expert_ids,
+                             uint64_t full_expert_bytes,
+                             uint64_t full_row_bytes,
+                             uint64_t half_expert_bytes,
+                             uint64_t half_row_bytes, uint32_t half,
+                             std::vector<uint8_t> &packed) {
+    packed.resize(expert_ids.size() * half_expert_bytes);
+    for (size_t compact = 0; compact < expert_ids.size(); ++compact) {
+        for (uint32_t row = 0; row < kOutput; ++row) {
+            const uint64_t source = offset +
+                (uint64_t)expert_ids[compact] * full_expert_bytes +
+                (uint64_t)row * full_row_bytes +
+                (uint64_t)half * half_row_bytes;
+            CHECK(tensor_range(gguf, source, half_row_bytes),
+                  "rank-local down expert range");
+            std::memcpy(packed.data() + compact * half_expert_bytes +
+                            (uint64_t)row * half_row_bytes,
+                        gguf.map + source, (size_t)half_row_bytes);
+        }
+    }
+    return true;
+}
+
+bool parse_fnv64(const char *value, uint64_t &hash) {
+    if (!value || std::strlen(value) != 16) return false;
+    hash = 0;
+    for (size_t i = 0; i < 16; ++i) {
+        const unsigned char c = (unsigned char)value[i];
+        uint64_t digit = 0;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10u;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10u;
+        else return false;
+        hash = (hash << 4u) | digit;
+    }
+    return true;
+}
+
 bool launch(ds4_gpu_tensor &out, ds4_gpu_tensor &gate,
             ds4_gpu_tensor &up, ds4_gpu_tensor &mid,
             ds4_gpu_tensor &down, const void *gate_weight,
@@ -510,7 +567,9 @@ bool run_roce_composition(const Glm5TestGGUF &gguf,
                           const std::vector<float> &reference,
                           const std::vector<float> &half0,
                           const std::vector<float> &half1,
-                          uint64_t route_contract_hash) {
+                          uint64_t route_contract_hash,
+                          bool exclusive_rank_local = false,
+                          uint64_t expected_composed_fnv = 0) {
     const char *role_value = std::getenv("DS4_GLM5_TP_ROLE");
     if (!role_value) return true;
     CHECK(std::strcmp(role_value, "leader") == 0 ||
@@ -592,7 +651,9 @@ bool run_roce_composition(const Glm5TestGGUF &gguf,
                             error, sizeof(error)) == 1,
           error);
 
-    const uint64_t bytes = (uint64_t)reference.size() * sizeof(float);
+    const std::vector<float> &local =
+        exclusive_rank_local ? half0 : (leader ? half0 : half1);
+    const uint64_t bytes = (uint64_t)local.size() * sizeof(float);
     const uint64_t capacity_bytes =
         (uint64_t)ds4_tp_big_capacity_rows(transport.tp) *
         kOutput * sizeof(float);
@@ -604,8 +665,9 @@ bool run_roce_composition(const Glm5TestGGUF &gguf,
         base + ds4_tp_slab_big_out_offset(transport.tp));
     float *in = reinterpret_cast<float *>(
         base + ds4_tp_slab_big_in_offset(transport.tp));
-    const std::vector<float> &local = leader ? half0 : half1;
-    CHECK(local.size() == reference.size() && half0.size() == half1.size(),
+    CHECK(local.size() == (size_t)kTokens * kOutput &&
+          (exclusive_rank_local ||
+           (local.size() == reference.size() && half0.size() == half1.size())),
           "bounded TP output shapes");
     std::memcpy(out, local.data(), (size_t)bytes);
     std::memset(in, 0, (size_t)bytes);
@@ -616,10 +678,13 @@ bool run_roce_composition(const Glm5TestGGUF &gguf,
           "exchange bounded GLM5 half over RoCE");
 
     OracleStats composition;
-    std::vector<float> composed(reference.size());
-    for (size_t i = 0; i < reference.size(); ++i) {
+    std::vector<float> composed(local.size());
+    for (size_t i = 0; i < local.size(); ++i) {
+        // The serial control uses the GPU tensor-add path. Exact equality here
+        // also gates host-add/GPU-add parity for these bounded oracle vectors.
         composed[i] = out[i] + in[i];
-        composition.add(composed[i], reference[i], 3.0e-7, 3.0e-7);
+        if (!exclusive_rank_local)
+            composition.add(composed[i], reference[i], 3.0e-7, 3.0e-7);
     }
     const uint64_t composed_fnv =
         fnv1a64(composed.data(), bytes);
@@ -627,21 +692,37 @@ bool run_roce_composition(const Glm5TestGGUF &gguf,
                             composed_fnv,
                             error, sizeof(error)) == 1,
           error);
-    std::fprintf(stderr,
-        "GLM5 bounded TP RoCE role=%s device=%s bytes=%llu "
-        "direct=1 "
-        "bad=%llu max_abs=%.9g max_rel=%.9g "
-        "local_fnv=%016llx peer_fnv=%016llx composed_fnv=%016llx "
-        "reference_fnv=%016llx\n",
-        role_value, device, (unsigned long long)bytes,
-        (unsigned long long)composition.bad,
-        composition.max_abs, composition.max_rel,
-        (unsigned long long)fnv1a64(out, bytes),
-        (unsigned long long)fnv1a64(in, bytes),
-        (unsigned long long)composed_fnv,
-        (unsigned long long)fnv1a64(reference.data(), bytes));
-    CHECK(composition.pass(),
-          "bounded two-process RoCE composition matches full Q4_K oracle");
+    if (exclusive_rank_local) {
+        std::fprintf(stderr,
+            "GLM5 bounded TP RoCE role=%s device=%s bytes=%llu "
+            "direct=1 exclusive_rank_local=1 compare=fnv "
+            "local_fnv=%016llx peer_fnv=%016llx composed_fnv=%016llx "
+            "blessed_fnv=%016llx\n",
+            role_value, device, (unsigned long long)bytes,
+            (unsigned long long)fnv1a64(out, bytes),
+            (unsigned long long)fnv1a64(in, bytes),
+            (unsigned long long)composed_fnv,
+            (unsigned long long)expected_composed_fnv);
+    } else {
+        std::fprintf(stderr,
+            "GLM5 bounded TP RoCE role=%s device=%s bytes=%llu "
+            "direct=1 exclusive_rank_local=0 "
+            "bad=%llu max_abs=%.9g max_rel=%.9g "
+            "local_fnv=%016llx peer_fnv=%016llx composed_fnv=%016llx "
+            "reference_fnv=%016llx\n",
+            role_value, device, (unsigned long long)bytes,
+            (unsigned long long)composition.bad,
+            composition.max_abs, composition.max_rel,
+            (unsigned long long)fnv1a64(out, bytes),
+            (unsigned long long)fnv1a64(in, bytes),
+            (unsigned long long)composed_fnv,
+            (unsigned long long)fnv1a64(reference.data(), bytes));
+    }
+    CHECK(exclusive_rank_local ? composed_fnv == expected_composed_fnv :
+                                composition.pass(),
+          exclusive_rank_local ?
+              "exclusive rank-local RoCE output matches blessed composition" :
+              "bounded two-process RoCE composition matches full Q4_K oracle");
     return true;
 }
 
@@ -909,6 +990,135 @@ bool run_test() {
         }
         CHECK(association_oracle.pass(),
               "router expert-to-compact-slot weight association");
+    }
+
+    const char *exclusive_value =
+        std::getenv("DS4_GLM5_TP_EXCLUSIVE_RANK_LOCAL");
+    CHECK(!exclusive_value ||
+              (exclusive_value[0] == '1' && exclusive_value[1] == '\0'),
+          "DS4_GLM5_TP_EXCLUSIVE_RANK_LOCAL must be exactly 1 when set");
+    if (exclusive_value) {
+        const char *role = std::getenv("DS4_GLM5_TP_ROLE");
+        CHECK(router_dynamic && role &&
+              (std::strcmp(role, "leader") == 0 ||
+               std::strcmp(role, "worker") == 0),
+              "exclusive rank-local mode requires dynamic leader/worker");
+        const uint32_t local_half =
+            std::strcmp(role, "leader") == 0 ? 0u : 1u;
+        const char *expected_value =
+            std::getenv("DS4_GLM5_TP_EXPECT_COMPOSED_FNV");
+        uint64_t expected_composed = 0;
+        CHECK(parse_fnv64(expected_value, expected_composed),
+              "exclusive rank-local mode requires a 16-digit control FNV");
+
+        uint32_t distinct_route_sets = 0;
+        for (uint32_t token = 0; token < kTokens; ++token) {
+            bool seen = false;
+            for (uint32_t prior = 0; prior < token && !seen; ++prior) {
+                seen = std::memcmp(
+                    real_route_ids.data() + (size_t)token * kUsed,
+                    real_route_ids.data() + (size_t)prior * kUsed,
+                    kUsed * sizeof(uint32_t)) == 0;
+            }
+            distinct_route_sets += !seen;
+        }
+        uint32_t hot_experts = 0, cold_experts = 0;
+        for (uint32_t count : compact_counts) {
+            hot_experts += count >= kWmmaMinCount;
+            cold_experts += count != 0 && count < kWmmaMinCount;
+        }
+        CHECK(distinct_route_sets == kTokens && expert_ids.size() > kUsed &&
+              hot_experts != 0 && cold_experts != 0,
+              "exclusive rank-local route diversity and hot/cold coverage");
+
+        std::vector<uint8_t> local_gate, local_up, local_down;
+        CHECK(gather_gate_half_direct(
+                  gguf, gate_offset, expert_ids, full_gate_expert,
+                  half_gate_expert, local_half, local_gate) &&
+              gather_gate_half_direct(
+                  gguf, up_offset, expert_ids, full_gate_expert,
+                  half_gate_expert, local_half, local_up) &&
+              gather_down_half_direct(
+                  gguf, down_offset, expert_ids,
+                  full_down_expert, full_down_row,
+                  half_down_expert, half_down_row,
+                  local_half, local_down),
+              "gather only the rank-local 1024-column expert half");
+        const uint32_t compact_expert_count = (uint32_t)expert_ids.size();
+        const uint64_t table_bytes =
+            (uint64_t)compact_expert_count * half_gate_expert;
+        CHECK(local_gate.size() == table_bytes &&
+              local_up.size() == table_bytes &&
+              local_down.size() == table_bytes,
+              "rank-local packed table byte contract");
+
+        DeviceWeights device;
+        CHECK(hipMalloc(&device.gate_half[local_half], table_bytes) == hipSuccess &&
+              hipMalloc(&device.up_half[local_half], table_bytes) == hipSuccess &&
+              hipMalloc(&device.down_half[local_half], table_bytes) == hipSuccess,
+              "allocate only rank-local expert tables");
+        CHECK(hipMemcpy(device.gate_half[local_half], local_gate.data(),
+                        table_bytes, hipMemcpyHostToDevice) == hipSuccess &&
+              hipMemcpy(device.up_half[local_half], local_up.data(),
+                        table_bytes, hipMemcpyHostToDevice) == hipSuccess &&
+              hipMemcpy(device.down_half[local_half], local_down.data(),
+                        table_bytes, hipMemcpyHostToDevice) == hipSuccess,
+              "upload only rank-local expert tables");
+
+        ComponentTensors tensors;
+        const uint64_t pair_count = (uint64_t)kTokens * kUsed;
+        const uint64_t mid_bytes = pair_count * kHalfMid * sizeof(float);
+        const uint64_t down_bytes = pair_count * kOutput * sizeof(float);
+        const uint64_t out_bytes = (uint64_t)kTokens * kOutput * sizeof(float);
+        CHECK(upload(tensors.selected, selected.data(),
+                     pair_count * sizeof(int32_t)) &&
+              upload(tensors.weights, route_weights.data(),
+                     pair_count * sizeof(float)) &&
+              upload(tensors.input, input.data(),
+                     (uint64_t)input.size() * sizeof(float)) &&
+              alloc_tensor(tensors.gate, mid_bytes) &&
+              alloc_tensor(tensors.up, mid_bytes) &&
+              alloc_tensor(tensors.mid, mid_bytes) &&
+              alloc_tensor(tensors.down, down_bytes) &&
+              alloc_tensor(tensors.out_full, out_bytes),
+              "allocate exclusive rank-local component tensors");
+        CHECK(launch(
+                  tensors.out_full, tensors.gate, tensors.up, tensors.mid,
+                  tensors.down, device.gate_half[local_half],
+                  device.up_half[local_half], device.down_half[local_half],
+                  half_gate_expert, gate_row_bytes,
+                  half_down_expert, half_down_row,
+                  tensors.selected, tensors.weights, tensors.input,
+                  compact_expert_count, kHalfMid),
+              "execute only the rank-local 1024-column Q4_K shard");
+        std::vector<float> local_output((size_t)kTokens * kOutput);
+        CHECK(ds4_gpu_tensor_read(&tensors.out_full, 0,
+                                  local_output.data(), out_bytes),
+              "read exclusive rank-local Q4_K output");
+        const uint64_t routed_ids_fnv = fnv1a64(
+            real_route_ids.data(), real_route_ids.size() * sizeof(uint32_t));
+        const uint64_t route_weights_fnv = fnv1a64(
+            route_weights.data(), route_weights.size() * sizeof(float));
+        const uint64_t route_contract_hash =
+            routed_ids_fnv ^
+            ((route_weights_fnv << 1u) | (route_weights_fnv >> 63u));
+        const std::vector<float> empty;
+        CHECK(run_roce_composition(
+                  gguf, empty, local_output, empty, route_contract_hash,
+                  true, expected_composed),
+              "exclusive rank-local RoCE composition");
+        std::fprintf(stderr,
+            "PASS same-GGUF GLM5 Q4_K exclusive_rank_local=1 role=%s "
+            "local_half=%u compact_table=%u distinct_routes=%u "
+            "hot_experts=%u cold_experts=%u "
+            "gate_fnv=%016llx up_fnv=%016llx down_fnv=%016llx "
+            "tp_roce=1\n",
+            role, local_half, compact_expert_count, distinct_route_sets,
+            hot_experts, cold_experts,
+            (unsigned long long)fnv1a64(local_gate.data(), table_bytes),
+            (unsigned long long)fnv1a64(local_up.data(), table_bytes),
+            (unsigned long long)fnv1a64(local_down.data(), table_bytes));
+        return true;
     }
 
     std::vector<uint8_t> gate_full, up_full, down_full;

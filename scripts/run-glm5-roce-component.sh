@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce the bounded two-process GLM-5.3 Q4_K transport-fidelity gate.
+# Reproduce the bounded two-process GLM-5.3 Q4_K rank-local RoCE gate.
 set -euo pipefail
 
 usage() {
@@ -34,6 +34,7 @@ COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-192.168.99.1}
 PORT_BASE=${DS4_GLM5_TP_PORT_BASE:-15720}
 SEEDS=${DS4_GLM5_ROUTER_SEEDS:-"2 3 6"}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test}
+CONNECT_TIMEOUT=${DS4_GLM5_TP_CONNECT_TIMEOUT_SEC:-120}
 OUT=$DS4_RESEARCH_ROOT/glm5-next-tp2/$TAG
 BINARY=$REPO/tests/test_rocm_glm5_q4k_shard_compose
 PEER_BINARY=$PEER_DIR/test_rocm_glm5_q4k_shard_compose
@@ -58,6 +59,22 @@ require_log() {
     echo "error: missing $label in $log" >&2
     return 1
   }
+}
+
+log_field() {
+  local log=$1 key=$2
+  sed -n "s/.*${key}=\([0-9A-Fa-f]\{16\}\).*/\1/p" "$log" | tail -n 1
+}
+
+for value in "$COORDINATOR_ADDR" "$PEER_DEVICE" "$PEER_DIR"; do
+  [[ $value != *"'"* && $value != *$'\n'* ]] || {
+    echo "error: remote command values may not contain quotes or newlines" >&2
+    exit 2
+  }
+done
+[[ $CONNECT_TIMEOUT =~ ^[1-9][0-9]*$ ]] || {
+  echo "error: invalid DS4_GLM5_TP_CONNECT_TIMEOUT_SEC" >&2
+  exit 2
 }
 
 [[ -f $MODEL ]] || { echo "error: local model not found: $MODEL" >&2; exit 2; }
@@ -105,14 +122,30 @@ for seed in $SEEDS; do
     DS4_GLM5_MODEL="$MODEL" \
     DS4_GLM5_ROUTER_MOE_DYNAMIC=1 \
     DS4_GLM5_ROUTER_JITTER_SEED="$seed" \
+    "$BINARY" >"$run/control.log" 2>&1
+  require_log "$run/control.log" \
+    'PASS same-GGUF GLM5 Q4_K .*tp_roce=0' \
+    'single-process full/1024+1024 oracle'
+  CONTROL_FNV=$(log_field "$run/control.log" shard_fnv)
+  [[ $CONTROL_FNV =~ ^[0-9A-Fa-f]{16}$ ]] || {
+    echo "error: missing serial shard oracle for seed $seed" >&2
+    exit 1
+  }
+  timeout 180s env \
+    DS4_GLM5_MODEL="$MODEL" \
+    DS4_GLM5_ROUTER_MOE_DYNAMIC=1 \
+    DS4_GLM5_ROUTER_JITTER_SEED="$seed" \
+    DS4_GLM5_TP_EXCLUSIVE_RANK_LOCAL=1 \
+    DS4_GLM5_TP_EXPECT_COMPOSED_FNV="$CONTROL_FNV" \
+    DS4_GLM5_TP_CONNECT_TIMEOUT_SEC="$CONNECT_TIMEOUT" \
     DS4_GLM5_TP_ROLE=leader \
     DS4_GLM5_TP_HOST="$COORDINATOR_ADDR" \
     DS4_GLM5_TP_PORT="$port" \
     DS4_GLM5_TP_RDMA_DEVICE="$LOCAL_DEVICE" \
     "$BINARY" >"$run/leader.log" 2>&1 &
   leader_pid=$!
-  timeout 150s ssh -o BatchMode=yes "$PEER" \
-    "DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_ROUTER_MOE_DYNAMIC=1 DS4_GLM5_ROUTER_JITTER_SEED='$seed' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$COORDINATOR_ADDR' DS4_GLM5_TP_PORT='$port' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' '$PEER_BINARY'" \
+  timeout 180s ssh -o BatchMode=yes "$PEER" \
+    "DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_ROUTER_MOE_DYNAMIC=1 DS4_GLM5_ROUTER_JITTER_SEED='$seed' DS4_GLM5_TP_EXCLUSIVE_RANK_LOCAL=1 DS4_GLM5_TP_EXPECT_COMPOSED_FNV='$CONTROL_FNV' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$CONNECT_TIMEOUT' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$COORDINATOR_ADDR' DS4_GLM5_TP_PORT='$port' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' '$PEER_BINARY'" \
     >"$run/worker.log" 2>&1 &
   worker_pid=$!
   set +e
@@ -121,7 +154,7 @@ for seed in $SEEDS; do
   set -e
   if (( leader_rc != 0 || worker_rc != 0 )); then
     echo "error: seed $seed failed (leader=$leader_rc worker=$worker_rc)" >&2
-    tail -30 "$run/leader.log" "$run/worker.log" >&2
+    tail -n 30 "$run/leader.log" "$run/worker.log" >&2
     exit 1
   fi
   for log in "$run/leader.log" "$run/worker.log"; do
@@ -129,9 +162,32 @@ for seed in $SEEDS; do
     require_log "$log" 'rdma GID index 3 (RoCE v2)' 'RoCE v2 proof'
     require_log "$log" 'mlx5 queue pair uses RC' 'RC proof'
     require_log "$log" 'registered host slab as 3 MRs' 'three-MR proof'
-    require_log "$log" 'GLM5 bounded TP RoCE .*direct=1 .*bad=0' 'direct clean composition'
+    require_log "$log" \
+      'GLM5 bounded TP RoCE .*direct=1 exclusive_rank_local=1 compare=fnv' \
+      'direct exclusive rank-local FNV composition'
+    require_log "$log" \
+      'PASS same-GGUF GLM5 Q4_K exclusive_rank_local=1' \
+      'exclusive rank-local PASS marker'
     require_log "$log" 'tp_roce=1' 'TP RoCE PASS marker'
   done
+  require_log "$run/leader.log" 'role=leader .*local_half=0' \
+    'leader half ownership'
+  require_log "$run/worker.log" 'role=worker .*local_half=1' \
+    'worker half ownership'
+  LEADER_LOCAL=$(log_field "$run/leader.log" local_fnv)
+  LEADER_PEER=$(log_field "$run/leader.log" peer_fnv)
+  WORKER_LOCAL=$(log_field "$run/worker.log" local_fnv)
+  WORKER_PEER=$(log_field "$run/worker.log" peer_fnv)
+  LEADER_COMPOSED=$(log_field "$run/leader.log" composed_fnv)
+  WORKER_COMPOSED=$(log_field "$run/worker.log" composed_fnv)
+  [[ $LEADER_LOCAL == "$WORKER_PEER" &&
+     $WORKER_LOCAL == "$LEADER_PEER" &&
+     $LEADER_LOCAL != "$WORKER_LOCAL" &&
+     $LEADER_COMPOSED == "$CONTROL_FNV" &&
+     $WORKER_COMPOSED == "$CONTROL_FNV" ]] || {
+    echo "error: seed $seed payload/oracle hash chain did not close" >&2
+    exit 1
+  }
   echo "PASS seed=$seed"
   index=$((index + 1))
 done
