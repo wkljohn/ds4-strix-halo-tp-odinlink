@@ -80,6 +80,43 @@ bool compare_values(const char *name, const std::vector<float> &got,
     return true;
 }
 
+bool compare_absorbed_scores(const std::vector<float> &query,
+                             const std::vector<float> &qk_low,
+                             const std::vector<float> &kv_norm,
+                             const std::vector<float> &k_nope) {
+    double maximum = 0.0;
+    double error2 = 0.0;
+    double reference2 = 0.0;
+    for (uint32_t token = 0u; token < kRows; ++token) {
+        for (uint32_t head = 0u; head < kHeads; ++head) {
+            double absorbed = 0.0;
+            double explicit_key = 0.0;
+            for (uint32_t j = 0u; j < kKvLora; ++j) {
+                absorbed +=
+                    (double)qk_low[(uint64_t)head * kKvLora + j] *
+                    kv_norm[(uint64_t)token * kKvLora + j];
+            }
+            for (uint32_t j = 0u; j < kHeadDim; ++j) {
+                explicit_key +=
+                    (double)query[(uint64_t)head * kHeadDim + j] *
+                    k_nope[((uint64_t)token * kHeads + head) * kHeadDim + j];
+            }
+            const double error = absorbed - explicit_key;
+            maximum = std::max(maximum, std::fabs(error));
+            error2 += error * error;
+            reference2 += explicit_key * explicit_key;
+        }
+    }
+    const double nmse = error2 / std::max(reference2, 1.0e-30);
+    std::fprintf(stderr,
+                 "GLM5 MLA absorption count=%u max_abs=%.9g nmse=%.9g\n",
+                 kRows * kHeads, maximum, nmse);
+    CHECK(reference2 >= 1.0e-6, "non-degenerate MLA absorption reference");
+    CHECK(maximum <= 5.0e-5 && nmse <= 2.0e-13,
+          "MLA absorbed and explicit key scores agree");
+    return true;
+}
+
 bool run_test() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     const char *oracle_prefix = std::getenv("DS4_GLM5_MLA_QKV_ORACLE_PREFIX");
@@ -139,8 +176,10 @@ bool run_test() {
     ds4_gpu_tensor *d_kv_raw = alloc_f32((uint64_t)kRows * kKvLora);
     ds4_gpu_tensor *d_kv_norm = alloc_f32((uint64_t)kRows * kKvLora);
     ds4_gpu_tensor *d_qk_low = alloc_f32((uint64_t)kHeads * kKvLora);
+    ds4_gpu_tensor *d_k_nope = alloc_f32(
+        (uint64_t)kRows * kHeads * kHeadDim);
     CHECK(d_hidden && d_q_a && d_q_resid && d_query && d_kv_raw &&
-          d_kv_norm && d_qk_low,
+          d_kv_norm && d_qk_low && d_k_nope,
           "allocate bounded MLA QKV component tensors");
     ds4_gpu_tensor *d_query_hidden = ds4_gpu_tensor_view(
         d_hidden, (uint64_t)(kRows - 1u) * kHidden * sizeof(float),
@@ -168,17 +207,22 @@ bool run_test() {
           ds4_gpu_glm_qk_lowrank_typed_tensor(
               d_qk_low, d_query, gguf.map, gguf.size, k_b_offset, 8u,
               kHeads, kKvLora, kHeadDim, kHeadDim) &&
+          ds4_gpu_glm_k_b_project_typed_tensor(
+              d_k_nope, d_kv_norm, gguf.map, gguf.size, k_b_offset, 8u,
+              kRows, kKvLora, kHeadDim, kHeads) &&
           ds4_gpu_synchronize(),
           "execute real block-3 MLA Q/KV trunk");
 
     std::vector<float> got_q_a, got_q_resid, got_query, got_kv_raw,
-        got_kv_norm, got_qk_low;
+        got_kv_norm, got_qk_low, got_k_nope;
     CHECK(read_tensor(d_q_a, kQRank, got_q_a) &&
           read_tensor(d_q_resid, kQRank, got_q_resid) &&
           read_tensor(d_query, kHeads * kHeadDim, got_query) &&
           read_tensor(d_kv_raw, kRows * kKvLora, got_kv_raw) &&
           read_tensor(d_kv_norm, kRows * kKvLora, got_kv_norm) &&
-          read_tensor(d_qk_low, kHeads * kKvLora, got_qk_low),
+          read_tensor(d_qk_low, kHeads * kKvLora, got_qk_low) &&
+          read_tensor(d_k_nope, (uint64_t)kRows * kHeads * kHeadDim,
+                      got_k_nope),
           "read MLA QKV component outputs");
 
     /* Both independent gfx1151 nodes produced identical observations.  Keep
@@ -196,10 +240,14 @@ bool run_test() {
           compare_values("qk_low", got_qk_low, expected_qk_low,
                          8.0e-6, 2.0e-12),
           "MLA QKV component numerical gates");
+    CHECK(compare_absorbed_scores(got_query, got_qk_low, got_kv_norm,
+                                  got_k_nope),
+          "MLA independent key-absorption identity");
     CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "rank-local MLA QKV invokes no TP exchange");
 
     ds4_gpu_tensor_free(d_query_hidden);
+    ds4_gpu_tensor_free(d_k_nope);
     ds4_gpu_tensor_free(d_qk_low);
     ds4_gpu_tensor_free(d_kv_norm);
     ds4_gpu_tensor_free(d_kv_raw);
