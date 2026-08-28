@@ -4216,6 +4216,28 @@ extern "C" int ds4_gpu_routed_moe_batch_q4k_control(
     return rc;
 }
 
+/* Research-only capture of the exact production Q8_K activation quantizer.
+ * There is intentionally no public-header declaration or production caller. */
+extern "C" int ds4_gpu_q8k_quantize_research_control(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        uint32_t in_dim, uint32_t n_rows) {
+    const char *enabled = getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
+    uint64_t blocks = 0, bytes = 0, x_elements = 0, x_bytes = 0;
+    if (!enabled || enabled[0] != '1' || enabled[1] != '\0' ||
+        !out || !out->ptr || !x || !x->ptr || n_rows == 0u ||
+        in_dim == 0u || (in_dim % CUDA_QK_K) != 0u ||
+        !cuda_u64_mul_checked(n_rows, in_dim / CUDA_QK_K, &blocks) ||
+        !cuda_u64_mul_checked(blocks, sizeof(cuda_block_q8_K), &bytes) ||
+        !cuda_u64_mul_checked(n_rows, in_dim, &x_elements) ||
+        !cuda_u64_mul_checked(x_elements, sizeof(float), &x_bytes) ||
+        out->bytes < bytes || x->bytes < x_bytes) {
+        return 0;
+    }
+    q8_K_quantize_kernel<<<dim3(in_dim / CUDA_QK_K, n_rows), 256>>>(
+        (cuda_block_q8_K *)out->ptr, (const float *)x->ptr, in_dim, n_rows);
+    return cuda_ok(cudaGetLastError(), "Q8_K research quantize launch");
+}
+
 /* Research-only kernel timing control.  Weight buffers are already resident
  * device allocations, so hipEvent intervals contain arithmetic and routing
  * setup only—not model-map copies or packed-layout construction. */

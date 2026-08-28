@@ -28,6 +28,8 @@ extern "C" int ds4_gpu_routed_moe_batch_q4k_direct_control(
         const void *, uint64_t, uint64_t, uint64_t, uint64_t,
         const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t,
         float, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t);
+extern "C" int ds4_gpu_q8k_quantize_research_control(
+        ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t);
 
 namespace {
 
@@ -56,6 +58,13 @@ struct Q8KBlock {
     float d;
     int8_t qs[256];
     int16_t bsums[16];
+};
+
+struct Q81Comparison {
+    uint64_t changed_values = 0;
+    uint64_t changed_scales = 0;
+    uint64_t changed_sums = 0;
+    float max_scale_delta = 0.0f;
 };
 
 static_assert(sizeof(Q4KBlock) == kQ4Block, "Q4_K layout drift");
@@ -96,7 +105,7 @@ struct DeviceWeights {
 };
 
 struct ComponentTensors {
-    ds4_gpu_tensor selected = {}, weights = {}, input = {};
+    ds4_gpu_tensor selected = {}, weights = {}, input = {}, input_q8 = {};
     ds4_gpu_tensor gate = {}, up = {}, mid = {}, down = {};
     ds4_gpu_tensor out_full = {}, out_half0 = {}, out_half1 = {}, out_sum = {};
 
@@ -109,6 +118,7 @@ struct ComponentTensors {
         ds4_gpu_tensor_free_in_place(&mid);
         ds4_gpu_tensor_free_in_place(&up);
         ds4_gpu_tensor_free_in_place(&gate);
+        ds4_gpu_tensor_free_in_place(&input_q8);
         ds4_gpu_tensor_free_in_place(&input);
         ds4_gpu_tensor_free_in_place(&weights);
         ds4_gpu_tensor_free_in_place(&selected);
@@ -143,6 +153,50 @@ float half_bits(uint16_t bits) {
     half value;
     std::memcpy(&value, &bits, sizeof(value));
     return __half2float(value);
+}
+
+Q81Comparison compare_q81_effective(const std::vector<Q8KBlock> &expected,
+                                    const std::vector<Q8KBlock> &actual) {
+    Q81Comparison result;
+    if (expected.size() != actual.size()) {
+        result.changed_values = UINT64_MAX;
+        return result;
+    }
+    for (size_t block = 0; block < expected.size(); ++block) {
+        result.max_scale_delta = std::max(
+            result.max_scale_delta,
+            std::fabs(expected[block].d - actual[block].d));
+        result.changed_scales +=
+            half_round(expected[block].d) != half_round(actual[block].d);
+        for (uint32_t group = 0; group < 8u; ++group) {
+            const int expected_sum = expected[block].bsums[2u * group] +
+                                     expected[block].bsums[2u * group + 1u];
+            const int actual_sum = actual[block].bsums[2u * group] +
+                                   actual[block].bsums[2u * group + 1u];
+            result.changed_sums +=
+                half_round(expected[block].d * (float)expected_sum) !=
+                half_round(actual[block].d * (float)actual_sum);
+        }
+        for (uint32_t i = 0; i < kQk; ++i)
+            result.changed_values +=
+                expected[block].qs[i] != actual[block].qs[i];
+    }
+    return result;
+}
+
+bool valid_q8k_capture(const std::vector<Q8KBlock> &blocks) {
+    bool any_nonzero = false;
+    for (const Q8KBlock &block : blocks) {
+        if (!std::isfinite(block.d)) return false;
+        any_nonzero |= block.d != 0.0f;
+        for (uint32_t group = 0; group < 16u; ++group) {
+            int sum = 0;
+            for (uint32_t i = 0; i < 16u; ++i)
+                sum += block.qs[group * 16u + i];
+            if (sum != block.bsums[group]) return false;
+        }
+    }
+    return any_nonzero;
 }
 
 void q4k_scale_min(uint32_t group, const uint8_t *packed,
@@ -234,9 +288,49 @@ float q4k_q81_reference(const Q4KBlock *weights,
     return result;
 }
 
+float router_sigmoid(float value) {
+    if (value >= 0.0f) {
+        const float exponential = std::exp(-value);
+        return 1.0f / (1.0f + exponential);
+    }
+    const float exponential = std::exp(value);
+    return exponential / (1.0f + exponential);
+}
+
+float router_reference(const float *router, const float *bias,
+                       const float *input, uint32_t expert_ids[kUsed],
+                       float expert_weights[kUsed], float scale) {
+    std::vector<float> probs(kTotalExperts);
+    std::vector<uint32_t> order(kTotalExperts);
+    for (uint32_t expert = 0; expert < kTotalExperts; ++expert) {
+        const float *row = router + (uint64_t)expert * kInput;
+        double logit = 0.0;
+        for (uint32_t column = 0; column < kInput; ++column)
+            logit += (double)row[column] * input[column];
+        probs[expert] = router_sigmoid((float)logit);
+        order[expert] = expert;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        const float av = probs[a] + bias[a];
+        const float bv = probs[b] + bias[b];
+        return av > bv || (av == bv && a < b);
+    });
+    float sum = 0.0f;
+    for (uint32_t slot = 0; slot < kUsed; ++slot) {
+        expert_ids[slot] = order[slot];
+        expert_weights[slot] = probs[order[slot]];
+        sum += expert_weights[slot];
+    }
+    sum = std::max(sum, 6.103515625e-5f);
+    for (uint32_t slot = 0; slot < kUsed; ++slot)
+        expert_weights[slot] = expert_weights[slot] / sum * scale;
+    return sum;
+}
+
 struct OracleStats {
     uint64_t count = 0, bad = 0, nonfinite = 0;
     double max_abs = 0.0, max_rel = 0.0, max_gate_ratio = 0.0;
+    float max_abs_actual = 0.0f, max_abs_expected = 0.0f;
 
     void add(float actual, float expected, double absolute, double relative) {
         ++count;
@@ -246,7 +340,11 @@ struct OracleStats {
             return;
         }
         const double error = std::fabs((double)actual - expected);
-        max_abs = std::max(max_abs, error);
+        if (error > max_abs) {
+            max_abs = error;
+            max_abs_actual = actual;
+            max_abs_expected = expected;
+        }
         max_rel = std::max(max_rel,
                            error / std::max(1.0e-12, std::fabs((double)expected)));
         const double tolerance = absolute + relative * std::fabs((double)expected);
@@ -262,10 +360,12 @@ bool tensor_range(const Glm5TestGGUF &gguf, uint64_t offset, uint64_t bytes) {
 }
 
 bool gather_experts(const Glm5TestGGUF &gguf, uint64_t offset,
+                    const uint32_t expert_ids[kUsed],
                     uint64_t expert_bytes, std::vector<uint8_t> &compact) {
     compact.resize((size_t)kUsed * expert_bytes);
     for (uint32_t slot = 0; slot < kUsed; ++slot) {
-        const uint64_t source = offset + (uint64_t)kExpertIds[slot] * expert_bytes;
+        const uint64_t source =
+            offset + (uint64_t)expert_ids[slot] * expert_bytes;
         CHECK(tensor_range(gguf, source, expert_bytes),
               "real GGUF expert range");
         std::memcpy(compact.data() + (uint64_t)slot * expert_bytes,
@@ -355,11 +455,110 @@ bool run_test() {
     // halves preserve the full path's quantization scales. A future change to
     // row-wide activation scaling invalidates this split-consistency premise.
 
+    const char *bridge_value = std::getenv("DS4_GLM5_ROUTER_MOE_BRIDGE");
+    CHECK(!bridge_value || (bridge_value[0] == '1' && bridge_value[1] == '\0'),
+          "DS4_GLM5_ROUTER_MOE_BRIDGE must be exactly 1 when set");
+    const bool router_bridge = bridge_value && std::strcmp(bridge_value, "1") == 0;
+    uint32_t jitter_seed = 0;
+    CHECK(glm5_test_router_seed(jitter_seed),
+          "valid DS4_GLM5_ROUTER_JITTER_SEED");
+    uint32_t expert_ids[kUsed];
+    std::copy(kExpertIds, kExpertIds + kUsed, expert_ids);
+    float bridge_weights[kUsed] = {};
+    const float *bridge_router = nullptr;
+    float bridge_scale = 0.0f;
+    float bridge_prob_sum = 0.0f;
+
+    std::vector<int32_t> selected((size_t)kTokens * kUsed);
+    std::vector<float> route_weights((size_t)kTokens * kUsed);
+    std::vector<float> input((size_t)kTokens * kInput);
+    for (uint32_t token = 0; token < kTokens; ++token) {
+        for (uint32_t i = 0; i < kInput; ++i) {
+            if (router_bridge) {
+                input[(size_t)token * kInput + i] =
+                    glm5_test_router_input(token, i, jitter_seed);
+            } else {
+                const int value = (int)((i * 17u + token * 13u) % 127u) - 63;
+                input[(size_t)token * kInput + i] = (float)value / 256.0f;
+            }
+        }
+    }
+    if (router_bridge) {
+        bool normalize = false;
+        uint64_t router_offset = 0, bias_offset = 0;
+        CHECK(gguf.metadata("glm5-next.expert_weights_scale", bridge_scale) &&
+              bridge_scale == 2.5f &&
+              gguf.metadata("glm5-next.expert_weights_norm", normalize) &&
+              normalize &&
+              gguf.tensor("blk.3.ffn_gate_inp.weight",
+                          {kInput, kTotalExperts}, 0u, router_offset) &&
+              gguf.tensor("blk.3.exp_probs_b.bias",
+                          {kTotalExperts}, 0u, bias_offset),
+              "bind same-GGUF normalized top-8 router bridge");
+        const uint64_t router_bytes =
+            (uint64_t)kTotalExperts * kInput * sizeof(float);
+        const uint64_t bias_bytes = (uint64_t)kTotalExperts * sizeof(float);
+        CHECK(tensor_range(gguf, router_offset, router_bytes) &&
+              tensor_range(gguf, bias_offset, bias_bytes),
+              "router bridge payload ranges");
+        bridge_router =
+            reinterpret_cast<const float *>(gguf.map + router_offset);
+        // This bridge intentionally validates one real router-selected expert
+        // set, not dynamic per-token routing. Token 0 supplies the eight real
+        // IDs and weights; all 32 arithmetic rows reuse that set under a
+        // coprime compact-slot permutation to exercise every WMMA expert tile.
+        bridge_prob_sum = router_reference(
+            bridge_router,
+            reinterpret_cast<const float *>(gguf.map + bias_offset),
+            input.data(), expert_ids, bridge_weights, bridge_scale);
+    }
+    for (uint32_t token = 0; token < kTokens; ++token) {
+        float sum = 0.0f;
+        for (uint32_t slot = 0; slot < kUsed; ++slot) {
+            // A fixed coprime permutation makes sorted-pair preparation
+            // non-trivial while every token still exercises all eight slots.
+            const uint32_t compact_slot = (slot * 5u + token * 3u) & 7u;
+            selected[(size_t)token * kUsed + slot] = (int32_t)compact_slot;
+            const float value = router_bridge
+                ? bridge_weights[compact_slot]
+                : (float)(kUsed - slot + (token & 1u)) * 0.03125f;
+            route_weights[(size_t)token * kUsed + slot] = value;
+            sum += value;
+        }
+        if (!router_bridge) {
+            for (uint32_t slot = 0; slot < kUsed; ++slot)
+                route_weights[(size_t)token * kUsed + slot] /= sum;
+        }
+    }
+    OracleStats association_oracle;
+    if (router_bridge) {
+        for (uint32_t token = 0; token < kTokens; ++token) {
+            for (uint32_t slot = 0; slot < kUsed; ++slot) {
+                const uint64_t pair = (uint64_t)token * kUsed + slot;
+                const uint32_t compact_slot = (uint32_t)selected[pair];
+                const uint32_t real_expert = expert_ids[compact_slot];
+                const float *row = bridge_router + (uint64_t)real_expert * kInput;
+                double logit = 0.0;
+                for (uint32_t column = 0; column < kInput; ++column)
+                    logit += (double)row[column] * input[column];
+                const float expected =
+                    router_sigmoid((float)logit) / bridge_prob_sum * bridge_scale;
+                association_oracle.add(route_weights[pair], expected,
+                                       1.0e-7, 1.0e-7);
+            }
+        }
+        CHECK(association_oracle.pass(),
+              "router expert-to-compact-slot weight association");
+    }
+
     std::vector<uint8_t> gate_full, up_full, down_full;
     std::vector<uint8_t> gate_half[2], up_half[2], down_half[2];
-    CHECK(gather_experts(gguf, gate_offset, full_gate_expert, gate_full) &&
-          gather_experts(gguf, up_offset, full_gate_expert, up_full) &&
-          gather_experts(gguf, down_offset, full_down_expert, down_full),
+    CHECK(gather_experts(gguf, gate_offset, expert_ids,
+                         full_gate_expert, gate_full) &&
+          gather_experts(gguf, up_offset, expert_ids,
+                         full_gate_expert, up_full) &&
+          gather_experts(gguf, down_offset, expert_ids,
+                         full_down_expert, down_full),
           "gather eight real GLM5 experts");
     for (uint32_t half = 0; half < 2; ++half) {
         pack_gate_half(gate_full, full_gate_expert, half_gate_expert,
@@ -416,32 +615,11 @@ bool run_test() {
               "upload compact half expert tables");
     }
 
-    std::vector<int32_t> selected((size_t)kTokens * kUsed);
-    std::vector<float> route_weights((size_t)kTokens * kUsed);
-    std::vector<float> input((size_t)kTokens * kInput);
-    for (uint32_t token = 0; token < kTokens; ++token) {
-        float sum = 0.0f;
-        for (uint32_t slot = 0; slot < kUsed; ++slot) {
-            // A fixed coprime permutation makes sorted-pair preparation
-            // non-trivial while every token still exercises all eight slots.
-            const uint32_t compact_slot = (slot * 5u + token * 3u) & 7u;
-            selected[(size_t)token * kUsed + slot] = (int32_t)compact_slot;
-            const float value = (float)(kUsed - slot + (token & 1u)) * 0.03125f;
-            route_weights[(size_t)token * kUsed + slot] = value;
-            sum += value;
-        }
-        for (uint32_t slot = 0; slot < kUsed; ++slot)
-            route_weights[(size_t)token * kUsed + slot] /= sum;
-        for (uint32_t i = 0; i < kInput; ++i) {
-            const int value = (int)((i * 17u + token * 13u) % 127u) - 63;
-            input[(size_t)token * kInput + i] = (float)value / 256.0f;
-        }
-    }
-
     ComponentTensors tensors;
     ds4_gpu_tensor &selected_gpu = tensors.selected;
     ds4_gpu_tensor &weights_gpu = tensors.weights;
     ds4_gpu_tensor &input_gpu = tensors.input;
+    ds4_gpu_tensor &input_q8_gpu = tensors.input_q8;
     ds4_gpu_tensor &gate = tensors.gate;
     ds4_gpu_tensor &up = tensors.up;
     ds4_gpu_tensor &mid = tensors.mid;
@@ -460,6 +638,8 @@ bool run_test() {
                  pair_count * sizeof(float)) &&
           upload(input_gpu, input.data(),
                  (uint64_t)input.size() * sizeof(float)) &&
+          alloc_tensor(input_q8_gpu,
+                       (uint64_t)kTokens * (kInput / kQk) * sizeof(Q8KBlock)) &&
           alloc_tensor(gate, mid_bytes) && alloc_tensor(up, mid_bytes) &&
           alloc_tensor(mid, mid_bytes) && alloc_tensor(down, down_bytes) &&
           alloc_tensor(out_full, out_bytes) &&
@@ -467,6 +647,16 @@ bool run_test() {
           alloc_tensor(out_half1, out_bytes) &&
           alloc_tensor(out_sum, out_bytes),
           "allocate GLM5 MoE component tensors");
+
+    CHECK(ds4_gpu_q8k_quantize_research_control(
+              &input_q8_gpu, &input_gpu, kInput, kTokens) &&
+          ds4_gpu_synchronize(), "capture production Q8_K activation blocks");
+    std::vector<Q8KBlock> production_input_q8(
+        (size_t)kTokens * (kInput / kQk));
+    CHECK(ds4_gpu_tensor_read(
+              &input_q8_gpu, 0, production_input_q8.data(),
+              (uint64_t)production_input_q8.size() * sizeof(Q8KBlock)),
+          "read production Q8_K activation blocks");
 
     CHECK(launch(out_full, gate, up, mid, down,
                  device.gate_full, device.up_full, device.down_full,
@@ -477,6 +667,14 @@ bool run_test() {
     std::vector<float> full_mid((size_t)pair_count * kFullMid);
     CHECK(ds4_gpu_tensor_read(&mid, 0, full_mid.data(), mid_bytes),
           "read full-path pair-major intermediate for host oracle");
+    std::vector<Q8KBlock> production_mid_q8(
+        (size_t)pair_count * (kFullMid / kQk));
+    CHECK(ds4_gpu_tensor_read(
+              &gate, 0, production_mid_q8.data(),
+              (uint64_t)production_mid_q8.size() * sizeof(Q8KBlock)),
+          "read production intermediate Q8_K blocks before shard reuse");
+    CHECK(valid_q8k_capture(production_mid_q8),
+          "production intermediate Q8_K scratch alias and block invariants");
     CHECK(launch(out_half0, gate, up, mid, down,
                  device.gate_half[0], device.up_half[0], device.down_half[0],
                  half_gate_expert, gate_row_bytes,
@@ -510,6 +708,32 @@ bool run_test() {
                          input_q8[(size_t)token * (kInput / kQk) + block]);
         }
     }
+    uint64_t q8_changed_blocks = 0;
+    for (size_t block = 0; block < input_q8.size(); ++block) {
+        const Q8KBlock &expected = input_q8[block];
+        const Q8KBlock &actual = production_input_q8[block];
+        q8_changed_blocks += std::memcmp(&expected, &actual,
+                                         sizeof(Q8KBlock)) != 0;
+    }
+    const Q81Comparison input_q81 =
+        compare_q81_effective(input_q8, production_input_q8);
+    std::fprintf(stderr,
+        "GLM5 Q8_K host-production comparison blocks=%zu changed_blocks=%llu "
+        "q81_changed_values=%llu q81_changed_scales=%llu "
+        "q81_changed_sums=%llu max_scale_delta=%.9g host_fnv=%016llx "
+        "production_fnv=%016llx\n",
+        input_q8.size(), (unsigned long long)q8_changed_blocks,
+        (unsigned long long)input_q81.changed_values,
+        (unsigned long long)input_q81.changed_scales,
+        (unsigned long long)input_q81.changed_sums,
+        input_q81.max_scale_delta,
+        (unsigned long long)fnv1a64(input_q8.data(),
+                                    input_q8.size() * sizeof(Q8KBlock)),
+        (unsigned long long)fnv1a64(production_input_q8.data(),
+                                    production_input_q8.size() * sizeof(Q8KBlock)));
+    CHECK(input_q81.changed_values == 0 && input_q81.changed_scales == 0 &&
+          input_q81.changed_sums == 0,
+          "host Q8_K oracle matches production-effective Q8_1 input");
     std::vector<Q8KBlock> mid_q8((size_t)pair_count * (kFullMid / kQk));
     for (uint64_t pair = 0; pair < pair_count; ++pair) {
         for (uint32_t block = 0; block < kFullMid / kQk; ++block) {
@@ -518,6 +742,25 @@ bool run_test() {
                          mid_q8[pair * (kFullMid / kQk) + block]);
         }
     }
+    const Q81Comparison mid_q81 =
+        compare_q81_effective(mid_q8, production_mid_q8);
+    std::fprintf(stderr,
+        "GLM5 intermediate Q8_K host-production comparison blocks=%zu "
+        "q81_changed_values=%llu q81_changed_scales=%llu "
+        "q81_changed_sums=%llu max_scale_delta=%.9g host_fnv=%016llx "
+        "production_fnv=%016llx\n",
+        mid_q8.size(), (unsigned long long)mid_q81.changed_values,
+        (unsigned long long)mid_q81.changed_scales,
+        (unsigned long long)mid_q81.changed_sums,
+        mid_q81.max_scale_delta,
+        (unsigned long long)fnv1a64(mid_q8.data(),
+                                    mid_q8.size() * sizeof(Q8KBlock)),
+        (unsigned long long)fnv1a64(production_mid_q8.data(),
+                                    production_mid_q8.size() * sizeof(Q8KBlock)));
+    CHECK(!router_bridge ||
+          (mid_q81.changed_values == 0 && mid_q81.changed_scales == 0 &&
+           mid_q81.changed_sums == 0),
+          "host Q8_K oracle matches production-effective Q8_1 intermediate");
 
     // Sample separated tokens and rows but cover every route slot. The mid
     // leg is an independent same-GGUF scalar arithmetic reference. The final
@@ -583,12 +826,15 @@ bool run_test() {
     }
     std::fprintf(stderr,
         "GLM5 Q4_K independent scalar oracle mid=%llu bad=%llu "
-        "max_abs=%.9g max_rel=%.9g max_gate_ratio=%.9g "
+        "max_abs=%.9g max_abs_actual=%.9g max_abs_expected=%.9g "
+        "max_rel=%.9g max_gate_ratio=%.9g "
         "output=%llu bad=%llu max_abs=%.9g max_rel=%.9g "
         "max_gate_ratio=%.9g reference_fnv=%016llx actual_fnv=%016llx\n",
         (unsigned long long)mid_oracle.count,
         (unsigned long long)mid_oracle.bad,
-        mid_oracle.max_abs, mid_oracle.max_rel, mid_oracle.max_gate_ratio,
+        mid_oracle.max_abs, mid_oracle.max_abs_actual,
+        mid_oracle.max_abs_expected, mid_oracle.max_rel,
+        mid_oracle.max_gate_ratio,
         (unsigned long long)output_oracle.count,
         (unsigned long long)output_oracle.bad,
         output_oracle.max_abs, output_oracle.max_rel,
@@ -640,14 +886,34 @@ bool run_test() {
     const uint64_t up_weight_fnv = fnv1a64(up_full.data(), up_full.size());
     const uint64_t down_weight_fnv = fnv1a64(down_full.data(),
                                               down_full.size());
+    const uint64_t expert_ids_fnv = fnv1a64(expert_ids, sizeof(expert_ids));
+    const uint64_t route_weights_fnv =
+        fnv1a64(route_weights.data(), route_weights.size() * sizeof(float));
+    std::fprintf(stderr,
+        "GLM5 Q4_K expert set router_bridge=%d seed_active=%d seed=%u "
+        "ids=%u,%u,%u,%u,%u,%u,%u,%u ids_fnv=%016llx "
+        "route_source=%s distinct_route_sets=%u association_pairs=%llu "
+        "route_weights_fnv=%016llx association_bad=%llu "
+        "association_max_abs=%.9g\n",
+        router_bridge, router_bridge, jitter_seed,
+        expert_ids[0], expert_ids[1], expert_ids[2],
+        expert_ids[3], expert_ids[4], expert_ids[5], expert_ids[6],
+        expert_ids[7], (unsigned long long)expert_ids_fnv,
+        router_bridge ? "token0" : "synthetic",
+        router_bridge ? 1u : 0u,
+        (unsigned long long)association_oracle.count,
+        (unsigned long long)route_weights_fnv,
+        (unsigned long long)association_oracle.bad,
+        association_oracle.max_abs);
     std::fprintf(stderr,
         "GLM5 Q4_K shard split-consistency layer=3 descriptor_experts=288 "
-        "compact_table=8 gathered_ids=0,1,17,63,127,191,255,287 "
+        "compact_table=8 router_bridge=%d "
         "tokens=%u changed_telemetry=%llu nonfinite=%llu "
         "independent_halves=%d max_abs=%.9g max_rel=%.9g nmse=%.9g "
         "gate_weight_fnv=%016llx up_weight_fnv=%016llx "
         "down_weight_fnv=%016llx full_fnv=%016llx shard_fnv=%016llx\n",
-        kTokens, (unsigned long long)changed, (unsigned long long)nonfinite,
+        router_bridge, kTokens, (unsigned long long)changed,
+        (unsigned long long)nonfinite,
         independent_halves, max_abs, max_rel, nmse,
         (unsigned long long)gate_weight_fnv,
         (unsigned long long)up_weight_fnv,
@@ -658,8 +924,11 @@ bool run_test() {
     CHECK(oracle_pass,
           "sampled same-GGUF scalar mid and conditioned-down arithmetic oracle");
     std::fprintf(stderr,
-                 "PASS same-GGUF GLM5 Q4_K sampled scalar-mid, "
-                 "conditioned-down, and top-8 shard split-consistency\n");
+                 "PASS same-GGUF GLM5 Q4_K router_bridge=%d "
+                 "route_source=%s sampled "
+                 "scalar-mid, conditioned-down, and top-8 shard "
+                 "split-consistency\n",
+                 router_bridge, router_bridge ? "token0" : "synthetic");
     return true;
 }
 

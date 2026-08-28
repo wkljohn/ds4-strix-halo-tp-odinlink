@@ -2,7 +2,10 @@
 #define DS4_TESTS_GLM5_GGUF_TEST_HPP
 
 #include <cstdint>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -12,6 +15,36 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+static inline bool glm5_test_router_seed(uint32_t &seed) {
+    const char *value = std::getenv("DS4_GLM5_ROUTER_JITTER_SEED");
+    if (!value) {
+        seed = 2u;
+        return true;
+    }
+    if (!value[0] || value[0] == '-') return false;
+    errno = 0;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno || !end || *end || parsed > std::numeric_limits<uint32_t>::max())
+        return false;
+    seed = (uint32_t)parsed;
+    return true;
+}
+
+// Seeds 2, 12, and 20 are the cross-node gate set: each stays away from Q8_K
+// rounding ties at both the input and intermediate. Other seeds are accepted
+// for diagnosis but are not promised to satisfy the bit-exact Q8_1 oracle.
+static inline float glm5_test_router_input(uint32_t token, uint32_t column,
+                                           uint32_t seed) {
+    const int value = (int)((column * 37u + token * 53u +
+                             (column >> 4u) * 11u) % 509u) - 254;
+    const uint32_t mixed = column * 193u + token * 389u +
+                           (column >> 3u) * 17u + seed * 761u;
+    const int jitter = (int)(mixed % 997u) - 498;
+    return (float)value / (1024.0f + (float)(token & 7u)) +
+           (float)jitter * 5.0e-7f;
+}
 
 struct Glm5TestCursor {
     const uint8_t *base = nullptr;

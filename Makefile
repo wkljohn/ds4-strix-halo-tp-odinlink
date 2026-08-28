@@ -113,7 +113,7 @@ test-glm5-next-mhc-oracle:
 		"$(DS4_GLM5_MODEL)"
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" python3 tests/test_glm5_mhc_external_reference.py
 
-.PHONY: test-rocm-glm5-q4k-shard-compose
+.PHONY: test-rocm-glm5-q4k-shard-compose test-rocm-glm5-router-moe-bridge test-rocm-glm5-router-moe-bridge-seeds
 tests/test_rocm_glm5_q4k_shard_compose.o: tests/test_rocm_glm5_q4k_shard_compose.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
@@ -122,6 +122,15 @@ tests/test_rocm_glm5_q4k_shard_compose: tests/test_rocm_glm5_q4k_shard_compose.o
 
 test-rocm-glm5-q4k-shard-compose: tests/test_rocm_glm5_q4k_shard_compose
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_shard_compose
+
+test-rocm-glm5-router-moe-bridge: tests/test_rocm_glm5_q4k_shard_compose
+	DS4_GLM5_ROUTER_MOE_BRIDGE=1 DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_shard_compose
+
+test-rocm-glm5-router-moe-bridge-seeds: tests/test_rocm_glm5_q4k_shard_compose tests/test_rocm_glm5_router_realweight
+	@set -e; for seed in 2 12 20; do \
+		DS4_GLM5_ROUTER_JITTER_SEED=$$seed DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_router_realweight; \
+		DS4_GLM5_ROUTER_JITTER_SEED=$$seed DS4_GLM5_ROUTER_MOE_BRIDGE=1 DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_q4k_shard_compose; \
+	done
 
 .PHONY: test-rocm-glm5-router-realweight
 tests/test_rocm_glm5_router_realweight.o: tests/test_rocm_glm5_router_realweight.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h

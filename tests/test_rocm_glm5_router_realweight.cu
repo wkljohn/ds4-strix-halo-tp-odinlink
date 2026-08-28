@@ -163,13 +163,14 @@ bool run_test() {
     const float *router = reinterpret_cast<const float *>(gguf.map + router_offset);
     const float *bias = reinterpret_cast<const float *>(gguf.map + bias_offset);
 
+    uint32_t jitter_seed = 0;
+    CHECK(glm5_test_router_seed(jitter_seed),
+          "valid DS4_GLM5_ROUTER_JITTER_SEED");
     std::vector<float> input((size_t)kTokens * kInput);
     for (uint32_t token = 0; token < kTokens; ++token) {
         for (uint32_t column = 0; column < kInput; ++column) {
-            const int value = (int)((column * 37u + token * 53u +
-                                     (column >> 4u) * 11u) % 509u) - 254;
             input[(size_t)token * kInput + column] =
-                (float)value / (1024.0f + (float)(token & 7u));
+                glm5_test_router_input(token, column, jitter_seed);
         }
     }
 
@@ -333,16 +334,17 @@ bool run_test() {
           "router rejects whitelisted geometry with undersized tensors and NaN scale");
 
     std::fprintf(stderr,
-        "GLM5 same-GGUF router layer=%u tokens=%u experts=%u topk=%u "
+        "GLM5 same-GGUF router layer=%u tokens=%u experts=%u topk=%u seed=%u "
         "id_mismatch=%llu gpu_logit_route_mismatch=%llu "
         "min_choice_margin=%.9g "
         "logits_bad=%llu max_abs=%.9g max_gate_ratio=%.9g "
         "probs_bad=%llu max_abs=%.9g max_gate_ratio=%.9g "
         "weights_bad=%llu max_abs=%.9g max_gate_ratio=%.9g "
         "weight_sum_bad=%llu max_weight_sum_error=%.9g "
-        "router_fnv=%016llx bias_fnv=%016llx selected_fnv=%016llx "
+        "router_fnv=%016llx bias_fnv=%016llx token0_ids_fnv=%016llx "
+        "selected_fnv=%016llx "
         "weights_fnv=%016llx\n",
-        kLayer, kTokens, kExperts, kUsed,
+        kLayer, kTokens, kExperts, kUsed, jitter_seed,
         (unsigned long long)id_mismatch,
         (unsigned long long)gpu_logit_route_mismatch,
         min_choice_margin,
@@ -355,6 +357,8 @@ bool run_test() {
         (unsigned long long)weight_sum_bad, max_weight_sum_error,
         (unsigned long long)fnv1a64(router, router_bytes),
         (unsigned long long)fnv1a64(bias, bias_bytes),
+        (unsigned long long)fnv1a64(gpu_selected.data(),
+                                    kUsed * sizeof(int32_t)),
         (unsigned long long)fnv1a64(gpu_selected.data(), selected_bytes),
         (unsigned long long)fnv1a64(gpu_weights.data(), weights_bytes));
     CHECK(logit_stats.pass() && probability_stats.pass() && weight_stats.pass(),
@@ -363,7 +367,8 @@ bool run_test() {
           "exact deterministic top-8 router IDs");
     CHECK(weight_sum_bad == 0,
           "top-8 expert weights sum to GGUF-configured scale");
-    CHECK(min_choice_margin > 1.0e-5,
+    CHECK(min_choice_margin > std::max(
+              1.0e-5, 8.0 * (probability_stats.max_abs + 2.0e-6)),
           "router top-8 boundary has useful numerical margin");
     std::fprintf(stderr,
                  "PASS same-GGUF GLM5 F32 router and deterministic top-8\n");
