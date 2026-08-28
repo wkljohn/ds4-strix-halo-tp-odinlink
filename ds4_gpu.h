@@ -1664,6 +1664,34 @@ int ds4_gpu_glm5_kpool_tensor(
         uint32_t              pool_size,
         uint32_t              first_valid);
 
+/* Single-sequence GLM-5.3 decode selection helpers. The mask preserves the
+ * upstream finite minimum sentinel. Expansion converts selected pool IDs back
+ * to raw token IDs and appends the incomplete visible tail (at most 3 rows).
+ * valid_keys must be one contiguous visible run beginning at first_valid.
+ * selected_pool_count is computed from complete valid pools, never raw pool
+ * capacity, and may be zero for an all-tail context; output width is exactly
+ * token_budget + pool_size - 1. Unoccupied entries are -1. Consumers must
+ * compact them or use an indexed-attention path with selected_rows_valid=false;
+ * the unchecked selected_rows_valid=true fast path must never receive them. */
+int ds4_gpu_glm5_mask_pool_scores_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *pool_valid,
+        uint32_t              n_pools);
+
+int ds4_gpu_glm5_expand_pool_selection_tensor(
+        ds4_gpu_tensor       *selected_tokens,
+        const ds4_gpu_tensor *selected_pools,
+        const ds4_gpu_tensor *pool_indices,
+        const ds4_gpu_tensor *pool_valid,
+        const ds4_gpu_tensor *valid_keys,
+        uint32_t              n_pools,
+        uint32_t              selected_pool_count,
+        uint32_t              n_rows,
+        uint32_t              first_valid,
+        uint32_t              visible_count,
+        uint32_t              token_budget,
+        uint32_t              pool_size);
+
 int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
         ds4_gpu_tensor       *qk_low,
         const ds4_gpu_tensor *q,

@@ -25070,6 +25070,105 @@ extern "C" int ds4_gpu_glm5_kpool_tensor(
     return cuda_ok(cudaGetLastError(), "glm5 kpool4 launch");
 }
 
+__global__ static void glm5_mask_pool_scores_kernel(
+        float *scores, const uint32_t *pool_valid, uint32_t n_pools) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_pools && pool_valid[i] == 0u)
+        scores[i] = -3.402823466e+38F;
+}
+
+__global__ static void glm5_expand_pool_selection_kernel(
+        int32_t *selected_tokens,
+        const uint32_t *selected_pools,
+        const int32_t *pool_indices,
+        const uint32_t *pool_valid,
+        const uint32_t *valid_keys,
+        uint32_t n_pools,
+        uint32_t selected_pool_count,
+        uint32_t n_rows,
+        uint32_t first_valid,
+        uint32_t visible_count,
+        uint32_t token_budget) {
+    const uint32_t output_width = token_budget + 3u;
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= output_width) return;
+    int32_t value = -1;
+    const uint32_t expanded = selected_pool_count * 4u;
+    if (i < expanded) {
+        const uint32_t slot = i >> 2u;
+        const uint32_t member = i & 3u;
+        const uint32_t pool = selected_pools[slot];
+        if (pool < n_pools && pool_valid[pool] != 0u)
+            value = pool_indices[(uint64_t)pool * 4u + member];
+    } else if (i < expanded + 3u) {
+        const uint32_t member = i - expanded;
+        const uint32_t tail_count = visible_count & 3u;
+        const uint32_t tail_start =
+            first_valid + visible_count - tail_count;
+        const uint32_t row = tail_start + member;
+        if (member < tail_count && row < n_rows && valid_keys[row] != 0u)
+            value = (int32_t)row;
+    }
+    selected_tokens[i] = value;
+}
+
+extern "C" int ds4_gpu_glm5_mask_pool_scores_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *pool_valid,
+        uint32_t              n_pools) {
+    if (!scores || !pool_valid || !scores->ptr || !pool_valid->ptr ||
+        n_pools == 0u ||
+        scores->bytes < (uint64_t)n_pools * sizeof(float) ||
+        pool_valid->bytes < (uint64_t)n_pools * sizeof(uint32_t)) return 0;
+    const uint32_t threads = 256u;
+    glm5_mask_pool_scores_kernel<<<(n_pools + threads - 1u) / threads,
+                                    threads>>>(
+            (float *)scores->ptr, (const uint32_t *)pool_valid->ptr, n_pools);
+    return cuda_ok(cudaGetLastError(), "glm5 mask pool scores launch");
+}
+
+extern "C" int ds4_gpu_glm5_expand_pool_selection_tensor(
+        ds4_gpu_tensor       *selected_tokens,
+        const ds4_gpu_tensor *selected_pools,
+        const ds4_gpu_tensor *pool_indices,
+        const ds4_gpu_tensor *pool_valid,
+        const ds4_gpu_tensor *valid_keys,
+        uint32_t              n_pools,
+        uint32_t              selected_pool_count,
+        uint32_t              n_rows,
+        uint32_t              first_valid,
+        uint32_t              visible_count,
+        uint32_t              token_budget,
+        uint32_t              pool_size) {
+    if (!selected_tokens || !selected_pools || !pool_indices || !pool_valid ||
+        !valid_keys || !selected_tokens->ptr || !selected_pools->ptr ||
+        !pool_indices->ptr || !pool_valid->ptr || !valid_keys->ptr ||
+        n_pools == 0u || n_rows == 0u || first_valid > n_rows ||
+        visible_count > n_rows - first_valid ||
+        pool_size != 4u || token_budget != 2048u ||
+        selected_pool_count > n_pools ||
+        selected_pool_count > token_budget / pool_size) return 0;
+    const uint32_t output_width = token_budget + pool_size - 1u;
+    if (selected_tokens->bytes < (uint64_t)output_width * sizeof(int32_t) ||
+        selected_pools->bytes <
+            (uint64_t)selected_pool_count * sizeof(uint32_t) ||
+        pool_indices->bytes <
+            (uint64_t)n_pools * pool_size * sizeof(int32_t) ||
+        pool_valid->bytes < (uint64_t)n_pools * sizeof(uint32_t) ||
+        valid_keys->bytes < (uint64_t)n_rows * sizeof(uint32_t)) return 0;
+    const uint32_t threads = 256u;
+    glm5_expand_pool_selection_kernel<<<
+        (output_width + threads - 1u) / threads, threads>>>(
+            (int32_t *)selected_tokens->ptr,
+            (const uint32_t *)selected_pools->ptr,
+            (const int32_t *)pool_indices->ptr,
+            (const uint32_t *)pool_valid->ptr,
+            (const uint32_t *)valid_keys->ptr, n_pools,
+            selected_pool_count, n_rows, first_valid, visible_count,
+            token_budget);
+    return cuda_ok(cudaGetLastError(), "glm5 expand pool selection launch");
+}
+
 extern "C" int ds4_gpu_glm_k_b_project_typed_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *kv_norm,

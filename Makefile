@@ -258,6 +258,17 @@ test-rocm-glm5-kpool: tests/test_rocm_glm5_kpool
 	python3 tests/test_glm5_kpool_external_reference.py
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_kpool
 
+.PHONY: test-rocm-glm5-indexer-select
+tests/test_rocm_glm5_indexer_select.o: tests/test_rocm_glm5_indexer_select.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_rocm_glm5_indexer_select: tests/test_rocm_glm5_indexer_select.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-indexer-select: tests/test_rocm_glm5_indexer_select
+	python3 tests/test_glm5_indexer_select_external_reference.py
+	./tests/test_rocm_glm5_indexer_select
+
 .PHONY: test-glm5-kda-tp-digest
 tests/test_glm5_kda_tp_digest: tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c $(LDLIBS)
