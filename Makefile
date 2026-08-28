@@ -279,6 +279,29 @@ tests/test_rocm_glm5_bf16_round: tests/test_rocm_glm5_bf16_round.o tests/ds4_tp_
 test-rocm-glm5-bf16-round: tests/test_rocm_glm5_bf16_round
 	./tests/test_rocm_glm5_bf16_round
 
+.PHONY: test-rocm-glm5-nope-score
+tests/test_rocm_glm5_nope_score.o: tests/test_rocm_glm5_nope_score.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_rocm_glm5_nope_score: tests/test_rocm_glm5_nope_score.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-nope-score: tests/test_rocm_glm5_nope_score
+	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "DS4_RESEARCH_ROOT is required" >&2; exit 1; }
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
+	python3 scripts/probe-glm5-next-nope-score.py \
+		--output "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/nope-score-layer3-oracle.json" \
+		--dump-prefix "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/nope-score-layer3" \
+		"$(DS4_GLM5_MODEL)" >/dev/null
+	env -u DS4_ROCM_DISABLE_BF16_SHAREDX \
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+	DS4_GLM5_NOPE_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/nope-score-layer3" \
+		./tests/test_rocm_glm5_nope_score
+	DS4_ROCM_DISABLE_BF16_SHAREDX=1 \
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+	DS4_GLM5_NOPE_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/nope-score-layer3" \
+		./tests/test_rocm_glm5_nope_score
+
 .PHONY: test-glm5-kda-tp-digest
 tests/test_glm5_kda_tp_digest: tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c $(LDLIBS)
