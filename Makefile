@@ -98,12 +98,20 @@ test-glm5-next-contract:
 	python3 scripts/check-glm5-next-gguf.py "$(DS4_GLM5_MODEL)"
 	python3 scripts/probe-glm5-next-weights.py . "$(DS4_GLM5_MODEL)"
 	python3 scripts/probe-glm5-next-kda-payload.py "$(DS4_GLM5_MODEL)"
+	python3 scripts/probe-glm5-next-mla-norms.py "$(DS4_GLM5_MODEL)"
 	python3 scripts/plan-glm5-next-residency.py . "$(DS4_GLM5_MODEL)"
 	python3 tests/test_glm5_next_oracles.py
 	python3 tests/test_glm5_kda_external_reference.py
 
 test-glm5-next-kda-projection:
 	python3 scripts/probe-glm5-next-kda-projection.py "$(DS4_GLM5_MODEL)"
+
+.PHONY: test-glm5-next-mla-norms
+test-glm5-next-mla-norms:
+	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "error: set DS4_RESEARCH_ROOT" >&2; exit 2; }
+	python3 scripts/probe-glm5-next-mla-norms.py \
+		--output "$(DS4_RESEARCH_ROOT)/glm5-next-tp2/mla-norm-provenance.json" \
+		"$(DS4_GLM5_MODEL)"
 
 .PHONY: test-glm5-next-mhc-oracle
 test-glm5-next-mhc-oracle:
