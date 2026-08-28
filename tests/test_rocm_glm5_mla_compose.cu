@@ -178,6 +178,211 @@ bool compare_bf16_ulps(const char *name, const std::vector<float> &got,
     return true;
 }
 
+struct TensorSet {
+    std::vector<ds4_gpu_tensor *> values;
+    ~TensorSet() {
+        for (auto it = values.rbegin(); it != values.rend(); ++it)
+            ds4_gpu_tensor_free(*it);
+    }
+    ds4_gpu_tensor *keep(ds4_gpu_tensor *value) {
+        if (value) values.push_back(value);
+        return value;
+    }
+};
+
+bool run_scaled_pool_crossover(
+        const Glm5TestGGUF &gguf, uint64_t pool_ape, uint64_t v_b,
+        ds4_gpu_tensor *index_key, ds4_gpu_tensor *pool_gate,
+        ds4_gpu_tensor *cache, ds4_gpu_tensor *index_q,
+        ds4_gpu_tensor *head_weights, ds4_gpu_tensor *query,
+        ds4_gpu_tensor *qk_low) {
+    constexpr uint32_t rows = 13u, complete_rows = 12u;
+    constexpr uint32_t top_k = 8u, pool_size = 4u;
+    constexpr uint32_t complete_pools = complete_rows / pool_size;
+    constexpr uint32_t pools = (rows + pool_size - 1u) / pool_size;
+    constexpr uint32_t selected_pool_count = top_k / pool_size;
+    constexpr uint32_t expanded_width = top_k + pool_size - 1u;
+    TensorSet tensors;
+    const auto bytes = [&tensors](uint64_t n) {
+        return tensors.keep(ds4_gpu_tensor_alloc(n));
+    };
+    ds4_gpu_tensor *valid = bytes(rows * sizeof(uint32_t));
+    ds4_gpu_tensor *extended_keys = bytes(
+        (uint64_t)rows * kIndexDim * sizeof(float));
+    ds4_gpu_tensor *extended_gate = bytes(
+        (uint64_t)rows * kIndexDim * sizeof(float));
+    ds4_gpu_tensor *extended_cache = bytes(
+        (uint64_t)rows * kKvLora * sizeof(float));
+    ds4_gpu_tensor *full_pooled = bytes(
+        (uint64_t)complete_pools * kIndexDim * sizeof(float));
+    ds4_gpu_tensor *full_indices = bytes(
+        (uint64_t)complete_pools * pool_size * sizeof(int32_t));
+    ds4_gpu_tensor *full_valid = bytes(
+        complete_pools * sizeof(uint32_t));
+    ds4_gpu_tensor *incremental_pooled = bytes(
+        (uint64_t)complete_pools * kIndexDim * sizeof(float));
+    ds4_gpu_tensor *one_indices = bytes(pool_size * sizeof(int32_t));
+    ds4_gpu_tensor *one_valid = bytes(sizeof(uint32_t));
+    ds4_gpu_tensor *pooled13 = bytes(
+        (uint64_t)pools * kIndexDim * sizeof(float));
+    ds4_gpu_tensor *indices13 = bytes(
+        (uint64_t)pools * pool_size * sizeof(int32_t));
+    ds4_gpu_tensor *pool_valid9 = bytes(pools * sizeof(uint32_t));
+    ds4_gpu_tensor *pool_scores = bytes(
+        complete_pools * sizeof(float));
+    ds4_gpu_tensor *selected_pools = bytes(
+        selected_pool_count * sizeof(uint32_t));
+    ds4_gpu_tensor *expanded = bytes(
+        expanded_width * sizeof(int32_t));
+    ds4_gpu_tensor *dense = bytes(rows * sizeof(int32_t));
+    ds4_gpu_tensor *heads_pooled = bytes(
+        (uint64_t)kHeads * kHeadDim * sizeof(float));
+    ds4_gpu_tensor *heads_dense = bytes(
+        (uint64_t)kHeads * kHeadDim * sizeof(float));
+    CHECK(valid && extended_keys && extended_gate && extended_cache &&
+              full_pooled && full_indices && full_valid &&
+              incremental_pooled && one_indices && one_valid && pooled13 &&
+              indices13 && pool_valid9 && pool_scores && selected_pools &&
+              expanded && dense && heads_pooled && heads_dense,
+          "allocate scaled pool-crossover tensors");
+
+    std::vector<float> source_keys, source_gate, source_cache;
+    CHECK(read_tensor(index_key, kRows * kIndexDim, source_keys) &&
+              read_tensor(pool_gate, kRows * kIndexDim, source_gate) &&
+              read_tensor(cache, kRows * kKvLora, source_cache),
+          "read source rows for scaled three-pool crossover");
+    std::vector<float> host_keys((uint64_t)rows * kIndexDim);
+    std::vector<float> host_gate((uint64_t)rows * kIndexDim);
+    std::vector<float> host_cache((uint64_t)rows * kKvLora);
+    for (uint32_t row = 0u; row < rows; ++row) {
+        const uint32_t source = row % kRows;
+        std::copy_n(source_keys.data() + (uint64_t)source * kIndexDim,
+                    kIndexDim, host_keys.data() + (uint64_t)row * kIndexDim);
+        std::copy_n(source_gate.data() + (uint64_t)source * kIndexDim,
+                    kIndexDim, host_gate.data() + (uint64_t)row * kIndexDim);
+        std::copy_n(source_cache.data() + (uint64_t)source * kKvLora,
+                    kKvLora, host_cache.data() + (uint64_t)row * kKvLora);
+    }
+    std::vector<uint32_t> valid_rows(rows, 1u);
+    CHECK(ds4_gpu_tensor_write(valid, 0u, valid_rows.data(),
+                               valid_rows.size() * sizeof(uint32_t)) &&
+              ds4_gpu_tensor_write(extended_keys, 0u, host_keys.data(),
+                                   host_keys.size() * sizeof(float)) &&
+              ds4_gpu_tensor_write(extended_gate, 0u, host_gate.data(),
+                                   host_gate.size() * sizeof(float)) &&
+              ds4_gpu_tensor_write(extended_cache, 0u, host_cache.data(),
+                                   host_cache.size() * sizeof(float)) &&
+              ds4_gpu_glm5_kpool_tensor(
+                  full_pooled, full_indices, full_valid, extended_keys,
+                  extended_gate,
+                  valid, gguf.map, gguf.size, pool_ape, complete_rows,
+                  kIndexDim, pool_size, 0u),
+          "build full three-pool crossover reference");
+
+    for (uint32_t group = 0u; group < complete_pools; ++group) {
+        const uint64_t row_offset =
+            (uint64_t)group * pool_size * kIndexDim * sizeof(float);
+        const uint64_t row_bytes =
+            (uint64_t)pool_size * kIndexDim * sizeof(float);
+        ds4_gpu_tensor *keys_view = tensors.keep(ds4_gpu_tensor_view(
+            extended_keys, row_offset, row_bytes));
+        ds4_gpu_tensor *gate_view = tensors.keep(ds4_gpu_tensor_view(
+            extended_gate, row_offset, row_bytes));
+        ds4_gpu_tensor *valid_view = tensors.keep(ds4_gpu_tensor_view(
+            valid, (uint64_t)group * pool_size * sizeof(uint32_t),
+            pool_size * sizeof(uint32_t)));
+        ds4_gpu_tensor *out_view = tensors.keep(ds4_gpu_tensor_view(
+            incremental_pooled,
+            (uint64_t)group * kIndexDim * sizeof(float),
+            kIndexDim * sizeof(float)));
+        CHECK(keys_view && gate_view && valid_view && out_view &&
+                  ds4_gpu_glm5_kpool_tensor(
+                      out_view, one_indices, one_valid, keys_view, gate_view,
+                      valid_view, gguf.map, gguf.size, pool_ape, pool_size,
+                      kIndexDim, pool_size, 0u),
+              "reuse validated four-row kernel for one incremental pool");
+    }
+
+    CHECK(ds4_gpu_glm5_kpool_tensor(
+              pooled13, indices13, pool_valid9, extended_keys, extended_gate,
+              valid,
+              gguf.map, gguf.size, pool_ape, rows, kIndexDim, pool_size, 0u) &&
+          ds4_gpu_glm_indexer_score_one_tensor(
+              pool_scores, index_q, head_weights, pooled13, complete_pools,
+              kIndexHeads, kIndexDim, 0.08838834764831845f, false) &&
+          ds4_gpu_indexer_topk_tensor(
+              selected_pools, pool_scores, complete_pools, 1u,
+              selected_pool_count) &&
+          ds4_gpu_glm5_expand_pool_selection_tensor(
+              expanded, selected_pools, indices13, pool_valid9, valid, pools,
+              selected_pool_count, rows, 0u, rows, top_k, pool_size) &&
+          ds4_gpu_synchronize(),
+          "score and expand a nontrivial two-of-three pool selection");
+
+    std::vector<uint32_t> got_selected;
+    std::vector<int32_t> got_indices, local_indices;
+    std::vector<uint32_t> local_valid;
+    CHECK(read_tensor(selected_pools, selected_pool_count, got_selected) &&
+              read_tensor(indices13, pools * pool_size, got_indices) &&
+              read_tensor(one_indices, pool_size, local_indices) &&
+              read_tensor(one_valid, 1u, local_valid),
+          "read scaled selection and pool-local index contract");
+    CHECK(local_indices == std::vector<int32_t>({0, 1, 2, 3}) &&
+              local_valid == std::vector<uint32_t>({1u}),
+          "incremental four-row pooling returns pool-local indices");
+    CHECK(got_selected[0] != got_selected[1],
+          "scaled top-k selects two distinct pools");
+    std::vector<int32_t> expected(expanded_width, -1);
+    for (uint32_t slot = 0u; slot < selected_pool_count; ++slot) {
+        CHECK(got_selected[slot] < complete_pools,
+              "top-k selects only complete pools");
+        for (uint32_t member = 0u; member < pool_size; ++member)
+            expected[slot * pool_size + member] =
+                got_indices[got_selected[slot] * pool_size + member];
+    }
+    expected[top_k] = (int32_t)(rows - 1u);
+    CHECK(ds4_gpu_tensor_write(dense, 0u, expected.data(),
+                               expected.size() * sizeof(int32_t)) &&
+          ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+              heads_pooled, query, qk_low, extended_cache, nullptr, gguf.map,
+              gguf.size, v_b, 8u, expanded, expanded_width, rows, false,
+              kHeads, kKvLora, kHeadDim, 0u, kHeadDim, 0u,
+              1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+              heads_dense, query, qk_low, extended_cache, nullptr, gguf.map,
+              gguf.size, v_b, 8u, dense, expanded_width, rows, false,
+              kHeads, kKvLora, kHeadDim, 0u, kHeadDim, 0u,
+              1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_synchronize(),
+          "execute scaled token-9 pooled and dense attention paths");
+
+    std::vector<float> got_full, got_incremental, got_pooled_heads,
+        got_dense_heads;
+    std::vector<int32_t> got_expanded;
+    CHECK(read_tensor(full_pooled, complete_pools * kIndexDim, got_full) &&
+              read_tensor(incremental_pooled,
+                          complete_pools * kIndexDim, got_incremental) &&
+              read_tensor(expanded, expanded_width, got_expanded) &&
+              read_tensor(heads_pooled, kHeads * kHeadDim,
+                          got_pooled_heads) &&
+              read_tensor(heads_dense, kHeads * kHeadDim, got_dense_heads),
+          "read scaled crossover boundaries");
+    CHECK(got_full == got_incremental,
+          "incremental four-row pooling is bit-identical to full pooling");
+    CHECK(got_expanded == expected,
+          "scaled expansion matches independently composed pool rows and tail");
+    CHECK(got_pooled_heads == got_dense_heads,
+          "token-9 pooled attention is bit-identical to dense selection");
+    std::fprintf(stderr,
+        "GLM5 scaled pool crossover top_k=8 visible=13 pooled_fnv=%016llx "
+        "heads_fnv=%016llx\n",
+        (unsigned long long)fnv1a64(
+            got_incremental.data(), got_incremental.size() * sizeof(float)),
+        (unsigned long long)fnv1a64(
+            got_pooled_heads.data(), got_pooled_heads.size() * sizeof(float)));
+    return true;
+}
+
 bool run_roce_output(const Glm5TestGGUF &gguf,
                      const std::vector<float> &half0,
                      const std::vector<float> &half1,
@@ -1016,6 +1221,10 @@ bool run_test() {
               kHidden, kHc) &&
           ds4_gpu_synchronize(),
           "execute sparse MLA, output reduction and local mHC carry");
+    CHECK(run_scaled_pool_crossover(
+              gguf, pool_ape, v_b, d_index_key, d_pool_gate, d_cache,
+              d_index_q, d_head_weights, d_query, d_qk_low),
+          "scaled top-k=8 token-9 crossover matches dense attention");
 
     std::vector<float> got_hc_split, got_hc_collapsed, got_hidden,
         got_hc_carried_local, got_hc_carried_add, got_q_resid, got_query,

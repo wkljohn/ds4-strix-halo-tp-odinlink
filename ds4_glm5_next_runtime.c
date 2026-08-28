@@ -6,13 +6,19 @@ bool ds4_glm5_next_layer_is_mla(uint32_t layer) {
     return layer == DS4_GLM5_NEXT_TRUNK_COUNT || (layer & 3u) == 3u;
 }
 
-int ds4_glm5_next_mla_dense_selection_visible(
-        uint64_t token_count, uint32_t capacity_tokens, uint32_t *visible) {
-    if (!visible || capacity_tokens == 0u ||
-        token_count >= capacity_tokens ||
-        token_count >= DS4_GLM5_NEXT_INDEX_TOP_K) return 0;
+int ds4_glm5_next_mla_dense_selection_visible_for_topk(
+        uint64_t token_count, uint32_t capacity_tokens, uint32_t top_k,
+        uint32_t *visible) {
+    if (!visible || capacity_tokens == 0u || top_k == 0u ||
+        token_count >= capacity_tokens || token_count >= top_k) return 0;
     *visible = (uint32_t)token_count + 1u;
     return 1;
+}
+
+int ds4_glm5_next_mla_dense_selection_visible(
+        uint64_t token_count, uint32_t capacity_tokens, uint32_t *visible) {
+    return ds4_glm5_next_mla_dense_selection_visible_for_topk(
+        token_count, capacity_tokens, DS4_GLM5_NEXT_INDEX_TOP_K, visible);
 }
 
 int ds4_glm5_next_build_tp_gate_mask(

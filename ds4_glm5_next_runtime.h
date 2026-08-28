@@ -111,6 +111,11 @@ bool ds4_glm5_next_layer_is_mla(uint32_t layer);
  * first token that requires pooled selection. */
 int ds4_glm5_next_mla_dense_selection_visible(
         uint64_t token_count, uint32_t capacity_tokens, uint32_t *visible);
+/* Internal scale-model entry for crossover tests. Production callers use the
+ * fixed 2048-row wrapper above; this is not an inference quality knob. */
+int ds4_glm5_next_mla_dense_selection_visible_for_topk(
+        uint64_t token_count, uint32_t capacity_tokens, uint32_t top_k,
+        uint32_t *visible);
 int ds4_glm5_next_build_tp_gate_mask(
         uint64_t mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS],
         uint32_t *gate_count);

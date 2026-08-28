@@ -72,6 +72,7 @@ typedef struct {
 } cuda_block_iq2_xxs;
 
 #include "ds4_gpu_mgpu.h"
+#include "ds4_glm5_next_runtime.h"
 #include "ds4_iq2_tables_cuda.inc"
 
 typedef struct {
@@ -25238,7 +25239,9 @@ extern "C" int ds4_gpu_glm5_expand_pool_selection_tensor(
         !pool_indices->ptr || !pool_valid->ptr || !valid_keys->ptr ||
         n_pools == 0u || n_rows == 0u || first_valid > n_rows ||
         visible_count > n_rows - first_valid ||
-        pool_size != 4u || token_budget != 2048u ||
+        pool_size != 4u || token_budget == 0u ||
+        token_budget % pool_size != 0u ||
+        token_budget > DS4_GLM5_NEXT_INDEX_TOP_K ||
         selected_pool_count > n_pools ||
         selected_pool_count > token_budget / pool_size) return 0;
     const uint32_t output_width = token_budget + pool_size - 1u;

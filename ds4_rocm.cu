@@ -46,6 +46,7 @@
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
+#include "ds4_glm5_next_runtime.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

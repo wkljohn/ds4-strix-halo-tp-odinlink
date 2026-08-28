@@ -67,6 +67,14 @@ static int test_contract(void) {
           "token 2049 fails closed until pooled selection is implemented");
     CHECK(!ds4_glm5_next_mla_dense_selection_visible(8u, 8u, &visible),
           "dense-selection policy enforces state capacity");
+    CHECK(ds4_glm5_next_mla_dense_selection_visible_for_topk(
+              7u, 16u, 8u, &visible) && visible == 8u &&
+          !ds4_glm5_next_mla_dense_selection_visible_for_topk(
+              8u, 16u, 8u, &visible),
+          "scaled policy crosses from dense token 8 to pooled token 9");
+    CHECK(!ds4_glm5_next_mla_dense_selection_visible_for_topk(
+              0u, 16u, 0u, &visible),
+          "scaled policy rejects a zero top-k");
     uint64_t gate_mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS] = {0};
     uint32_t gate_count = 0;
     CHECK(ds4_glm5_next_build_tp_gate_mask(gate_mask, &gate_count) &&
