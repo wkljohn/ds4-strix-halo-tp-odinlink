@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define CHECK(expr, message) do {                                           \
@@ -44,6 +45,13 @@ constexpr uint32_t kTokens = 32;
 constexpr uint32_t kQ4Block = 144;
 constexpr uint32_t kQk = 256;
 constexpr float kClamp = 10.0f;
+constexpr uint32_t kWmmaMinCount = 6;
+// The production routed-Q4_K down path currently fixes this to one, so every
+// selected expert uses the integer-WMMA down projection.
+constexpr uint32_t kDownWmmaMinCount = 1;
+constexpr uint64_t kDynamicMidSumRoundingBudget = 2;
+static_assert(kDownWmmaMinCount == 1u,
+              "production down-path threshold assumption");
 constexpr uint32_t kExpertIds[kUsed] = {0, 1, 17, 63, 127, 191, 255, 287};
 static_assert((uint64_t)kTokens * kOutput <= UINT32_MAX,
               "ds4_gpu_add_tensor element count must fit uint32_t");
@@ -122,6 +130,19 @@ struct ComponentTensors {
         ds4_gpu_tensor_free_in_place(&input);
         ds4_gpu_tensor_free_in_place(&weights);
         ds4_gpu_tensor_free_in_place(&selected);
+    }
+};
+
+struct RouterTensors {
+    ds4_gpu_tensor input = {}, logits = {}, probs = {};
+    ds4_gpu_tensor selected = {}, weights = {};
+
+    ~RouterTensors() {
+        ds4_gpu_tensor_free_in_place(&weights);
+        ds4_gpu_tensor_free_in_place(&selected);
+        ds4_gpu_tensor_free_in_place(&probs);
+        ds4_gpu_tensor_free_in_place(&logits);
+        ds4_gpu_tensor_free_in_place(&input);
     }
 };
 
@@ -288,6 +309,47 @@ float q4k_q81_reference(const Q4KBlock *weights,
     return result;
 }
 
+// Independent reconstruction of the cold-expert DP4A path. Unlike integer
+// WMMA, this path retains the F32 Q8_K scale and reduces K blocks through the
+// same eight quarter-wave lanes used by moe_gate_up_q4K_cold_tile16_kernel.
+float q4k_q8k_cold_reference(const Q4KBlock *weights,
+                             const Q8KBlock *activations,
+                             uint32_t blocks) {
+    float lane_sum[8] = {};
+    for (uint32_t lane = 0; lane < 8u; ++lane) {
+        for (uint32_t block = lane; block < blocks; block += 8u) {
+            const Q4KBlock &weight = weights[block];
+            const Q8KBlock &activation = activations[block];
+            const float wd = half_bits(weight.d);
+            const float wm = half_bits(weight.dmin);
+            int isum = 0, summs = 0;
+            for (uint32_t group = 0; group < 8u; ++group) {
+                uint8_t scale, minimum;
+                q4k_scale_min(group, weight.scales, scale, minimum);
+                const uint32_t byte_offset = (group >> 1u) * 32u;
+                const uint32_t shift = (group & 1u) ? 4u : 0u;
+                int dot = 0;
+                for (uint32_t i = 0; i < 32u; ++i) {
+                    const int q4 =
+                        (weight.qs[byte_offset + i] >> shift) & 15u;
+                    dot += q4 * (int)activation.qs[group * 32u + i];
+                }
+                isum += (int)scale * dot;
+                summs += (int)minimum *
+                    (activation.bsums[group * 2u] +
+                     activation.bsums[group * 2u + 1u]);
+            }
+            lane_sum[lane] += activation.d * wd * (float)isum -
+                              activation.d * wm * (float)summs;
+        }
+    }
+    for (uint32_t offset = 4u; offset != 0u; offset >>= 1u) {
+        for (uint32_t lane = 0; lane < offset; ++lane)
+            lane_sum[lane] += lane_sum[lane + offset];
+    }
+    return lane_sum[0];
+}
+
 float router_sigmoid(float value) {
     if (value >= 0.0f) {
         const float exponential = std::exp(-value);
@@ -360,10 +422,11 @@ bool tensor_range(const Glm5TestGGUF &gguf, uint64_t offset, uint64_t bytes) {
 }
 
 bool gather_experts(const Glm5TestGGUF &gguf, uint64_t offset,
-                    const uint32_t expert_ids[kUsed],
+                    const std::vector<uint32_t> &expert_ids,
                     uint64_t expert_bytes, std::vector<uint8_t> &compact) {
-    compact.resize((size_t)kUsed * expert_bytes);
-    for (uint32_t slot = 0; slot < kUsed; ++slot) {
+    if (expert_ids.empty()) return false;
+    compact.resize(expert_ids.size() * expert_bytes);
+    for (size_t slot = 0; slot < expert_ids.size(); ++slot) {
         const uint64_t source =
             offset + (uint64_t)expert_ids[slot] * expert_bytes;
         CHECK(tensor_range(gguf, source, expert_bytes),
@@ -377,8 +440,9 @@ bool gather_experts(const Glm5TestGGUF &gguf, uint64_t offset,
 void pack_gate_half(const std::vector<uint8_t> &full,
                     uint64_t full_expert_bytes, uint64_t half_expert_bytes,
                     uint32_t half, std::vector<uint8_t> &packed) {
-    packed.resize((size_t)kUsed * half_expert_bytes);
-    for (uint32_t expert = 0; expert < kUsed; ++expert) {
+    const size_t expert_count = full.size() / full_expert_bytes;
+    packed.resize(expert_count * half_expert_bytes);
+    for (size_t expert = 0; expert < expert_count; ++expert) {
         std::memcpy(packed.data() + (uint64_t)expert * half_expert_bytes,
                     full.data() + (uint64_t)expert * full_expert_bytes +
                         (uint64_t)half * half_expert_bytes,
@@ -390,8 +454,9 @@ void pack_down_half(const std::vector<uint8_t> &full,
                     uint64_t full_expert_bytes, uint64_t full_row_bytes,
                     uint64_t half_expert_bytes, uint64_t half_row_bytes,
                     uint32_t half, std::vector<uint8_t> &packed) {
-    packed.resize((size_t)kUsed * half_expert_bytes);
-    for (uint32_t expert = 0; expert < kUsed; ++expert) {
+    const size_t expert_count = full.size() / full_expert_bytes;
+    packed.resize(expert_count * half_expert_bytes);
+    for (size_t expert = 0; expert < expert_count; ++expert) {
         for (uint32_t row = 0; row < kOutput; ++row) {
             const uint64_t source = (uint64_t)expert * full_expert_bytes +
                                     (uint64_t)row * full_row_bytes +
@@ -412,13 +477,14 @@ bool launch(ds4_gpu_tensor &out, ds4_gpu_tensor &gate,
             uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
             uint64_t down_expert_bytes, uint64_t down_row_bytes,
             const ds4_gpu_tensor &selected, const ds4_gpu_tensor &weights,
-            const ds4_gpu_tensor &input, uint32_t mid_dim) {
+            const ds4_gpu_tensor &input, uint32_t total_experts,
+            uint32_t mid_dim) {
     const int launched = ds4_gpu_routed_moe_batch_q4k_direct_control(
         &out, &gate, &up, &mid, &down,
         gate_weight, up_weight, down_weight,
         gate_expert_bytes, gate_row_bytes,
         down_expert_bytes, down_row_bytes,
-        &selected, &weights, kUsed, kUsed, kClamp, &input,
+        &selected, &weights, total_experts, kUsed, kClamp, &input,
         3u, kTokens, mid_dim);
     if (!launched || !ds4_gpu_synchronize()) return false;
     return hipGetLastError() == hipSuccess;
@@ -456,25 +522,34 @@ bool run_test() {
     // row-wide activation scaling invalidates this split-consistency premise.
 
     const char *bridge_value = std::getenv("DS4_GLM5_ROUTER_MOE_BRIDGE");
+    const char *dynamic_value = std::getenv("DS4_GLM5_ROUTER_MOE_DYNAMIC");
     CHECK(!bridge_value || (bridge_value[0] == '1' && bridge_value[1] == '\0'),
           "DS4_GLM5_ROUTER_MOE_BRIDGE must be exactly 1 when set");
-    const bool router_bridge = bridge_value && std::strcmp(bridge_value, "1") == 0;
+    CHECK(!dynamic_value ||
+              (dynamic_value[0] == '1' && dynamic_value[1] == '\0'),
+          "DS4_GLM5_ROUTER_MOE_DYNAMIC must be exactly 1 when set");
+    const bool router_bridge = bridge_value != nullptr;
+    const bool router_dynamic = dynamic_value != nullptr;
+    CHECK(!(router_bridge && router_dynamic),
+          "router bridge and dynamic modes are mutually exclusive");
+    const bool router_mode = router_bridge || router_dynamic;
     uint32_t jitter_seed = 0;
     CHECK(glm5_test_router_seed(jitter_seed),
           "valid DS4_GLM5_ROUTER_JITTER_SEED");
-    uint32_t expert_ids[kUsed];
-    std::copy(kExpertIds, kExpertIds + kUsed, expert_ids);
+    std::vector<uint32_t> expert_ids(kExpertIds, kExpertIds + kUsed);
     float bridge_weights[kUsed] = {};
     const float *bridge_router = nullptr;
+    const float *bridge_bias = nullptr;
     float bridge_scale = 0.0f;
-    float bridge_prob_sum = 0.0f;
+    std::vector<float> route_sums(kTokens, 0.0f);
 
     std::vector<int32_t> selected((size_t)kTokens * kUsed);
     std::vector<float> route_weights((size_t)kTokens * kUsed);
+    std::vector<uint32_t> real_route_ids((size_t)kTokens * kUsed);
     std::vector<float> input((size_t)kTokens * kInput);
     for (uint32_t token = 0; token < kTokens; ++token) {
         for (uint32_t i = 0; i < kInput; ++i) {
-            if (router_bridge) {
+            if (router_mode) {
                 input[(size_t)token * kInput + i] =
                     glm5_test_router_input(token, i, jitter_seed);
             } else {
@@ -483,9 +558,9 @@ bool run_test() {
             }
         }
     }
-    if (router_bridge) {
+    uint64_t router_offset = 0, bias_offset = 0;
+    if (router_mode) {
         bool normalize = false;
-        uint64_t router_offset = 0, bias_offset = 0;
         CHECK(gguf.metadata("glm5-next.expert_weights_scale", bridge_scale) &&
               bridge_scale == 2.5f &&
               gguf.metadata("glm5-next.expert_weights_norm", normalize) &&
@@ -503,74 +578,14 @@ bool run_test() {
               "router bridge payload ranges");
         bridge_router =
             reinterpret_cast<const float *>(gguf.map + router_offset);
-        // This bridge intentionally validates one real router-selected expert
-        // set, not dynamic per-token routing. Token 0 supplies the eight real
-        // IDs and weights; all 32 arithmetic rows reuse that set under a
-        // coprime compact-slot permutation to exercise every WMMA expert tile.
-        bridge_prob_sum = router_reference(
-            bridge_router,
-            reinterpret_cast<const float *>(gguf.map + bias_offset),
-            input.data(), expert_ids, bridge_weights, bridge_scale);
-    }
-    for (uint32_t token = 0; token < kTokens; ++token) {
-        float sum = 0.0f;
-        for (uint32_t slot = 0; slot < kUsed; ++slot) {
-            // A fixed coprime permutation makes sorted-pair preparation
-            // non-trivial while every token still exercises all eight slots.
-            const uint32_t compact_slot = (slot * 5u + token * 3u) & 7u;
-            selected[(size_t)token * kUsed + slot] = (int32_t)compact_slot;
-            const float value = router_bridge
-                ? bridge_weights[compact_slot]
-                : (float)(kUsed - slot + (token & 1u)) * 0.03125f;
-            route_weights[(size_t)token * kUsed + slot] = value;
-            sum += value;
-        }
-        if (!router_bridge) {
-            for (uint32_t slot = 0; slot < kUsed; ++slot)
-                route_weights[(size_t)token * kUsed + slot] /= sum;
-        }
-    }
-    OracleStats association_oracle;
-    if (router_bridge) {
-        for (uint32_t token = 0; token < kTokens; ++token) {
-            for (uint32_t slot = 0; slot < kUsed; ++slot) {
-                const uint64_t pair = (uint64_t)token * kUsed + slot;
-                const uint32_t compact_slot = (uint32_t)selected[pair];
-                const uint32_t real_expert = expert_ids[compact_slot];
-                const float *row = bridge_router + (uint64_t)real_expert * kInput;
-                double logit = 0.0;
-                for (uint32_t column = 0; column < kInput; ++column)
-                    logit += (double)row[column] * input[column];
-                const float expected =
-                    router_sigmoid((float)logit) / bridge_prob_sum * bridge_scale;
-                association_oracle.add(route_weights[pair], expected,
-                                       1.0e-7, 1.0e-7);
-            }
-        }
-        CHECK(association_oracle.pass(),
-              "router expert-to-compact-slot weight association");
+        bridge_bias =
+            reinterpret_cast<const float *>(gguf.map + bias_offset);
     }
 
-    std::vector<uint8_t> gate_full, up_full, down_full;
-    std::vector<uint8_t> gate_half[2], up_half[2], down_half[2];
-    CHECK(gather_experts(gguf, gate_offset, expert_ids,
-                         full_gate_expert, gate_full) &&
-          gather_experts(gguf, up_offset, expert_ids,
-                         full_gate_expert, up_full) &&
-          gather_experts(gguf, down_offset, expert_ids,
-                         full_down_expert, down_full),
-          "gather eight real GLM5 experts");
-    for (uint32_t half = 0; half < 2; ++half) {
-        pack_gate_half(gate_full, full_gate_expert, half_gate_expert,
-                       half, gate_half[half]);
-        pack_gate_half(up_full, full_gate_expert, half_gate_expert,
-                       half, up_half[half]);
-        pack_down_half(down_full, full_down_expert, full_down_row,
-                       half_down_expert, half_down_row,
-                       half, down_half[half]);
-    }
-
+    const std::string wmma_min_count = std::to_string(kWmmaMinCount);
     CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0 &&
+          setenv("DS4_ROCM_Q4K_WMMA_MIN_COUNT",
+                 wmma_min_count.c_str(), 1) == 0 &&
           setenv("DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP", "1", 1) == 0 &&
           setenv("DS4_ROCM_Q4K_WMMA_FUSE_MID", "1", 1) == 0 &&
           unsetenv("DS4_ROCM_Q4K_WMMA_LAYER_LOG") == 0 &&
@@ -587,9 +602,191 @@ bool run_test() {
     CHECK(ds4_gpu_init_multi(&config), "initialize gfx1151");
     runtime.active = true;
 
+    uint64_t gpu_router_id_mismatch = 0;
+    OracleStats gpu_router_weight_oracle;
+
+    if (router_bridge) {
+        // The bounded bridge keeps one real route set. Token 0 supplies the
+        // IDs and weights; all rows reuse it under a compact-slot permutation.
+        uint32_t token_ids[kUsed];
+        route_sums[0] = router_reference(
+            bridge_router, bridge_bias, input.data(), token_ids,
+            bridge_weights, bridge_scale);
+        expert_ids.assign(token_ids, token_ids + kUsed);
+        for (uint32_t token = 0; token < kTokens; ++token) {
+            route_sums[token] = route_sums[0];
+            for (uint32_t slot = 0; slot < kUsed; ++slot) {
+                const uint32_t compact_slot = (slot * 5u + token * 3u) & 7u;
+                const uint64_t pair = (uint64_t)token * kUsed + slot;
+                selected[pair] = (int32_t)compact_slot;
+                route_weights[pair] = bridge_weights[compact_slot];
+                real_route_ids[pair] = expert_ids[compact_slot];
+            }
+        }
+    } else if (router_dynamic) {
+        // Use the production GPU router's actual IDs and weights. The CPU
+        // implementation remains only an independent oracle for exact IDs and
+        // bounded weights. The compact table uses deterministic first-
+        // occurrence order and preserves production top-8 slot order.
+        std::vector<uint32_t> cpu_route_ids((size_t)kTokens * kUsed);
+        std::vector<float> cpu_route_weights((size_t)kTokens * kUsed);
+        for (uint32_t token = 0; token < kTokens; ++token) {
+            route_sums[token] = router_reference(
+                bridge_router, bridge_bias,
+                input.data() + (size_t)token * kInput,
+                cpu_route_ids.data() + (size_t)token * kUsed,
+                cpu_route_weights.data() + (size_t)token * kUsed,
+                bridge_scale);
+        }
+
+        const uint64_t input_bytes =
+            (uint64_t)input.size() * sizeof(float);
+        const uint64_t logits_bytes =
+            (uint64_t)kTokens * kTotalExperts * sizeof(float);
+        const uint64_t selected_bytes =
+            (uint64_t)kTokens * kUsed * sizeof(int32_t);
+        const uint64_t weights_bytes =
+            (uint64_t)kTokens * kUsed * sizeof(float);
+        std::vector<int32_t> gpu_route_ids((size_t)kTokens * kUsed);
+        std::vector<float> gpu_route_weights((size_t)kTokens * kUsed);
+        {
+            RouterTensors router;
+            CHECK(upload(router.input, input.data(), input_bytes) &&
+                  alloc_tensor(router.logits, logits_bytes) &&
+                  alloc_tensor(router.probs, logits_bytes) &&
+                  alloc_tensor(router.selected, selected_bytes) &&
+                  alloc_tensor(router.weights, weights_bytes),
+                  "allocate production GPU router bridge tensors");
+            CHECK(ds4_gpu_matmul_f32_tensor(
+                      &router.logits, gguf.map, gguf.size, router_offset,
+                      kInput, kTotalExperts, &router.input, kTokens),
+                  "execute production GLM5 router GEMM for MoE bridge");
+            CHECK(ds4_gpu_glm_router_select_batch_tensor(
+                      &router.selected, &router.weights, &router.probs,
+                      gguf.map, gguf.size, bias_offset, &router.logits,
+                      kTotalExperts, kUsed, bridge_scale, kTokens),
+                  "execute production GLM5 top-8 selector for MoE bridge");
+            CHECK(ds4_gpu_synchronize() &&
+                  ds4_gpu_tensor_read(&router.selected, 0,
+                                      gpu_route_ids.data(), selected_bytes) &&
+                  ds4_gpu_tensor_read(&router.weights, 0,
+                                      gpu_route_weights.data(), weights_bytes),
+                  "read production GPU router IDs and weights");
+        }
+
+        for (uint64_t pair = 0; pair < (uint64_t)kTokens * kUsed; ++pair) {
+            CHECK(gpu_route_ids[pair] >= 0 &&
+                  (uint32_t)gpu_route_ids[pair] < kTotalExperts,
+                  "production GPU route ID range");
+            gpu_router_id_mismatch +=
+                (uint32_t)gpu_route_ids[pair] != cpu_route_ids[pair];
+            gpu_router_weight_oracle.add(
+                gpu_route_weights[pair], cpu_route_weights[pair],
+                2.0e-6, 2.0e-5);
+        }
+        CHECK(gpu_router_id_mismatch == 0,
+              "production GPU and independent CPU router IDs agree");
+        CHECK(gpu_router_weight_oracle.pass(),
+              "production GPU router weights satisfy independent oracle");
+
+        expert_ids.clear();
+        for (uint32_t token = 0; token < kTokens; ++token) {
+            for (uint32_t slot = 0; slot < kUsed; ++slot) {
+                const uint64_t pair = (uint64_t)token * kUsed + slot;
+                const uint32_t real_id = (uint32_t)gpu_route_ids[pair];
+                auto found = std::find(expert_ids.begin(), expert_ids.end(),
+                                       real_id);
+                if (found == expert_ids.end()) {
+                    expert_ids.push_back(real_id);
+                    found = expert_ids.end() - 1;
+                }
+                selected[pair] = (int32_t)(found - expert_ids.begin());
+                route_weights[pair] = gpu_route_weights[pair];
+                real_route_ids[pair] = real_id;
+            }
+        }
+        CHECK(expert_ids.size() >= kUsed &&
+              expert_ids.size() <= kTotalExperts,
+              "dynamic top-8 compact expert union size");
+    } else {
+        for (uint32_t token = 0; token < kTokens; ++token) {
+            float sum = 0.0f;
+            for (uint32_t slot = 0; slot < kUsed; ++slot) {
+                const uint32_t compact_slot = (slot * 5u + token * 3u) & 7u;
+                const uint64_t pair = (uint64_t)token * kUsed + slot;
+                selected[pair] = (int32_t)compact_slot;
+                const float value =
+                    (float)(kUsed - slot + (token & 1u)) * 0.03125f;
+                route_weights[pair] = value;
+                sum += value;
+            }
+            for (uint32_t slot = 0; slot < kUsed; ++slot)
+                route_weights[(size_t)token * kUsed + slot] /= sum;
+        }
+    }
+    std::vector<uint32_t> compact_counts(expert_ids.size(), 0u);
+    for (int32_t compact : selected) {
+        CHECK(compact >= 0 && (size_t)compact < expert_ids.size(),
+              "selected compact expert range");
+        ++compact_counts[(uint32_t)compact];
+    }
+    OracleStats association_oracle;
+    if (router_mode) {
+        for (uint32_t token = 0; token < kTokens; ++token) {
+            for (uint32_t slot = 0; slot < kUsed; ++slot) {
+                const uint64_t pair = (uint64_t)token * kUsed + slot;
+                const uint32_t compact_slot = (uint32_t)selected[pair];
+                const uint32_t real_expert = expert_ids[compact_slot];
+                const float *row = bridge_router + (uint64_t)real_expert * kInput;
+                double logit = 0.0;
+                const float *route_input = input.data() +
+                    (router_dynamic ? (size_t)token * kInput : 0u);
+                for (uint32_t column = 0; column < kInput; ++column)
+                    logit += (double)row[column] * route_input[column];
+                const float expected =
+                    router_sigmoid((float)logit) / route_sums[token] *
+                    bridge_scale;
+                association_oracle.add(
+                    route_weights[pair], expected,
+                    router_dynamic ? 2.0e-6 : 1.0e-7,
+                    router_dynamic ? 2.0e-5 : 1.0e-7);
+            }
+        }
+        CHECK(association_oracle.pass(),
+              "router expert-to-compact-slot weight association");
+    }
+
+    std::vector<uint8_t> gate_full, up_full, down_full;
+    std::vector<uint8_t> gate_half[2], up_half[2], down_half[2];
+    CHECK(gather_experts(gguf, gate_offset, expert_ids,
+                         full_gate_expert, gate_full) &&
+          gather_experts(gguf, up_offset, expert_ids,
+                         full_gate_expert, up_full) &&
+          gather_experts(gguf, down_offset, expert_ids,
+                         full_down_expert, down_full),
+          "gather compact real GLM5 expert union");
+    for (uint32_t half = 0; half < 2; ++half) {
+        pack_gate_half(gate_full, full_gate_expert, half_gate_expert,
+                       half, gate_half[half]);
+        pack_gate_half(up_full, full_gate_expert, half_gate_expert,
+                       half, up_half[half]);
+        pack_down_half(down_full, full_down_expert, full_down_row,
+                       half_down_expert, half_down_row,
+                       half, down_half[half]);
+    }
+
     DeviceWeights device;
-    const uint64_t full_table_bytes = (uint64_t)kUsed * full_gate_expert;
-    const uint64_t half_table_bytes = (uint64_t)kUsed * half_gate_expert;
+    CHECK(expert_ids.size() <= UINT32_MAX,
+          "compact expert union fits runtime descriptor");
+    const uint32_t compact_expert_count = (uint32_t)expert_ids.size();
+    const uint64_t full_table_bytes =
+        (uint64_t)compact_expert_count * full_gate_expert;
+    const uint64_t half_table_bytes =
+        (uint64_t)compact_expert_count * half_gate_expert;
+    CHECK(gate_full.size() == full_table_bytes &&
+          up_full.size() == full_table_bytes &&
+          down_full.size() == full_table_bytes,
+          "compact full table byte contract");
     CHECK(hipMalloc(&device.gate_full, full_table_bytes) == hipSuccess &&
           hipMalloc(&device.up_full, full_table_bytes) == hipSuccess &&
           hipMalloc(&device.down_full, full_table_bytes) == hipSuccess,
@@ -662,7 +859,8 @@ bool run_test() {
                  device.gate_full, device.up_full, device.down_full,
                  full_gate_expert, gate_row_bytes,
                  full_down_expert, full_down_row,
-                 selected_gpu, weights_gpu, input_gpu, kFullMid),
+                 selected_gpu, weights_gpu, input_gpu,
+                 compact_expert_count, kFullMid),
           "execute full 2048 top-8 Q4_K control");
     std::vector<float> full_mid((size_t)pair_count * kFullMid);
     CHECK(ds4_gpu_tensor_read(&mid, 0, full_mid.data(), mid_bytes),
@@ -679,12 +877,14 @@ bool run_test() {
                  device.gate_half[0], device.up_half[0], device.down_half[0],
                  half_gate_expert, gate_row_bytes,
                  half_down_expert, half_down_row,
-                 selected_gpu, weights_gpu, input_gpu, kHalfMid) &&
+                 selected_gpu, weights_gpu, input_gpu,
+                 compact_expert_count, kHalfMid) &&
           launch(out_half1, gate, up, mid, down,
                  device.gate_half[1], device.up_half[1], device.down_half[1],
                  half_gate_expert, gate_row_bytes,
                  half_down_expert, half_down_row,
-                 selected_gpu, weights_gpu, input_gpu, kHalfMid),
+                 selected_gpu, weights_gpu, input_gpu,
+                 compact_expert_count, kHalfMid),
           "execute both 1024 top-8 Q4_K shards");
     CHECK(ds4_gpu_add_tensor(&out_sum, &out_half0, &out_half1,
                              kTokens * kOutput) &&
@@ -757,9 +957,14 @@ bool run_test() {
                                     mid_q8.size() * sizeof(Q8KBlock)),
         (unsigned long long)fnv1a64(production_mid_q8.data(),
                                     production_mid_q8.size() * sizeof(Q8KBlock)));
-    CHECK(!router_bridge ||
+    // Dynamic production-router weights can place an intermediate exactly on
+    // a host/GPU F32 quantizer rounding boundary. Keep the compact values and
+    // effective half scales exact, bound that diagnostic to at most two of
+    // 16,384 effective sums, and use the captured production blocks below.
+    CHECK(!router_mode ||
           (mid_q81.changed_values == 0 && mid_q81.changed_scales == 0 &&
-           mid_q81.changed_sums == 0),
+           mid_q81.changed_sums <=
+               (router_dynamic ? kDynamicMidSumRoundingBudget : 0u)),
           "host Q8_K oracle matches production-effective Q8_1 intermediate");
 
     // Sample separated tokens and rows but cover every route slot. The mid
@@ -773,25 +978,39 @@ bool run_test() {
     constexpr uint32_t oracle_out_rows[] =
         {0u, 1u, 127u, 1023u, 2047u, 3071u, 4095u};
     OracleStats mid_oracle, output_oracle;
+    uint64_t mid_oracle_hot = 0, mid_oracle_cold = 0;
     std::vector<float> oracle_values;
     std::vector<float> oracle_actual_values;
     for (uint32_t token : oracle_tokens) {
+        // Use the independently inspected production activation capture for
+        // arithmetic validation. The host quantizer comparison above remains
+        // the separate quantization oracle; the cold path consumes its F32
+        // scale, so an effective-F16-only host substitute is insufficient.
         const Q8KBlock *token_q8 =
-            input_q8.data() + (size_t)token * (kInput / kQk);
+            production_input_q8.data() + (size_t)token * (kInput / kQk);
         for (uint32_t slot = 0; slot < kUsed; ++slot) {
             const uint64_t pair = (uint64_t)token * kUsed + slot;
             const uint32_t expert = (uint32_t)selected[pair];
+            const bool hot_wmma =
+                compact_counts[expert] >= kWmmaMinCount;
             for (uint32_t row : oracle_mid_rows) {
+                const uint32_t real_expert = expert_ids[expert];
                 const auto *gate_row = reinterpret_cast<const Q4KBlock *>(
-                    gate_full.data() + (uint64_t)expert * full_gate_expert +
+                    gguf.map + gate_offset +
+                    (uint64_t)real_expert * full_gate_expert +
                     (uint64_t)row * gate_row_bytes);
                 const auto *up_row = reinterpret_cast<const Q4KBlock *>(
-                    up_full.data() + (uint64_t)expert * full_gate_expert +
+                    gguf.map + up_offset +
+                    (uint64_t)real_expert * full_gate_expert +
                     (uint64_t)row * gate_row_bytes);
-                float gate_ref = q4k_q81_reference(
+                const auto reference_dot = hot_wmma
+                    ? q4k_q81_reference : q4k_q8k_cold_reference;
+                float gate_ref = reference_dot(
                     gate_row, token_q8, kInput / kQk);
-                float up_ref = q4k_q81_reference(
+                float up_ref = reference_dot(
                     up_row, token_q8, kInput / kQk);
+                mid_oracle_hot += hot_wmma;
+                mid_oracle_cold += !hot_wmma;
                 gate_ref = std::min(gate_ref, kClamp);
                 up_ref = std::max(-kClamp, std::min(up_ref, kClamp));
                 const float expected =
@@ -809,12 +1028,14 @@ bool run_test() {
             for (uint32_t slot = 0; slot < kUsed; ++slot) {
                 const uint64_t pair = (uint64_t)token * kUsed + slot;
                 const uint32_t expert = (uint32_t)selected[pair];
+                const uint32_t real_expert = expert_ids[expert];
                 const auto *down_row = reinterpret_cast<const Q4KBlock *>(
-                    down_full.data() + (uint64_t)expert * full_down_expert +
+                    gguf.map + down_offset +
+                    (uint64_t)real_expert * full_down_expert +
                     (uint64_t)row * full_down_row);
                 expected += q4k_q81_reference(
                     down_row,
-                    mid_q8.data() + pair * (kFullMid / kQk),
+                    production_mid_q8.data() + pair * (kFullMid / kQk),
                     kFullMid / kQk);
             }
             output_oracle.add(reference[(size_t)token * kOutput + row],
@@ -826,12 +1047,15 @@ bool run_test() {
     }
     std::fprintf(stderr,
         "GLM5 Q4_K independent scalar oracle mid=%llu bad=%llu "
+        "hot=%llu cold=%llu "
         "max_abs=%.9g max_abs_actual=%.9g max_abs_expected=%.9g "
         "max_rel=%.9g max_gate_ratio=%.9g "
         "output=%llu bad=%llu max_abs=%.9g max_rel=%.9g "
         "max_gate_ratio=%.9g reference_fnv=%016llx actual_fnv=%016llx\n",
         (unsigned long long)mid_oracle.count,
         (unsigned long long)mid_oracle.bad,
+        (unsigned long long)mid_oracle_hot,
+        (unsigned long long)mid_oracle_cold,
         mid_oracle.max_abs, mid_oracle.max_abs_actual,
         mid_oracle.max_abs_expected, mid_oracle.max_rel,
         mid_oracle.max_gate_ratio,
@@ -886,33 +1110,65 @@ bool run_test() {
     const uint64_t up_weight_fnv = fnv1a64(up_full.data(), up_full.size());
     const uint64_t down_weight_fnv = fnv1a64(down_full.data(),
                                               down_full.size());
-    const uint64_t expert_ids_fnv = fnv1a64(expert_ids, sizeof(expert_ids));
+    const uint64_t expert_ids_fnv =
+        fnv1a64(expert_ids.data(), expert_ids.size() * sizeof(uint32_t));
+    const uint64_t token0_ids_fnv = router_mode
+        ? fnv1a64(expert_ids.data(), kUsed * sizeof(uint32_t)) : 0u;
+    const uint64_t routed_ids_fnv = router_mode
+        ? fnv1a64(real_route_ids.data(),
+                  real_route_ids.size() * sizeof(uint32_t)) : 0u;
     const uint64_t route_weights_fnv =
         fnv1a64(route_weights.data(), route_weights.size() * sizeof(float));
+    uint32_t distinct_route_sets = router_bridge ? 1u : 0u;
+    if (router_dynamic) {
+        for (uint32_t token = 0; token < kTokens; ++token) {
+            bool seen = false;
+            for (uint32_t prior = 0; prior < token && !seen; ++prior) {
+                seen = std::memcmp(
+                    real_route_ids.data() + (size_t)token * kUsed,
+                    real_route_ids.data() + (size_t)prior * kUsed,
+                    kUsed * sizeof(uint32_t)) == 0;
+            }
+            distinct_route_sets += !seen;
+        }
+    }
+    const char *route_source = router_dynamic ? "production-gpu-per-token" :
+                               router_bridge ? "token0" : "synthetic";
     std::fprintf(stderr,
-        "GLM5 Q4_K expert set router_bridge=%d seed_active=%d seed=%u "
-        "ids=%u,%u,%u,%u,%u,%u,%u,%u ids_fnv=%016llx "
-        "route_source=%s distinct_route_sets=%u association_pairs=%llu "
+        "GLM5 Q4_K expert set router_bridge=%d router_dynamic=%d "
+        "seed_active=%d seed=%u compact_count=%u "
+        "token0_ids=%u,%u,%u,%u,%u,%u,%u,%u "
+        "compact_ids_fnv=%016llx token0_ids_fnv=%016llx "
+        "routed_ids_fnv=%016llx "
+        "route_source=%s distinct_route_sets=%u gpu_router_id_mismatch=%llu "
+        "gpu_router_weight_bad=%llu gpu_router_weight_max_abs=%.9g "
+        "association_pairs=%llu "
         "route_weights_fnv=%016llx association_bad=%llu "
         "association_max_abs=%.9g\n",
-        router_bridge, router_bridge, jitter_seed,
+        router_bridge, router_dynamic, router_mode, jitter_seed,
+        compact_expert_count,
         expert_ids[0], expert_ids[1], expert_ids[2],
         expert_ids[3], expert_ids[4], expert_ids[5], expert_ids[6],
         expert_ids[7], (unsigned long long)expert_ids_fnv,
-        router_bridge ? "token0" : "synthetic",
-        router_bridge ? 1u : 0u,
+        (unsigned long long)token0_ids_fnv,
+        (unsigned long long)routed_ids_fnv,
+        route_source, distinct_route_sets,
+        (unsigned long long)gpu_router_id_mismatch,
+        (unsigned long long)gpu_router_weight_oracle.bad,
+        gpu_router_weight_oracle.max_abs,
         (unsigned long long)association_oracle.count,
         (unsigned long long)route_weights_fnv,
         (unsigned long long)association_oracle.bad,
         association_oracle.max_abs);
     std::fprintf(stderr,
         "GLM5 Q4_K shard split-consistency layer=3 descriptor_experts=288 "
-        "compact_table=8 router_bridge=%d "
+        "compact_table=%u router_bridge=%d router_dynamic=%d "
         "tokens=%u changed_telemetry=%llu nonfinite=%llu "
         "independent_halves=%d max_abs=%.9g max_rel=%.9g nmse=%.9g "
         "gate_weight_fnv=%016llx up_weight_fnv=%016llx "
         "down_weight_fnv=%016llx full_fnv=%016llx shard_fnv=%016llx\n",
-        router_bridge, kTokens, (unsigned long long)changed,
+        compact_expert_count, router_bridge, router_dynamic, kTokens,
+        (unsigned long long)changed,
         (unsigned long long)nonfinite,
         independent_halves, max_abs, max_rel, nmse,
         (unsigned long long)gate_weight_fnv,
@@ -920,15 +1176,22 @@ bool run_test() {
         (unsigned long long)down_weight_fnv,
         (unsigned long long)fnv1a64(reference.data(), out_bytes),
         (unsigned long long)fnv1a64(candidate.data(), out_bytes));
+    CHECK(!router_dynamic || distinct_route_sets == kTokens,
+          "dynamic mode requires a distinct real route set per token");
+    CHECK(!router_dynamic || compact_expert_count > kUsed,
+          "dynamic mode requires a real multi-token expert union");
+    CHECK(!router_dynamic || (mid_oracle_hot != 0 && mid_oracle_cold != 0),
+          "dynamic mode samples both hot-WMMA and cold-DP4A experts");
     CHECK(pass, "same-GGUF 1024/1024 top-8 numerical envelope");
     CHECK(oracle_pass,
           "sampled same-GGUF scalar mid and conditioned-down arithmetic oracle");
     std::fprintf(stderr,
                  "PASS same-GGUF GLM5 Q4_K router_bridge=%d "
+                 "router_dynamic=%d "
                  "route_source=%s sampled "
                  "scalar-mid, conditioned-down, and top-8 shard "
                  "split-consistency\n",
-                 router_bridge, router_bridge ? "token0" : "synthetic");
+                 router_bridge, router_dynamic, route_source);
     return true;
 }
 

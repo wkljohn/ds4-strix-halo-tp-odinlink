@@ -32,9 +32,10 @@ static inline bool glm5_test_router_seed(uint32_t &seed) {
     return true;
 }
 
-// Seeds 2, 12, and 20 are the cross-node gate set: each stays away from Q8_K
-// rounding ties at both the input and intermediate. Other seeds are accepted
-// for diagnosis but are not promised to satisfy the bit-exact Q8_1 oracle.
+// Bridge seeds 2/12/20 and dynamic-route seeds 2/3/6 are the cross-node gate
+// sets. Their inputs preserve production-effective Q8_1 exactly; dynamic
+// production-router weights may expose the separately bounded intermediate
+// sum-rounding diagnostic. Other seeds remain diagnostic only.
 static inline float glm5_test_router_input(uint32_t token, uint32_t column,
                                            uint32_t seed) {
     const int value = (int)((column * 37u + token * 53u +
