@@ -206,6 +206,7 @@ tests/test_rocm_glm5_kda_layer: tests/test_rocm_glm5_kda_layer.o tests/ds4_glm5_
 
 test-rocm-glm5-kda-layer: tests/test_rocm_glm5_kda_layer
 	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "error: set DS4_RESEARCH_ROOT" >&2; exit 2; }
+	env -u DS4_ROCM_DISABLE_BF16_SHAREDX \
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
 	DS4_GLM5_KDA_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/kda-layer0-oracle" \
 		./tests/test_rocm_glm5_kda_layer

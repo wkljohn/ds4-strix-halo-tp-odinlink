@@ -196,6 +196,11 @@ def main() -> int:
         payload_hash.update(payload)
         value_w = value_w.reshape(64, 256, 512)
         heads = torch.einsum("hj,hdj->hd", attention_lora, value_w)
+        attn_output_w, payload = qkv.q8_matrix(
+            blob, data_start, tensors, f"{prefix}.attn_output.weight",
+            (16384, 4096))
+        payload_hash.update(payload)
+        attn_output = F.linear(heads.reshape(1, 16384), attn_output_w)
         blob.close()
 
     arrays = {
@@ -219,6 +224,7 @@ def main() -> int:
         ".selected_pools.u32": i32_bytes(selected_pools),
         ".selected_tokens.i32": i32_bytes(selected_tokens),
         ".heads.f32": f32_bytes(heads),
+        ".attn_output.f32": f32_bytes(attn_output),
     }
     document = {
         "status": "same-GGUF sparse-MLA heads component oracle; not promoted inference",

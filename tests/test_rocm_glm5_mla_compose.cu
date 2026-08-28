@@ -95,7 +95,8 @@ bool run_test() {
     std::vector<float> hidden, expected_q_resid, expected_query,
         expected_kv_norm, expected_qk_low, expected_index_q,
         expected_index_key, expected_pool_gate, expected_head_weights,
-        expected_pooled, expected_pool_scores, expected_heads;
+        expected_pooled, expected_pool_scores, expected_heads,
+        expected_attn_output;
     std::vector<uint32_t> valid, expected_pool_valid, expected_selected_pools;
     std::vector<int32_t> expected_pool_indices, expected_selected_tokens;
     CHECK(read_array(base + ".hidden.f32", kRows * kHidden, hidden) &&
@@ -128,7 +129,9 @@ bool run_test() {
           read_array(base + ".selected_tokens.i32", kSelectedTokens,
                      expected_selected_tokens) &&
           read_array(base + ".heads.f32", kHeads * kHeadDim,
-                     expected_heads),
+                     expected_heads) &&
+          read_array(base + ".attn_output.f32", kHidden,
+                     expected_attn_output),
           "read sparse-MLA heads composition oracle dumps");
 
     Glm5TestGGUF gguf;
@@ -136,7 +139,8 @@ bool run_test() {
     uint64_t q_a = 0u, q_norm = 0u, q_b = 0u, kv_a = 0u,
              kv_norm_w = 0u, k_b = 0u, v_b = 0u, index_q_w = 0u,
              index_k_w = 0u, index_weight_w = 0u, pool_gate_w = 0u,
-             pool_ape = 0u, index_norm_w = 0u, index_norm_b = 0u;
+             pool_ape = 0u, index_norm_w = 0u, index_norm_b = 0u,
+             attn_output_w = 0u;
     CHECK(gguf.tensor("blk.3.attn_q_a.weight", {4096u, 1536u}, 8u, q_a) &&
           gguf.tensor("blk.3.attn_q_a_norm.weight", {1536u}, 0u, q_norm) &&
           gguf.tensor("blk.3.attn_q_b.weight", {1536u, 16384u}, 8u, q_b) &&
@@ -150,7 +154,9 @@ bool run_test() {
           gguf.tensor("blk.3.indexer.pool_gate.weight", {4096u, 128u}, 30u, pool_gate_w) &&
           gguf.tensor("blk.3.indexer.pool_ape.weight", {128u, 4u}, 30u, pool_ape) &&
           gguf.tensor("blk.3.indexer.k_norm.weight", {128u}, 0u, index_norm_w) &&
-          gguf.tensor("blk.3.indexer.k_norm.bias", {128u}, 0u, index_norm_b),
+          gguf.tensor("blk.3.indexer.k_norm.bias", {128u}, 0u, index_norm_b) &&
+          gguf.tensor("blk.3.attn_output.weight", {16384u, 4096u}, 8u,
+                      attn_output_w),
           "bind every real block-3 sparse-MLA tensor");
 
     ds4_gpu_config config = {};
@@ -189,11 +195,16 @@ bool run_test() {
     ds4_gpu_tensor *d_selected_tokens = ds4_gpu_tensor_alloc(
         (uint64_t)kExpandedWidth * sizeof(int32_t));
     ds4_gpu_tensor *d_heads = f32((uint64_t)kHeads * kHeadDim);
+    ds4_gpu_tensor *d_attn_full = f32(kHidden);
+    ds4_gpu_tensor *d_attn_half0 = f32(kHidden);
+    ds4_gpu_tensor *d_attn_half1 = f32(kHidden);
+    ds4_gpu_tensor *d_attn_sum = f32(kHidden);
     CHECK(d_hidden && d_q_a && d_q_resid && d_query && d_kv_raw &&
           d_kv_norm && d_qk_low && d_cache && d_index_q &&
           d_index_k_raw && d_index_key && d_pool_gate && d_head_weights &&
           d_valid && d_pooled && d_pool_indices && d_pool_valid &&
-          d_pool_scores && d_selected_pools && d_selected_tokens && d_heads,
+          d_pool_scores && d_selected_pools && d_selected_tokens && d_heads &&
+          d_attn_full && d_attn_half0 && d_attn_half1 && d_attn_sum,
           "allocate bounded sparse-MLA heads composition tensors");
     ds4_gpu_tensor *d_last_hidden = ds4_gpu_tensor_view(
         d_hidden, (uint64_t)(kRows - 1u) * kHidden * sizeof(float),
@@ -277,12 +288,31 @@ bool run_test() {
               gguf.map, gguf.size, v_b, 8u, d_selected_tokens,
               kSelectedTokens, kRows, false, kHeads, kKvLora, kHeadDim,
               0u, kHeadDim, 0u, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_matmul_q8_0_tensor(
+              d_attn_full, gguf.map, gguf.size, attn_output_w,
+              kHeads * kHeadDim, kHidden, d_heads, 1u) &&
+          ds4_gpu_matmul_q8_0_kslice_tensor(
+              d_attn_half0, gguf.map, gguf.size, attn_output_w,
+              kHeads * kHeadDim, 0u, (kHeads * kHeadDim) / 2u,
+              kHidden, d_heads, 0u) &&
+          ds4_gpu_matmul_q8_0_kslice_tensor(
+              d_attn_half1, gguf.map, gguf.size, attn_output_w,
+              kHeads * kHeadDim, (kHeads * kHeadDim) / 2u,
+              (kHeads * kHeadDim) / 2u, kHidden, d_heads,
+              (kHeads * kHeadDim) / 2u) &&
+          ds4_gpu_add_tensor(d_attn_sum, d_attn_half0, d_attn_half1,
+                             kHidden) &&
+          !ds4_gpu_matmul_q8_0_kslice_tensor(
+              d_attn_half0, gguf.map, gguf.size, attn_output_w,
+              kHeads * kHeadDim, 0u,
+              (kHeads * kHeadDim) / 2u + 32u, kHidden, d_heads, 0u) &&
           ds4_gpu_synchronize(),
           "execute selected zero-RoPE attention and real value projection");
 
     std::vector<float> got_q_resid, got_query, got_kv_norm, got_qk_low,
         got_index_q, got_index_key, got_pool_gate, got_head_weights,
-        got_pooled, got_pool_scores, got_heads;
+        got_pooled, got_pool_scores, got_heads, got_attn_full,
+        got_attn_sum;
     std::vector<uint32_t> got_pool_valid, got_selected_pools;
     std::vector<int32_t> got_pool_indices, got_expanded_tokens;
     CHECK(read_tensor(d_q_resid, kQRank, got_q_resid) &&
@@ -299,7 +329,9 @@ bool run_test() {
           read_tensor(d_pool_valid, kPools, got_pool_valid) &&
           read_tensor(d_selected_pools, kSelectedPools, got_selected_pools) &&
           read_tensor(d_selected_tokens, kExpandedWidth, got_expanded_tokens) &&
-          read_tensor(d_heads, kHeads * kHeadDim, got_heads),
+          read_tensor(d_heads, kHeads * kHeadDim, got_heads) &&
+          read_tensor(d_attn_full, kHidden, got_attn_full) &&
+          read_tensor(d_attn_sum, kHidden, got_attn_sum),
           "read every sparse-MLA heads composition boundary");
 
     CHECK(compare_values("q_resid", got_q_resid, expected_q_resid,
@@ -344,10 +376,21 @@ bool run_test() {
           compare_values("heads", got_heads, expected_heads,
                          1.0e-6, 5.0e-13),
           "selected score and final attention output gates");
+    CHECK(compare_values("attn_full", got_attn_full, expected_attn_output,
+                         8.0e-6, 6.0e-12) &&
+          compare_values("attn_tp_sum", got_attn_sum, expected_attn_output,
+                         8.0e-6, 6.0e-12) &&
+          compare_values("sum_vs_full", got_attn_sum, got_attn_full,
+                         3.0e-6, 6.0e-13),
+          "full and two-half Q8 attention output composition");
     CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "rank-local sparse-MLA heads invokes no TP exchange");
 
     ds4_gpu_tensor_free(d_last_hidden);
+    ds4_gpu_tensor_free(d_attn_sum);
+    ds4_gpu_tensor_free(d_attn_half1);
+    ds4_gpu_tensor_free(d_attn_half0);
+    ds4_gpu_tensor_free(d_attn_full);
     ds4_gpu_tensor_free(d_heads);
     ds4_gpu_tensor_free(d_selected_tokens);
     ds4_gpu_tensor_free(d_selected_pools);
