@@ -251,6 +251,19 @@ int ds4_gpu_q4k_packed_slice_load(
         uint32_t    row_count,
         uint64_t    column_byte_base,
         uint64_t    column_byte_count);
+/* Synchronously load one expert from a declared nonlinear slice into a
+ * caller-owned, reusable device slot.  This correctness-first primitive
+ * waits for prior device work before overwriting the slot and never
+ * materializes the full expert table. */
+int ds4_gpu_q4k_packed_slice_load_expert(
+        const void            *model_map,
+        uint64_t               tensor_offset,
+        uint32_t               row_base,
+        uint32_t               row_count,
+        uint64_t               column_byte_base,
+        uint64_t               column_byte_count,
+        uint32_t               expert,
+        ds4_gpu_tensor        *dst);
 int ds4_gpu_q4k_packed_slice_resolve(
         const void                    *model_map,
         uint64_t                       tensor_offset,

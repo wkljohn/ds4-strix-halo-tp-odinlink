@@ -6289,6 +6289,32 @@ static uint64_t cuda_round_up(uint64_t v, uint64_t align) {
     return rem == 0 ? v : v + (align - rem);
 }
 
+/* Discard only complete pages wholly contained by a selected expert window.
+ * Rounding outward would evict an adjacent expert's boundary pages and, for
+ * ROW_RANGE, the peer row half.  A K_RANGE window necessarily spans complete
+ * source rows, including the locally unused peer column half. */
+static void cuda_model_discard_source_full_pages(
+        const void *model_map, uint64_t model_size,
+        uint64_t offset, uint64_t bytes) {
+    if (!model_map || bytes == 0u || offset > model_size) return;
+    if (bytes > model_size - offset) bytes = model_size - offset;
+    const long page_sz_l = sysconf(_SC_PAGESIZE);
+    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
+    const uint64_t first = cuda_round_up(offset, page_sz);
+    const uint64_t last = cuda_round_down(offset + bytes, page_sz);
+    if (last <= first) return;
+#if defined(POSIX_FADV_DONTNEED)
+    if (g_model_fd >= 0) {
+        (void)posix_fadvise(g_model_fd, (off_t)first,
+                            (off_t)(last - first), POSIX_FADV_DONTNEED);
+    }
+#endif
+#if defined(POSIX_MADV_DONTNEED)
+    (void)posix_madvise((char *)model_map + first,
+                        (size_t)(last - first), POSIX_MADV_DONTNEED);
+#endif
+}
+
 static void *cuda_align_ptr(void *ptr, uint64_t align) {
     if (align <= 1) return ptr;
     uintptr_t p = (uintptr_t)ptr;
@@ -6723,6 +6749,78 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
                                  p->column_byte_count),
             p->n_expert, (double)p->packed_bytes / 1048576.0,
             p->kind == DS4_GPU_Q4K_PACKED_ROW_RANGE ? "row" : "K");
+    return 1;
+}
+
+extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count,
+        uint32_t expert, ds4_gpu_tensor *dst) {
+    cuda_q4k_packed_slice *p = cuda_q4k_packed_slice_find(
+        model_map, tensor_offset, row_base, row_count,
+        column_byte_base, column_byte_count);
+    if (!p || !dst || !dst->ptr || expert >= p->n_expert ||
+        dst->bytes < p->packed_expert_bytes ||
+        (g_model_fd >= 0 && g_model_fd_host_base != model_map)) {
+        return 0;
+    }
+
+    uint64_t source_window_bytes = 0;
+    if (!cuda_u64_mul_checked(p->row_count, p->source_row_bytes,
+                              &source_window_bytes)) {
+        return 0;
+    }
+    const uint64_t source_offset = p->tensor_offset +
+        (uint64_t)expert * p->source_expert_bytes +
+        (uint64_t)p->row_base * p->source_row_bytes;
+    if (source_offset > p->model_size ||
+        source_window_bytes > p->model_size - source_offset) {
+        return 0;
+    }
+
+    const char *source = (const char *)model_map + source_offset;
+    const int contiguous = p->column_byte_base == 0u &&
+                           p->column_byte_count == p->source_row_bytes;
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K selected expert reuse wait failed expert=%u: "
+                "%s\n", expert, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    if (contiguous) {
+        err = cudaMemcpy(dst->ptr, source, (size_t)p->packed_expert_bytes,
+                         cudaMemcpyHostToDevice);
+    } else {
+        std::vector<char> packed;
+        try {
+            packed.resize((size_t)p->packed_expert_bytes);
+        } catch (...) {
+            return 0;
+        }
+        for (uint32_t row = 0; row < p->row_count; ++row) {
+            memcpy(packed.data() + (uint64_t)row * p->column_byte_count,
+                   source + (uint64_t)row * p->source_row_bytes +
+                       p->column_byte_base,
+                   (size_t)p->column_byte_count);
+        }
+        err = cudaMemcpy(dst->ptr, packed.data(),
+                         (size_t)p->packed_expert_bytes,
+                         cudaMemcpyHostToDevice);
+    }
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K selected expert upload failed expert=%u "
+                "bytes=%llu: %s\n",
+                expert, (unsigned long long)p->packed_expert_bytes,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    cuda_model_discard_source_full_pages(
+        model_map, p->model_size, source_offset, source_window_bytes);
     return 1;
 }
 

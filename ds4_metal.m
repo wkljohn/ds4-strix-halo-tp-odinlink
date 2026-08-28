@@ -10214,6 +10214,16 @@ int ds4_gpu_q4k_packed_slice_load(
     return 0;
 }
 
+int ds4_gpu_q4k_packed_slice_load_expert(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count,
+        uint32_t expert, ds4_gpu_tensor *dst) {
+    (void)model_map; (void)tensor_offset; (void)row_base; (void)row_count;
+    (void)column_byte_base; (void)column_byte_count; (void)expert; (void)dst;
+    return 0;
+}
+
 int ds4_gpu_q4k_packed_slice_resolve(
         const void *model_map, uint64_t tensor_offset,
         uint32_t n_expert, uint32_t source_rows,
