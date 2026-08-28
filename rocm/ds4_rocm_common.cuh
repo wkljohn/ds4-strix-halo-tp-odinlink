@@ -164,6 +164,8 @@ __global__ static void matmul_bf16_kernel(
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
 }
 
+#include "ds4_rocm_bf16_toktile.cuh"
+
 __global__ static void matmul_f16_ordered_chunks_kernel(
         float *out,
         const __half *w,

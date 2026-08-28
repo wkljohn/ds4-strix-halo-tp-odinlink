@@ -1432,6 +1432,39 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
+static int matmul_bf16_f32_toktile_w32_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    uint32_t first = 0u;
+    const uint32_t chunks32 = n_tok / 32u;
+    if (chunks32 > 0u) {
+        matmul_bf16_f32_toktile_w32_kernel<32u><<<
+                dim3(out_dim, chunks32), kDs4Bf16ToktileThreads>>>(
+            out, weight, x, in_dim, out_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "matmul_bf16 token-tile32 launch")) return 0;
+        first = chunks32 * 32u;
+    }
+#define DS4_BF16_LAUNCH_TAIL(T) do {                                      \
+        if (n_tok - first >= (T)) {                                       \
+            matmul_bf16_f32_toktile_w32_kernel<(T)><<<                  \
+                out_dim, kDs4Bf16ToktileThreads>>>(                     \
+                out + (uint64_t)first * out_dim, weight,                  \
+                x + (uint64_t)first * in_dim, in_dim, out_dim);           \
+            if (!cuda_ok(cudaGetLastError(),                              \
+                         "matmul_bf16 token-tail launch")) return 0;     \
+            first += (T);                                                 \
+        }                                                                 \
+    } while (0)
+    DS4_BF16_LAUNCH_TAIL(16u);
+    DS4_BF16_LAUNCH_TAIL(8u);
+    DS4_BF16_LAUNCH_TAIL(4u);
+    DS4_BF16_LAUNCH_TAIL(2u);
+    DS4_BF16_LAUNCH_TAIL(1u);
+#undef DS4_BF16_LAUNCH_TAIL
+    return first == n_tok;
+}
+
 extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
@@ -1461,6 +1494,31 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
                 (uint32_t)in_dim,
                 out_dim);
         return cuda_ok(cudaGetLastError(), "matmul_bf16 sharedx launch");
+    }
+    /* Launcher/test contract: rollback variables are set before process start,
+     * so cache the environment lookup on the first BF16 projection. */
+    static const int batch_toktile_disabled =
+        getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
+    if (!batch_toktile_disabled && n_tok >= 16u &&
+        in_dim >= 1024u && out_dim >= 1024u &&
+        in_dim <= UINT32_MAX && out_dim <= UINT32_MAX &&
+        n_tok <= UINT32_MAX && !g_quality_mode &&
+        !cuda_runtime_config()->graph_dump) {
+        static int verbose_reported = 0;
+        if (!verbose_reported &&
+            getenv("DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE") != NULL) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "BF16 F32 token-tile path engaged: tokens=%llu "
+                    "in=%llu out=%llu\n",
+                    (unsigned long long)n_tok,
+                    (unsigned long long)in_dim,
+                    (unsigned long long)out_dim);
+            verbose_reported = 1;
+        }
+        return matmul_bf16_f32_toktile_w32_launch(
+            (float *)out->ptr, (const uint16_t *)wptr,
+            (const float *)x->ptr, (uint32_t)in_dim,
+            (uint32_t)out_dim, (uint32_t)n_tok);
     }
     const dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_bf16_kernel<<<grid, 256>>>((float *)out->ptr,

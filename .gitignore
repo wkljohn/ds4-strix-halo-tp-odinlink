@@ -57,6 +57,8 @@
 /tests/test_rocm_glm5_nope_attention
 /tests/test_rocm_glm5_mla_qkv
 /tests/test_rocm_glm5_mla_compose
+/tests/test_rocm_glm5_prefix_layer3_tp
+/tests/test_rocm_bf16_batch_gemm
 /tests/test_rocm_q4k_packed_slice_registry
 /tests/test_rocm_shared_routed_overlap
 /tests/test_rocm_q4k_slot_balance_oracle

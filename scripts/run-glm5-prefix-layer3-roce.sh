@@ -74,7 +74,10 @@ PERF_MODE=${DS4_GLM5_PERF_MODE:-0}
 KDA_ROUTED_BATCH_TEST=${DS4_GLM5_KDA_ROUTED_BATCH_TEST:-0}
 KDA_ROUTED_BATCH_ROWS=${DS4_GLM5_KDA_ROUTED_BATCH_ROWS:-3}
 KDA_ROUTED_PROFILE_REPEATS=${DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS:-0}
+KDA_ROUTED_CONTINUATION_ROWS=${DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS:-1}
 ROCPROF_RANK=${DS4_GLM5_ROCPROF_RANK:-}
+BF16_TOKTILE_DISABLE=${DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE:-}
+BF16_TOKTILE_VERBOSE=${DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE:-}
 EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
@@ -152,8 +155,26 @@ done
   echo "error: KDA routed profile repeats require the 33-row batch test" >&2
   exit 2
 }
+[[ $KDA_ROUTED_CONTINUATION_ROWS == 1 ||
+   $KDA_ROUTED_CONTINUATION_ROWS == 16 ]] || {
+  echo "error: DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS must be 1 or 16" >&2
+  exit 2
+}
+[[ $KDA_ROUTED_CONTINUATION_ROWS == 1 ||
+   ($KDA_ROUTED_BATCH_TEST == 1 && $KDA_ROUTED_BATCH_ROWS == 33) ]] || {
+  echo "error: 16 continuation rows require the 33-row batch test" >&2
+  exit 2
+}
 [[ -z $ROCPROF_RANK || $ROCPROF_RANK == leader ]] || {
   echo "error: DS4_GLM5_ROCPROF_RANK currently supports only leader" >&2
+  exit 2
+}
+[[ -z $BF16_TOKTILE_DISABLE || $BF16_TOKTILE_DISABLE == 1 ]] || {
+  echo "error: DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE must be empty or 1" >&2
+  exit 2
+}
+[[ -z $BF16_TOKTILE_VERBOSE || $BF16_TOKTILE_VERBOSE == 1 ]] || {
+  echo "error: DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE must be empty or 1" >&2
   exit 2
 }
 [[ -z $EXPECTED_GENERATED_FNV ||
@@ -247,17 +268,36 @@ mkdir -p "$(dirname -- "$OUT")"
 mkdir "$OUT"
 
 SOURCE_FILES=(
+  Makefile .gitignore
   ds4.c ds4.h ds4_glm5_kda.c ds4_glm5_kda.h
   ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h
   ds4_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_next_exec.h
-  ds4_rocm_compat.cu rocm/ds4_rocm_glm5_kda.cuh
+  ds4_rocm_compat.cu rocm/ds4_rocm_common.cuh
+  rocm/ds4_rocm_bf16_toktile.cuh
+  rocm/ds4_rocm_matmul.cuh rocm/ds4_rocm_glm5_kda.cuh
   scripts/run-glm5-prefix-layer3-roce.sh
   tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp
+  tests/test_rocm_bf16_batch_gemm.cu
   tests/test_rocm_glm5_prefix_layer3_tp.cu
 )
 (cd "$REPO" && sha256sum "${SOURCE_FILES[@]}") >"$OUT/source-files.sha256"
 (cd "$REPO" && git status --short) >"$OUT/source.status"
 (cd "$REPO" && git diff --binary -- "${SOURCE_FILES[@]}") >"$OUT/source.diff"
+for source_file in "${SOURCE_FILES[@]}"; do
+  if ! (cd "$REPO" &&
+        git ls-files --error-unmatch -- "$source_file" >/dev/null 2>&1); then
+    set +e
+    (cd "$REPO" &&
+      git diff --no-index --binary -- /dev/null "$source_file") \
+      >>"$OUT/source.diff"
+    source_diff_rc=$?
+    set -e
+    [[ $source_diff_rc == 1 ]] || {
+      echo "error: failed to archive untracked source $source_file" >&2
+      exit 1
+    }
+  fi
+done
 SOURCE_DIFF_SHA=$(sha256sum "$OUT/source.diff" | awk '{print $1}')
 
 make -C "$REPO" -j"$(nproc)" tests/test_rocm_glm5_prefix_layer3_tp
@@ -370,7 +410,10 @@ printf 'perf_mode=%s\n' "$PERF_MODE" >>"$OUT/run.env"
 printf 'kda_routed_batch_test=%s\n' "$KDA_ROUTED_BATCH_TEST" >>"$OUT/run.env"
 printf 'kda_routed_batch_rows=%s\n' "$KDA_ROUTED_BATCH_ROWS" >>"$OUT/run.env"
 printf 'kda_routed_profile_repeats=%s\n' "$KDA_ROUTED_PROFILE_REPEATS" >>"$OUT/run.env"
+printf 'kda_routed_continuation_rows=%s\n' "$KDA_ROUTED_CONTINUATION_ROWS" >>"$OUT/run.env"
 printf 'rocprof_rank=%s\n' "$ROCPROF_RANK" >>"$OUT/run.env"
+printf 'bf16_toktile_disabled=%s\n' "$([[ -n $BF16_TOKTILE_DISABLE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
+printf 'bf16_toktile_verbose=%s\n' "$([[ -n $BF16_TOKTILE_VERBOSE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
 printf 'expected_generated_fnv=%s\n' "$EXPECTED_GENERATED_FNV" >>"$OUT/run.env"
 if [[ -n $TEXT_PROMPT ]]; then
   printf 'text_prompt=%s\n' "$TEXT_PROMPT" >>"$OUT/run.env"
@@ -399,6 +442,8 @@ text_env=()
 remote_text_env=
 local_rdma_env=()
 remote_rdma_env=
+local_candidate_env=()
+remote_candidate_env=
 if [[ -n $GID_INDEX ]]; then
   local_rdma_env+=(DS4_GLM5_TP_RDMA_GID_INDEX="$GID_INDEX")
   remote_rdma_env+=" DS4_GLM5_TP_RDMA_GID_INDEX='$GID_INDEX'"
@@ -406,6 +451,14 @@ fi
 if [[ $RDMA_PROFILE == odinlink ]]; then
   local_rdma_env+=(DS4_TP_VERBS_LIB="$LOCAL_VERBS_LIB")
   remote_rdma_env+=" DS4_TP_VERBS_LIB='$PEER_VERBS_LIB'"
+fi
+if [[ -n $BF16_TOKTILE_DISABLE ]]; then
+  local_candidate_env+=(DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE=1)
+  remote_candidate_env+=' DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE=1'
+fi
+if [[ -n $BF16_TOKTILE_VERBOSE ]]; then
+  local_candidate_env+=(DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE=1)
+  remote_candidate_env+=' DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE=1'
 fi
 if [[ -n $TEXT_PROMPT ]]; then
   text_env+=(DS4_GLM5_TEXT_PROMPT="$TEXT_PROMPT")
@@ -443,12 +496,14 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_KDA_ROUTED_BATCH_TEST="$KDA_ROUTED_BATCH_TEST" \
   DS4_GLM5_KDA_ROUTED_BATCH_ROWS="$KDA_ROUTED_BATCH_ROWS" \
   DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS="$KDA_ROUTED_PROFILE_REPEATS" \
+  DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS="$KDA_ROUTED_CONTINUATION_ROWS" \
   "${local_rdma_env[@]}" \
+  "${local_candidate_env[@]}" \
   "${text_env[@]}" \
   "${local_command[@]}" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS'$remote_rdma_env$remote_text_env '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS' DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS='$KDA_ROUTED_CONTINUATION_ROWS'$remote_rdma_env$remote_candidate_env$remote_text_env '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 

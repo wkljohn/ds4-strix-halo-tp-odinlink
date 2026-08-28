@@ -353,6 +353,23 @@ bool run() {
           "KDA routed profile repeats are bounded and use 33 rows");
     const uint32_t kda_profile_repeats =
         (uint32_t)kda_profile_repeats_long;
+    const char *kda_continuation_rows_env =
+        std::getenv("DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS");
+    char *kda_continuation_rows_end = nullptr;
+    const unsigned long kda_continuation_rows_long =
+        kda_continuation_rows_env ?
+        std::strtoul(kda_continuation_rows_env,
+                     &kda_continuation_rows_end, 10) : 1ul;
+    CHECK((!kda_continuation_rows_env ||
+              (kda_continuation_rows_end &&
+               *kda_continuation_rows_end == '\0')) &&
+              (kda_continuation_rows_long == 1ul ||
+               kda_continuation_rows_long == 16ul) &&
+              (kda_continuation_rows_long == 1ul ||
+               (kda_batch_test && kda_batch_rows == 33u)),
+          "KDA routed continuation rows are the bounded 1 or 16 fixture");
+    const uint32_t kda_continuation_rows =
+        (uint32_t)kda_continuation_rows_long;
     const char *full_tokens_env = std::getenv("DS4_GLM5_FULL_TOKENS");
     const uint32_t full_tokens = !full_tokens_env ? 1u :
         std::strcmp(full_tokens_env, "1") == 0 ? 1u :
@@ -422,7 +439,7 @@ bool run() {
     }
     const uint32_t context_capacity = text_mode ?
         (uint32_t)prompt_tokens.value.len + text_generate :
-        kda_batch_test ? kda_batch_rows + 1u : 2u;
+        kda_batch_test ? kda_batch_rows + kda_continuation_rows : 2u;
     Glm5NextKShardPlan kshard;
     CHECK(!full_trunk || glm5_next_build_kshard_plan(gguf, offsets, kshard),
           "build exact full-trunk compact residency plan");
@@ -499,6 +516,7 @@ bool run() {
         ((uint64_t)layer_timing << 57u) ^
         ((uint64_t)kda_batch_test << 58u) ^
         ((uint64_t)kda_batch_rows << 32u) ^
+        ((uint64_t)kda_continuation_rows << 40u) ^
         prompt_hash ^ teacher_hash;
     if (text_mode) {
         std::fprintf(stderr,
@@ -611,7 +629,10 @@ bool run() {
             };
         }
         CHECK(ids.size() == rows, "select exact KDA routed token fixture");
-        constexpr uint32_t continuation_id = 17u;
+        constexpr uint32_t continuation_ids[16] = {
+            17u, 287u, 315u, 279u, 371u, 13u, 825u, 304u,
+            6623u, 323u, 25u, 7487u, 558u, 369u, 11478u, 7735u,
+        };
         StateGuard sequential_state, batch_state;
         WorkspaceGuard batch_workspace;
         TensorGuard batch_ids, batch_input, batch_output, sequential_output;
@@ -768,54 +789,93 @@ bool run() {
 
         std::vector<float> sequential_continue(kHcWidth);
         std::vector<float> batch_continue(kHcWidth);
-        CHECK(ds4_glm5_next_embed_token(
-                  &exec, continuation_id, current.value) &&
-              ds4_glm5_next_layer_forward(
-                  &exec, 4u, &sequential_state.value, workspace.value,
-                  current.value, output.value) &&
-              ds4_gpu_tensor_read(output.value, 0u,
-                                   sequential_continue.data(),
-                                   (uint64_t)kHcWidth * sizeof(float)) &&
-              ds4_glm5_next_layer_forward(
-                  &exec, 4u, &batch_state.value, workspace.value,
-                  current.value, output.value) &&
-              ds4_gpu_tensor_read(output.value, 0u, batch_continue.data(),
-                                   (uint64_t)kHcWidth * sizeof(float)),
-              "execute one-row continuation after KDA+routed batch");
-        const VectorError continuation_error =
-            vector_error(sequential_continue, batch_continue);
+        std::vector<float> batch_continuations(
+            (uint64_t)kda_continuation_rows * kHcWidth);
+        VectorError continuation_error = {};
+        continuation_error.cosine = 1.0;
+        uint32_t worst_continue_nrmse_step = 0u;
+        uint32_t worst_continue_cosine_step = 0u;
+        uint32_t worst_continue_max_abs_step = 0u;
+        for (uint32_t step = 0u; step < kda_continuation_rows; ++step) {
+            CHECK(ds4_glm5_next_embed_token(
+                      &exec, continuation_ids[step], current.value) &&
+                  ds4_glm5_next_layer_forward(
+                      &exec, 4u, &sequential_state.value, workspace.value,
+                      current.value, output.value) &&
+                  ds4_gpu_tensor_read(output.value, 0u,
+                                       sequential_continue.data(),
+                                       (uint64_t)kHcWidth * sizeof(float)) &&
+                  ds4_glm5_next_layer_forward(
+                      &exec, 4u, &batch_state.value, workspace.value,
+                      current.value, output.value) &&
+                  ds4_gpu_tensor_read(output.value, 0u,
+                      batch_continue.data(),
+                      (uint64_t)kHcWidth * sizeof(float)),
+                  "execute continuation after KDA+routed batch");
+            std::copy(batch_continue.begin(), batch_continue.end(),
+                      batch_continuations.begin() +
+                          (uint64_t)step * kHcWidth);
+            const VectorError step_error =
+                vector_error(sequential_continue, batch_continue);
+            std::fprintf(stderr,
+                "GLM5 KDA+routed continuation step role=%s step=%u "
+                "token=%u nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+                role, step, continuation_ids[step], step_error.nrmse,
+                step_error.cosine, step_error.max_abs);
+            if (step == 0u || step_error.nrmse > continuation_error.nrmse) {
+                continuation_error.nrmse = step_error.nrmse;
+                worst_continue_nrmse_step = step;
+            }
+            if (step == 0u || step_error.cosine < continuation_error.cosine) {
+                continuation_error.cosine = step_error.cosine;
+                worst_continue_cosine_step = step;
+            }
+            if (step == 0u || step_error.max_abs >
+                                  continuation_error.max_abs) {
+                continuation_error.max_abs = step_error.max_abs;
+                worst_continue_max_abs_step = step;
+            }
+        }
         std::fprintf(stderr,
             "GLM5 KDA+routed continuation measurement role=%s "
-            "nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
-            role, continuation_error.nrmse, continuation_error.cosine,
-            continuation_error.max_abs);
+            "rows=%u nrmse=%.9g worst_nrmse_step=%u "
+            "cosine=%.12g worst_cosine_step=%u max_abs=%.9g "
+            "worst_max_abs_step=%u\n",
+            role, kda_continuation_rows, continuation_error.nrmse,
+            worst_continue_nrmse_step, continuation_error.cosine,
+            worst_continue_cosine_step, continuation_error.max_abs,
+            worst_continue_max_abs_step);
         CHECK(continuation_error.nrmse <= 5.0e-4 &&
                   continuation_error.cosine >= 0.9999999 &&
                   continuation_error.max_abs <= 2.5e-5,
               "ordinary decode continues from KDA+routed batch state");
         const uint64_t continuation_hash = fnv64(
-            batch_continue.data(), batch_continue.size() * sizeof(float));
+            batch_continuations.data(),
+            batch_continuations.size() * sizeof(float));
         char continuation_hash_error[256] = {};
         CHECK(ds4_tp_hash_check(
                   tp.tp, UINT64_C(0x474c4d354b434f4e), continuation_hash,
                   continuation_hash_error,
                   sizeof(continuation_hash_error)) == 1,
               continuation_hash_error);
-        CHECK(sequential_state.value.kda.layer[4].token_count == rows + 1u &&
-                  batch_state.value.kda.layer[4].token_count == rows + 1u &&
+        CHECK(sequential_state.value.kda.layer[4].token_count ==
+                  rows + kda_continuation_rows &&
+                  batch_state.value.kda.layer[4].token_count ==
+                      rows + kda_continuation_rows &&
                   sequential_state.value.valid && batch_state.value.valid,
               "both KDA+routed paths commit identical recurrent length");
         std::fprintf(stderr,
             "PASS GLM5 KDA+routed batch role=%s rows=%u layer=4 "
             "nrmse=%.9g cosine=%.12g max_abs=%.9g output=%016llx "
             "continue_nrmse=%.9g continue_cosine=%.12g "
-            "continue_max_abs=%.9g continuation=%016llx "
+            "continue_max_abs=%.9g continue_rows=%u continuation=%016llx "
             "sequential_ms=%.3f batch_ms=%.3f speedup=%.3fx "
             "tp_seq=%llu packed_q4_bytes=%llu rdma=1\n",
             role, rows, batch_error.nrmse, batch_error.cosine,
             batch_error.max_abs, (unsigned long long)batch_hash,
             continuation_error.nrmse, continuation_error.cosine,
             continuation_error.max_abs,
+            kda_continuation_rows,
             (unsigned long long)continuation_hash,
             sequential_ms, batch_ms, sequential_ms / batch_ms,
             (unsigned long long)sequence,

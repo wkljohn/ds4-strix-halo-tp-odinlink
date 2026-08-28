@@ -1139,6 +1139,13 @@ tests/test_rocm_q8_kslice_rows: tests/test_rocm_q8_kslice_rows.o ds4_rocm.o ds4_
 test-rocm-q8-kslice-rows: tests/test_rocm_q8_kslice_rows
 	./tests/test_rocm_q8_kslice_rows
 
+.PHONY: test-rocm-bf16-batch-gemm
+tests/test_rocm_bf16_batch_gemm: tests/test_rocm_bf16_batch_gemm.cu rocm/ds4_rocm_bf16_toktile.cuh
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $< $(ROCM_LDLIBS)
+
+test-rocm-bf16-batch-gemm: tests/test_rocm_bf16_batch_gemm
+	./tests/test_rocm_bf16_batch_gemm
+
 tests/test_rocm_attention_q_b_fused.o: tests/test_rocm_attention_q_b_fused.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
