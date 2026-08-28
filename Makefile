@@ -302,6 +302,17 @@ test-rocm-glm5-nope-score: tests/test_rocm_glm5_nope_score
 	DS4_GLM5_NOPE_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/nope-score-layer3" \
 		./tests/test_rocm_glm5_nope_score
 
+.PHONY: test-rocm-glm5-nope-attention
+tests/test_rocm_glm5_nope_attention.o: tests/test_rocm_glm5_nope_attention.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_rocm_glm5_nope_attention: tests/test_rocm_glm5_nope_attention.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-nope-attention: tests/test_rocm_glm5_nope_attention
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_nope_attention
+
 .PHONY: test-glm5-kda-tp-digest
 tests/test_glm5_kda_tp_digest: tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_tp_digest.c ds4_glm5_kda.c $(LDLIBS)

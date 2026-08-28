@@ -3421,11 +3421,12 @@ static int glm_attention_indexed_lora_launch(
             return 0;
         }
     }
-    if (!lora_out || !q || !qk_low || !kv_lora_cache || !k_rope_cache ||
+    if (!lora_out || !q || !qk_low || !kv_lora_cache ||
+        (qk_rope == 0u ? k_rope_cache != NULL : k_rope_cache == NULL) ||
         n_tokens == 0u || n_selected == 0u ||
         cache_cap == 0u || n_selected > cache_cap ||
         n_head == 0u || kv_lora_dim == 0u ||
-        qk_nope == 0u || qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        qk_nope == 0u || (qk_rope & 1u) != 0u ||
         !cuda_attention_score_buffer_fits(n_selected) ||
         !isfinite(freq_base) || freq_base <= 0.0f ||
         !isfinite(freq_scale) || freq_scale <= 0.0f ||
@@ -3436,7 +3437,8 @@ static int glm_attention_indexed_lora_launch(
         !cuda_tensor_has_elems3(qk_low, n_tokens, n_head, kv_lora_dim, sizeof(float)) ||
         (has_selected && !cuda_tensor_has_elems2(selected, n_tokens, n_selected, sizeof(int32_t))) ||
         !glm_rocm_tensor_has_cache2(kv_lora_cache, cache_cap, kv_lora_dim, elem) ||
-        !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem)) {
+        (qk_rope != 0u &&
+         !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem))) {
         return 0;
     }
     /* Once the visible context exceeds the indexer's top-k, each token carries
@@ -3447,7 +3449,7 @@ static int glm_attention_indexed_lora_launch(
      * fallback for diagnosis and numerical comparisons. */
     const char *selected_attn_gemm_env =
         getenv("DS4_ROCM_GLM_SELECTED_ATTN_GEMM");
-    if (!causal_range && has_selected &&
+    if (qk_rope != 0u && !causal_range && has_selected &&
         (selected_attn_gemm_env == NULL ||
          cuda_env_present(selected_attn_gemm_env)) &&
         glm_attention_indexed_lora_selected_gemm(lora_out,
@@ -3491,7 +3493,7 @@ static int glm_attention_indexed_lora_launch(
      * scalar attention kernel. */
     const char *causal_attn_gemm_env =
         getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM");
-    if (causal_range && !has_selected &&
+    if (qk_rope != 0u && causal_range && !has_selected &&
         (causal_attn_gemm_env == NULL ||
          cuda_env_present(causal_attn_gemm_env)) &&
         glm_attention_indexed_lora_causal_gemm(lora_out,
@@ -3534,7 +3536,8 @@ static int glm_attention_indexed_lora_launch(
                                                             (const float *)q->ptr,
                                                             (const float *)qk_low->ptr,
                                                             (const char *)kv_lora_cache->ptr,
-                                                            (const char *)k_rope_cache->ptr,
+                                                            k_rope_cache ?
+                                                                (const char *)k_rope_cache->ptr : NULL,
                                                             has_selected ? (const int32_t *)selected->ptr : NULL,
                                                             n_tokens,
                                                             pos0,
@@ -3579,6 +3582,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
         float attn_factor,
         float beta_fast,
         float beta_slow) {
+    if (qk_rope == 0u) return 0;
     return glm_attention_indexed_lora_launch(lora_out, q, qk_low, kv_lora_cache,
                                              k_rope_cache, selected, n_tokens, 0,
                                              n_selected, cache_cap, cache_f16,
@@ -3610,6 +3614,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         float attn_factor,
         float beta_fast,
         float beta_slow) {
+    if (qk_rope == 0u) return 0;
     return glm_attention_indexed_lora_launch(lora_out, q, qk_low, kv_lora_cache,
                                              k_rope_cache, NULL, n_tokens, pos0,
                                              n_selected, cache_cap, cache_f16,
@@ -3641,6 +3646,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
         float attn_factor,
         float beta_fast,
         float beta_slow) {
+    if (qk_rope == 0u) return 0;
     return glm_attention_indexed_lora_launch(lora_out, q, qk_low, kv_lora_cache,
                                              k_rope_cache, selected, n_tokens, 0,
                                              n_selected, cache_cap, cache_f16,
@@ -3775,7 +3781,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
         !q ||
         !qk_low ||
         !kv_lora_cache ||
-        !k_rope_cache ||
+        (qk_rope == 0u ? k_rope_cache != NULL : k_rope_cache == NULL) ||
         !selected ||
         !model_map ||
         n_selected == 0u ||
@@ -3785,7 +3791,6 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
         kv_lora_dim == 0u ||
         value_dim == 0u ||
         qk_nope == 0u ||
-        qk_rope == 0u ||
         (qk_rope & 1u) != 0u ||
         !cuda_attention_score_buffer_fits(n_selected) ||
         !isfinite(freq_base) || freq_base <= 0.0f ||
@@ -3797,7 +3802,8 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
         !cuda_tensor_has_i32(selected, n_selected) ||
         !cuda_tensor_has_bytes(heads, heads_bytes) ||
         !glm_rocm_tensor_has_cache2(kv_lora_cache, cache_cap, kv_lora_dim, elem) ||
-        !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem)) {
+        (qk_rope != 0u &&
+         !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem))) {
         return 0;
     }
     ds4_gpu_tensor q_view = *q;

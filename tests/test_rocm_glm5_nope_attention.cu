@@ -1,0 +1,334 @@
+#include "ds4_gpu.h"
+#include "ds4_gpu_mgpu.h"
+#include "tests/glm5_gguf_test.hpp"
+
+#include <hip/hip_fp16.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+#define CHECK(expr, message) do {                                           \
+    if (!(expr)) {                                                          \
+        std::fprintf(stderr, "FAIL %s (line %d)\n", message, __LINE__);    \
+        return false;                                                       \
+    }                                                                       \
+} while (0)
+
+namespace {
+
+constexpr uint32_t kHeads = 64u;
+constexpr uint32_t kQkNope = 256u;
+constexpr uint32_t kKvLora = 512u;
+constexpr uint32_t kValue = 256u;
+constexpr uint32_t kRows = 10u;
+constexpr uint32_t kSelected = 7u;
+
+float half_to_float(uint16_t value) {
+    const uint32_t sign = (uint32_t)(value & 0x8000u) << 16u;
+    uint32_t exponent = (value >> 10u) & 0x1fu;
+    uint32_t fraction = value & 0x03ffu;
+    uint32_t bits = 0u;
+    if (exponent == 0u) {
+        if (fraction == 0u) {
+            bits = sign;
+        } else {
+            int shift = 0;
+            while ((fraction & 0x0400u) == 0u) {
+                fraction <<= 1u;
+                ++shift;
+            }
+            fraction &= 0x03ffu;
+            bits = sign | (uint32_t)(113 - shift) << 23u | fraction << 13u;
+        }
+    } else if (exponent == 31u) {
+        bits = sign | 0x7f800000u | fraction << 13u;
+    } else {
+        bits = sign | (exponent + 112u) << 23u | fraction << 13u;
+    }
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+float q8_dot(const uint8_t *row, const float *x) {
+    float total = 0.0f;
+    for (uint32_t block = 0u; block < kKvLora / 32u; ++block) {
+        uint16_t scale_bits = 0u;
+        std::memcpy(&scale_bits, row + (uint64_t)block * 34u,
+                    sizeof(scale_bits));
+        const float scale = half_to_float(scale_bits);
+        const int8_t *quant =
+            (const int8_t *)(row + (uint64_t)block * 34u + 2u);
+        float subtotal = 0.0f;
+        for (uint32_t i = 0u; i < 32u; ++i) {
+            subtotal += (float)quant[i] * x[block * 32u + i];
+        }
+        total += scale * subtotal;
+    }
+    return total;
+}
+
+bool run_test() {
+    const char *model = std::getenv("DS4_GLM5_MODEL");
+    CHECK(model && model[0], "GLM5 model environment");
+
+    Glm5TestGGUF gguf;
+    CHECK(gguf.open_file(model), "open GLM5 GGUF directory");
+    uint64_t value_offset = 0u;
+    CHECK(gguf.tensor("blk.3.attn_v_b.weight", {512u, 256u, 64u},
+                      8u, value_offset),
+          "bind real block-3 Q8 value projection");
+
+    ds4_gpu_config config = {};
+    config.n_gpus = 1u;
+    config.device_indices[0] = 0u;
+    CHECK(ds4_gpu_init_multi(&config) &&
+          ds4_gpu_set_model_fd_for_map(gguf.fd, gguf.map) &&
+          ds4_gpu_set_model_map(gguf.map, gguf.size),
+          "initialize gfx1151 and register model map");
+
+    std::vector<float> query((uint64_t)kHeads * kQkNope);
+    std::vector<float> qk_low((uint64_t)kHeads * kKvLora);
+    std::vector<float> cache((uint64_t)kRows * kKvLora);
+    std::vector<int32_t> selected = {8, 1, -1, 6, 3, 0, 5};
+    for (size_t i = 0; i < query.size(); ++i) {
+        query[i] = (float)((int)((i * 11u) % 41u) - 20) * 0.001953125f;
+    }
+    for (size_t i = 0; i < qk_low.size(); ++i) {
+        qk_low[i] = (float)((int)((i * 7u) % 37u) - 18) * 0.00390625f;
+    }
+    for (size_t i = 0; i < cache.size(); ++i) {
+        cache[i] =
+            (float)((int)((i * 13u) % 43u) - 21) * 0.003713f +
+            (float)((int)(i % 7u) - 3) * 0.000011f;
+    }
+
+    const uint64_t value_row_bytes = (kKvLora / 32u) * 34u;
+    const uint8_t *value_weight =
+        (const uint8_t *)gguf.map + value_offset;
+    const auto reference = [&](const std::vector<float> &cache_values,
+                               uint32_t qk_dim) {
+        std::vector<float> out((uint64_t)kHeads * kValue, 0.0f);
+        std::vector<float> scores(kSelected);
+        std::vector<float> lora(kKvLora);
+        const float score_scale = 1.0f / std::sqrt((float)qk_dim);
+        for (uint32_t head = 0u; head < kHeads; ++head) {
+            float maximum = -std::numeric_limits<float>::infinity();
+            for (uint32_t s = 0u; s < kSelected; ++s) {
+                const int32_t row = selected[s];
+                float score = -std::numeric_limits<float>::infinity();
+                if (row >= 0 && (uint32_t)row < kRows) {
+                    const float *low =
+                        qk_low.data() + (uint64_t)head * kKvLora;
+                    const float *kv =
+                        cache_values.data() + (uint64_t)row * kKvLora;
+                    score = 0.0f;
+                    for (uint32_t j = 0u; j < kKvLora; ++j) {
+                        score += low[j] * kv[j];
+                    }
+                    score *= score_scale;
+                }
+                scores[s] = score;
+                maximum = std::max(maximum, score);
+            }
+            float denominator = 0.0f;
+            for (uint32_t s = 0u; s < kSelected; ++s) {
+                scores[s] = std::exp(scores[s] - maximum);
+                denominator += scores[s];
+            }
+            for (uint32_t j = 0u; j < kKvLora; ++j) {
+                float total = 0.0f;
+                for (uint32_t s = 0u; s < kSelected; ++s) {
+                    const int32_t row = selected[s];
+                    if (row >= 0 && (uint32_t)row < kRows) {
+                        total += scores[s] *
+                            cache_values[(uint64_t)row * kKvLora + j];
+                    }
+                }
+                lora[j] = total / denominator;
+            }
+            for (uint32_t value = 0u; value < kValue; ++value) {
+                const uint8_t *row = value_weight +
+                    ((uint64_t)head * kValue + value) * value_row_bytes;
+                out[(uint64_t)head * kValue + value] =
+                    q8_dot(row, lora.data());
+            }
+        }
+        return out;
+    };
+    const std::vector<float> expected = reference(cache, kQkNope);
+
+    ds4_gpu_tensor *d_query = ds4_gpu_tensor_alloc(
+        (uint64_t)query.size() * sizeof(float));
+    ds4_gpu_tensor *d_low = ds4_gpu_tensor_alloc(
+        (uint64_t)qk_low.size() * sizeof(float));
+    ds4_gpu_tensor *d_cache = ds4_gpu_tensor_alloc(
+        (uint64_t)cache.size() * sizeof(float));
+    ds4_gpu_tensor *d_selected = ds4_gpu_tensor_alloc(
+        (uint64_t)selected.size() * sizeof(int32_t));
+    ds4_gpu_tensor *d_heads = ds4_gpu_tensor_alloc(
+        (uint64_t)expected.size() * sizeof(float));
+    CHECK(d_query && d_low && d_cache && d_selected && d_heads,
+          "allocate bounded NoPE attention tensors");
+    CHECK(ds4_gpu_tensor_write(d_query, 0u, query.data(),
+                               (uint64_t)query.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(d_low, 0u, qk_low.data(),
+                               (uint64_t)qk_low.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(d_cache, 0u, cache.data(),
+                               (uint64_t)cache.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(d_selected, 0u, selected.data(),
+                               (uint64_t)selected.size() * sizeof(int32_t)),
+          "upload NoPE attention inputs");
+
+    CHECK(ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+              d_heads, d_query, d_low, d_cache, nullptr,
+              gguf.map, gguf.size, value_offset, 8u, d_selected,
+              kSelected, kRows, false, kHeads, kKvLora, kQkNope, 0u,
+              kValue, 0u, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_synchronize(),
+          "execute zero-RoPE indexed decode attention");
+    std::vector<float> got(expected.size());
+    CHECK(ds4_gpu_tensor_read(d_heads, 0u, got.data(),
+                              (uint64_t)got.size() * sizeof(float)),
+          "read NoPE attention output");
+
+    double maximum = 0.0;
+    double error2 = 0.0;
+    double reference2 = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        CHECK(std::isfinite(got[i]) && std::isfinite(expected[i]),
+              "finite NoPE attention output");
+        const double error = (double)got[i] - expected[i];
+        maximum = std::max(maximum, std::fabs(error));
+        error2 += error * error;
+        reference2 += (double)expected[i] * expected[i];
+    }
+    const double nmse = error2 / std::max(reference2, 1.0e-30);
+    std::fprintf(stderr,
+                 "GLM5 NoPE indexed attention count=%zu max_abs=%.9g "
+                 "nmse=%.9g\n", got.size(), maximum, nmse);
+    CHECK(maximum <= 2.0e-5 && nmse <= 1.0e-10,
+          "NoPE attention numerical envelope");
+
+    std::vector<uint16_t> cache_f16(cache.size());
+    std::vector<float> cache_f16_reference(cache.size());
+    for (size_t i = 0; i < cache.size(); ++i) {
+        const __half value = __float2half_rn(cache[i]);
+        std::memcpy(&cache_f16[i], &value, sizeof(uint16_t));
+        cache_f16_reference[i] = half_to_float(cache_f16[i]);
+    }
+    ds4_gpu_tensor *d_cache_f16 = ds4_gpu_tensor_alloc(
+        (uint64_t)cache_f16.size() * sizeof(uint16_t));
+    CHECK(d_cache_f16 &&
+          ds4_gpu_tensor_write(d_cache_f16, 0u, cache_f16.data(),
+                               (uint64_t)cache_f16.size() * sizeof(uint16_t)) &&
+          ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+              d_heads, d_query, d_low, d_cache_f16, nullptr,
+              gguf.map, gguf.size, value_offset, 8u, d_selected,
+              kSelected, kRows, true, kHeads, kKvLora, kQkNope, 0u,
+              kValue, 0u, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_synchronize() &&
+          ds4_gpu_tensor_read(d_heads, 0u, got.data(),
+                              (uint64_t)got.size() * sizeof(float)),
+          "execute and read F16-cache NoPE attention");
+    const std::vector<float> expected_f16 =
+        reference(cache_f16_reference, kQkNope);
+    maximum = 0.0;
+    error2 = 0.0;
+    reference2 = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const double error = (double)got[i] - expected_f16[i];
+        maximum = std::max(maximum, std::fabs(error));
+        error2 += error * error;
+        reference2 += (double)expected_f16[i] * expected_f16[i];
+    }
+    const double f16_nmse = error2 / std::max(reference2, 1.0e-30);
+    std::fprintf(stderr,
+                 "GLM5 NoPE F16-cache attention count=%zu max_abs=%.9g "
+                 "nmse=%.9g\n", got.size(), maximum, f16_nmse);
+    CHECK(maximum <= 2.0e-5 && f16_nmse <= 1.0e-10,
+          "F16-cache NoPE attention numerical envelope");
+
+    CHECK(!ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+              d_heads, d_query, d_low, d_cache, nullptr,
+              gguf.map, gguf.size, value_offset, 8u, d_selected,
+              kSelected, kRows, false, kHeads, kKvLora, kQkNope, 64u,
+              kValue, 0u, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+          "nonzero RoPE rejects a null cache");
+
+    constexpr uint32_t kRope = 64u;
+    std::vector<float> query_rope((uint64_t)kHeads * (kQkNope + kRope), 0.0f);
+    std::vector<float> rope_cache((uint64_t)kRows * kRope, 0.0f);
+    for (uint32_t head = 0u; head < kHeads; ++head) {
+        std::memcpy(query_rope.data() + (uint64_t)head * (kQkNope + kRope),
+                    query.data() + (uint64_t)head * kQkNope,
+                    (uint64_t)kQkNope * sizeof(float));
+    }
+    ds4_gpu_tensor *d_query_rope = ds4_gpu_tensor_alloc(
+        (uint64_t)query_rope.size() * sizeof(float));
+    ds4_gpu_tensor *d_rope = ds4_gpu_tensor_alloc(
+        (uint64_t)rope_cache.size() * sizeof(float));
+    CHECK(d_query_rope && d_rope &&
+          ds4_gpu_tensor_write(d_query_rope, 0u, query_rope.data(),
+                               (uint64_t)query_rope.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(d_rope, 0u, rope_cache.data(),
+                               (uint64_t)rope_cache.size() * sizeof(float)) &&
+          ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+              d_heads, d_query_rope, d_low, d_cache, d_rope,
+              gguf.map, gguf.size, value_offset, 8u, d_selected,
+              kSelected, kRows, false, kHeads, kKvLora, kQkNope, kRope,
+              kValue, 0u, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_synchronize(),
+          "unchanged nonzero-RoPE control executes");
+    CHECK(ds4_gpu_tensor_read(d_heads, 0u, got.data(),
+                              (uint64_t)got.size() * sizeof(float)),
+          "read nonzero-RoPE control output");
+    const std::vector<float> expected_rope =
+        reference(cache, kQkNope + kRope);
+    maximum = 0.0;
+    error2 = 0.0;
+    reference2 = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        const double error = (double)got[i] - expected_rope[i];
+        maximum = std::max(maximum, std::fabs(error));
+        error2 += error * error;
+        reference2 += (double)expected_rope[i] * expected_rope[i];
+    }
+    const double rope_nmse = error2 / std::max(reference2, 1.0e-30);
+    std::fprintf(stderr,
+                 "GLM RoPE regression control count=%zu max_abs=%.9g "
+                 "nmse=%.9g\n", got.size(), maximum, rope_nmse);
+    CHECK(maximum <= 2.0e-5 && rope_nmse <= 1.0e-10,
+          "nonzero-RoPE control numerical envelope");
+
+    ds4_gpu_tensor dummy_rope = {};
+    CHECK(!ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+              d_heads, d_query, d_low, d_cache, &dummy_rope,
+              gguf.map, gguf.size, value_offset, 8u, d_selected,
+              kSelected, kRows, false, kHeads, kKvLora, kQkNope, 1u,
+              kValue, 0u, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+          "odd RoPE width remains rejected");
+
+    ds4_gpu_tensor_free(d_rope);
+    ds4_gpu_tensor_free(d_query_rope);
+    ds4_gpu_tensor_free(d_cache_f16);
+    ds4_gpu_tensor_free(d_heads);
+    ds4_gpu_tensor_free(d_selected);
+    ds4_gpu_tensor_free(d_cache);
+    ds4_gpu_tensor_free(d_low);
+    ds4_gpu_tensor_free(d_query);
+    ds4_gpu_cleanup();
+    std::fprintf(stderr,
+                 "PASS real-Q8 GLM5 zero-RoPE indexed attention gate\n");
+    return true;
+}
+
+}  // namespace
+
+int main() { return run_test() ? 0 : 1; }

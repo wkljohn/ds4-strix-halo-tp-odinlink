@@ -1821,6 +1821,9 @@ int ds4_gpu_rope_tail_decode_rows_tensor(
         float                               beta_fast,
         float                               beta_slow);
 
+/* qk_rope may be zero for a metadata-validated NoPE model. In that case the
+ * rope cache must be NULL. Nonzero-RoPE callers retain the original required
+ * cache contract; batch/prefill zero-RoPE entry points remain unsupported. */
 int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         ds4_gpu_tensor       *heads,
         const ds4_gpu_tensor *q,
