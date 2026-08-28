@@ -159,18 +159,47 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
     return true;
 }
 
+struct LayerTiming {
+    double kda_dense_ms = 0.0;
+    double kda_routed_ms = 0.0;
+    double mla_routed_ms = 0.0;
+    uint64_t kda_dense_calls = 0u;
+    uint64_t kda_routed_calls = 0u;
+    uint64_t mla_routed_calls = 0u;
+};
+
 bool execute_full_token(ds4_glm5_next_exec_ctx &exec,
                         ds4_glm5_next_state &state,
                         ds4_glm5_next_workspace *workspace,
                         uint32_t token,
                         ds4_gpu_tensor *&current,
-                        ds4_gpu_tensor *&output) {
+                        ds4_gpu_tensor *&output,
+                        LayerTiming *timing = nullptr) {
     CHECK(ds4_glm5_next_embed_token(&exec, token, current),
           "embed text token");
     for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        const auto begin = std::chrono::steady_clock::now();
         CHECK(ds4_glm5_next_layer_forward(
                   &exec, il, &state, workspace, current, output),
               "execute text token through complete trunk");
+        if (timing) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin).count();
+            const ds4_glm5_next_layer_offsets &layer = exec.model->layer[il];
+            if (layer.attention == DS4_GLM5_NEXT_ATTN_KDA &&
+                layer.ffn == DS4_GLM5_NEXT_FFN_DENSE) {
+                timing->kda_dense_ms += ms;
+                timing->kda_dense_calls++;
+            } else if (layer.attention == DS4_GLM5_NEXT_ATTN_KDA &&
+                       layer.ffn == DS4_GLM5_NEXT_FFN_ROUTED) {
+                timing->kda_routed_ms += ms;
+                timing->kda_routed_calls++;
+            } else if (layer.attention == DS4_GLM5_NEXT_ATTN_MLA &&
+                       layer.ffn == DS4_GLM5_NEXT_FFN_ROUTED) {
+                timing->mla_routed_ms += ms;
+                timing->mla_routed_calls++;
+            }
+        }
         std::swap(current, output);
     }
     return true;
@@ -253,6 +282,12 @@ bool run() {
                            std::strcmp(perf_mode_env, "1") == 0;
     CHECK(!perf_mode_env || perf_mode || std::strcmp(perf_mode_env, "0") == 0,
           "performance mode is exactly 0 or 1");
+    const char *layer_timing_env = std::getenv("DS4_GLM5_LAYER_TIMING");
+    const bool layer_timing = layer_timing_env &&
+                              std::strcmp(layer_timing_env, "1") == 0;
+    CHECK(!layer_timing_env || layer_timing ||
+              std::strcmp(layer_timing_env, "0") == 0,
+          "layer timing is exactly 0 or 1");
     const char *text_generate_env = std::getenv("DS4_GLM5_TEXT_GENERATE");
     char *text_generate_end = nullptr;
     const unsigned long text_generate_long = text_generate_env ?
@@ -373,6 +408,7 @@ bool run() {
         ((uint64_t)full_trunk << 8u) ^ full_tokens ^
         ((uint64_t)text_mode << 16u) ^ ((uint64_t)text_generate << 24u) ^
         ((uint64_t)perf_mode << 56u) ^
+        ((uint64_t)layer_timing << 57u) ^
         prompt_hash ^ teacher_hash;
     if (text_mode) {
         std::fprintf(stderr,
@@ -473,11 +509,13 @@ bool run() {
         using Clock = std::chrono::steady_clock;
         const auto prompt_begin = Clock::now();
         uint32_t executed = 0u;
+        LayerTiming prompt_layer_timing;
         for (int i = 0; i < prompt_tokens.value.len; ++i) {
             CHECK(execute_full_token(
                       exec, state.value, workspace.value,
                       (uint32_t)prompt_tokens.value.v[i],
-                      current.value, output.value),
+                      current.value, output.value,
+                      layer_timing ? &prompt_layer_timing : nullptr),
                   "execute exact chat prompt token");
             executed++;
         }
@@ -485,6 +523,25 @@ bool run() {
                   sequence == (uint64_t)executed * 53u,
               "chat prompt commits one complete TP schedule per token");
         const auto prompt_end = Clock::now();
+        if (layer_timing) {
+            const double classified = prompt_layer_timing.kda_dense_ms +
+                prompt_layer_timing.kda_routed_ms +
+                prompt_layer_timing.mla_routed_ms;
+            std::fprintf(stderr,
+                "GLM5 prompt layer timing role=%s tokens=%d "
+                "kda_dense_ms=%.3f kda_dense_calls=%llu "
+                "kda_routed_ms=%.3f kda_routed_calls=%llu "
+                "mla_routed_ms=%.3f mla_routed_calls=%llu "
+                "classified_ms=%.3f\n",
+                role, prompt_tokens.value.len,
+                prompt_layer_timing.kda_dense_ms,
+                (unsigned long long)prompt_layer_timing.kda_dense_calls,
+                prompt_layer_timing.kda_routed_ms,
+                (unsigned long long)prompt_layer_timing.kda_routed_calls,
+                prompt_layer_timing.mla_routed_ms,
+                (unsigned long long)prompt_layer_timing.mla_routed_calls,
+                classified);
+        }
 
         std::vector<float> host_logits(perf_mode ? 0u : 154880u);
         std::vector<uint32_t> generated;
