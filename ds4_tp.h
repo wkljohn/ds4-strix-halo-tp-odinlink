@@ -214,6 +214,10 @@ int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
 /* True only when large batch gates use verbs instead of TCP fallback. */
 bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *tp);
+/* True when this payload lies wholly inside the registered slab, so the bulk
+ * path will not stage through the batch regions. */
+bool ds4_tp_big_gate_is_direct(const ds4_tp *tp, const void *out,
+                               const void *in, uint64_t bytes);
 /* True only when the selected provider requires a host-pinned GPU-visible
  * slab for NIC registration. OdinLink keeps its existing device allocation. */
 bool ds4_tp_requires_host_slab(const ds4_tp *tp);

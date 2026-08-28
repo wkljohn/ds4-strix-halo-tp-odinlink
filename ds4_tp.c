@@ -14,6 +14,7 @@
 #include <limits.h>
 #include <math.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -480,13 +481,55 @@ static int tp_listen(const char *host, int port, char *err, size_t errlen) {
         if (fd < 0) continue;
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 2) == 0) break;
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 2) == 0) {
+            const int flags = fcntl(fd, F_GETFL, 0);
+            if (flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0)
+                break;
+        }
         close(fd);
         fd = -1;
     }
     freeaddrinfo(res);
     if (fd < 0) tp_set_err(err, errlen, "tp listen %s:%d: %s", host, port, strerror(errno));
     return fd;
+}
+
+/* The worker's dial path has always honored the connect deadline. Apply the
+ * same contract to both leader accepts so a missing/failed peer cannot leave
+ * a loaded coordinator parked forever. */
+static int tp_accept_with_timeout(int listener, uint64_t timeout_sec,
+                                  const char *which,
+                                  char *err, size_t errlen) {
+    const double deadline = tp_now_sec() + (double)timeout_sec;
+    for (;;) {
+        const double remaining = deadline - tp_now_sec();
+        if (remaining <= 0.0) {
+            errno = ETIMEDOUT;
+            tp_set_err(err, errlen, "tp %s accept timed out after %llu seconds",
+                       which, (unsigned long long)timeout_sec);
+            return -1;
+        }
+        double timeout_ms_f = ceil(remaining * 1000.0);
+        if (timeout_ms_f > (double)INT_MAX) timeout_ms_f = (double)INT_MAX;
+        struct pollfd pfd = { .fd = listener, .events = POLLIN };
+        const int ready = poll(&pfd, 1, (int)timeout_ms_f);
+        if (ready > 0) {
+            const int fd = accept(listener, NULL, NULL);
+            if (fd >= 0) {
+                const int flags = fcntl(fd, F_GETFL, 0);
+                if (flags >= 0) (void)fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+                return fd;
+            }
+            if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+                return -1;
+            continue;
+        }
+        if (ready == 0) continue;
+        if (errno == EINTR) continue;
+        tp_set_err(err, errlen, "tp %s accept poll: %s",
+                   which, strerror(errno));
+        return -1;
+    }
 }
 
 static int tp_dial(const char *host, int port, double timeout_sec, char *err, size_t errlen) {
@@ -1800,13 +1843,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     const double bg_t0 = g_bg_trace ? tp_now_sec() : 0.0;
     double bg_copy = 0.0;
 
-    const uintptr_t slab_lo = (uintptr_t)tp->slab;
-    const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
     const uintptr_t out_lo = (uintptr_t)out;
     const uintptr_t in_lo = (uintptr_t)in;
-    const bool direct =
-        out_lo >= slab_lo && out_lo <= slab_hi && bytes <= slab_hi - out_lo &&
-        in_lo >= slab_lo && in_lo <= slab_hi && bytes <= slab_hi - in_lo;
+    const bool direct = ds4_tp_big_gate_is_direct(tp, out, in, bytes);
     uint8_t *stage_send = tp->slab + tp->batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->batch_in_off;
     uint64_t off = 0;
@@ -2148,9 +2187,11 @@ int ds4_tp_create(
         if (listener < 0) goto fail;
         fprintf(stderr, "ds4-tp: waiting for worker on %s:%d ...\n",
                 opt->listen_host ? opt->listen_host : "0.0.0.0", opt->listen_port);
-        tp->control_fd = accept(listener, NULL, NULL);
+        tp->control_fd = tp_accept_with_timeout(
+                listener, connect_timeout_sec, "control", err, errlen);
         if (tp->control_fd < 0) {
-            tp_set_err(err, errlen, "tp accept: %s", strerror(errno));
+            if (!err || !err[0])
+                tp_set_err(err, errlen, "tp control accept: %s", strerror(errno));
             goto fail;
         }
     } else {
@@ -2174,9 +2215,11 @@ int ds4_tp_create(
          * interleave with gate payloads.  Created under RDMA too for
          * headers, verify-block gates, and transport fallback. */
         if (tp->rank == 0) {
-            tp->data_fd = accept(listener, NULL, NULL);
+            tp->data_fd = tp_accept_with_timeout(
+                    listener, connect_timeout_sec, "data", err, errlen);
             if (tp->data_fd < 0) {
-                tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
+                if (!err || !err[0])
+                    tp_set_err(err, errlen, "tp data accept: %s", strerror(errno));
                 goto fail;
             }
         } else {
@@ -2228,6 +2271,18 @@ bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *tp) {
     (void)tp;
     return false;
 #endif
+}
+bool ds4_tp_big_gate_is_direct(const ds4_tp *tp, const void *out,
+                               const void *in, uint64_t bytes) {
+    if (!tp || !tp->slab || !out || !in || bytes == 0) return false;
+    const uintptr_t slab_lo = (uintptr_t)tp->slab;
+    const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
+    const uintptr_t out_lo = (uintptr_t)out;
+    const uintptr_t in_lo = (uintptr_t)in;
+    return out_lo >= slab_lo && out_lo <= slab_hi &&
+           bytes <= slab_hi - out_lo &&
+           in_lo >= slab_lo && in_lo <= slab_hi &&
+           bytes <= slab_hi - in_lo;
 }
 bool ds4_tp_requires_host_slab(const ds4_tp *tp) {
 #ifdef DS4_TP_HAVE_VERBS
