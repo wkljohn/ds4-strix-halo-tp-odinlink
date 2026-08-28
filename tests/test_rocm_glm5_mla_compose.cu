@@ -160,7 +160,8 @@ bool run_roce_output(const Glm5TestGGUF &gguf,
                      const std::vector<float> &half1,
                      const std::vector<float> &expected,
                      std::vector<float> &composed,
-                     std::vector<float> &peer_received) {
+                     std::vector<float> &peer_received,
+                     TpGuard *persistent_transport) {
     composed.clear();
     peer_received.clear();
     const char *role_value = std::getenv("DS4_GLM5_TP_ROLE");
@@ -211,7 +212,11 @@ bool run_roce_output(const Glm5TestGGUF &gguf,
     identity.gate_slot_step = DS4_TP_GATES_PER_LAYER;
     identity.gates_per_token = 42u;
 
-    TpGuard transport;
+    TpGuard local_transport;
+    TpGuard &transport = persistent_transport ?
+        *persistent_transport : local_transport;
+    CHECK(!transport.tp && !transport.slab,
+          "MLA persistent transport starts empty");
     char error[256] = {};
     CHECK(ds4_tp_create(&transport.tp, &options, &identity,
                         error, sizeof(error)), error);
@@ -670,8 +675,10 @@ bool run_test() {
                          3.0e-6, 6.0e-13),
           "full and two-half Q8 attention output composition");
     std::vector<float> roce_composed, roce_peer;
+    TpGuard block_tp;
     CHECK(run_roce_output(gguf, got_attn_half0, got_attn_half1,
-                          expected_attn_output, roce_composed, roce_peer),
+                          expected_attn_output, roce_composed, roce_peer,
+                          &block_tp),
           "mandatory-RDMA MLA output composition");
     const char *tp_role = std::getenv("DS4_GLM5_TP_ROLE");
     if (tp_role) {
