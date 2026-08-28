@@ -1641,6 +1641,29 @@ int ds4_gpu_glm_indexer_scores_batch_tensor(
         float                 scale,
         bool                  cache_f16);
 
+/* GLM-5.3 NoPE indexer learned pool-4 compression.  pool_ape is BF16 in
+ * GGUF layout [head_dim, 4], equivalent to the upstream [4, head_dim]
+ * parameter. The raw pool axis matches upstream ceil(n_rows/4): invalid
+ * members carry index -1, survivor members still form the diagnostic pooled
+ * key, and pool_valid is true only for four valid members. Callers must filter
+ * pool_valid before scoring/selecting and append the visible tail separately.
+ * first_valid must be the first set entry of valid_keys for this single
+ * sequence; a batched consumer must derive and gate that value per sequence. */
+int ds4_gpu_glm5_kpool_tensor(
+        ds4_gpu_tensor       *pooled_keys,
+        ds4_gpu_tensor       *pool_indices,
+        ds4_gpu_tensor       *pool_valid,
+        const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *gate_scores,
+        const ds4_gpu_tensor *valid_keys,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              pool_ape_offset,
+        uint32_t              n_rows,
+        uint32_t              head_dim,
+        uint32_t              pool_size,
+        uint32_t              first_valid);
+
 int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
         ds4_gpu_tensor       *qk_low,
         const ds4_gpu_tensor *q,
