@@ -22,6 +22,9 @@ typedef struct {
     ds4_gpu_tensor *tp_big_in;
     void *tp_big_out_host;
     void *tp_big_in_host;
+    /* Transport-global, monotonically increasing big-gate sequence.  It is
+     * deliberately not reset with a model sequence while the TP link lives. */
+    uint64_t *tp_sequence;
 } ds4_glm5_next_exec_ctx;
 
 /* The initial production slice is a one-token decode workspace.  A later

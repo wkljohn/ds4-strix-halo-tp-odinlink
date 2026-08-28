@@ -254,6 +254,17 @@ test-glm5-dense-block0-external-reference: tests/test_rocm_glm5_dense_block0
 	python3 tests/test_glm5_dense_block0_external_reference.py \
 		"$(DS4_GLM5_MODEL)" "$$trace_dir/block0"
 
+.PHONY: test-rocm-glm5-prefix-layer3-tp
+tests/test_rocm_glm5_prefix_layer3_tp.o: tests/test_rocm_glm5_prefix_layer3_tp.cu tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp ds4_glm5_kda.h ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_rocm_glm5_prefix_layer3_tp: tests/test_rocm_glm5_prefix_layer3_tp.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-prefix-layer3-tp: tests/test_rocm_glm5_prefix_layer3_tp
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_prefix_layer3_tp
+
 .PHONY: test-rocm-glm5-mhc-carry
 tests/test_rocm_glm5_mhc_carry.o: tests/test_rocm_glm5_mhc_carry.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
