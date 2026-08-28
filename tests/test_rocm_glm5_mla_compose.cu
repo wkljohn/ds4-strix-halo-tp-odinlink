@@ -336,6 +336,17 @@ bool run_second_gate_probe(TpGuard &transport, bool leader) {
     return true;
 }
 
+struct FfnPrerouterState {
+    ds4_gpu_tensor *hidden = nullptr;
+    ds4_gpu_tensor *selected = nullptr;
+    ds4_gpu_tensor *weights = nullptr;
+    ~FfnPrerouterState() {
+        ds4_gpu_tensor_free(weights);
+        ds4_gpu_tensor_free(selected);
+        ds4_gpu_tensor_free(hidden);
+    }
+};
+
 bool run_ffn_prerouter(
         const Glm5TestGGUF &gguf, const ds4_gpu_tensor *carried,
         uint64_t hc_fn, uint64_t hc_scale, uint64_t hc_base,
@@ -344,7 +355,8 @@ bool run_ffn_prerouter(
         const std::vector<float> &expected_hidden,
         const std::vector<int32_t> &expected_ids,
         const std::vector<float> &expected_weights,
-        const char *label, uint64_t &route_hash) {
+        const char *label, uint64_t &route_hash,
+        FfnPrerouterState *retained) {
     ds4_gpu_tensor *flat = ds4_gpu_tensor_alloc(
         (uint64_t)kHc * kHidden * sizeof(float));
     ds4_gpu_tensor *mix = ds4_gpu_tensor_alloc(
@@ -432,9 +444,66 @@ bool run_ffn_prerouter(
             (unsigned long long)weights_hash,
             (unsigned long long)route_hash);
     }
+    if (ok && retained) {
+        CHECK(!retained->hidden && !retained->selected && !retained->weights,
+              "retained FFN prerouter state starts empty");
+        retained->hidden = hidden;
+        retained->selected = selected;
+        retained->weights = weights;
+        hidden = nullptr;
+        selected = nullptr;
+        weights = nullptr;
+    }
     if (!ok) (void)ds4_gpu_synchronize();
     release();
     CHECK(ok, "execute and validate FFN mHC/router boundary");
+    return true;
+}
+
+bool run_shared_half_gpu(const Glm5TestGGUF &gguf,
+                         const ds4_gpu_tensor *hidden,
+                         uint64_t gate_offset, uint64_t up_offset,
+                         uint64_t down_offset, uint32_t half,
+                         ds4_gpu_tensor **output) {
+    constexpr uint32_t full_mid = 2048u;
+    constexpr uint32_t half_mid = 1024u;
+    constexpr uint64_t q8_block_bytes = 34u;
+    constexpr uint64_t q8_qk = 32u;
+    CHECK(hidden && output && !*output && half < 2u,
+          "shared-expert GPU half geometry");
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(
+        (uint64_t)half_mid * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(
+        (uint64_t)half_mid * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(
+        (uint64_t)half_mid * sizeof(float));
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(
+        (uint64_t)kHidden * sizeof(float));
+    const uint64_t row_bytes =
+        (kHidden / q8_qk) * q8_block_bytes;
+    const uint64_t row_offset =
+        (uint64_t)half * half_mid * row_bytes;
+    bool ok = gate && up && mid && out;
+    if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(
+                 gate, gguf.map, gguf.size, gate_offset + row_offset,
+                 kHidden, half_mid, hidden, 1u) &&
+             ds4_gpu_matmul_q8_0_tensor(
+                 up, gguf.map, gguf.size, up_offset + row_offset,
+                 kHidden, half_mid, hidden, 1u) &&
+             ds4_gpu_swiglu_tensor(mid, gate, up, half_mid, 10.0f, 1.0f) &&
+             ds4_gpu_matmul_q8_0_kslice_tensor(
+                 out, gguf.map, gguf.size, down_offset, full_mid,
+                 (uint64_t)half * half_mid, half_mid, kHidden, mid, 0u) &&
+             ds4_gpu_synchronize();
+    }
+    if (!ok) (void)ds4_gpu_synchronize();
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(gate);
+    if (!ok) ds4_gpu_tensor_free(out);
+    CHECK(ok, "execute shared-expert Q8 rank half from GPU hidden state");
+    *output = out;
     return true;
 }
 
@@ -453,7 +522,7 @@ bool run_test() {
         expected_index_key, expected_pool_gate, expected_head_weights,
         expected_pooled, expected_pool_scores, expected_heads,
         expected_attn_output, expected_ffn_split, expected_ffn_hidden,
-        expected_router_weights;
+        expected_router_weights, expected_shared_output;
     std::vector<uint32_t> valid, expected_pool_valid, expected_selected_pools;
     std::vector<int32_t> expected_pool_indices, expected_selected_tokens,
         expected_router_ids;
@@ -507,7 +576,9 @@ bool run_test() {
           read_array(base + ".router_ids.i32", 8u,
                      expected_router_ids) &&
           read_array(base + ".router_weights.f32", 8u,
-                     expected_router_weights),
+                     expected_router_weights) &&
+          read_array(base + ".shared_output.f32", kHidden,
+                     expected_shared_output),
           "read sparse-MLA heads composition oracle dumps");
 
     Glm5TestGGUF gguf;
@@ -519,7 +590,8 @@ bool run_test() {
              pool_ape = 0u, index_norm_w = 0u, index_norm_b = 0u,
              attn_output_w = 0u, hc_ffn_fn = 0u, hc_ffn_base = 0u,
              hc_ffn_scale = 0u, ffn_norm = 0u, router_weight = 0u,
-             router_bias = 0u;
+             router_bias = 0u, shared_gate = 0u, shared_up = 0u,
+             shared_down = 0u;
     CHECK(gguf.tensor("blk.3.hc_attn_fn.weight", {16384u, 24u}, 30u,
                       hc_fn) &&
           gguf.tensor("blk.3.hc_attn_base.weight", {24u}, 0u, hc_base) &&
@@ -552,6 +624,13 @@ bool run_test() {
                       router_weight) &&
           gguf.tensor("blk.3.exp_probs_b.bias", {288u}, 0u, router_bias),
           "bind real block-3 mHC and sparse-MLA tensors");
+    CHECK(gguf.tensor("blk.3.ffn_gate_shexp.weight",
+                      {4096u, 2048u}, 8u, shared_gate) &&
+          gguf.tensor("blk.3.ffn_up_shexp.weight",
+                      {4096u, 2048u}, 8u, shared_up) &&
+          gguf.tensor("blk.3.ffn_down_shexp.weight",
+                      {2048u, 4096u}, 8u, shared_down),
+          "bind real block-3 shared Q8 expert tensors");
 
     ds4_gpu_config config = {};
     config.n_gpus = 1u;
@@ -868,6 +947,8 @@ bool run_test() {
         std::getenv("DS4_GLM5_BLOCK_SESSION_PROBE");
     const char *ffn_prerouter =
         std::getenv("DS4_GLM5_BLOCK_FFN_PREROUTER");
+    const char *ffn_shared =
+        std::getenv("DS4_GLM5_BLOCK_FFN_SHARED");
     CHECK(!block_probe ||
               ((block_probe[0] == '0' || block_probe[0] == '1') &&
                block_probe[1] == '\0'),
@@ -876,20 +957,28 @@ bool run_test() {
               ((ffn_prerouter[0] == '0' || ffn_prerouter[0] == '1') &&
                ffn_prerouter[1] == '\0'),
           "FFN prerouter mode must be exactly 0 or 1 when set");
+    CHECK(!ffn_shared ||
+              ((ffn_shared[0] == '0' || ffn_shared[0] == '1') &&
+               ffn_shared[1] == '\0'),
+          "FFN shared mode must be exactly 0 or 1 when set");
     const bool block_probe_enabled =
         block_probe && block_probe[0] == '1';
     const bool ffn_prerouter_enabled =
         ffn_prerouter && ffn_prerouter[0] == '1';
+    const bool ffn_shared_enabled = ffn_shared && ffn_shared[0] == '1';
     CHECK(!block_probe_enabled || tp_role,
           "block-session probe requires a TP role");
+    CHECK(!ffn_shared_enabled || (ffn_prerouter_enabled && tp_role),
+          "FFN shared mode requires prerouter mode and a TP role");
     uint64_t serial_route_hash = 0u;
+    FfnPrerouterState serial_ffn, roce_ffn;
     if (ffn_prerouter_enabled) {
         CHECK(run_ffn_prerouter(
                   gguf, d_hc_carried_add, hc_ffn_fn, hc_ffn_scale,
                   hc_ffn_base, ffn_norm, router_weight, router_bias,
                   expected_ffn_split, expected_ffn_hidden,
                   expected_router_ids, expected_router_weights,
-                  "serial", serial_route_hash),
+                  "serial", serial_route_hash, &serial_ffn),
               "serial attention carry reaches FFN prerouter");
     }
     if (tp_role) {
@@ -955,7 +1044,7 @@ bool run_test() {
                       hc_ffn_base, ffn_norm, router_weight, router_bias,
                       expected_ffn_split, expected_ffn_hidden,
                       expected_router_ids, expected_router_weights,
-                      "roce", roce_route_hash) &&
+                      "roce", roce_route_hash, &roce_ffn) &&
                   serial_route_hash == roce_route_hash,
                   "serial and RoCE FFN route states are identical");
             char error[256] = {};
@@ -963,6 +1052,55 @@ bool run_test() {
                       block_tp.tp, UINT64_C(0x474c4d3533420010),
                       roce_route_hash, error, sizeof(error)) == 1,
                   error);
+            if (ffn_shared_enabled) {
+                ds4_gpu_tensor *serial_half0 = nullptr;
+                ds4_gpu_tensor *serial_half1 = nullptr;
+                ds4_gpu_tensor *serial_sum = ds4_gpu_tensor_alloc(
+                    (uint64_t)kHidden * sizeof(float));
+                ds4_gpu_tensor *roce_local = nullptr;
+                const uint32_t local_half =
+                    std::strcmp(tp_role, "leader") == 0 ? 0u : 1u;
+                CHECK(serial_sum &&
+                      run_shared_half_gpu(
+                          gguf, serial_ffn.hidden, shared_gate, shared_up,
+                          shared_down, 0u, &serial_half0) &&
+                      run_shared_half_gpu(
+                          gguf, serial_ffn.hidden, shared_gate, shared_up,
+                          shared_down, 1u, &serial_half1) &&
+                      ds4_gpu_add_tensor(serial_sum, serial_half0,
+                                         serial_half1, kHidden) &&
+                      run_shared_half_gpu(
+                          gguf, roce_ffn.hidden, shared_gate, shared_up,
+                          shared_down, local_half, &roce_local) &&
+                      ds4_gpu_synchronize(),
+                      "execute serial and rank-local shared Q8 expert");
+                std::vector<float> got_shared, got_serial_local,
+                    got_roce_local;
+                CHECK(read_tensor(serial_sum, kHidden, got_shared) &&
+                      read_tensor(local_half == 0u ? serial_half0 :
+                                                     serial_half1,
+                                  kHidden, got_serial_local) &&
+                      read_tensor(roce_local, kHidden, got_roce_local) &&
+                      compare_values("shared_full", got_shared,
+                                     expected_shared_output,
+                                     8.0e-7, 1.0e-10) &&
+                      got_serial_local == got_roce_local,
+                      "shared Q8 serial/full and RoCE-local numerical gates");
+                std::fprintf(stderr,
+                    "GLM5 block FFN shared role=%s local_half=%u "
+                    "local_fnv=%016llx full_fnv=%016llx cache_bytes=0\n",
+                    tp_role, local_half,
+                    (unsigned long long)fnv1a64(
+                        got_roce_local.data(),
+                        got_roce_local.size() * sizeof(float)),
+                    (unsigned long long)fnv1a64(
+                        got_shared.data(),
+                        got_shared.size() * sizeof(float)));
+                ds4_gpu_tensor_free(roce_local);
+                ds4_gpu_tensor_free(serial_sum);
+                ds4_gpu_tensor_free(serial_half1);
+                ds4_gpu_tensor_free(serial_half0);
+            }
         }
         if (block_probe_enabled) {
             CHECK(run_second_gate_probe(
