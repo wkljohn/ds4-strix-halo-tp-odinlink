@@ -32,8 +32,8 @@ DS4_GLM5_MODEL ?= models/GLM-5.3-Flash-Q4_K.gguf
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_glm5_kda_schedule.o ds4_glm5_next_runtime.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -43,8 +43,8 @@ ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o ds4_glm5_kda_schedule.o ds4_glm5_next_runtime.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 # Resolve the ROCm toolchain once.  A gfx1151 build must not silently pick an
 # older `hipcc` from PATH when the validated 7.14 toolchain is available.
@@ -235,10 +235,10 @@ test-rocm-glm5-bf16-embedding: tests/test_rocm_glm5_bf16_embedding
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_bf16_embedding
 
 .PHONY: test-rocm-glm5-dense-block0 test-glm5-dense-block0-external-reference
-tests/test_rocm_glm5_dense_block0.o: tests/test_rocm_glm5_dense_block0.cu tests/glm5_gguf_test.hpp ds4_glm5_kda.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+tests/test_rocm_glm5_dense_block0.o: tests/test_rocm_glm5_dense_block0.cu tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp ds4_glm5_kda.h ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_rocm_glm5_dense_block0: tests/test_rocm_glm5_dense_block0.o ds4_glm5_kda.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+tests/test_rocm_glm5_dense_block0: tests/test_rocm_glm5_dense_block0.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-glm5-dense-block0: tests/test_rocm_glm5_dense_block0
@@ -675,14 +675,14 @@ check-rocm-strix:
 
 strix-halo: check-rocm-strix
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
 strix-halo-quality-score:
 	$(MAKE) -B gguf-tools/quality-testing/score_official \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -732,11 +732,17 @@ ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_glm5_kda.h ds4_glm5
 ds4_glm5_kda.o: ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_kda.c
 
+ds4_glm5_kda_schedule.o: ds4_glm5_kda.c ds4_glm5_kda.h
+	$(CC) $(CFLAGS) -DDS4_GLM5_KDA_SCHEDULE_ONLY -c -o $@ ds4_glm5_kda.c
+
 ds4_glm5_next_runtime.o: ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h ds4_glm5_kda.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_runtime.c
 
 ds4_glm5_next_state.o: ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_state.c
+
+ds4_glm5_next_exec.o: ds4_glm5_next_exec.c ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_exec.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c

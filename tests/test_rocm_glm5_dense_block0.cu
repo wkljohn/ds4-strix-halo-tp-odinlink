@@ -1,10 +1,12 @@
 #include "ds4_glm5_kda.h"
+#include "ds4_glm5_next_exec.h"
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 extern "C" {
 #include "ds4_tp.h"
 }
 #include "tests/glm5_gguf_test.hpp"
+#include "tests/glm5_next_real_offsets.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -276,10 +278,60 @@ static bool run_test(void) {
     const uint64_t hash = fnv64(first);
     CHECK(hash == kExpectedPrefixFNV,
           "complete dense-prefix output matches the pinned same-GGUF fingerprint");
+
+    ds4_glm5_next_model_offsets model_offsets = {};
+    ds4_glm5_next_state resident = {};
+    ds4_glm5_next_workspace *runtime_workspace = nullptr;
+    CHECK(glm5_next_bind_real_offsets(gguf, model_offsets) &&
+          ds4_glm5_next_state_init(&resident, &model_offsets, 1u, nullptr) &&
+          (runtime_workspace = ds4_glm5_next_workspace_create()) != nullptr,
+          "bind full model and allocate production resident runtime");
+    ds4_glm5_next_exec_ctx exec = {};
+    exec.model_map = gguf.map;
+    exec.model_size = gguf.size;
+    exec.model = &model_offsets;
+    ds4_gpu_tensor *tiny_output = ds4_gpu_tensor_alloc(sizeof(float));
+    CHECK(tiny_output && ds4_glm5_next_embed_token(&exec, 42u, tensors.cur) &&
+          !ds4_glm5_next_layer_forward(
+              &exec, 0u, &resident, runtime_workspace,
+              tensors.cur, tiny_output) &&
+          resident.valid && resident.kda.layer[0].token_count == 0u,
+          "undersized output fails before resident state mutation");
+    ds4_gpu_tensor_free(tiny_output);
+    const auto execute_runtime_prefix = [&](std::vector<float> &result) {
+        if (!ds4_glm5_next_embed_token(&exec, 42u, tensors.cur)) return false;
+        for (uint32_t il = 0u; il < 3u; ++il) {
+            if (!ds4_glm5_next_layer_forward(
+                    &exec, il, &resident, runtime_workspace,
+                    tensors.cur, tensors.out)) return false;
+            if (il + 1u < 3u) std::swap(tensors.cur, tensors.out);
+        }
+        result.resize(kHcWidth);
+        return ds4_gpu_tensor_read(tensors.out, 0u, result.data(),
+                                   (uint64_t)kHcWidth * sizeof(float)) != 0;
+    };
+    std::vector<float> runtime_first, runtime_second;
+    CHECK(execute_runtime_prefix(runtime_first) && runtime_first == first,
+          "production executor matches the independent dense-prefix harness");
+    CHECK(ds4_glm5_next_state_reset(&resident) &&
+          execute_runtime_prefix(runtime_second) &&
+          runtime_second == runtime_first,
+          "production resident executor is deterministic after atomic reset");
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(resident.kda.layer[il].token_count == 1u,
+              "production dense-prefix KDA state advances once");
+    }
+    CHECK(!ds4_glm5_next_layer_forward(
+              &exec, 3u, &resident, runtime_workspace,
+              tensors.cur, tensors.out) && resident.valid &&
+          resident.mla[3].token_count == 0u,
+          "unimplemented MLA+routed kind fails before resident mutation");
     std::fprintf(stderr,
                  "PASS same-GGUF GLM5 dense prefix block0=%016llx prefix=%016llx\n",
                  (unsigned long long)block0_hash,
                  (unsigned long long)hash);
+    ds4_glm5_next_workspace_destroy(runtime_workspace);
+    ds4_glm5_next_state_free(&resident);
     tensors.clear();
     ds4_glm5_kda_workspace_free(&workspace);
     ds4_glm5_kda_slot_free(&slot);

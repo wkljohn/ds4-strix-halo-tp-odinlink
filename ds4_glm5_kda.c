@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef DS4_GLM5_KDA_SCHEDULE_ONLY
 static int mul_u64(uint64_t a, uint64_t b, uint64_t *result) {
     if (!result || (a != 0 && b > UINT64_MAX / a)) return 0;
     *result = a * b;
@@ -52,6 +53,7 @@ int ds4_glm5_kda_state_bytes(uint64_t kda_count, uint32_t slot_count,
     }
     return 1;
 }
+#endif
 
 int ds4_glm5_kda_build_schedule(ds4_glm5_layer_kind *out,
                                 uint32_t capacity,
@@ -76,6 +78,7 @@ int ds4_glm5_kda_build_schedule(ds4_glm5_layer_kind *out,
     return 1;
 }
 
+#ifndef DS4_GLM5_KDA_SCHEDULE_ONLY
 void ds4_glm5_kda_slot_free(ds4_glm5_kda_slot *slot) {
     if (!slot) return;
     if (slot->layer) {
@@ -373,3 +376,4 @@ int ds4_glm5_kda_digest_equal(const ds4_glm5_kda_digest *rank0,
            rank0->recurrent_fnv64 == rank1->recurrent_fnv64 &&
            rank0->token_count == rank1->token_count;
 }
+#endif
