@@ -702,8 +702,8 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                x_elem_off);
-/* CUDA multi-row variant. Each input row contains only the owned contiguous
- * K slice, while each output row spans the full projection width. */
+/* Multi-row variant. Each input row contains only the owned contiguous K
+ * slice, while each output row spans the full projection width. */
 int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

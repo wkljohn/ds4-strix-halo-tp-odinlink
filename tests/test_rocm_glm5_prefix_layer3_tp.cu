@@ -45,6 +45,53 @@ uint64_t fnv64(const void *data, uint64_t bytes) {
     return hash;
 }
 
+struct VectorError {
+    double nrmse = 0.0;
+    double cosine = 0.0;
+    double max_abs = 0.0;
+};
+
+VectorError vector_error_data(const float *reference, const float *candidate,
+                              size_t count) {
+    VectorError result;
+    if (!reference || !candidate || count == 0u) {
+        result.nrmse = INFINITY;
+        result.cosine = -1.0;
+        result.max_abs = INFINITY;
+        return result;
+    }
+    long double diff2 = 0.0L, ref2 = 0.0L;
+    long double dot = 0.0L, candidate2 = 0.0L;
+    for (size_t i = 0u; i < count; ++i) {
+        const long double a = reference[i];
+        const long double b = candidate[i];
+        const long double d = b - a;
+        diff2 += d * d;
+        ref2 += a * a;
+        dot += a * b;
+        candidate2 += b * b;
+        result.max_abs = std::max(result.max_abs, std::fabs((double)d));
+    }
+    result.nrmse = ref2 > 0.0L ? std::sqrt((double)(diff2 / ref2)) :
+        (diff2 == 0.0L ? 0.0 : INFINITY);
+    result.cosine = ref2 > 0.0L && candidate2 > 0.0L ?
+        (double)(dot / std::sqrt(ref2 * candidate2)) : 0.0;
+    return result;
+}
+
+VectorError vector_error(const std::vector<float> &reference,
+                         const std::vector<float> &candidate) {
+    if (reference.size() != candidate.size()) {
+        VectorError invalid;
+        invalid.nrmse = INFINITY;
+        invalid.cosine = -1.0;
+        invalid.max_abs = INFINITY;
+        return invalid;
+    }
+    return vector_error_data(
+        reference.data(), candidate.data(), reference.size());
+}
+
 struct TensorGuard {
     ds4_gpu_tensor *value = nullptr;
     ~TensorGuard() { ds4_gpu_tensor_free(value); }
@@ -88,8 +135,12 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
                uint32_t context_capacity,
                TpGuard &guard, ds4_glm5_next_exec_ctx &exec,
                uint64_t &sequence) {
+    char direct_rows[32] = {};
+    CHECK(std::snprintf(direct_rows, sizeof(direct_rows), "%u",
+                        context_capacity) > 0,
+          "format exact TP batch row capacity");
     CHECK(setenv("DS4_TP_BIG_DIRECT", "1", 1) == 0 &&
-          setenv("DS4_TP_BIG_DIRECT_MAX_ROWS", "1", 1) == 0,
+          setenv("DS4_TP_BIG_DIRECT_MAX_ROWS", direct_rows, 1) == 0,
           "select mandatory direct RDMA");
     ds4_tp_options options = {};
     options.role = leader ? DS4_TP_LEADER : DS4_TP_WORKER;
@@ -139,14 +190,15 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
           ds4_tp_attach_slab(guard.tp, ds4_gpu_tensor_contents(guard.slab),
                              error, sizeof(error)), error);
     const uint64_t row_bytes = (uint64_t)kWidth * sizeof(float);
+    const uint64_t direct_bytes = (uint64_t)context_capacity * row_bytes;
     guard.big_out = ds4_gpu_tensor_view(
-        guard.slab, ds4_tp_slab_big_out_offset(guard.tp), row_bytes);
+        guard.slab, ds4_tp_slab_big_out_offset(guard.tp), direct_bytes);
     guard.big_in = ds4_gpu_tensor_view(
-        guard.slab, ds4_tp_slab_big_in_offset(guard.tp), row_bytes);
+        guard.slab, ds4_tp_slab_big_in_offset(guard.tp), direct_bytes);
     CHECK(guard.big_out && guard.big_in &&
           ds4_tp_big_gate_is_direct(
               guard.tp, ds4_gpu_tensor_contents(guard.big_out),
-              ds4_gpu_tensor_contents(guard.big_in), row_bytes),
+              ds4_gpu_tensor_contents(guard.big_in), direct_bytes),
           "GLM5 layer3 uses direct registered big-gate rows");
 
     exec.tp = guard.tp;
@@ -268,6 +320,23 @@ bool run() {
     const char *full_trunk_env = std::getenv("DS4_GLM5_FULL_TRUNK");
     const bool full_trunk = full_trunk_env &&
                             std::strcmp(full_trunk_env, "1") == 0;
+    const char *kda_batch_env =
+        std::getenv("DS4_GLM5_KDA_ROUTED_BATCH_TEST");
+    const bool kda_batch_test = kda_batch_env &&
+        std::strcmp(kda_batch_env, "1") == 0;
+    CHECK(!kda_batch_env || kda_batch_test ||
+              std::strcmp(kda_batch_env, "0") == 0,
+          "KDA routed batch test selector is exactly 0 or 1");
+    const char *kda_batch_rows_env =
+        std::getenv("DS4_GLM5_KDA_ROUTED_BATCH_ROWS");
+    char *kda_batch_rows_end = nullptr;
+    const unsigned long kda_batch_rows_long = kda_batch_rows_env ?
+        std::strtoul(kda_batch_rows_env, &kda_batch_rows_end, 10) : 3ul;
+    CHECK((!kda_batch_rows_env ||
+              (kda_batch_rows_end && *kda_batch_rows_end == '\0')) &&
+              (kda_batch_rows_long == 3ul || kda_batch_rows_long == 33ul),
+          "KDA routed batch rows are the bounded 3 or 33 fixture");
+    const uint32_t kda_batch_rows = (uint32_t)kda_batch_rows_long;
     const char *full_tokens_env = std::getenv("DS4_GLM5_FULL_TOKENS");
     const uint32_t full_tokens = !full_tokens_env ? 1u :
         std::strcmp(full_tokens_env, "1") == 0 ? 1u :
@@ -321,6 +390,8 @@ bool run() {
     }
     CHECK(!perf_mode || (text_mode && teacher_ids.empty()),
           "performance mode requires greedy text generation");
+    CHECK(!kda_batch_test || (full_trunk && !text_mode),
+          "KDA routed batch test requires full trunk and no text mode");
     CodecGuard codec;
     TokensGuard prompt_tokens;
     if (text_mode) {
@@ -334,7 +405,8 @@ bool run() {
               "real chat prompt token count is bounded to 1..64");
     }
     const uint32_t context_capacity = text_mode ?
-        (uint32_t)prompt_tokens.value.len + text_generate : 2u;
+        (uint32_t)prompt_tokens.value.len + text_generate :
+        kda_batch_test ? kda_batch_rows + 1u : 2u;
     Glm5NextKShardPlan kshard;
     CHECK(!full_trunk || glm5_next_build_kshard_plan(gguf, offsets, kshard),
           "build exact full-trunk compact residency plan");
@@ -409,6 +481,8 @@ bool run() {
         ((uint64_t)text_mode << 16u) ^ ((uint64_t)text_generate << 24u) ^
         ((uint64_t)perf_mode << 56u) ^
         ((uint64_t)layer_timing << 57u) ^
+        ((uint64_t)kda_batch_test << 58u) ^
+        ((uint64_t)kda_batch_rows << 32u) ^
         prompt_hash ^ teacher_hash;
     if (text_mode) {
         std::fprintf(stderr,
@@ -494,7 +568,7 @@ bool run() {
             (unsigned long long)(free_before_install - free_after_install));
     }
 
-    if (text_mode) {
+    if (text_mode || kda_batch_test) {
         char ready_error[256] = {};
         CHECK(ds4_gpu_synchronize() &&
                   ds4_tp_hash_check(
@@ -503,6 +577,234 @@ bool run() {
                       sizeof(ready_error)) == 1,
               ready_error[0] ? ready_error :
                   "both ranks ready after full-trunk residency");
+    }
+
+    if (kda_batch_test) {
+        using Clock = std::chrono::steady_clock;
+        const uint32_t rows = kda_batch_rows;
+        std::vector<uint32_t> ids;
+        if (rows == 3u) {
+            ids = {42u, 154822u, 154824u};
+        } else {
+            ids = {
+                154822u, 154824u, 154826u, 25062u, 287u, 29905u, 371u,
+                25u, 7487u, 154827u, 675u, 279u, 11478u, 7735u, 369u,
+                6623u, 323u, 279u, 3150u, 315u, 41907u, 323u, 4968u,
+                18110u, 558u, 13u, 21754u, 304u, 825u, 11646u, 13u,
+                154828u, 154841u,
+            };
+        }
+        CHECK(ids.size() == rows, "select exact KDA routed token fixture");
+        constexpr uint32_t continuation_id = 17u;
+        StateGuard sequential_state, batch_state;
+        WorkspaceGuard batch_workspace;
+        TensorGuard batch_ids, batch_input, batch_output, sequential_output;
+        CHECK(ds4_glm5_next_state_init(
+                  &sequential_state.value, &offsets, rows + 1u, nullptr) &&
+              ds4_glm5_next_state_init(
+                  &batch_state.value, &offsets, rows + 1u, nullptr) &&
+              (batch_workspace.value =
+                   ds4_glm5_next_workspace_create_capacity(rows)) != nullptr &&
+              (batch_ids.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * sizeof(uint32_t))) != nullptr &&
+              (batch_input.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              (batch_output.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              (sequential_output.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              ds4_gpu_tensor_write(batch_ids.value, 0u, ids.data(),
+                                    (uint64_t)rows * sizeof(uint32_t)) &&
+              ds4_glm5_next_embed_tokens(
+                  &exec, batch_ids.value, rows, batch_input.value),
+              "allocate exact KDA+routed row comparison");
+
+        const auto sequential_begin = Clock::now();
+        for (uint32_t row = 0u; row < rows; ++row) {
+            ds4_gpu_tensor *row_input = ds4_gpu_tensor_view(
+                batch_input.value,
+                (uint64_t)row * kHcWidth * sizeof(float),
+                (uint64_t)kHcWidth * sizeof(float));
+            ds4_gpu_tensor *row_output = ds4_gpu_tensor_view(
+                sequential_output.value,
+                (uint64_t)row * kHcWidth * sizeof(float),
+                (uint64_t)kHcWidth * sizeof(float));
+            const bool row_ok = row_input && row_output &&
+                ds4_glm5_next_layer_forward(
+                    &exec, 4u, &sequential_state.value,
+                    workspace.value, row_input, row_output);
+            ds4_gpu_tensor_free(row_output);
+            ds4_gpu_tensor_free(row_input);
+            CHECK(row_ok,
+                  "execute sequential KDA+routed comparison row");
+        }
+        const auto sequential_end = Clock::now();
+
+        const auto batch_begin = Clock::now();
+        CHECK(ds4_glm5_next_layer_forward_batch(
+                  &exec, 4u, &batch_state.value, batch_workspace.value,
+                  batch_input.value, batch_output.value, rows),
+              "execute production KDA+routed batch");
+        const auto batch_end = Clock::now();
+        const double sequential_ms =
+            std::chrono::duration<double, std::milli>(
+                sequential_end - sequential_begin).count();
+        const double batch_ms =
+            std::chrono::duration<double, std::milli>(
+                batch_end - batch_begin).count();
+        std::vector<float> sequential((uint64_t)rows * kHcWidth);
+        std::vector<float> batch((uint64_t)rows * kHcWidth);
+        CHECK(ds4_gpu_tensor_read(
+                  sequential_output.value, 0u, sequential.data(),
+                  sequential.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(batch_output.value, 0u, batch.data(),
+                                  batch.size() * sizeof(float)),
+              "read sequential and production KDA+routed rows");
+        const VectorError batch_error = vector_error(sequential, batch);
+        VectorError worst_row;
+        worst_row.cosine = 1.0;
+        uint32_t worst_nrmse_row = 0u, worst_cosine_row = 0u;
+        uint32_t worst_max_abs_row = 0u;
+        for (uint32_t row = 0u; row < rows; ++row) {
+            const VectorError row_error = vector_error_data(
+                sequential.data() + (uint64_t)row * kHcWidth,
+                batch.data() + (uint64_t)row * kHcWidth, kHcWidth);
+            if (row == 0u || row_error.nrmse > worst_row.nrmse) {
+                worst_row.nrmse = row_error.nrmse;
+                worst_nrmse_row = row;
+            }
+            if (row == 0u || row_error.cosine < worst_row.cosine) {
+                worst_row.cosine = row_error.cosine;
+                worst_cosine_row = row;
+            }
+            if (row == 0u || row_error.max_abs > worst_row.max_abs) {
+                worst_row.max_abs = row_error.max_abs;
+                worst_max_abs_row = row;
+            }
+        }
+        std::fprintf(stderr,
+            "GLM5 KDA+routed batch measurement role=%s rows=%u "
+            "nrmse=%.9g cosine=%.12g max_abs=%.9g "
+            "worst_row_nrmse=%.9g worst_nrmse_row=%u "
+            "worst_row_cosine=%.12g worst_cosine_row=%u "
+            "worst_row_max_abs=%.9g worst_max_abs_row=%u "
+            "sequential_ms=%.3f batch_ms=%.3f speedup=%.3fx\n",
+            role, rows, batch_error.nrmse, batch_error.cosine,
+            batch_error.max_abs,
+            worst_row.nrmse, worst_nrmse_row,
+            worst_row.cosine, worst_cosine_row,
+            worst_row.max_abs, worst_max_abs_row,
+            sequential_ms, batch_ms,
+            sequential_ms / batch_ms);
+        /* These bounds are pinned from the independently recorded 33-row
+         * measurement with approximately 3x headroom. The batch Q4_K WMMA
+         * lane intentionally has a different reduction path; later full-logit
+         * and teacher gates decide whether that arithmetic is promotable. */
+        const double nrmse_bound = rows == 3u ? 4.1e-3 : 7.0e-3;
+        const double cosine_bound = rows == 3u ? 0.999997 : 0.999993;
+        const double max_abs_bound = rows == 3u ? 3.6e-4 : 2.5e-3;
+        CHECK(batch_error.nrmse <= nrmse_bound &&
+                  batch_error.cosine >= cosine_bound &&
+                  batch_error.max_abs <= max_abs_bound,
+              "KDA+routed batch matches sequential same-GGUF execution");
+        const uint64_t batch_hash =
+            fnv64(batch.data(), batch.size() * sizeof(float));
+        char batch_hash_error[256] = {};
+        CHECK(ds4_tp_hash_check(
+                  tp.tp, UINT64_C(0x474c4d354b424154), batch_hash,
+                  batch_hash_error, sizeof(batch_hash_error)) == 1,
+              batch_hash_error);
+
+        ds4_glm5_kda_digest sequential_digest = {};
+        ds4_glm5_kda_digest batch_digest = {};
+        CHECK(ds4_glm5_kda_layer_digest(
+                  &sequential_state.value.kda.layer[4], batch_output.value,
+                  1u, &sequential_digest) &&
+              ds4_glm5_kda_layer_digest(
+                  &batch_state.value.kda.layer[4], batch_output.value,
+                  1u, &batch_digest),
+              "read sequential and batch KDA recurrent digests");
+        const bool recurrent_digest_equal =
+            sequential_digest.q_history_fnv64 ==
+                batch_digest.q_history_fnv64 &&
+            sequential_digest.k_history_fnv64 ==
+                batch_digest.k_history_fnv64 &&
+            sequential_digest.v_history_fnv64 ==
+                batch_digest.v_history_fnv64 &&
+            sequential_digest.recurrent_fnv64 ==
+                batch_digest.recurrent_fnv64 &&
+            sequential_digest.token_count == batch_digest.token_count;
+        const uint64_t batch_digest_hash =
+            fnv64(&batch_digest, sizeof(batch_digest));
+        char batch_digest_error[256] = {};
+        CHECK(ds4_tp_hash_check(
+                  tp.tp, UINT64_C(0x474c4d354b444947), batch_digest_hash,
+                  batch_digest_error, sizeof(batch_digest_error)) == 1,
+              batch_digest_error);
+        std::fprintf(stderr,
+            "GLM5 KDA+routed state role=%s recurrent_digest_equal=%d "
+            "sequential_recurrent=%016llx batch_recurrent=%016llx "
+            "batch_digest=%016llx\n",
+            role, recurrent_digest_equal ? 1 : 0,
+            (unsigned long long)sequential_digest.recurrent_fnv64,
+            (unsigned long long)batch_digest.recurrent_fnv64,
+            (unsigned long long)batch_digest_hash);
+
+        std::vector<float> sequential_continue(kHcWidth);
+        std::vector<float> batch_continue(kHcWidth);
+        CHECK(ds4_glm5_next_embed_token(
+                  &exec, continuation_id, current.value) &&
+              ds4_glm5_next_layer_forward(
+                  &exec, 4u, &sequential_state.value, workspace.value,
+                  current.value, output.value) &&
+              ds4_gpu_tensor_read(output.value, 0u,
+                                   sequential_continue.data(),
+                                   (uint64_t)kHcWidth * sizeof(float)) &&
+              ds4_glm5_next_layer_forward(
+                  &exec, 4u, &batch_state.value, workspace.value,
+                  current.value, output.value) &&
+              ds4_gpu_tensor_read(output.value, 0u, batch_continue.data(),
+                                   (uint64_t)kHcWidth * sizeof(float)),
+              "execute one-row continuation after KDA+routed batch");
+        const VectorError continuation_error =
+            vector_error(sequential_continue, batch_continue);
+        std::fprintf(stderr,
+            "GLM5 KDA+routed continuation measurement role=%s "
+            "nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+            role, continuation_error.nrmse, continuation_error.cosine,
+            continuation_error.max_abs);
+        CHECK(continuation_error.nrmse <= 5.0e-4 &&
+                  continuation_error.cosine >= 0.9999999 &&
+                  continuation_error.max_abs <= 2.5e-5,
+              "ordinary decode continues from KDA+routed batch state");
+        const uint64_t continuation_hash = fnv64(
+            batch_continue.data(), batch_continue.size() * sizeof(float));
+        char continuation_hash_error[256] = {};
+        CHECK(ds4_tp_hash_check(
+                  tp.tp, UINT64_C(0x474c4d354b434f4e), continuation_hash,
+                  continuation_hash_error,
+                  sizeof(continuation_hash_error)) == 1,
+              continuation_hash_error);
+        CHECK(sequential_state.value.kda.layer[4].token_count == rows + 1u &&
+                  batch_state.value.kda.layer[4].token_count == rows + 1u &&
+                  sequential_state.value.valid && batch_state.value.valid,
+              "both KDA+routed paths commit identical recurrent length");
+        std::fprintf(stderr,
+            "PASS GLM5 KDA+routed batch role=%s rows=%u layer=4 "
+            "nrmse=%.9g cosine=%.12g max_abs=%.9g output=%016llx "
+            "continue_nrmse=%.9g continue_cosine=%.12g "
+            "continue_max_abs=%.9g continuation=%016llx "
+            "sequential_ms=%.3f batch_ms=%.3f speedup=%.3fx "
+            "tp_seq=%llu packed_q4_bytes=%llu rdma=1\n",
+            role, rows, batch_error.nrmse, batch_error.cosine,
+            batch_error.max_abs, (unsigned long long)batch_hash,
+            continuation_error.nrmse, continuation_error.cosine,
+            continuation_error.max_abs,
+            (unsigned long long)continuation_hash,
+            sequential_ms, batch_ms, sequential_ms / batch_ms,
+            (unsigned long long)sequence,
+            (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
+        return true;
     }
 
     if (text_mode) {

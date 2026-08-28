@@ -71,6 +71,8 @@ TEXT_PROMPT=${DS4_GLM5_TEXT_PROMPT:-}
 TEXT_GENERATE=${DS4_GLM5_TEXT_GENERATE:-4}
 TEXT_TEACHER_IDS=${DS4_GLM5_TEXT_TEACHER_IDS:-}
 PERF_MODE=${DS4_GLM5_PERF_MODE:-0}
+KDA_ROUTED_BATCH_TEST=${DS4_GLM5_KDA_ROUTED_BATCH_TEST:-0}
+KDA_ROUTED_BATCH_ROWS=${DS4_GLM5_KDA_ROUTED_BATCH_ROWS:-3}
 EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
@@ -123,6 +125,19 @@ done
 }
 [[ $PERF_MODE == 0 || $PERF_MODE == 1 ]] || {
   echo "error: DS4_GLM5_PERF_MODE must be 0 or 1" >&2
+  exit 2
+}
+[[ $KDA_ROUTED_BATCH_TEST == 0 || $KDA_ROUTED_BATCH_TEST == 1 ]] || {
+  echo "error: DS4_GLM5_KDA_ROUTED_BATCH_TEST must be 0 or 1" >&2
+  exit 2
+}
+[[ $KDA_ROUTED_BATCH_TEST == 0 ||
+   ($FULL_TRUNK == 1 && -z $TEXT_PROMPT) ]] || {
+  echo "error: KDA routed batch test requires full trunk and no text prompt" >&2
+  exit 2
+}
+[[ $KDA_ROUTED_BATCH_ROWS == 3 || $KDA_ROUTED_BATCH_ROWS == 33 ]] || {
+  echo "error: DS4_GLM5_KDA_ROUTED_BATCH_ROWS must be 3 or 33" >&2
   exit 2
 }
 [[ -z $EXPECTED_GENERATED_FNV ||
@@ -336,6 +351,8 @@ printf 'text_mode=%s\n' "$([[ -n $TEXT_PROMPT ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
 printf 'text_generate=%s\n' "$TEXT_GENERATE" >>"$OUT/run.env"
 printf 'perf_mode=%s\n' "$PERF_MODE" >>"$OUT/run.env"
+printf 'kda_routed_batch_test=%s\n' "$KDA_ROUTED_BATCH_TEST" >>"$OUT/run.env"
+printf 'kda_routed_batch_rows=%s\n' "$KDA_ROUTED_BATCH_ROWS" >>"$OUT/run.env"
 printf 'expected_generated_fnv=%s\n' "$EXPECTED_GENERATED_FNV" >>"$OUT/run.env"
 if [[ -n $TEXT_PROMPT ]]; then
   printf 'text_prompt=%s\n' "$TEXT_PROMPT" >>"$OUT/run.env"
@@ -391,12 +408,14 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_TP_CONNECT_TIMEOUT_SEC="$TIMEOUT" \
   DS4_GLM5_FULL_TRUNK="$FULL_TRUNK" \
   DS4_GLM5_FULL_TOKENS="$FULL_TOKENS" \
+  DS4_GLM5_KDA_ROUTED_BATCH_TEST="$KDA_ROUTED_BATCH_TEST" \
+  DS4_GLM5_KDA_ROUTED_BATCH_ROWS="$KDA_ROUTED_BATCH_ROWS" \
   "${local_rdma_env[@]}" \
   "${text_env[@]}" \
   "$BINARY" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS'$remote_rdma_env$remote_text_env '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS'$remote_rdma_env$remote_text_env '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 
@@ -424,7 +443,9 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
     grep -q '"fallback_calls":0' "$log"
     ! grep -q 'rdma device mlx5_' "$log"
   fi
-  if [[ -n $TEXT_PROMPT ]]; then
+  if [[ $KDA_ROUTED_BATCH_TEST == 1 ]]; then
+    grep -q 'PASS GLM5 KDA+routed batch role=' "$log"
+  elif [[ -n $TEXT_PROMPT ]]; then
     grep -q 'GLM5 text prompt role=' "$log"
     grep -q 'PASS GLM5 real-text role=' "$log"
     if [[ $PERF_MODE == 1 ]]; then
@@ -444,7 +465,17 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
     grep -q 'window_cache_bytes=0 rdma=1' "$log"
   fi
 done
-if [[ -n $TEXT_PROMPT ]]; then
+if [[ $KDA_ROUTED_BATCH_TEST == 1 ]]; then
+  LEADER_OUTPUT=$(sed -n '/PASS GLM5 KDA+routed batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+  WORKER_OUTPUT=$(sed -n '/PASS GLM5 KDA+routed batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  LEADER_CONT=$(sed -n '/PASS GLM5 KDA+routed batch role=/s/.* continuation=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+  WORKER_CONT=$(sed -n '/PASS GLM5 KDA+routed batch role=/s/.* continuation=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  [[ -n $LEADER_OUTPUT && $LEADER_OUTPUT == "$WORKER_OUTPUT" &&
+     -n $LEADER_CONT && $LEADER_CONT == "$WORKER_CONT" ]] || {
+    echo "error: all-rank KDA+routed batch or continuation hashes differ" >&2
+    exit 1
+  }
+elif [[ -n $TEXT_PROMPT ]]; then
   LEADER_OUTPUT=$(sed -n 's/.* generated_fnv=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
   WORKER_OUTPUT=$(sed -n 's/.* generated_fnv=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
   LEADER_IDS=$(sed -n '/GLM5 text prompt /s/.* token_fnv=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
@@ -467,7 +498,8 @@ else
     exit 1
   }
 fi
-if [[ $FULL_TRUNK == 1 && -z $TEXT_PROMPT ]]; then
+if [[ $FULL_TRUNK == 1 && -z $TEXT_PROMPT &&
+      $KDA_ROUTED_BATCH_TEST == 0 ]]; then
   LEADER_TRUNK=$(sed -n 's/.* trunk_output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
   WORKER_TRUNK=$(sed -n 's/.* trunk_output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
   LEADER_LOGITS=$(sed -n 's/.* logits=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)

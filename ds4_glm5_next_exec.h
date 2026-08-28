@@ -69,9 +69,9 @@ int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
                                 const ds4_gpu_tensor *hc_in,
                                 ds4_gpu_tensor *hc_out);
 
-/* Exact-capacity multi-row execution.  The first independently validated
- * slice supports the replicated dense KDA prefix only; every other layer kind
- * fails before mutating resident state. */
+/* Exact-capacity multi-row execution. Independently validated layer kinds are
+ * enabled one at a time; unsupported combinations fail before mutating
+ * resident state. */
 int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
                                       uint32_t layer,
                                       ds4_glm5_next_state *state,

@@ -1713,9 +1713,11 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
  * makes it read exactly the K-slice of every row. The caller supplies an x
  * already offset to the slice, matching ds4_cuda.cu:27498-27505.
  *
- * DECODE ONLY. This uses the n_tok == 1 shared-x path; n_tok > 1 fails closed
- * with a message rather than silently computing the wrong thing. Prefill is
- * blocked by separate unavailable-stubs anyway.
+ * Decode retains the one-row shared-x path. Multi-row callers quantize only
+ * the compact activation slice and reuse the existing DP4A token-tile kernel
+ * in bounded eight-row chunks. Passing the full source row stride while
+ * shifting the weight base to block_start preserves the packed Q8_0 layout
+ * without copying or expanding weights.
  * ------------------------------------------------------------------------ */
 extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
@@ -1729,12 +1731,8 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
      * ds4_cuda.cu:15800 applies the identical guard. */
     if ((in_start % 32u) != 0u || (in_count % 32u) != 0u ||
         in_start > in_dim || in_count > in_dim - in_start) return 0;
-    if (n_tok != 1u) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "q8_0 kslice: only n_tok==1 (decode) implemented, got %llu\n",
-                (unsigned long long)n_tok);
-        return 0;
-    }
+    if (n_tok > UINT32_MAX || out_dim > UINT32_MAX ||
+        in_count > UINT32_MAX) return 0;
     const uint64_t full_blocks  = (in_dim + 31u) / 32u;
     const uint64_t block_start  = in_start / 32u;
     const uint64_t slice_blocks = in_count / 32u;
@@ -1743,10 +1741,15 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     if (weight_offset > model_size ||
         !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
         weight_bytes > model_size - weight_offset) return 0;
-    if (x->bytes < in_count * sizeof(float) ||
-        out->bytes < out_dim * sizeof(float)) return 0;
-    /* The shared-x kernel stages the whole slice in LDS. */
-    if (in_count > 8192u) {
+    uint64_t x_elements = 0u, out_elements = 0u;
+    if (!cuda_u64_mul_checked(n_tok, in_count, &x_elements) ||
+        !cuda_u64_mul_checked(n_tok, out_dim, &out_elements) ||
+        x_elements > UINT64_MAX / sizeof(float) ||
+        out_elements > UINT64_MAX / sizeof(float) ||
+        x->bytes < x_elements * sizeof(float) ||
+        out->bytes < out_elements * sizeof(float)) return 0;
+    /* Only the one-row shared-x kernel stages the whole slice in LDS. */
+    if (n_tok == 1u && in_count > 8192u) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "q8_0 kslice: slice %llu exceeds the shared-x LDS budget\n",
                 (unsigned long long)in_count);
@@ -1755,6 +1758,50 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes,
                                             "q8_0_kslice");
     if (!wptr) return 0;
+
+    if (n_tok > 1u) {
+        uint64_t quantized_count = 0u, scale_count = 0u;
+        if (!cuda_u64_mul3_checked(n_tok, slice_blocks, 32u,
+                                   &quantized_count) ||
+            !cuda_u64_mul_checked(n_tok, slice_blocks, &scale_count)) {
+            return 0;
+        }
+        const uint64_t scale_offset =
+            (quantized_count + 15u) & ~UINT64_C(15);
+        if (scale_count > (UINT64_MAX - scale_offset) / sizeof(float)) {
+            return 0;
+        }
+        const uint64_t tmp_bytes =
+            scale_offset + scale_count * sizeof(float);
+        void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 kslice rows prequant");
+        if (!tmp) return 0;
+        int8_t *xq = (int8_t *)tmp;
+        float *xscale = (float *)((char *)tmp + scale_offset);
+        const dim3 qgrid((uint32_t)slice_blocks, (uint32_t)n_tok, 1u);
+        quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+            xq, xscale, (const float *)x->ptr, in_count, slice_blocks);
+        if (!cuda_ok(cudaGetLastError(),
+                     "q8_0 kslice rows quantize launch")) return 0;
+        const unsigned char *slice_w =
+            reinterpret_cast<const unsigned char *>(wptr) +
+            block_start * 34u;
+        uint64_t token_base = 0u;
+        while (token_base < n_tok) {
+            const uint32_t rows = (uint32_t)(
+                n_tok - token_base > 8u ? 8u : n_tok - token_base);
+            cuda_launch_q8_small_batch_dp4a(
+                (float *)out->ptr + token_base * out_dim,
+                slice_w,
+                xq + token_base * slice_blocks * 32u,
+                xscale + token_base * slice_blocks,
+                (uint32_t)slice_blocks, (uint32_t)out_dim,
+                rows, row_bytes);
+            if (!cuda_ok(cudaGetLastError(),
+                         "q8_0 kslice rows DP4A launch")) return 0;
+            token_base += rows;
+        }
+        return 1;
+    }
 
     const unsigned threads = attention_output_expand_threads();
     const unsigned rows_per_block = threads / 32u;
