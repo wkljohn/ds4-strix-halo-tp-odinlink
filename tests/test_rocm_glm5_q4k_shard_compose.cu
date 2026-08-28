@@ -1,6 +1,9 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 #include "tests/glm5_gguf_test.hpp"
+extern "C" {
+#include "ds4_tp.h"
+}
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -21,8 +24,6 @@
     }                                                                       \
 } while (0)
 
-typedef int (*ds4_tp_devcopy_fn)(void *, const void *, uint64_t);
-extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
 extern "C" int ds4_gpu_routed_moe_batch_q4k_direct_control(
         ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
         ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, const void *,
@@ -82,6 +83,21 @@ struct RuntimeGuard {
     bool active = false;
     ~RuntimeGuard() {
         if (active) ds4_gpu_cleanup();
+    }
+};
+
+struct TpGuard {
+    ds4_tp *tp = nullptr;
+    void *slab = nullptr;
+
+    ~TpGuard() {
+        if (tp) ds4_tp_free(tp);
+        if (slab) {
+            const hipError_t rc = hipHostFree(slab);
+            if (rc != hipSuccess)
+                std::fprintf(stderr, "WARN hipHostFree TP slab: %s\n",
+                             hipGetErrorString(rc));
+        }
     }
 };
 
@@ -488,6 +504,145 @@ bool launch(ds4_gpu_tensor &out, ds4_gpu_tensor &gate,
         3u, kTokens, mid_dim);
     if (!launched || !ds4_gpu_synchronize()) return false;
     return hipGetLastError() == hipSuccess;
+}
+
+bool run_roce_composition(const Glm5TestGGUF &gguf,
+                          const std::vector<float> &reference,
+                          const std::vector<float> &half0,
+                          const std::vector<float> &half1,
+                          uint64_t route_contract_hash) {
+    const char *role_value = std::getenv("DS4_GLM5_TP_ROLE");
+    if (!role_value) return true;
+    CHECK(std::strcmp(role_value, "leader") == 0 ||
+          std::strcmp(role_value, "worker") == 0,
+          "DS4_GLM5_TP_ROLE must be exactly leader or worker");
+    const bool leader = std::strcmp(role_value, "leader") == 0;
+    const char *host = std::getenv("DS4_GLM5_TP_HOST");
+    const char *device = std::getenv("DS4_GLM5_TP_RDMA_DEVICE");
+    const char *port_value = std::getenv("DS4_GLM5_TP_PORT");
+    const char *connect_timeout =
+        std::getenv("DS4_GLM5_TP_CONNECT_TIMEOUT_SEC");
+    if (!connect_timeout || !connect_timeout[0]) connect_timeout = "120";
+    CHECK(host && host[0] && device && device[0] && port_value && port_value[0],
+          "bounded TP host, RDMA device, and port are required");
+    char *port_end = nullptr;
+    const long port = std::strtol(port_value, &port_end, 10);
+    CHECK(port_end && *port_end == '\0' && port >= 1024 && port <= 65535,
+          "bounded TP port range");
+    const std::string direct_rows = std::to_string(kTokens);
+    CHECK(setenv("DS4_TP_BIG_DIRECT", "1", 1) == 0 &&
+          setenv("DS4_TP_BIG_DIRECT_MAX_ROWS", direct_rows.c_str(), 1) == 0 &&
+          setenv("DS4_TP_CONNECT_TIMEOUT_SEC", connect_timeout, 1) == 0 &&
+          unsetenv("DS4_TP_VERBS_LIB") == 0,
+          "select bounded system-verbs RoCE slab");
+    std::fprintf(stderr,
+        "GLM5 bounded TP setup system_verbs=1 big_direct=1 rows=%u "
+        "connect_timeout=%ss route_contract=%016llx\n",
+        kTokens, connect_timeout, (unsigned long long)route_contract_hash);
+
+    ds4_tp_options options = {};
+    options.role = leader ? DS4_TP_LEADER : DS4_TP_WORKER;
+    options.requested = true;
+    options.listen_host = leader ? host : nullptr;
+    options.listen_port = leader ? (int)port : 0;
+    options.leader_host = leader ? nullptr : host;
+    options.leader_port = leader ? 0 : (int)port;
+    options.transport = DS4_TP_TRANSPORT_RDMA;
+    options.rdma_device = device;
+    options.rdma_gid_index = 3;
+    options.rdma_gid_index_set = true;
+
+    ds4_tp_identity identity = {};
+    identity.gguf_bytes = gguf.size;
+    identity.model_id = 3u;  // DS4_VARIANT_GLM53
+    // Keep the real graph depth in the hello/slab geometry. The current bulk
+    // capability predicate requires the normal >=4 MiB batch region even for
+    // a direct big-region payload; this test does not use that staging region.
+    identity.n_layer = 46;
+    identity.n_embd = kOutput;
+    identity.n_vocab = 154880u;
+    identity.quant_bits = 4;
+    identity.ctx_size = kTokens;
+    identity.runtime_features =
+        DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD;
+    identity.gate_slot_start = 3u * DS4_TP_GATES_PER_LAYER +
+                               DS4_TP_GATE_FFN;
+    identity.gate_slot_step = DS4_TP_GATES_PER_LAYER;
+    identity.gates_per_token = 46u - 1u - 3u;
+
+    TpGuard transport;
+    char error[256] = {};
+    CHECK(ds4_tp_create(&transport.tp, &options, &identity,
+                        error, sizeof(error)), error);
+    CHECK(ds4_tp_is_rdma(transport.tp),
+          "explicit bounded TP transport is RDMA");
+    CHECK(ds4_tp_requires_host_slab(transport.tp),
+          "mlx5 selects mapped host slab");
+    const uint64_t slab_bytes = ds4_tp_alloc_slab_bytes(transport.tp);
+    CHECK(slab_bytes != 0 &&
+          hipHostMalloc(&transport.slab, slab_bytes,
+                        hipHostMallocMapped) == hipSuccess,
+          "allocate bounded mapped RoCE slab");
+    CHECK(ds4_tp_attach_slab(transport.tp, transport.slab,
+                             error, sizeof(error)), error);
+    CHECK(ds4_tp_big_gate_is_rdma_capable(transport.tp),
+          "bounded TP bulk gate is RDMA capable after slab registration");
+    CHECK(ds4_tp_hash_check(transport.tp, UINT64_C(0x474c4d5200000001),
+                            route_contract_hash,
+                            error, sizeof(error)) == 1,
+          error);
+
+    const uint64_t bytes = (uint64_t)reference.size() * sizeof(float);
+    const uint64_t capacity_bytes =
+        (uint64_t)ds4_tp_big_capacity_rows(transport.tp) *
+        kOutput * sizeof(float);
+    CHECK(ds4_tp_big_capacity_rows(transport.tp) >= kTokens &&
+          bytes <= capacity_bytes,
+          "bounded TP payload fits each registered big region");
+    auto *base = static_cast<uint8_t *>(transport.slab);
+    float *out = reinterpret_cast<float *>(
+        base + ds4_tp_slab_big_out_offset(transport.tp));
+    float *in = reinterpret_cast<float *>(
+        base + ds4_tp_slab_big_in_offset(transport.tp));
+    const std::vector<float> &local = leader ? half0 : half1;
+    CHECK(local.size() == reference.size() && half0.size() == half1.size(),
+          "bounded TP output shapes");
+    std::memcpy(out, local.data(), (size_t)bytes);
+    std::memset(in, 0, (size_t)bytes);
+    CHECK(ds4_tp_big_gate_is_direct(transport.tp, out, in, bytes),
+          "bounded TP payload uses the registered direct regions");
+    CHECK(ds4_tp_big_gate_exchange(transport.tp, 3u, 1u,
+                                   out, in, bytes),
+          "exchange bounded GLM5 half over RoCE");
+
+    OracleStats composition;
+    std::vector<float> composed(reference.size());
+    for (size_t i = 0; i < reference.size(); ++i) {
+        composed[i] = out[i] + in[i];
+        composition.add(composed[i], reference[i], 3.0e-7, 3.0e-7);
+    }
+    const uint64_t composed_fnv =
+        fnv1a64(composed.data(), bytes);
+    CHECK(ds4_tp_hash_check(transport.tp, UINT64_C(0x474c4d5200000002),
+                            composed_fnv,
+                            error, sizeof(error)) == 1,
+          error);
+    std::fprintf(stderr,
+        "GLM5 bounded TP RoCE role=%s device=%s bytes=%llu "
+        "direct=1 "
+        "bad=%llu max_abs=%.9g max_rel=%.9g "
+        "local_fnv=%016llx peer_fnv=%016llx composed_fnv=%016llx "
+        "reference_fnv=%016llx\n",
+        role_value, device, (unsigned long long)bytes,
+        (unsigned long long)composition.bad,
+        composition.max_abs, composition.max_rel,
+        (unsigned long long)fnv1a64(out, bytes),
+        (unsigned long long)fnv1a64(in, bytes),
+        (unsigned long long)composed_fnv,
+        (unsigned long long)fnv1a64(reference.data(), bytes));
+    CHECK(composition.pass(),
+          "bounded two-process RoCE composition matches full Q4_K oracle");
+    return true;
 }
 
 bool run_test() {
@@ -1185,13 +1340,22 @@ bool run_test() {
     CHECK(pass, "same-GGUF 1024/1024 top-8 numerical envelope");
     CHECK(oracle_pass,
           "sampled same-GGUF scalar mid and conditioned-down arithmetic oracle");
+    CHECK(!std::getenv("DS4_GLM5_TP_ROLE") || router_dynamic,
+          "bounded TP RoCE composition requires dynamic GPU routing");
+    const uint64_t route_contract_hash =
+        routed_ids_fnv ^
+        ((route_weights_fnv << 1u) | (route_weights_fnv >> 63u));
+    CHECK(run_roce_composition(gguf, reference, half0, half1,
+                               route_contract_hash),
+          "bounded TP RoCE composition");
     std::fprintf(stderr,
                  "PASS same-GGUF GLM5 Q4_K router_bridge=%d "
                  "router_dynamic=%d "
-                 "route_source=%s sampled "
+                 "route_source=%s tp_roce=%d sampled "
                  "scalar-mid, conditioned-down, and top-8 shard "
                  "split-consistency\n",
-                 router_bridge, router_dynamic, route_source);
+                 router_bridge, router_dynamic, route_source,
+                 std::getenv("DS4_GLM5_TP_ROLE") != nullptr);
     return true;
 }
 
