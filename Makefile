@@ -234,6 +234,16 @@ tests/test_rocm_glm5_bf16_embedding: tests/test_rocm_glm5_bf16_embedding.o tests
 test-rocm-glm5-bf16-embedding: tests/test_rocm_glm5_bf16_embedding
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_bf16_embedding
 
+.PHONY: test-rocm-glm5-dense-block0
+tests/test_rocm_glm5_dense_block0.o: tests/test_rocm_glm5_dense_block0.cu tests/glm5_gguf_test.hpp ds4_glm5_kda.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
+
+tests/test_rocm_glm5_dense_block0: tests/test_rocm_glm5_dense_block0.o ds4_glm5_kda.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-dense-block0: tests/test_rocm_glm5_dense_block0
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_dense_block0
+
 .PHONY: test-rocm-glm5-mhc-carry
 tests/test_rocm_glm5_mhc_carry.o: tests/test_rocm_glm5_mhc_carry.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
