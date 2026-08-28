@@ -10224,6 +10224,38 @@ int ds4_gpu_q4k_packed_slice_load_expert(
     return 0;
 }
 
+ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
+        const ds4_gpu_q4k_window_cache_config *config) {
+    (void)config; return NULL;
+}
+void ds4_gpu_q4k_window_cache_destroy(ds4_gpu_q4k_window_cache *cache) {
+    (void)cache;
+}
+int ds4_gpu_q4k_window_cache_prepare(
+        ds4_gpu_q4k_window_cache *cache, const int32_t *expert_ids,
+        uint32_t count, int32_t *slot_ids) {
+    (void)cache; (void)expert_ids; (void)count; (void)slot_ids; return 0;
+}
+int ds4_gpu_q4k_window_cache_device_view(
+        const ds4_gpu_q4k_window_cache *cache, const void **gate,
+        const void **up, const void **down, uint64_t *gate_expert_bytes,
+        uint64_t *down_expert_bytes) {
+    (void)cache; (void)gate; (void)up; (void)down;
+    (void)gate_expert_bytes; (void)down_expert_bytes; return 0;
+}
+int ds4_gpu_q4k_window_cache_read_slot(
+        const ds4_gpu_q4k_window_cache *cache, uint32_t slot,
+        void *gate, uint64_t gate_bytes, void *up, uint64_t up_bytes,
+        void *down, uint64_t down_bytes) {
+    (void)cache; (void)slot; (void)gate; (void)gate_bytes;
+    (void)up; (void)up_bytes; (void)down; (void)down_bytes; return 0;
+}
+int ds4_gpu_q4k_window_cache_get_stats(
+        const ds4_gpu_q4k_window_cache *cache,
+        ds4_gpu_q4k_window_cache_stats *stats) {
+    (void)cache; (void)stats; return 0;
+}
+
 int ds4_gpu_q4k_packed_slice_resolve(
         const void *model_map, uint64_t tensor_offset,
         uint32_t n_expert, uint32_t source_rows,

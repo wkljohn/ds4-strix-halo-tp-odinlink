@@ -116,6 +116,36 @@ struct cuda_q4k_packed_slice {
     int blocked_logged;
 };
 
+struct cuda_q4k_window_cache_entry {
+    int32_t expert;
+    uint64_t last_used;
+    int valid;
+};
+
+struct ds4_gpu_q4k_window_cache {
+    const void *model_map;
+    size_t gate_slice_index;
+    size_t up_slice_index;
+    size_t down_slice_index;
+    char *base;
+    char *gate;
+    char *up;
+    char *down;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t capacity_bytes;
+    uint64_t clock;
+    uint64_t prepares;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t fills;
+    uint64_t evictions;
+    uint32_t n_expert;
+    uint32_t slots;
+    std::vector<int32_t> expert_to_slot;
+    std::vector<cuda_q4k_window_cache_entry> entries;
+};
+
 struct cuda_q8_f16_range {
     const void *host_base;
     uint64_t offset;
@@ -322,6 +352,7 @@ static std::vector<cuda_model_image> g_q4k_kshard_pre_images;
 static std::vector<cuda_model_image> g_q4k_kshard_borrowed_images;
 static std::vector<cuda_q4k_packed_slice> g_q4k_packed_slices;
 static std::unordered_multimap<uint64_t, size_t> g_q4k_packed_by_offset;
+static std::vector<ds4_gpu_q4k_window_cache *> g_q4k_window_caches;
 struct cuda_q4k_kshard_blocked_range {
     const void *host_base;
     uint64_t offset;
@@ -941,6 +972,15 @@ static int cuda_q4k_packed_slice_refuse_routed_tables(
 }
 
 static void cuda_q4k_packed_slice_release_all(void) {
+    if (!g_q4k_window_caches.empty()) {
+        (void)cudaDeviceSynchronize();
+    }
+    for (ds4_gpu_q4k_window_cache *cache : g_q4k_window_caches) {
+        if (!cache) continue;
+        if (cache->base) (void)cudaFree(cache->base);
+        delete cache;
+    }
+    g_q4k_window_caches.clear();
     for (cuda_q4k_packed_slice &p : g_q4k_packed_slices) {
         if (p.device_ptr && p.owns_device_ptr) (void)cudaFree(p.device_ptr);
         p.device_ptr = NULL;
@@ -6821,6 +6861,338 @@ extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
     }
     cuda_model_discard_source_full_pages(
         model_map, p->model_size, source_offset, source_window_bytes);
+    return 1;
+}
+
+extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
+        const ds4_gpu_q4k_window_cache_config *config) {
+    const uint32_t max_slots = 4u * DS4_ROCM_N_EXPERT_USED;
+    if (!config || !config->model_map || config->n_expert == 0u ||
+        config->slots < DS4_ROCM_N_EXPERT_USED ||
+        config->slots > max_slots ||
+        config->slots > config->n_expert) return NULL;
+
+    cuda_q4k_packed_slice *gate = cuda_q4k_packed_slice_find(
+        config->model_map, config->gate_offset,
+        config->gate_row_base, config->gate_row_count,
+        config->gate_column_byte_base,
+        config->gate_column_byte_count);
+    cuda_q4k_packed_slice *up = cuda_q4k_packed_slice_find(
+        config->model_map, config->up_offset,
+        config->gate_row_base, config->gate_row_count,
+        config->gate_column_byte_base,
+        config->gate_column_byte_count);
+    cuda_q4k_packed_slice *down = cuda_q4k_packed_slice_find(
+        config->model_map, config->down_offset,
+        config->down_row_base, config->down_row_count,
+        config->down_column_byte_base,
+        config->down_column_byte_count);
+    const uint64_t block_bytes = sizeof(cuda_block_q4_K);
+    uint64_t expected_down_base = 0, expected_down_count = 0;
+    if (!gate || !up || !down || gate == up || gate == down || up == down ||
+        gate->kind != DS4_GPU_Q4K_PACKED_ROW_RANGE ||
+        up->kind != DS4_GPU_Q4K_PACKED_ROW_RANGE ||
+        down->kind != DS4_GPU_Q4K_PACKED_K_RANGE ||
+        gate->loaded || up->loaded || down->loaded ||
+        gate->n_expert != config->n_expert ||
+        up->n_expert != config->n_expert ||
+        down->n_expert != config->n_expert ||
+        gate->model_size != up->model_size ||
+        gate->model_size != down->model_size ||
+        gate->source_rows != up->source_rows ||
+        gate->source_row_bytes != up->source_row_bytes ||
+        gate->row_base != up->row_base ||
+        gate->row_count != up->row_count ||
+        gate->column_byte_base != 0u ||
+        up->column_byte_base != 0u ||
+        gate->column_byte_count != gate->source_row_bytes ||
+        up->column_byte_count != up->source_row_bytes ||
+        gate->packed_expert_bytes != up->packed_expert_bytes ||
+        gate->row_count * 2u != gate->source_rows ||
+        (gate->row_base != 0u && gate->row_base != gate->row_count) ||
+        (gate->row_base % CUDA_QK_K) != 0u ||
+        (gate->row_count % CUDA_QK_K) != 0u ||
+        down->row_base != 0u ||
+        down->row_count != down->source_rows ||
+        down->column_byte_count * 2u != down->source_row_bytes ||
+        (down->column_byte_base != 0u &&
+         down->column_byte_base != down->column_byte_count) ||
+        !cuda_u64_mul_checked(gate->row_base / CUDA_QK_K,
+                              block_bytes, &expected_down_base) ||
+        !cuda_u64_mul_checked(gate->row_count / CUDA_QK_K,
+                              block_bytes, &expected_down_count) ||
+        down->column_byte_base != expected_down_base ||
+        down->column_byte_count != expected_down_count) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K window cache descriptor coupling refused\n");
+        return NULL;
+    }
+
+    uint64_t gate_slab = 0, down_slab = 0, gate_pair = 0, total = 0;
+    if (!cuda_u64_mul_checked(config->slots, gate->packed_expert_bytes,
+                              &gate_slab) ||
+        !cuda_u64_mul_checked(config->slots, down->packed_expert_bytes,
+                              &down_slab) ||
+        !cuda_u64_mul_checked(2u, gate_slab, &gate_pair) ||
+        !cuda_u64_add_checked(gate_pair, down_slab, &total) ||
+        total > (uint64_t)SIZE_MAX) return NULL;
+
+    ds4_gpu_q4k_window_cache *cache = NULL;
+    try {
+        cache = new ds4_gpu_q4k_window_cache();
+        cache->expert_to_slot.assign(config->n_expert, -1);
+        cache->entries.resize(config->slots);
+    } catch (...) {
+        delete cache;
+        return NULL;
+    }
+    cache->model_map = config->model_map;
+    cache->gate_slice_index = (size_t)(gate - g_q4k_packed_slices.data());
+    cache->up_slice_index = (size_t)(up - g_q4k_packed_slices.data());
+    cache->down_slice_index = (size_t)(down - g_q4k_packed_slices.data());
+    cache->gate_expert_bytes = gate->packed_expert_bytes;
+    cache->down_expert_bytes = down->packed_expert_bytes;
+    cache->capacity_bytes = total;
+    cache->n_expert = config->n_expert;
+    cache->slots = config->slots;
+    cache->base = NULL;
+    cudaError_t err = cudaMalloc((void **)&cache->base, (size_t)total);
+    if (err != cudaSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K window cache allocation failed slots=%u "
+                "bytes=%.2f MiB: %s\n", config->slots,
+                (double)total / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        delete cache;
+        return NULL;
+    }
+    cache->gate = cache->base;
+    cache->up = cache->gate + gate_slab;
+    cache->down = cache->up + gate_slab;
+    try {
+        g_q4k_window_caches.push_back(cache);
+    } catch (...) {
+        (void)cudaFree(cache->base);
+        delete cache;
+        return NULL;
+    }
+    return cache;
+}
+
+extern "C" void ds4_gpu_q4k_window_cache_destroy(
+        ds4_gpu_q4k_window_cache *cache) {
+    if (!cache) return;
+    const auto found = std::find(g_q4k_window_caches.begin(),
+                                 g_q4k_window_caches.end(), cache);
+    if (found == g_q4k_window_caches.end()) return;
+    (void)cudaDeviceSynchronize();
+    if (cache->base) (void)cudaFree(cache->base);
+    g_q4k_window_caches.erase(found);
+    delete cache;
+}
+
+extern "C" int ds4_gpu_q4k_window_cache_prepare(
+        ds4_gpu_q4k_window_cache *cache, const int32_t *expert_ids,
+        uint32_t count, int32_t *slot_ids) {
+    if (!cache ||
+        std::find(g_q4k_window_caches.begin(), g_q4k_window_caches.end(),
+                  cache) == g_q4k_window_caches.end() ||
+        cache->gate_slice_index >= g_q4k_packed_slices.size() ||
+        cache->up_slice_index >= g_q4k_packed_slices.size() ||
+        cache->down_slice_index >= g_q4k_packed_slices.size() ||
+        !expert_ids || !slot_ids || count == 0u ||
+        count > cache->n_expert) return 0;
+    const cuda_q4k_packed_slice &gate_slice =
+        g_q4k_packed_slices[cache->gate_slice_index];
+    const cuda_q4k_packed_slice &up_slice =
+        g_q4k_packed_slices[cache->up_slice_index];
+    const cuda_q4k_packed_slice &down_slice =
+        g_q4k_packed_slices[cache->down_slice_index];
+    if (gate_slice.host_base != cache->model_map ||
+        up_slice.host_base != cache->model_map ||
+        down_slice.host_base != cache->model_map ||
+        gate_slice.packed_expert_bytes != cache->gate_expert_bytes ||
+        up_slice.packed_expert_bytes != cache->gate_expert_bytes ||
+        down_slice.packed_expert_bytes != cache->down_expert_bytes) return 0;
+    std::vector<uint8_t> requested;
+    std::vector<int32_t> unique;
+    try {
+        requested.assign(cache->n_expert, 0u);
+        unique.reserve(count);
+    } catch (...) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const int32_t expert = expert_ids[i];
+        if (expert < 0 || (uint32_t)expert >= cache->n_expert) return 0;
+        if (!requested[(uint32_t)expert]) {
+            requested[(uint32_t)expert] = 1u;
+            unique.push_back(expert);
+        }
+    }
+    if (unique.size() > cache->slots) return 0;
+    cache->prepares++;
+
+    for (int32_t expert : unique) {
+        int32_t slot = cache->expert_to_slot[(uint32_t)expert];
+        if (slot >= 0) {
+            if ((uint32_t)slot >= cache->slots ||
+                !cache->entries[(uint32_t)slot].valid ||
+                cache->entries[(uint32_t)slot].expert != expert) return 0;
+            cache->entries[(uint32_t)slot].last_used = ++cache->clock;
+            cache->hits++;
+            continue;
+        }
+        cache->misses++;
+        uint32_t victim = cache->slots;
+        uint64_t oldest = UINT64_MAX;
+        for (uint32_t s = 0; s < cache->slots; ++s) {
+            const cuda_q4k_window_cache_entry &entry = cache->entries[s];
+            if (!entry.valid) {
+                victim = s;
+                break;
+            }
+            if (entry.expert >= 0 &&
+                requested[(uint32_t)entry.expert]) continue;
+            if (entry.last_used < oldest) {
+                oldest = entry.last_used;
+                victim = s;
+            }
+        }
+        if (victim == cache->slots) return 0;
+        cuda_q4k_window_cache_entry &entry = cache->entries[victim];
+        if (entry.valid) {
+            if (entry.expert < 0 ||
+                (uint32_t)entry.expert >= cache->n_expert ||
+                cache->expert_to_slot[(uint32_t)entry.expert] !=
+                    (int32_t)victim) return 0;
+            cache->expert_to_slot[(uint32_t)entry.expert] = -1;
+            entry.valid = 0;
+            cache->evictions++;
+        }
+
+        ds4_gpu_tensor gate_dst = {};
+        ds4_gpu_tensor up_dst = {};
+        ds4_gpu_tensor down_dst = {};
+        gate_dst.ptr = cache->gate +
+            (uint64_t)victim * cache->gate_expert_bytes;
+        gate_dst.bytes = cache->gate_expert_bytes;
+        gate_dst.device_id = 0;
+        up_dst.ptr = cache->up +
+            (uint64_t)victim * cache->gate_expert_bytes;
+        up_dst.bytes = cache->gate_expert_bytes;
+        up_dst.device_id = 0;
+        down_dst.ptr = cache->down +
+            (uint64_t)victim * cache->down_expert_bytes;
+        down_dst.bytes = cache->down_expert_bytes;
+        down_dst.device_id = 0;
+        if (!ds4_gpu_q4k_packed_slice_load_expert(
+                cache->model_map, gate_slice.tensor_offset,
+                gate_slice.row_base, gate_slice.row_count,
+                gate_slice.column_byte_base,
+                gate_slice.column_byte_count,
+                (uint32_t)expert, &gate_dst) ||
+            !ds4_gpu_q4k_packed_slice_load_expert(
+                cache->model_map, up_slice.tensor_offset,
+                up_slice.row_base, up_slice.row_count,
+                up_slice.column_byte_base,
+                up_slice.column_byte_count,
+                (uint32_t)expert, &up_dst) ||
+            !ds4_gpu_q4k_packed_slice_load_expert(
+                cache->model_map, down_slice.tensor_offset,
+                down_slice.row_base, down_slice.row_count,
+                down_slice.column_byte_base,
+                down_slice.column_byte_count,
+                (uint32_t)expert, &down_dst)) {
+            entry.expert = -1;
+            entry.valid = 0;
+            return 0;
+        }
+        entry.expert = expert;
+        entry.last_used = ++cache->clock;
+        cache->fills++;
+        entry.valid = 1;
+        cache->expert_to_slot[(uint32_t)expert] = (int32_t)victim;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const int32_t slot =
+            cache->expert_to_slot[(uint32_t)expert_ids[i]];
+        if (slot < 0 || (uint32_t)slot >= cache->slots ||
+            !cache->entries[(uint32_t)slot].valid) return 0;
+        slot_ids[i] = slot;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_q4k_window_cache_device_view(
+        const ds4_gpu_q4k_window_cache *cache, const void **gate,
+        const void **up, const void **down, uint64_t *gate_expert_bytes,
+        uint64_t *down_expert_bytes) {
+    if (gate) *gate = NULL;
+    if (up) *up = NULL;
+    if (down) *down = NULL;
+    if (gate_expert_bytes) *gate_expert_bytes = 0u;
+    if (down_expert_bytes) *down_expert_bytes = 0u;
+    if (!cache ||
+        std::find(g_q4k_window_caches.begin(), g_q4k_window_caches.end(),
+                  cache) == g_q4k_window_caches.end() ||
+        !gate || !up || !down || !gate_expert_bytes ||
+        !down_expert_bytes || !cache->base) return 0;
+    *gate = cache->gate;
+    *up = cache->up;
+    *down = cache->down;
+    *gate_expert_bytes = cache->gate_expert_bytes;
+    *down_expert_bytes = cache->down_expert_bytes;
+    return 1;
+}
+
+extern "C" int ds4_gpu_q4k_window_cache_read_slot(
+        const ds4_gpu_q4k_window_cache *cache, uint32_t slot,
+        void *gate, uint64_t gate_bytes, void *up, uint64_t up_bytes,
+        void *down, uint64_t down_bytes) {
+    if (!cache ||
+        std::find(g_q4k_window_caches.begin(), g_q4k_window_caches.end(),
+                  cache) == g_q4k_window_caches.end() ||
+        slot >= cache->slots || !cache->entries[slot].valid ||
+        !gate || gate_bytes != cache->gate_expert_bytes ||
+        !up || up_bytes != cache->gate_expert_bytes ||
+        !down || down_bytes != cache->down_expert_bytes) return 0;
+    cudaError_t err = cudaMemcpy(
+        gate, cache->gate + (uint64_t)slot * cache->gate_expert_bytes,
+        (size_t)cache->gate_expert_bytes, cudaMemcpyDeviceToHost);
+    if (err == cudaSuccess) {
+        err = cudaMemcpy(
+            up, cache->up + (uint64_t)slot * cache->gate_expert_bytes,
+            (size_t)cache->gate_expert_bytes, cudaMemcpyDeviceToHost);
+    }
+    if (err == cudaSuccess) {
+        err = cudaMemcpy(
+            down, cache->down + (uint64_t)slot * cache->down_expert_bytes,
+            (size_t)cache->down_expert_bytes, cudaMemcpyDeviceToHost);
+    }
+    if (err == cudaSuccess) return 1;
+    (void)cudaGetLastError();
+    return 0;
+}
+
+extern "C" int ds4_gpu_q4k_window_cache_get_stats(
+        const ds4_gpu_q4k_window_cache *cache,
+        ds4_gpu_q4k_window_cache_stats *stats) {
+    if (!cache ||
+        std::find(g_q4k_window_caches.begin(), g_q4k_window_caches.end(),
+                  cache) == g_q4k_window_caches.end() ||
+        !stats) return 0;
+    memset(stats, 0, sizeof(*stats));
+    stats->prepares = cache->prepares;
+    stats->hits = cache->hits;
+    stats->misses = cache->misses;
+    stats->fills = cache->fills;
+    stats->evictions = cache->evictions;
+    stats->capacity_bytes = cache->capacity_bytes;
+    stats->slot_count = cache->slots;
+    for (const cuda_q4k_window_cache_entry &entry : cache->entries) {
+        if (entry.valid) stats->resident_count++;
+    }
     return 1;
 }
 

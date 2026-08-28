@@ -3813,6 +3813,26 @@ extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
         uint32_t, ds4_gpu_tensor *) {
     return 0;
 }
+extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
+        const ds4_gpu_q4k_window_cache_config *) { return NULL; }
+extern "C" void ds4_gpu_q4k_window_cache_destroy(
+        ds4_gpu_q4k_window_cache *) {}
+extern "C" int ds4_gpu_q4k_window_cache_prepare(
+        ds4_gpu_q4k_window_cache *, const int32_t *, uint32_t, int32_t *) {
+    return 0;
+}
+extern "C" int ds4_gpu_q4k_window_cache_device_view(
+        const ds4_gpu_q4k_window_cache *, const void **, const void **,
+        const void **, uint64_t *, uint64_t *) { return 0; }
+extern "C" int ds4_gpu_q4k_window_cache_read_slot(
+        const ds4_gpu_q4k_window_cache *, uint32_t, void *, uint64_t,
+        void *, uint64_t, void *, uint64_t) {
+    return 0;
+}
+extern "C" int ds4_gpu_q4k_window_cache_get_stats(
+        const ds4_gpu_q4k_window_cache *, ds4_gpu_q4k_window_cache_stats *) {
+    return 0;
+}
 
 extern "C" int ds4_gpu_q4k_packed_slice_resolve(
         const void *, uint64_t, uint32_t, uint32_t, uint64_t,

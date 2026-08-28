@@ -290,6 +290,66 @@ int ds4_gpu_q4k_packed_slice_readback(
         uint64_t    bytes);
 uint64_t ds4_gpu_q4k_packed_slice_bytes(void);
 
+typedef struct ds4_gpu_q4k_window_cache ds4_gpu_q4k_window_cache;
+typedef struct ds4_gpu_q4k_window_cache_config {
+    const void *model_map;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint32_t n_expert;
+    uint32_t gate_row_base;
+    uint32_t gate_row_count;
+    uint64_t gate_column_byte_base;
+    uint64_t gate_column_byte_count;
+    uint32_t down_row_base;
+    uint32_t down_row_count;
+    uint64_t down_column_byte_base;
+    uint64_t down_column_byte_count;
+    uint32_t slots;
+} ds4_gpu_q4k_window_cache_config;
+
+typedef struct ds4_gpu_q4k_window_cache_stats {
+    uint64_t prepares;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t fills;
+    uint64_t evictions;
+    uint64_t capacity_bytes;
+    uint32_t resident_count;
+    uint32_t slot_count;
+} ds4_gpu_q4k_window_cache_stats;
+
+/* Hard-capped cache for one rank-local Q4_K routed-expert window.  prepare()
+ * rewrites global expert IDs to compact slot IDs suitable for direct packed
+ * MoE indexing.  Entries are published only after all three tensors upload. */
+ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
+        const ds4_gpu_q4k_window_cache_config *config);
+void ds4_gpu_q4k_window_cache_destroy(ds4_gpu_q4k_window_cache *cache);
+int ds4_gpu_q4k_window_cache_prepare(
+        ds4_gpu_q4k_window_cache *cache,
+        const int32_t             *expert_ids,
+        uint32_t                   count,
+        int32_t                   *slot_ids);
+int ds4_gpu_q4k_window_cache_device_view(
+        const ds4_gpu_q4k_window_cache *cache,
+        const void                    **gate,
+        const void                    **up,
+        const void                    **down,
+        uint64_t                       *gate_expert_bytes,
+        uint64_t                       *down_expert_bytes);
+int ds4_gpu_q4k_window_cache_read_slot(
+        const ds4_gpu_q4k_window_cache *cache,
+        uint32_t                        slot,
+        void                           *gate,
+        uint64_t                        gate_bytes,
+        void                           *up,
+        uint64_t                        up_bytes,
+        void                           *down,
+        uint64_t                        down_bytes);
+int ds4_gpu_q4k_window_cache_get_stats(
+        const ds4_gpu_q4k_window_cache *cache,
+        ds4_gpu_q4k_window_cache_stats *stats);
+
 typedef struct ds4_gpu_q4k_kshard_layer {
     uint64_t gate_offset;
     uint64_t up_offset;
