@@ -199,15 +199,14 @@ int ds4_glm5_next_embed_token(const ds4_glm5_next_exec_ctx *ctx,
                GLM5_WIDTH, GLM5_HC);
 }
 
-static int dense_kda_forward(const ds4_glm5_next_exec_ctx *ctx,
+static int kda_attention_one(const ds4_glm5_next_exec_ctx *ctx,
                              uint32_t il,
                              ds4_glm5_next_state *state,
                              ds4_glm5_next_workspace *w,
-                             const ds4_gpu_tensor *hc_in,
-                             ds4_gpu_tensor *hc_out) {
+                             const ds4_gpu_tensor *hc_in) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     ds4_glm5_kda_layer_state *kda = &state->kda.layer[il];
-    const int ok =
+    return
         ds4_gpu_rms_norm_plain_rows_tensor(
             w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u, 1.0e-5f) &&
         ds4_gpu_matmul_bf16_tensor(
@@ -224,7 +223,18 @@ static int dense_kda_forward(const ds4_glm5_next_exec_ctx *ctx,
             w->collapsed, w->attention, 1u) &&
         ds4_gpu_hc_expand_split_tensor(
             w->after_attention, w->attention, hc_in, w->hc_split,
-            GLM5_WIDTH, GLM5_HC) &&
+            GLM5_WIDTH, GLM5_HC);
+}
+
+static int dense_kda_forward(const ds4_glm5_next_exec_ctx *ctx,
+                             uint32_t il,
+                             ds4_glm5_next_state *state,
+                             ds4_glm5_next_workspace *w,
+                             const ds4_gpu_tensor *hc_in,
+                             ds4_gpu_tensor *hc_out) {
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    const int ok =
+        kda_attention_one(ctx, il, state, w, hc_in) &&
         ds4_gpu_rms_norm_plain_rows_tensor(
             w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u, 1.0e-5f) &&
         ds4_gpu_matmul_bf16_tensor(
@@ -454,7 +464,7 @@ static int mla_short_context_attention(const ds4_glm5_next_exec_ctx *ctx,
 
 static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                           uint32_t il,
-                          ds4_glm5_next_state *state,
+                          uint32_t token_ordinal,
                           ds4_glm5_next_workspace *w,
                           ds4_gpu_tensor *hc_out) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
@@ -491,7 +501,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             w->router_selected, w->router_weights, w->router_probs,
             ctx->model_map, ctx->model_size, f->exp_probs_b,
             w->router_logits, GLM5_EXPERTS, GLM5_EXPERTS_USED, 2.5f) &&
-        route_agrees(ctx, il, state->mla[il].token_count,
+        route_agrees(ctx, il, token_ordinal,
                      w->router_selected, w->router_weights) &&
         declare_local_q4k_half(ctx, layer) &&
         ds4_gpu_routed_moe_one_packed_q4k_tensor(
@@ -530,6 +540,22 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
     return ok;
 }
 
+static int kda_routed_one_forward(const ds4_glm5_next_exec_ctx *ctx,
+                                  uint32_t il,
+                                  ds4_glm5_next_state *state,
+                                  ds4_glm5_next_workspace *w,
+                                  const ds4_gpu_tensor *hc_in,
+                                  ds4_gpu_tensor *hc_out) {
+    ds4_glm5_kda_layer_state *kda = &state->kda.layer[il];
+    if (!tp_context_valid(ctx) || !kda->valid || !kda->recurrent ||
+        kda->token_count > UINT32_MAX) return 0;
+    const uint32_t token_ordinal = (uint32_t)kda->token_count;
+    const int ok = kda_attention_one(ctx, il, state, w, hc_in) &&
+                   routed_ffn_one(ctx, il, token_ordinal, w, hc_out);
+    if (!ok) ds4_glm5_next_state_invalidate(state);
+    return ok;
+}
+
 static int mla_routed_short_forward(const ds4_glm5_next_exec_ctx *ctx,
                                     uint32_t il,
                                     ds4_glm5_next_state *state,
@@ -543,7 +569,7 @@ static int mla_routed_short_forward(const ds4_glm5_next_exec_ctx *ctx,
         mla->token_count >= mla->capacity_tokens ||
         mla->token_count >= 4u) return 0;
     const int ok = mla_short_context_attention(ctx, il, state, w, hc_in) &&
-                   routed_ffn_one(ctx, il, state, w, hc_out);
+                   routed_ffn_one(ctx, il, mla->token_count, w, hc_out);
     if (!ok) {
         ds4_glm5_next_state_invalidate(state);
         return 0;
@@ -577,6 +603,11 @@ int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
         layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&
         state->mla[il].compact_kv && !state->kda.layer[il].recurrent) {
         return mla_routed_short_forward(ctx, il, state, w, hc_in, hc_out);
+    }
+    if (layer->attention == DS4_GLM5_NEXT_ATTN_KDA &&
+        layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&
+        state->kda.layer[il].recurrent && !state->mla[il].compact_kv) {
+        return kda_routed_one_forward(ctx, il, state, w, hc_in, hc_out);
     }
     return 0;
 }

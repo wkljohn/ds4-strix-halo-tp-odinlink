@@ -224,12 +224,30 @@ bool run() {
         index_key.data(), index_key.size() * sizeof(float));
     const uint64_t gate_hash = fnv64(
         pool_gate.data(), pool_gate.size() * sizeof(float));
-    const uint64_t packed_q4_bytes = ds4_gpu_q4k_packed_slice_bytes();
+    const uint64_t layer3_packed_q4_bytes =
+        ds4_gpu_q4k_packed_slice_bytes();
     char error[256] = {};
     CHECK(ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d35334f5554),
                             output_hash, error, sizeof(error)) == 1, error);
-    CHECK(packed_q4_bytes != 0u,
+    CHECK(layer3_packed_q4_bytes != 0u,
           "layer3 owns compact Q4 rank residency");
+
+    CHECK(ds4_glm5_next_layer_forward(
+              &exec, 4u, &state.value, workspace.value,
+              output.value, current.value),
+          "compose production KDA+routed layer4 over RoCE");
+    ds4_glm5_kda_digest kda4_token0 = {};
+    CHECK(state.value.kda.layer[4].token_count == 1u && sequence == 3u &&
+          ds4_glm5_kda_layer_digest(&state.value.kda.layer[4], current.value,
+                                    kHcWidth, &kda4_token0),
+          "layer4 commits one recurrent KDA step and one FFN exchange");
+    const uint64_t packed_q4_bytes = ds4_gpu_q4k_packed_slice_bytes();
+    CHECK(packed_q4_bytes > layer3_packed_q4_bytes &&
+          ds4_tp_hash_check(
+              tp.tp, UINT64_C(0x474c4d35344b4430),
+              fnv64(&kda4_token0, sizeof(kda4_token0)),
+              error, sizeof(error)) == 1,
+          "layer4 state/output are rank-identical and add one Q4 shard");
 
     CHECK(ds4_glm5_next_embed_token(&exec, 43u, current.value),
           "embed token 43");
@@ -245,7 +263,7 @@ bool run() {
               current.value, output.value),
           "execute second-token MLA cache-read layer3 over RoCE");
     CHECK(state.value.valid && state.value.mla[3].token_count == 2u &&
-          sequence == 4u &&
+          sequence == 5u &&
           ds4_gpu_q4k_packed_slice_bytes() == packed_q4_bytes,
           "second token commits after two exchanges without Q4 duplication");
 
@@ -283,16 +301,40 @@ bool run() {
           ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d3533544f4b),
                             state_hash, error, sizeof(error)) == 1,
           "second-token output/state are nontrivial and rank-identical");
+
+    CHECK(ds4_glm5_next_layer_forward(
+              &exec, 4u, &state.value, workspace.value,
+              output.value, current.value),
+          "execute second-token KDA+routed layer4 over RoCE");
+    ds4_glm5_kda_digest kda4_token1 = {};
+    CHECK(state.value.valid && state.value.kda.layer[4].token_count == 2u &&
+          sequence == 6u &&
+          ds4_gpu_q4k_packed_slice_bytes() == packed_q4_bytes &&
+          ds4_glm5_kda_layer_digest(&state.value.kda.layer[4], current.value,
+                                    kHcWidth, &kda4_token1) &&
+          kda4_token1.token_count == 2u &&
+          kda4_token1.output_fnv64 != kda4_token0.output_fnv64 &&
+          ds4_tp_hash_check(
+              tp.tp, UINT64_C(0x474c4d35344b4431),
+              fnv64(&kda4_token1, sizeof(kda4_token1)),
+              error, sizeof(error)) == 1,
+          "layer4 token1 advances recurrent state without Q4 duplication");
     std::fprintf(stderr,
         "PASS GLM5 prefix->layer3 token0 role=%s output=%016llx kv=%016llx "
         "index=%016llx pool_gate=%016llx token1_output=%016llx "
-        "kv2=%016llx index2=%016llx pool2=%016llx tp_seq=%llu "
-        "packed_q4_bytes=%llu window_cache_bytes=0 rdma=1\n",
+        "kv2=%016llx index2=%016llx pool2=%016llx "
+        "layer4_token0=%016llx layer4_token1=%016llx tp_seq=%llu "
+        "layer3_packed_q4_bytes=%llu packed_q4_bytes=%llu "
+        "window_cache_bytes=0 rdma=1\n",
         role, (unsigned long long)output_hash,
         (unsigned long long)kv_hash, (unsigned long long)index_hash,
         (unsigned long long)gate_hash, (unsigned long long)output1_hash,
         (unsigned long long)kv2_hash, (unsigned long long)index2_hash,
-        (unsigned long long)gate2_hash, (unsigned long long)sequence,
+        (unsigned long long)gate2_hash,
+        (unsigned long long)kda4_token0.output_fnv64,
+        (unsigned long long)kda4_token1.output_fnv64,
+        (unsigned long long)sequence,
+        (unsigned long long)layer3_packed_q4_bytes,
         (unsigned long long)packed_q4_bytes);
     return true;
 }
