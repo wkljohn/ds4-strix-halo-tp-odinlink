@@ -30,6 +30,8 @@ namespace {
 constexpr uint32_t kRows = 10u;
 constexpr uint32_t kFirstValid = 1u;
 constexpr uint32_t kHidden = 4096u;
+constexpr uint32_t kHc = 4u;
+constexpr uint32_t kHcMix = 24u;
 constexpr uint32_t kQRank = 1536u;
 constexpr uint32_t kHeads = 64u;
 constexpr uint32_t kHeadDim = 256u;
@@ -112,10 +114,55 @@ bool compare_values(const char *name, const std::vector<float> &got,
     return true;
 }
 
+uint16_t ordered_bf16(float value, bool &exact) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    exact = (bits & UINT32_C(0xffff)) == 0u;
+    uint16_t bf16 = (uint16_t)(bits >> 16u);
+    if ((bf16 & UINT16_C(0x7fff)) == 0u) bf16 = 0u;
+    return (bf16 & UINT16_C(0x8000)) != 0u
+        ? (uint16_t)~bf16 : (uint16_t)(bf16 | UINT16_C(0x8000));
+}
+
+bool compare_bf16_ulps(const char *name, const std::vector<float> &got,
+                       const std::vector<float> &expected,
+                       uint32_t ulp_limit) {
+    CHECK(got.size() == expected.size(), "BF16 ULP comparison shape");
+    uint32_t max_ulps = 0u;
+    uint64_t mismatches = 0u;
+    double max_abs = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        bool got_exact = false, expected_exact = false;
+        const uint16_t got_ordered = ordered_bf16(got[i], got_exact);
+        const uint16_t expected_ordered =
+            ordered_bf16(expected[i], expected_exact);
+        CHECK(got_exact && expected_exact,
+              "BF16 ULP comparison values lie on BF16 grid");
+        const uint32_t ulps = got_ordered > expected_ordered
+            ? (uint32_t)(got_ordered - expected_ordered)
+            : (uint32_t)(expected_ordered - got_ordered);
+        max_ulps = std::max(max_ulps, ulps);
+        mismatches += ulps != 0u;
+        max_abs = std::max(max_abs,
+                           std::fabs((double)got[i] - expected[i]));
+    }
+    std::fprintf(stderr,
+                 "GLM5 MLA compose %-12s count=%zu max_bf16_ulps=%u "
+                 "mismatches=%llu max_abs=%.9g\n",
+                 name, got.size(), max_ulps,
+                 (unsigned long long)mismatches, max_abs);
+    CHECK(max_ulps <= ulp_limit, "BF16 ULP numerical envelope");
+    return true;
+}
+
 bool run_roce_output(const Glm5TestGGUF &gguf,
                      const std::vector<float> &half0,
                      const std::vector<float> &half1,
-                     const std::vector<float> &expected) {
+                     const std::vector<float> &expected,
+                     std::vector<float> &composed,
+                     std::vector<float> &peer_received) {
+    composed.clear();
+    peer_received.clear();
     const char *role_value = std::getenv("DS4_GLM5_TP_ROLE");
     if (!role_value) return true;
     CHECK(std::strcmp(role_value, "leader") == 0 ||
@@ -205,8 +252,9 @@ bool run_roce_output(const Glm5TestGGUF &gguf,
     CHECK(ds4_tp_big_gate_exchange(transport.tp, 3u, 1u,
                                    out, in, bytes),
           "exchange MLA attention partial over RoCE");
-    std::vector<float> composed(kHidden);
+    composed.resize(kHidden);
     for (uint32_t i = 0u; i < kHidden; ++i) composed[i] = out[i] + in[i];
+    peer_received.assign(in, in + kHidden);
     CHECK(compare_values("roce_tp_sum", composed, expected,
                          8.0e-6, 6.0e-12),
           "RoCE-composed attention output matches oracle");
@@ -232,14 +280,26 @@ bool run_test() {
           "model and MLA composition oracle environment");
     const std::string base(oracle_prefix);
 
-    std::vector<float> hidden, expected_q_resid, expected_query,
+    std::vector<float> hc_residual, expected_hc_post, expected_hc_comb,
+        expected_hc_collapsed, hidden, expected_hc_carried,
+        expected_q_resid, expected_query,
         expected_kv_norm, expected_qk_low, expected_index_q,
         expected_index_key, expected_pool_gate, expected_head_weights,
         expected_pooled, expected_pool_scores, expected_heads,
         expected_attn_output;
     std::vector<uint32_t> valid, expected_pool_valid, expected_selected_pools;
     std::vector<int32_t> expected_pool_indices, expected_selected_tokens;
-    CHECK(read_array(base + ".hidden.f32", kRows * kHidden, hidden) &&
+    CHECK(read_array(base + ".hc_residual.f32",
+                     (uint64_t)kRows * kHc * kHidden, hc_residual) &&
+          read_array(base + ".hc_post.f32", kRows * kHc,
+                     expected_hc_post) &&
+          read_array(base + ".hc_comb.f32", kRows * kHc * kHc,
+                     expected_hc_comb) &&
+          read_array(base + ".hc_collapsed.f32", kRows * kHidden,
+                     expected_hc_collapsed) &&
+          read_array(base + ".hidden.f32", kRows * kHidden, hidden) &&
+          read_array(base + ".hc_carried.f32", kHc * kHidden,
+                     expected_hc_carried) &&
           read_array(base + ".q_resid.f32", kQRank, expected_q_resid) &&
           read_array(base + ".query.f32", kHeads * kHeadDim,
                      expected_query) &&
@@ -276,12 +336,18 @@ bool run_test() {
 
     Glm5TestGGUF gguf;
     CHECK(gguf.open_file(model), "open GLM5 GGUF directory");
-    uint64_t q_a = 0u, q_norm = 0u, q_b = 0u, kv_a = 0u,
+    uint64_t hc_fn = 0u, hc_base = 0u, hc_scale = 0u, attn_norm = 0u,
+             q_a = 0u, q_norm = 0u, q_b = 0u, kv_a = 0u,
              kv_norm_w = 0u, k_b = 0u, v_b = 0u, index_q_w = 0u,
              index_k_w = 0u, index_weight_w = 0u, pool_gate_w = 0u,
              pool_ape = 0u, index_norm_w = 0u, index_norm_b = 0u,
              attn_output_w = 0u;
-    CHECK(gguf.tensor("blk.3.attn_q_a.weight", {4096u, 1536u}, 8u, q_a) &&
+    CHECK(gguf.tensor("blk.3.hc_attn_fn.weight", {16384u, 24u}, 30u,
+                      hc_fn) &&
+          gguf.tensor("blk.3.hc_attn_base.weight", {24u}, 0u, hc_base) &&
+          gguf.tensor("blk.3.hc_attn_scale.weight", {3u}, 0u, hc_scale) &&
+          gguf.tensor("blk.3.attn_norm.weight", {4096u}, 0u, attn_norm) &&
+          gguf.tensor("blk.3.attn_q_a.weight", {4096u, 1536u}, 8u, q_a) &&
           gguf.tensor("blk.3.attn_q_a_norm.weight", {1536u}, 0u, q_norm) &&
           gguf.tensor("blk.3.attn_q_b.weight", {1536u, 16384u}, 8u, q_b) &&
           gguf.tensor("blk.3.attn_kv_a_mqa.weight", {4096u, 512u}, 8u, kv_a) &&
@@ -297,7 +363,7 @@ bool run_test() {
           gguf.tensor("blk.3.indexer.k_norm.bias", {128u}, 0u, index_norm_b) &&
           gguf.tensor("blk.3.attn_output.weight", {16384u, 4096u}, 8u,
                       attn_output_w),
-          "bind every real block-3 sparse-MLA tensor");
+          "bind real block-3 mHC and sparse-MLA tensors");
 
     ds4_gpu_config config = {};
     config.n_gpus = 1u;
@@ -310,6 +376,12 @@ bool run_test() {
     const auto f32 = [](uint64_t n) {
         return ds4_gpu_tensor_alloc(n * sizeof(float));
     };
+    ds4_gpu_tensor *d_hc_residual =
+        f32((uint64_t)kRows * kHc * kHidden);
+    ds4_gpu_tensor *d_hc_flat = f32((uint64_t)kRows * kHc * kHidden);
+    ds4_gpu_tensor *d_hc_mix = f32((uint64_t)kRows * kHcMix);
+    ds4_gpu_tensor *d_hc_split = f32((uint64_t)kRows * kHcMix);
+    ds4_gpu_tensor *d_hc_collapsed = f32((uint64_t)kRows * kHidden);
     ds4_gpu_tensor *d_hidden = f32((uint64_t)kRows * kHidden);
     ds4_gpu_tensor *d_q_a = f32(kQRank);
     ds4_gpu_tensor *d_q_resid = f32(kQRank);
@@ -340,25 +412,55 @@ bool run_test() {
     ds4_gpu_tensor *d_attn_half1 = f32(kHidden);
     ds4_gpu_tensor *d_attn_sum = f32(kHidden);
     ds4_gpu_tensor *d_attn_reject = f32(kHidden);
-    CHECK(d_hidden && d_q_a && d_q_resid && d_query && d_kv_raw &&
+    ds4_gpu_tensor *d_hc_carried_local = f32((uint64_t)kHc * kHidden);
+    ds4_gpu_tensor *d_hc_carried_add = f32((uint64_t)kHc * kHidden);
+    ds4_gpu_tensor *d_hc_carried_roce = f32((uint64_t)kHc * kHidden);
+    CHECK(d_hc_residual && d_hc_flat && d_hc_mix && d_hc_split &&
+          d_hc_collapsed && d_hidden && d_q_a && d_q_resid && d_query && d_kv_raw &&
           d_kv_norm && d_qk_low && d_cache && d_index_q &&
           d_index_k_raw && d_index_key && d_pool_gate && d_head_weights &&
           d_valid && d_pooled && d_pool_indices && d_pool_valid &&
           d_pool_scores && d_selected_pools && d_selected_tokens && d_heads &&
           d_attn_full && d_attn_half0 && d_attn_half1 && d_attn_sum &&
-          d_attn_reject,
-          "allocate bounded sparse-MLA heads composition tensors");
+          d_attn_reject && d_hc_carried_local && d_hc_carried_add &&
+          d_hc_carried_roce,
+          "allocate bounded mHC-to-sparse-MLA composition tensors");
     ds4_gpu_tensor *d_last_hidden = ds4_gpu_tensor_view(
         d_hidden, (uint64_t)(kRows - 1u) * kHidden * sizeof(float),
         (uint64_t)kHidden * sizeof(float));
-    CHECK(d_last_hidden &&
-          ds4_gpu_tensor_write(d_hidden, 0u, hidden.data(),
-                               (uint64_t)hidden.size() * sizeof(float)) &&
+    ds4_gpu_tensor *d_last_hc_residual = ds4_gpu_tensor_view(
+        d_hc_residual,
+        (uint64_t)(kRows - 1u) * kHc * kHidden * sizeof(float),
+        (uint64_t)kHc * kHidden * sizeof(float));
+    ds4_gpu_tensor *d_last_hc_split = ds4_gpu_tensor_view(
+        d_hc_split, (uint64_t)(kRows - 1u) * kHcMix * sizeof(float),
+        (uint64_t)kHcMix * sizeof(float));
+    ds4_gpu_tensor *d_last_hc_post = ds4_gpu_tensor_view(
+        d_hc_split,
+        ((uint64_t)(kRows - 1u) * kHcMix + kHc) * sizeof(float),
+        (uint64_t)kHc * sizeof(float));
+    ds4_gpu_tensor *d_last_hc_comb = ds4_gpu_tensor_view(
+        d_hc_split,
+        ((uint64_t)(kRows - 1u) * kHcMix + 2u * kHc) * sizeof(float),
+        (uint64_t)kHc * kHc * sizeof(float));
+    CHECK(d_last_hidden && d_last_hc_residual && d_last_hc_split &&
+          d_last_hc_post && d_last_hc_comb &&
+          ds4_gpu_tensor_write(d_hc_residual, 0u, hc_residual.data(),
+                               (uint64_t)hc_residual.size() * sizeof(float)) &&
           ds4_gpu_tensor_write(d_valid, 0u, valid.data(),
                                (uint64_t)valid.size() * sizeof(uint32_t)),
-          "upload sparse-MLA heads composition inputs");
+          "upload mHC residual and sparse-MLA validity inputs");
 
-    CHECK(ds4_gpu_matmul_q8_0_tensor(d_q_a, gguf.map, gguf.size, q_a,
+    CHECK(ds4_gpu_rms_norm_plain_rows_tensor(
+              d_hc_flat, d_hc_residual, kHc * kHidden, kRows, 1.0e-5f) &&
+          ds4_gpu_matmul_bf16_tensor(
+              d_hc_mix, gguf.map, gguf.size, hc_fn,
+              kHc * kHidden, kHcMix, d_hc_flat, kRows) &&
+          ds4_gpu_hc_split_weighted_sum_norm_tensor(
+              d_hc_collapsed, d_hidden, d_hc_split, d_hc_mix,
+              d_hc_residual, gguf.map, gguf.size, hc_scale, hc_base,
+              attn_norm, kHidden, kHc, 20u, 1.0e-6f, 1.0e-5f) &&
+          ds4_gpu_matmul_q8_0_tensor(d_q_a, gguf.map, gguf.size, q_a,
                                      kHidden, kQRank, d_last_hidden, 1u) &&
           ds4_gpu_rms_norm_weight_tensor(d_q_resid, d_q_a, gguf.map,
                                          gguf.size, q_norm, kQRank, 1.0e-5f) &&
@@ -376,7 +478,7 @@ bool run_test() {
           ds4_gpu_glm_qk_lowrank_typed_tensor(
               d_qk_low, d_query, gguf.map, gguf.size, k_b, 8u, kHeads,
               kKvLora, kHeadDim, kHeadDim),
-          "execute real Q/KV trunk and compact NoPE store");
+          "execute real mHC pre-stage, Q/KV trunk and compact NoPE store");
 
     CHECK(ds4_gpu_matmul_bf16_tensor(
               d_index_q, gguf.map, gguf.size, index_q_w, kQRank,
@@ -448,16 +550,34 @@ bool run_test() {
               d_attn_reject, gguf.map, gguf.size, attn_output_w,
               kHeads * kHeadDim, 0u,
               (kHeads * kHeadDim) / 2u - 1u, kHidden, d_heads, 0u) &&
+          ds4_gpu_hc_expand_split_tensor(
+              d_hc_carried_local, d_attn_sum, d_last_hc_residual,
+              d_last_hc_split, kHidden, kHc) &&
+          ds4_gpu_hc_expand_add_tensor(
+              d_hc_carried_add, d_attn_half0, d_attn_half1,
+              d_last_hc_residual, d_last_hc_post, d_last_hc_comb,
+              kHidden, kHc) &&
           ds4_gpu_synchronize(),
-          "execute selected zero-RoPE attention and real value projection");
+          "execute sparse MLA, output reduction and local mHC carry");
 
-    std::vector<float> got_q_resid, got_query, got_kv_norm, got_qk_low,
+    std::vector<float> got_hc_split, got_hc_collapsed, got_hidden,
+        got_hc_carried_local, got_hc_carried_add, got_q_resid, got_query,
+        got_kv_norm, got_qk_low,
         got_index_q, got_index_key, got_pool_gate, got_head_weights,
         got_pooled, got_pool_scores, got_heads, got_attn_full,
         got_attn_half0, got_attn_half1, got_attn_sum;
     std::vector<uint32_t> got_pool_valid, got_selected_pools;
     std::vector<int32_t> got_pool_indices, got_expanded_tokens;
-    CHECK(read_tensor(d_q_resid, kQRank, got_q_resid) &&
+    CHECK(read_tensor(d_hc_split, (uint64_t)kRows * kHcMix,
+                      got_hc_split) &&
+          read_tensor(d_hc_collapsed, (uint64_t)kRows * kHidden,
+                      got_hc_collapsed) &&
+          read_tensor(d_hidden, (uint64_t)kRows * kHidden, got_hidden) &&
+          read_tensor(d_hc_carried_local, (uint64_t)kHc * kHidden,
+                      got_hc_carried_local) &&
+          read_tensor(d_hc_carried_add, (uint64_t)kHc * kHidden,
+                      got_hc_carried_add) &&
+          read_tensor(d_q_resid, kQRank, got_q_resid) &&
           read_tensor(d_query, kHeads * kHeadDim, got_query) &&
           read_tensor(d_kv_norm, kRows * kKvLora, got_kv_norm) &&
           read_tensor(d_qk_low, kHeads * kKvLora, got_qk_low) &&
@@ -476,9 +596,31 @@ bool run_test() {
           read_tensor(d_attn_half0, kHidden, got_attn_half0) &&
           read_tensor(d_attn_half1, kHidden, got_attn_half1) &&
           read_tensor(d_attn_sum, kHidden, got_attn_sum),
-          "read every sparse-MLA heads composition boundary");
+          "read every mHC-to-sparse-MLA composition boundary");
 
-    CHECK(compare_values("q_resid", got_q_resid, expected_q_resid,
+    std::vector<float> got_hc_post((size_t)kRows * kHc);
+    std::vector<float> got_hc_comb((size_t)kRows * kHc * kHc);
+    for (uint32_t row = 0u; row < kRows; ++row) {
+        const float *split_row = got_hc_split.data() + (uint64_t)row * kHcMix;
+        std::copy(split_row + kHc, split_row + 2u * kHc,
+                  got_hc_post.data() + (uint64_t)row * kHc);
+        std::copy(split_row + 2u * kHc, split_row + kHcMix,
+                  got_hc_comb.data() + (uint64_t)row * kHc * kHc);
+    }
+
+    CHECK(compare_values("hc_post", got_hc_post, expected_hc_post,
+                         2.0e-6, 1.0e-10) &&
+          compare_values("hc_comb", got_hc_comb, expected_hc_comb,
+                         2.0e-6, 1.0e-10) &&
+          compare_values("hc_collapsed", got_hc_collapsed,
+                         expected_hc_collapsed, 2.0e-6, 1.0e-10) &&
+          compare_values("hc_attn_norm", got_hidden, hidden,
+                         2.0e-6, 1.0e-10) &&
+          compare_values("hc_carried_local", got_hc_carried_local,
+                         expected_hc_carried, 1.0e-5, 1.0e-10) &&
+          compare_values("hc_carried_add", got_hc_carried_add,
+                         expected_hc_carried, 1.0e-5, 1.0e-10) &&
+          compare_values("q_resid", got_q_resid, expected_q_resid,
                          5.0e-6, 2.0e-12) &&
           compare_values("query", got_query, expected_query,
                          1.0e-5, 2.0e-12) &&
@@ -490,8 +632,8 @@ bool run_test() {
                          0.015625, 5.0e-10) &&
           compare_values("index_key", got_index_key, expected_index_key,
                          0.000244140625, 1.0e-8) &&
-          compare_values("pool_gate", got_pool_gate, expected_pool_gate,
-                         0.0000152587890625, 1.0e-8) &&
+          compare_bf16_ulps("pool_gate", got_pool_gate,
+                            expected_pool_gate, 1u) &&
           compare_values("head_weights", got_head_weights,
                          expected_head_weights, 1.0e-5, 1.0e-10) &&
           compare_values("pooled", got_pooled, expected_pooled,
@@ -527,9 +669,68 @@ bool run_test() {
           compare_values("sum_vs_full", got_attn_sum, got_attn_full,
                          3.0e-6, 6.0e-13),
           "full and two-half Q8 attention output composition");
+    std::vector<float> roce_composed, roce_peer;
     CHECK(run_roce_output(gguf, got_attn_half0, got_attn_half1,
-                          expected_attn_output),
+                          expected_attn_output, roce_composed, roce_peer),
           "mandatory-RDMA MLA output composition");
+    const char *tp_role = std::getenv("DS4_GLM5_TP_ROLE");
+    if (tp_role) {
+        const bool leader = std::strcmp(tp_role, "leader") == 0;
+        ds4_gpu_tensor *d_owned_partial =
+            leader ? d_attn_half0 : d_attn_half1;
+        ds4_gpu_tensor *d_peer_partial =
+            leader ? d_attn_half1 : d_attn_half0;
+        const std::vector<float> poison(kHidden, 0.0f);
+        std::vector<float> poison_sum, poison_peer;
+        CHECK(roce_composed.size() == kHidden && roce_peer.size() == kHidden &&
+              ds4_gpu_tensor_write(d_attn_sum, 0u, poison.data(),
+                                   (uint64_t)kHidden * sizeof(float)) &&
+              ds4_gpu_tensor_write(d_peer_partial, 0u, poison.data(),
+                                   (uint64_t)kHidden * sizeof(float)) &&
+              ds4_gpu_synchronize() &&
+              read_tensor(d_attn_sum, kHidden, poison_sum) &&
+              read_tensor(d_peer_partial, kHidden, poison_peer) &&
+              poison_sum == poison && poison_peer == poison,
+              "poison prior local reduction and peer partial before upload");
+        CHECK(ds4_gpu_tensor_write(d_attn_sum, 0u, roce_composed.data(),
+                                   (uint64_t)kHidden * sizeof(float)) &&
+              ds4_gpu_tensor_write(d_peer_partial, 0u, roce_peer.data(),
+                                   (uint64_t)kHidden * sizeof(float)) &&
+              ds4_gpu_synchronize(),
+              "upload RoCE-composed row and received peer partial");
+        std::vector<float> uploaded_sum, uploaded_peer;
+        CHECK(read_tensor(d_attn_sum, kHidden, uploaded_sum) &&
+              read_tensor(d_peer_partial, kHidden, uploaded_peer) &&
+              uploaded_sum == roce_composed && uploaded_peer == roce_peer &&
+              fnv1a64(uploaded_sum.data(),
+                      (uint64_t)kHidden * sizeof(float)) ==
+                  fnv1a64(roce_composed.data(),
+                          (uint64_t)kHidden * sizeof(float)) &&
+              fnv1a64(uploaded_peer.data(),
+                      (uint64_t)kHidden * sizeof(float)) ==
+                  fnv1a64(roce_peer.data(),
+                          (uint64_t)kHidden * sizeof(float)) &&
+              ds4_gpu_hc_expand_add_tensor(
+                  d_hc_carried_roce, d_owned_partial, d_peer_partial,
+                  d_last_hc_residual, d_last_hc_post, d_last_hc_comb,
+                  kHidden, kHc) &&
+              ds4_gpu_synchronize(),
+              "consume received peer partial in production-form mHC add");
+        std::fprintf(stderr,
+                     "GLM5 MLA RoCE upload sum_fnv=%016llx peer_fnv=%016llx\n",
+                     (unsigned long long)fnv1a64(
+                         uploaded_sum.data(),
+                         (uint64_t)kHidden * sizeof(float)),
+                     (unsigned long long)fnv1a64(
+                         uploaded_peer.data(),
+                         (uint64_t)kHidden * sizeof(float)));
+        std::vector<float> got_hc_carried_roce;
+        CHECK(read_tensor(d_hc_carried_roce, (uint64_t)kHc * kHidden,
+                          got_hc_carried_roce) &&
+              compare_values("hc_carried_roce", got_hc_carried_roce,
+                             expected_hc_carried, 1.0e-5, 1.0e-10),
+              "RoCE attention output reaches correct mHC carry");
+    }
     if (!std::getenv("DS4_GLM5_TP_ROLE")) {
         CHECK(ds4_tp_test_get_exchange_calls() == 0u,
               "rank-local sparse-MLA heads invokes no TP exchange");
@@ -538,7 +739,14 @@ bool run_test() {
               "RoCE sparse-MLA output invokes exactly one TP exchange");
     }
 
+    ds4_gpu_tensor_free(d_last_hc_comb);
+    ds4_gpu_tensor_free(d_last_hc_post);
+    ds4_gpu_tensor_free(d_last_hc_split);
+    ds4_gpu_tensor_free(d_last_hc_residual);
     ds4_gpu_tensor_free(d_last_hidden);
+    ds4_gpu_tensor_free(d_hc_carried_roce);
+    ds4_gpu_tensor_free(d_hc_carried_add);
+    ds4_gpu_tensor_free(d_hc_carried_local);
     ds4_gpu_tensor_free(d_attn_reject);
     ds4_gpu_tensor_free(d_attn_sum);
     ds4_gpu_tensor_free(d_attn_half1);
@@ -565,9 +773,14 @@ bool run_test() {
     ds4_gpu_tensor_free(d_q_resid);
     ds4_gpu_tensor_free(d_q_a);
     ds4_gpu_tensor_free(d_hidden);
+    ds4_gpu_tensor_free(d_hc_collapsed);
+    ds4_gpu_tensor_free(d_hc_split);
+    ds4_gpu_tensor_free(d_hc_mix);
+    ds4_gpu_tensor_free(d_hc_flat);
+    ds4_gpu_tensor_free(d_hc_residual);
     ds4_gpu_cleanup();
     std::fprintf(stderr,
-                 "PASS same-GGUF GLM5 block-3 sparse-MLA heads gate\n");
+                 "PASS same-GGUF GLM5 block-3 mHC-to-sparse-MLA gate\n");
     return true;
 }
 

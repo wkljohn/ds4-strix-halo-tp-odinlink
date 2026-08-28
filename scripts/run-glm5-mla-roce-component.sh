@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce the two-node GLM-5.3 sparse-MLA attention-output RoCE gate.
+# Reproduce the two-node GLM-5.3 mHC-to-sparse-MLA RoCE component gate.
 set -euo pipefail
 
 usage() {
@@ -37,8 +37,8 @@ PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/mla-
 OUT=$DS4_RESEARCH_ROOT/glm5-next-tp2/$TAG
 BINARY=$REPO/tests/test_rocm_glm5_mla_compose
 PEER_BINARY=$PEER_DIR/test_rocm_glm5_mla_compose
-ORACLE=$DS4_RESEARCH_ROOT/glm5-next-tp2/raw/mla-compose-layer3
-PEER_ORACLE=$PEER_DIR/mla-compose-layer3
+ORACLE=$DS4_RESEARCH_ROOT/glm5-next-tp2/raw/mla-mhc-compose-layer3-v4
+PEER_ORACLE=$PEER_DIR/mla-mhc-compose-layer3-v4
 LOCAL_HOME=${HOME:?HOME is required}
 PEER_HOME=$(ssh -o BatchMode=yes "$PEER" 'printf %s "$HOME"')
 
@@ -94,7 +94,7 @@ mkdir "$OUT"
 make -C "$REPO" -j"$(nproc)" tests/test_rocm_glm5_mla_compose
 python3 "$REPO/scripts/probe-glm5-next-mla-compose.py" \
   --layer 3 --rows 10 --first-valid 1 \
-  --output "$DS4_RESEARCH_ROOT/glm5-next-tp2/mla-compose-layer3-oracle.json" \
+  --output "$DS4_RESEARCH_ROOT/glm5-next-tp2/mla-mhc-compose-layer3-v4-oracle.json" \
   --dump-prefix "$ORACLE" "$MODEL" >"$OUT/oracle.log"
 
 ssh -o BatchMode=yes "$PEER" "mkdir -p -- '$PEER_DIR'; test -f '$PEER_MODEL'"
@@ -180,7 +180,9 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
   require_log "$log" 'registered host slab as 3 MRs' 'three-MR proof'
   require_log "$log" 'GLM5 MLA TP RoCE .*bytes=16384 direct=1' \
     'direct attention-output exchange'
-  require_log "$log" 'PASS same-GGUF GLM5 block-3 sparse-MLA heads gate' \
+  require_log "$log" 'GLM5 MLA RoCE upload .*sum_fnv=.*peer_fnv=' \
+    'poisoned GPU upload and peer-consumption proof'
+  require_log "$log" 'PASS same-GGUF GLM5 block-3 mHC-to-sparse-MLA gate' \
     'composition PASS marker'
 done
 require_log "$OUT/leader.log" "role=leader device=$LOCAL_DEVICE" \
@@ -191,13 +193,17 @@ require_log "$OUT/worker.log" "role=worker device=$PEER_DEVICE" \
 LEADER_LOCAL=$(field "$OUT/leader.log" local_fnv)
 LEADER_PEER=$(field "$OUT/leader.log" peer_fnv)
 LEADER_SUM=$(field "$OUT/leader.log" composed_fnv)
+LEADER_UPLOAD=$(field "$OUT/leader.log" sum_fnv)
 WORKER_LOCAL=$(field "$OUT/worker.log" local_fnv)
 WORKER_PEER=$(field "$OUT/worker.log" peer_fnv)
 WORKER_SUM=$(field "$OUT/worker.log" composed_fnv)
+WORKER_UPLOAD=$(field "$OUT/worker.log" sum_fnv)
 [[ $LEADER_LOCAL == "$WORKER_PEER" &&
    $WORKER_LOCAL == "$LEADER_PEER" &&
    $LEADER_LOCAL != "$WORKER_LOCAL" &&
-   $LEADER_SUM == "$WORKER_SUM" ]] || {
+   $LEADER_SUM == "$WORKER_SUM" &&
+   $LEADER_UPLOAD == "$LEADER_SUM" &&
+   $WORKER_UPLOAD == "$WORKER_SUM" ]] || {
   echo "error: MLA RoCE payload hash chain did not close" >&2
   exit 1
 }
