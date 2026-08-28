@@ -5,11 +5,14 @@ extern "C" {
 }
 #include "tests/glm5_gguf_test.hpp"
 
+#include <hip/hip_runtime.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <string>
@@ -38,6 +41,31 @@ constexpr uint32_t kSelectedPools = 2u;
 constexpr uint32_t kSelectedTokens = 9u;
 constexpr uint32_t kTokenBudget = 2048u;
 constexpr uint32_t kExpandedWidth = kTokenBudget + 3u;
+
+struct TpGuard {
+    ds4_tp *tp = nullptr;
+    void *slab = nullptr;
+    ~TpGuard() {
+        if (tp) ds4_tp_free(tp);
+        if (slab) {
+            const hipError_t rc = hipHostFree(slab);
+            if (rc != hipSuccess) {
+                std::fprintf(stderr, "WARN hipHostFree MLA TP slab: %s\n",
+                             hipGetErrorString(rc));
+            }
+        }
+    }
+};
+
+uint64_t fnv1a64(const void *data, uint64_t bytes) {
+    const auto *p = static_cast<const uint8_t *>(data);
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0u; i < bytes; ++i) {
+        hash ^= p[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
 
 template <typename T>
 bool read_array(const std::string &path, size_t count, std::vector<T> &out) {
@@ -81,6 +109,118 @@ bool compare_values(const char *name, const std::vector<float> &got,
     CHECK(reference_max >= 1.0e-6, "non-degenerate MLA composition reference");
     CHECK(maximum <= max_abs_limit && nmse <= nmse_limit,
           "MLA composition numerical envelope");
+    return true;
+}
+
+bool run_roce_output(const Glm5TestGGUF &gguf,
+                     const std::vector<float> &half0,
+                     const std::vector<float> &half1,
+                     const std::vector<float> &expected) {
+    const char *role_value = std::getenv("DS4_GLM5_TP_ROLE");
+    if (!role_value) return true;
+    CHECK(std::strcmp(role_value, "leader") == 0 ||
+          std::strcmp(role_value, "worker") == 0,
+          "MLA TP role is leader or worker");
+    const bool leader = std::strcmp(role_value, "leader") == 0;
+    const char *host = std::getenv("DS4_GLM5_TP_HOST");
+    const char *device = std::getenv("DS4_GLM5_TP_RDMA_DEVICE");
+    const char *port_value = std::getenv("DS4_GLM5_TP_PORT");
+    const char *timeout = std::getenv("DS4_GLM5_TP_CONNECT_TIMEOUT_SEC");
+    if (!timeout || !timeout[0]) timeout = "120";
+    CHECK(host && host[0] && device && device[0] && port_value && port_value[0],
+          "MLA TP host, device and port are required");
+    char *end = nullptr;
+    const long port = std::strtol(port_value, &end, 10);
+    CHECK(end && *end == '\0' && port >= 1024 && port <= 65535,
+          "MLA TP port range");
+    CHECK(setenv("DS4_TP_BIG_DIRECT", "1", 1) == 0 &&
+          setenv("DS4_TP_BIG_DIRECT_MAX_ROWS", "1", 1) == 0 &&
+          setenv("DS4_TP_CONNECT_TIMEOUT_SEC", timeout, 1) == 0 &&
+          unsetenv("DS4_TP_VERBS_LIB") == 0,
+          "select system-verbs direct RoCE slab");
+
+    ds4_tp_options options = {};
+    options.role = leader ? DS4_TP_LEADER : DS4_TP_WORKER;
+    options.requested = true;
+    options.listen_host = leader ? host : nullptr;
+    options.listen_port = leader ? (int)port : 0;
+    options.leader_host = leader ? nullptr : host;
+    options.leader_port = leader ? 0 : (int)port;
+    options.transport = DS4_TP_TRANSPORT_RDMA;
+    options.rdma_device = device;
+    options.rdma_gid_index = 3;
+    options.rdma_gid_index_set = true;
+
+    ds4_tp_identity identity = {};
+    identity.gguf_bytes = gguf.size;
+    identity.model_id = 3u;
+    identity.n_layer = 46u;
+    identity.n_embd = kHidden;
+    identity.n_vocab = 154880u;
+    identity.quant_bits = 4u;
+    identity.ctx_size = 1u;
+    identity.gate_slot_start = 3u * DS4_TP_GATES_PER_LAYER +
+                               DS4_TP_GATE_ATTN;
+    identity.gate_slot_step = DS4_TP_GATES_PER_LAYER;
+    identity.gates_per_token = 42u;
+
+    TpGuard transport;
+    char error[256] = {};
+    CHECK(ds4_tp_create(&transport.tp, &options, &identity,
+                        error, sizeof(error)), error);
+    CHECK(ds4_tp_is_rdma(transport.tp) &&
+          ds4_tp_requires_host_slab(transport.tp),
+          "MLA TP selected mapped-host RDMA");
+    const uint64_t slab_bytes = ds4_tp_alloc_slab_bytes(transport.tp);
+    CHECK(slab_bytes != 0u &&
+          hipHostMalloc(&transport.slab, slab_bytes,
+                        hipHostMallocMapped) == hipSuccess,
+          "allocate MLA RoCE mapped slab");
+    CHECK(ds4_tp_attach_slab(transport.tp, transport.slab,
+                             error, sizeof(error)), error);
+    CHECK(ds4_tp_big_gate_is_rdma_capable(transport.tp),
+          "MLA direct gate is RDMA capable");
+    const uint64_t contract = fnv1a64(expected.data(),
+                                      expected.size() * sizeof(float));
+    CHECK(ds4_tp_hash_check(transport.tp, UINT64_C(0x474c4d4d4c410001),
+                            contract, error, sizeof(error)) == 1,
+          error);
+
+    const std::vector<float> &local = leader ? half0 : half1;
+    CHECK(local.size() == kHidden && half0.size() == half1.size() &&
+          expected.size() == kHidden,
+          "MLA RoCE partial shapes");
+    const uint64_t bytes = (uint64_t)kHidden * sizeof(float);
+    auto *base = static_cast<uint8_t *>(transport.slab);
+    float *out = reinterpret_cast<float *>(
+        base + ds4_tp_slab_big_out_offset(transport.tp));
+    float *in = reinterpret_cast<float *>(
+        base + ds4_tp_slab_big_in_offset(transport.tp));
+    std::memcpy(out, local.data(), bytes);
+    std::memset(in, 0, bytes);
+    const bool direct =
+        ds4_tp_big_gate_is_direct(transport.tp, out, in, bytes) != 0;
+    CHECK(ds4_tp_big_capacity_rows(transport.tp) >= 1u && direct,
+          "MLA partial lies in direct registered regions");
+    CHECK(ds4_tp_big_gate_exchange(transport.tp, 3u, 1u,
+                                   out, in, bytes),
+          "exchange MLA attention partial over RoCE");
+    std::vector<float> composed(kHidden);
+    for (uint32_t i = 0u; i < kHidden; ++i) composed[i] = out[i] + in[i];
+    CHECK(compare_values("roce_tp_sum", composed, expected,
+                         8.0e-6, 6.0e-12),
+          "RoCE-composed attention output matches oracle");
+    const uint64_t composed_hash = fnv1a64(composed.data(), bytes);
+    CHECK(ds4_tp_hash_check(transport.tp, UINT64_C(0x474c4d4d4c410002),
+                            composed_hash, error, sizeof(error)) == 1,
+          error);
+    std::fprintf(stderr,
+        "GLM5 MLA TP RoCE role=%s device=%s bytes=%llu direct=%d "
+        "local_fnv=%016llx peer_fnv=%016llx composed_fnv=%016llx\n",
+        role_value, device, (unsigned long long)bytes, direct ? 1 : 0,
+        (unsigned long long)fnv1a64(out, bytes),
+        (unsigned long long)fnv1a64(in, bytes),
+        (unsigned long long)composed_hash);
     return true;
 }
 
@@ -199,12 +339,14 @@ bool run_test() {
     ds4_gpu_tensor *d_attn_half0 = f32(kHidden);
     ds4_gpu_tensor *d_attn_half1 = f32(kHidden);
     ds4_gpu_tensor *d_attn_sum = f32(kHidden);
+    ds4_gpu_tensor *d_attn_reject = f32(kHidden);
     CHECK(d_hidden && d_q_a && d_q_resid && d_query && d_kv_raw &&
           d_kv_norm && d_qk_low && d_cache && d_index_q &&
           d_index_k_raw && d_index_key && d_pool_gate && d_head_weights &&
           d_valid && d_pooled && d_pool_indices && d_pool_valid &&
           d_pool_scores && d_selected_pools && d_selected_tokens && d_heads &&
-          d_attn_full && d_attn_half0 && d_attn_half1 && d_attn_sum,
+          d_attn_full && d_attn_half0 && d_attn_half1 && d_attn_sum &&
+          d_attn_reject,
           "allocate bounded sparse-MLA heads composition tensors");
     ds4_gpu_tensor *d_last_hidden = ds4_gpu_tensor_view(
         d_hidden, (uint64_t)(kRows - 1u) * kHidden * sizeof(float),
@@ -303,16 +445,16 @@ bool run_test() {
           ds4_gpu_add_tensor(d_attn_sum, d_attn_half0, d_attn_half1,
                              kHidden) &&
           !ds4_gpu_matmul_q8_0_kslice_tensor(
-              d_attn_half0, gguf.map, gguf.size, attn_output_w,
+              d_attn_reject, gguf.map, gguf.size, attn_output_w,
               kHeads * kHeadDim, 0u,
-              (kHeads * kHeadDim) / 2u + 32u, kHidden, d_heads, 0u) &&
+              (kHeads * kHeadDim) / 2u - 1u, kHidden, d_heads, 0u) &&
           ds4_gpu_synchronize(),
           "execute selected zero-RoPE attention and real value projection");
 
     std::vector<float> got_q_resid, got_query, got_kv_norm, got_qk_low,
         got_index_q, got_index_key, got_pool_gate, got_head_weights,
         got_pooled, got_pool_scores, got_heads, got_attn_full,
-        got_attn_sum;
+        got_attn_half0, got_attn_half1, got_attn_sum;
     std::vector<uint32_t> got_pool_valid, got_selected_pools;
     std::vector<int32_t> got_pool_indices, got_expanded_tokens;
     CHECK(read_tensor(d_q_resid, kQRank, got_q_resid) &&
@@ -331,6 +473,8 @@ bool run_test() {
           read_tensor(d_selected_tokens, kExpandedWidth, got_expanded_tokens) &&
           read_tensor(d_heads, kHeads * kHeadDim, got_heads) &&
           read_tensor(d_attn_full, kHidden, got_attn_full) &&
+          read_tensor(d_attn_half0, kHidden, got_attn_half0) &&
+          read_tensor(d_attn_half1, kHidden, got_attn_half1) &&
           read_tensor(d_attn_sum, kHidden, got_attn_sum),
           "read every sparse-MLA heads composition boundary");
 
@@ -383,10 +527,19 @@ bool run_test() {
           compare_values("sum_vs_full", got_attn_sum, got_attn_full,
                          3.0e-6, 6.0e-13),
           "full and two-half Q8 attention output composition");
-    CHECK(ds4_tp_test_get_exchange_calls() == 0u,
-          "rank-local sparse-MLA heads invokes no TP exchange");
+    CHECK(run_roce_output(gguf, got_attn_half0, got_attn_half1,
+                          expected_attn_output),
+          "mandatory-RDMA MLA output composition");
+    if (!std::getenv("DS4_GLM5_TP_ROLE")) {
+        CHECK(ds4_tp_test_get_exchange_calls() == 0u,
+              "rank-local sparse-MLA heads invokes no TP exchange");
+    } else {
+        CHECK(ds4_tp_test_get_exchange_calls() == 1u,
+              "RoCE sparse-MLA output invokes exactly one TP exchange");
+    }
 
     ds4_gpu_tensor_free(d_last_hidden);
+    ds4_gpu_tensor_free(d_attn_reject);
     ds4_gpu_tensor_free(d_attn_sum);
     ds4_gpu_tensor_free(d_attn_half1);
     ds4_gpu_tensor_free(d_attn_half0);
