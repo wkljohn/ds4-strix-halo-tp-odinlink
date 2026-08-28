@@ -93,6 +93,102 @@ bool run_test() {
           ds4_gpu_set_model_map(gguf.map, gguf.size),
           "initialize gfx1151 and register model map");
 
+    constexpr uint32_t kStoreTokens = 3u;
+    constexpr uint32_t kStoreCap = 5u;
+    std::vector<float> store_source((uint64_t)kStoreTokens * kKvLora);
+    for (size_t i = 0; i < store_source.size(); ++i) {
+        store_source[i] =
+            (float)((int)((i * 17u) % 47u) - 23) * 0.002731f +
+            (float)((int)(i % 5u) - 2) * 0.000013f;
+    }
+    std::vector<float> store_sentinel((uint64_t)kStoreCap * kKvLora,
+                                      123.25f);
+    ds4_gpu_tensor *d_store_source = ds4_gpu_tensor_alloc(
+        (uint64_t)store_source.size() * sizeof(float));
+    ds4_gpu_tensor *d_store_f32 = ds4_gpu_tensor_alloc(
+        (uint64_t)store_sentinel.size() * sizeof(float));
+    CHECK(d_store_source && d_store_f32 &&
+          ds4_gpu_tensor_write(d_store_source, 0u, store_source.data(),
+                               (uint64_t)store_source.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(d_store_f32, 0u, store_sentinel.data(),
+                               (uint64_t)store_sentinel.size() * sizeof(float)) &&
+          ds4_gpu_glm_store_compact_kv_tensor(
+              d_store_f32, nullptr, d_store_source, d_store_source,
+              1u, kStoreTokens, kStoreCap, kKvLora, kKvLora, 0u, false) &&
+          ds4_gpu_synchronize(),
+          "store F32 zero-RoPE compact KV");
+    std::vector<float> stored_f32(store_sentinel.size());
+    CHECK(ds4_gpu_tensor_read(d_store_f32, 0u, stored_f32.data(),
+                              (uint64_t)stored_f32.size() * sizeof(float)),
+          "read F32 zero-RoPE compact KV");
+    for (uint32_t row = 0u; row < kStoreCap; ++row) {
+        for (uint32_t j = 0u; j < kKvLora; ++j) {
+            const float expected = row >= 1u && row < 1u + kStoreTokens
+                ? store_source[(uint64_t)(row - 1u) * kKvLora + j]
+                : 123.25f;
+            CHECK(std::memcmp(&stored_f32[(uint64_t)row * kKvLora + j],
+                              &expected, sizeof(float)) == 0,
+                  "F32 store preserves payload and outer sentinels");
+        }
+    }
+
+    std::vector<uint16_t> store_sentinel_f16(
+        (uint64_t)kStoreCap * kKvLora);
+    const __half sentinel_half = __float2half_rn(-17.5f);
+    uint16_t sentinel_half_bits = 0u;
+    std::memcpy(&sentinel_half_bits, &sentinel_half, sizeof(uint16_t));
+    std::fill(store_sentinel_f16.begin(), store_sentinel_f16.end(),
+              sentinel_half_bits);
+    ds4_gpu_tensor *d_store_f16 = ds4_gpu_tensor_alloc(
+        (uint64_t)store_sentinel_f16.size() * sizeof(uint16_t));
+    CHECK(d_store_f16 &&
+          ds4_gpu_tensor_write(d_store_f16, 0u, store_sentinel_f16.data(),
+                               (uint64_t)store_sentinel_f16.size() * sizeof(uint16_t)) &&
+          ds4_gpu_glm_store_compact_kv_tensor(
+              d_store_f16, nullptr, d_store_source, d_store_source,
+              1u, kStoreTokens, kStoreCap, kKvLora, kKvLora, 0u, true) &&
+          ds4_gpu_synchronize(),
+          "store F16 zero-RoPE compact KV");
+    std::vector<uint16_t> stored_f16(store_sentinel_f16.size());
+    CHECK(ds4_gpu_tensor_read(d_store_f16, 0u, stored_f16.data(),
+                              (uint64_t)stored_f16.size() * sizeof(uint16_t)),
+          "read F16 zero-RoPE compact KV");
+    for (uint32_t row = 0u; row < kStoreCap; ++row) {
+        for (uint32_t j = 0u; j < kKvLora; ++j) {
+            uint16_t expected = sentinel_half_bits;
+            if (row >= 1u && row < 1u + kStoreTokens) {
+                const __half rounded = __float2half_rn(
+                    store_source[(uint64_t)(row - 1u) * kKvLora + j]);
+                std::memcpy(&expected, &rounded, sizeof(uint16_t));
+            }
+            CHECK(stored_f16[(uint64_t)row * kKvLora + j] == expected,
+                  "F16 store preserves rounded payload and outer sentinels");
+        }
+    }
+    CHECK(!ds4_gpu_glm_store_compact_kv_tensor(
+              d_store_f32, nullptr, d_store_source, d_store_source,
+              1u, 2u, kStoreCap, kKvLora + 64u, kKvLora,
+              64u, false),
+          "nonzero-RoPE store rejects a null cache");
+    CHECK(!ds4_gpu_glm_store_compact_kv_tensor(
+              d_store_f32, d_store_f32, d_store_source, d_store_source,
+              1u, kStoreTokens, kStoreCap, kKvLora, kKvLora, 0u, false),
+          "zero-RoPE store rejects a non-null cache");
+    CHECK(!ds4_gpu_glm_store_compact_kv_tensor(
+              d_store_f32, nullptr, d_store_source, d_store_source,
+              1u, 2u, kStoreCap, kKvLora - 1u, kKvLora, 0u, false),
+          "compact store rejects lora width beyond raw row");
+    CHECK(!ds4_gpu_glm_store_compact_kv_tensor(
+              d_store_f32, d_store_f32, d_store_source, d_store_source,
+              1u, 2u, kStoreCap, kKvLora + 63u, kKvLora, 64u, false),
+          "compact store rejects rope tail beyond raw row");
+    CHECK(!ds4_gpu_glm_store_compact_kv_tensor(
+              d_store_f32, nullptr, d_store_source, d_store_source,
+              4u, kStoreTokens, kStoreCap, kKvLora, kKvLora, 0u, false),
+          "zero-RoPE store rejects an overflowing position span");
+    std::fprintf(stderr,
+                 "GLM5 NoPE compact KV store F32/F16 payloads and sentinels exact\n");
+
     std::vector<float> query((uint64_t)kHeads * kQkNope);
     std::vector<float> qk_low((uint64_t)kHeads * kKvLora);
     std::vector<float> cache((uint64_t)kRows * kKvLora);
@@ -323,6 +419,9 @@ bool run_test() {
     ds4_gpu_tensor_free(d_cache);
     ds4_gpu_tensor_free(d_low);
     ds4_gpu_tensor_free(d_query);
+    ds4_gpu_tensor_free(d_store_f16);
+    ds4_gpu_tensor_free(d_store_f32);
+    ds4_gpu_tensor_free(d_store_source);
     ds4_gpu_cleanup();
     std::fprintf(stderr,
                  "PASS real-Q8 GLM5 zero-RoPE indexed attention gate\n");

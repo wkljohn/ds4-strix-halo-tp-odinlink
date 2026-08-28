@@ -1482,6 +1482,9 @@ int ds4_gpu_glm_k_b_project_typed_tensor(
         uint32_t              qk_nope,
         uint32_t              n_head);
 
+/* On ROCm, a metadata-validated NoPE model may pass qk_rope=0 and
+ * k_rope_cache=NULL. Nonzero-RoPE callers retain the mandatory separate
+ * rope-cache contract; other backends remain fail-closed at zero. */
 int ds4_gpu_glm_store_compact_kv_tensor(
         ds4_gpu_tensor       *kv_lora_cache,
         ds4_gpu_tensor       *k_rope_cache,

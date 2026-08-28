@@ -1461,18 +1461,22 @@ extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
         uint32_t qk_rope,
         bool cache_f16) {
     const uint64_t elem = cache_f16 ? sizeof(__half) : sizeof(float);
-    if (!kv_lora_cache || !k_rope_cache || !kv_norm || !kv_raw ||
+    if (!kv_lora_cache || !kv_norm || !kv_raw ||
+        (qk_rope == 0u ? k_rope_cache != NULL : k_rope_cache == NULL) ||
         !glm_rocm_check_pos_span(pos0, n_tokens, cache_cap) ||
-        kv_raw_dim == 0u || kv_lora_dim == 0u || qk_rope == 0u ||
+        kv_raw_dim == 0u || kv_lora_dim == 0u ||
+        kv_lora_dim > kv_raw_dim || qk_rope > kv_raw_dim - kv_lora_dim ||
         !cuda_tensor_has_elems2(kv_norm, n_tokens, kv_lora_dim, sizeof(float)) ||
         !cuda_tensor_has_elems2(kv_raw, n_tokens, kv_raw_dim, sizeof(float)) ||
         !glm_rocm_tensor_has_cache2(kv_lora_cache, cache_cap, kv_lora_dim, elem) ||
-        !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem)) {
+        (qk_rope != 0u &&
+         !glm_rocm_tensor_has_cache2(k_rope_cache, cache_cap, qk_rope, elem))) {
         return 0;
     }
-    dim3 grid(n_tokens, 2, 1);
+    dim3 grid(n_tokens, qk_rope == 0u ? 1u : 2u, 1);
     glm_store_compact_kv_kernel<<<grid, 256>>>((char *)kv_lora_cache->ptr,
-                                               (char *)k_rope_cache->ptr,
+                                               k_rope_cache ?
+                                                   (char *)k_rope_cache->ptr : NULL,
                                                (const float *)kv_norm->ptr,
                                                (const float *)kv_raw->ptr,
                                                pos0,
