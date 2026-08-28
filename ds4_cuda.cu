@@ -3959,6 +3959,16 @@ __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w
     out[i] = __half2float(reinterpret_cast<const __half *>(w)[(uint64_t)token * n_embd + e]);
 }
 
+__global__ static void embed_token_hc_bf16_kernel(float *out, const uint16_t *w,
+                                                   uint32_t token, uint32_t n_embd,
+                                                   uint32_t n_hc) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n = n_embd * n_hc;
+    if (i >= n) return;
+    uint32_t e = i % n_embd;
+    out[i] = __uint_as_float((uint32_t)w[(uint64_t)token * n_embd + e] << 16u);
+}
+
 __global__ static void embed_tokens_hc_kernel(
         float *out,
         const int32_t *tokens,
@@ -3977,6 +3987,21 @@ __global__ static void embed_tokens_hc_kernel(
     uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
     if (tok >= n_vocab) tok = 0;
     out[gid] = __half2float(w[(uint64_t)tok * n_embd + d]);
+}
+
+__global__ static void embed_tokens_hc_bf16_kernel(
+        float *out, const int32_t *tokens, const uint16_t *w,
+        uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
+    if (gid >= n) return;
+    uint32_t d = gid % n_embd;
+    uint64_t tmp = gid / n_embd;
+    uint32_t t = tmp / n_hc;
+    int32_t tok_i = tokens[t];
+    uint32_t tok = tok_i < 0 ? 0u : (uint32_t)tok_i;
+    if (tok >= n_vocab) tok = 0u;
+    out[gid] = __uint_as_float((uint32_t)w[(uint64_t)tok * n_embd + d] << 16u);
 }
 
 __global__ static void matmul_f16_kernel(
@@ -11728,6 +11753,53 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
         (const __half *)wptr,
         n_vocab, n_tokens, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "embed tokens launch");
+}
+
+extern "C" int ds4_gpu_embed_token_hc_bf16_tensor(
+        ds4_gpu_tensor *out_hc, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t n_vocab, uint32_t token,
+        uint32_t n_embd, uint32_t n_hc) {
+    if (!out_hc || !model_map || n_vocab == 0u || token >= n_vocab ||
+        n_embd == 0u || n_hc == 0u || (uint64_t)n_embd * n_hc > UINT32_MAX ||
+        (uint64_t)n_vocab * n_embd > UINT64_MAX / sizeof(uint16_t)) return 0;
+    const uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
+    const uint64_t out_bytes = (uint64_t)n_embd * n_hc * sizeof(float);
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        out_hc->bytes < out_bytes) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out_hc);
+    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset,
+                                                weight_bytes, logical_tier,
+                                                "token_embd_bf16");
+    if (!wptr) return 0;
+    const uint32_t n = n_embd * n_hc;
+    embed_token_hc_bf16_kernel<<<(n + 255u) / 256u, 256>>>(
+        (float *)out_hc->ptr, (const uint16_t *)wptr, token, n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "embed token bf16 launch");
+}
+
+extern "C" int ds4_gpu_embed_tokens_hc_bf16_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *tokens_t,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_vocab, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
+    if (!out_hc || !tokens_t || !model_map || n_vocab == 0u ||
+        n_tokens == 0u || n_embd == 0u || n_hc == 0u ||
+        (uint64_t)n_vocab * n_embd > UINT64_MAX / sizeof(uint16_t) ||
+        (uint64_t)n_tokens * n_hc > UINT64_MAX / n_embd) return 0;
+    const uint64_t weight_bytes = (uint64_t)n_vocab * n_embd * sizeof(uint16_t);
+    const uint64_t n = (uint64_t)n_tokens * n_hc * n_embd;
+    if (n > UINT64_MAX / sizeof(float) || weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        tokens_t->bytes < (uint64_t)n_tokens * sizeof(int32_t) ||
+        out_hc->bytes < n * sizeof(float)) return 0;
+    const int logical_tier = ds4_tensor_device_idx(out_hc);
+    const char *wptr = cuda_resolve_weight_ptr(model_map, weight_offset,
+                                                weight_bytes, logical_tier,
+                                                "token_embd_bf16");
+    if (!wptr) return 0;
+    embed_tokens_hc_bf16_kernel<<<(n + 255u) / 256u, 256>>>(
+        (float *)out_hc->ptr, (const int32_t *)tokens_t->ptr,
+        (const uint16_t *)wptr, n_vocab, n_tokens, n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "embed tokens bf16 launch");
 }
 
 static int indexer_scores_launch(
