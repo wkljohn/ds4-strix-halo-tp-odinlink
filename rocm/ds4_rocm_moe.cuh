@@ -5639,6 +5639,7 @@ __global__ static void moe_gate_up_q4K_cold_tile16_kernel(
             const uint32_t token = pair[np] / n_expert;
             xqb[np] = xq + (uint64_t)token * xq_blocks;
         }
+        if (np == 0u) break;
         if (xq_blocks <= 16u) {
             for (uint32_t i = (uint32_t)threadIdx.x;
                  i < np * xq_blocks; i += (uint32_t)blockDim.x) {

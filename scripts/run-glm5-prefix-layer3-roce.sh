@@ -78,6 +78,7 @@ KDA_ROUTED_CONTINUATION_ROWS=${DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS:-1}
 ROCPROF_RANK=${DS4_GLM5_ROCPROF_RANK:-}
 BF16_TOKTILE_DISABLE=${DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE:-}
 BF16_TOKTILE_VERBOSE=${DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE:-}
+Q4K_WMMA_MIN_COUNT=${DS4_ROCM_Q4K_WMMA_MIN_COUNT:-}
 EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
@@ -175,6 +176,12 @@ done
 }
 [[ -z $BF16_TOKTILE_VERBOSE || $BF16_TOKTILE_VERBOSE == 1 ]] || {
   echo "error: DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE must be empty or 1" >&2
+  exit 2
+}
+[[ -z $Q4K_WMMA_MIN_COUNT ||
+   ($Q4K_WMMA_MIN_COUNT =~ ^[0-9]+$ &&
+    $Q4K_WMMA_MIN_COUNT -ge 1 && $Q4K_WMMA_MIN_COUNT -le 16) ]] || {
+  echo "error: DS4_ROCM_Q4K_WMMA_MIN_COUNT must be empty or 1..16" >&2
   exit 2
 }
 [[ -z $EXPECTED_GENERATED_FNV ||
@@ -275,6 +282,8 @@ SOURCE_FILES=(
   ds4_rocm_compat.cu rocm/ds4_rocm_common.cuh
   rocm/ds4_rocm_bf16_toktile.cuh
   rocm/ds4_rocm_matmul.cuh rocm/ds4_rocm_glm5_kda.cuh
+  rocm/ds4_rocm_moe.cuh rocm/ds4_rocm_moe_launch.cuh
+  rocm/ds4_rocm_runtime.cuh
   scripts/run-glm5-prefix-layer3-roce.sh
   tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp
   tests/test_rocm_bf16_batch_gemm.cu
@@ -414,6 +423,7 @@ printf 'kda_routed_continuation_rows=%s\n' "$KDA_ROUTED_CONTINUATION_ROWS" >>"$O
 printf 'rocprof_rank=%s\n' "$ROCPROF_RANK" >>"$OUT/run.env"
 printf 'bf16_toktile_disabled=%s\n' "$([[ -n $BF16_TOKTILE_DISABLE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
 printf 'bf16_toktile_verbose=%s\n' "$([[ -n $BF16_TOKTILE_VERBOSE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
+printf 'q4k_wmma_min_count=%s\n' "${Q4K_WMMA_MIN_COUNT:-default}" >>"$OUT/run.env"
 printf 'expected_generated_fnv=%s\n' "$EXPECTED_GENERATED_FNV" >>"$OUT/run.env"
 if [[ -n $TEXT_PROMPT ]]; then
   printf 'text_prompt=%s\n' "$TEXT_PROMPT" >>"$OUT/run.env"
@@ -459,6 +469,11 @@ fi
 if [[ -n $BF16_TOKTILE_VERBOSE ]]; then
   local_candidate_env+=(DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE=1)
   remote_candidate_env+=' DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE=1'
+fi
+if [[ -n $Q4K_WMMA_MIN_COUNT ]]; then
+  local_candidate_env+=(
+    DS4_ROCM_Q4K_WMMA_MIN_COUNT="$Q4K_WMMA_MIN_COUNT")
+  remote_candidate_env+=" DS4_ROCM_Q4K_WMMA_MIN_COUNT='$Q4K_WMMA_MIN_COUNT'"
 fi
 if [[ -n $TEXT_PROMPT ]]; then
   text_env+=(DS4_GLM5_TEXT_PROMPT="$TEXT_PROMPT")
