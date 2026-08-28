@@ -11,6 +11,7 @@ extern "C" {
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -31,7 +32,7 @@ namespace {
 
 constexpr uint32_t kWidth = 4096u;
 constexpr uint32_t kHcWidth = 4u * kWidth;
-constexpr uint64_t kPrefixFNV = UINT64_C(0xb6c2590232ac924b);
+constexpr uint64_t kPrefixFNV = UINT64_C(0x6b704c8b12a398ef);
 
 uint64_t fnv64(const void *data, uint64_t bytes) {
     const auto *p = static_cast<const uint8_t *>(data);
@@ -86,10 +87,9 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
                uint32_t context_capacity,
                TpGuard &guard, ds4_glm5_next_exec_ctx &exec,
                uint64_t &sequence) {
-    CHECK(unsetenv("DS4_TP_VERBS_LIB") == 0 &&
-          setenv("DS4_TP_BIG_DIRECT", "1", 1) == 0 &&
+    CHECK(setenv("DS4_TP_BIG_DIRECT", "1", 1) == 0 &&
           setenv("DS4_TP_BIG_DIRECT_MAX_ROWS", "1", 1) == 0,
-          "select mandatory system-verbs direct RoCE");
+          "select mandatory direct RDMA");
     ds4_tp_options options = {};
     options.role = leader ? DS4_TP_LEADER : DS4_TP_WORKER;
     options.requested = true;
@@ -99,8 +99,16 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
     options.leader_port = leader ? 0 : port;
     options.transport = DS4_TP_TRANSPORT_RDMA;
     options.rdma_device = device;
-    options.rdma_gid_index = 3;
-    options.rdma_gid_index_set = true;
+    const char *gid_text = getenv("DS4_GLM5_TP_RDMA_GID_INDEX");
+    if (gid_text && gid_text[0]) {
+        char *end = nullptr;
+        errno = 0;
+        const long gid = strtol(gid_text, &end, 10);
+        CHECK(errno == 0 && end && *end == '\0' && gid >= 0 && gid <= 255,
+              "valid explicit RDMA GID index");
+        options.rdma_gid_index = (int)gid;
+        options.rdma_gid_index_set = true;
+    }
 
     ds4_tp_identity identity = {};
     identity.gguf_bytes = gguf.size;
@@ -562,8 +570,17 @@ bool run() {
     }
     std::vector<float> prefix(kHcWidth);
     CHECK(ds4_gpu_tensor_read(current.value, 0u, prefix.data(),
-                              prefix.size() * sizeof(float)) &&
-          fnv64(prefix.data(), prefix.size() * sizeof(float)) == kPrefixFNV,
+                              prefix.size() * sizeof(float)),
+          "read production dense prefix");
+    const uint64_t prefix_hash =
+        fnv64(prefix.data(), prefix.size() * sizeof(float));
+    if (prefix_hash != kPrefixFNV) {
+        std::fprintf(stderr,
+                     "dense-prefix fingerprint expected=%016llx observed=%016llx\n",
+                     (unsigned long long)kPrefixFNV,
+                     (unsigned long long)prefix_hash);
+    }
+    CHECK(prefix_hash == kPrefixFNV,
           "production prefix matches frozen real-GGUF fixture");
 
     if (full_trunk) {

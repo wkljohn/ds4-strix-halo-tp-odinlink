@@ -7,7 +7,7 @@ if [[ -z "$model" || ! -f "$model" ]]; then
     exit 2
 fi
 
-expected='ds4: glm5-next metadata and tensor layouts validated; resident KDA is component-gated only, while sparse MLA/indexer, mHC, FFN, output, and the full TP graph remain unimplemented; refusing inference'
+expected='ds4: glm5-next metadata and tensor layouts validated; staged full TP execution is not yet wired into the ordinary engine; refusing inference'
 log=$(mktemp)
 lock=$(mktemp -u /tmp/ds4-glm5-refusal.XXXXXX.lock)
 trap 'rm -f "$log" "$lock"' EXIT
@@ -28,4 +28,4 @@ if ! grep -Fqx "$expected" "$log"; then
     tail -40 "$log" >&2
     exit 1
 fi
-echo "PASS glm5-next runtime remains fail-closed after resident KDA validation"
+echo "PASS glm5-next ordinary runtime remains fail-closed until staged TP integration"

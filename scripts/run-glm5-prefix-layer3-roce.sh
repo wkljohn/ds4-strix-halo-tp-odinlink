@@ -28,10 +28,42 @@ REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 source "$REPO/scripts/ds4-research-root.sh"
 ds4_resolve_research_roots "$REPO"
 
-HOST=${DS4_COORDINATOR_ADDR:-192.168.99.1}
+RDMA_PROFILE=${DS4_GLM5_RDMA_PROFILE:-roce-v2}
+case $RDMA_PROFILE in
+  roce-v2)
+    HOST=${DS4_COORDINATOR_ADDR:-192.168.99.1}
+    LOCAL_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
+    PEER_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
+    GID_INDEX=${DS4_RDMA_GID_INDEX:-3}
+    LOCAL_VERBS_LIB=
+    PEER_VERBS_LIB=
+    ;;
+  odinlink)
+    HOST=${DS4_COORDINATOR_ADDR:-10.4.0.1}
+    LOCAL_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-odl_tb5_0}
+    PEER_DEVICE=${DS4_PEER_RDMA_DEVICE:-odl_tb5_0}
+    GID_INDEX=${DS4_RDMA_GID_INDEX:-}
+    LOCAL_VERBS_LIB=${DS4_TP_VERBS_LIB:-}
+    PEER_VERBS_LIB=${DS4_GLM5_PEER_VERBS_LIB:-$LOCAL_VERBS_LIB}
+    [[ -n $LOCAL_VERBS_LIB && -f $LOCAL_VERBS_LIB ]] || {
+      echo "error: OdinLink requires DS4_TP_VERBS_LIB naming its local standalone provider" >&2
+      exit 2
+    }
+    [[ $LOCAL_VERBS_LIB == *odl_tb5_verbs* ]] || {
+      echo "error: OdinLink provider path must name odl_tb5_verbs" >&2
+      exit 2
+    }
+    [[ -n $PEER_VERBS_LIB ]] || {
+      echo "error: OdinLink requires DS4_GLM5_PEER_VERBS_LIB or an identical provider path" >&2
+      exit 2
+    }
+    ;;
+  *)
+    echo "error: DS4_GLM5_RDMA_PROFILE must be roce-v2 or odinlink" >&2
+    exit 2
+    ;;
+esac
 PORT=${DS4_GLM5_PREFIX_TP_PORT:-15883}
-LOCAL_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
-PEER_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
 TIMEOUT=${DS4_GLM5_TP_CONNECT_TIMEOUT_SEC:-180}
 FULL_TRUNK=${DS4_GLM5_FULL_TRUNK:-0}
 FULL_TOKENS=${DS4_GLM5_FULL_TOKENS:-1}
@@ -47,7 +79,8 @@ LOCAL_HOME=${HOME:?HOME is required}
 PEER_HOME=$(ssh -o BatchMode=yes "$PEER" 'printf %s "$HOME"')
 
 for value in "$HOST" "$LOCAL_DEVICE" "$PEER_DEVICE" "$PEER_DIR" \
-             "$LOCAL_HOME" "$PEER_HOME" "$TEXT_PROMPT"; do
+             "$LOCAL_HOME" "$PEER_HOME" "$TEXT_PROMPT" \
+             "$LOCAL_VERBS_LIB" "$PEER_VERBS_LIB"; do
   [[ $value != *"'"* && $value != *$'\n'* ]] || {
     echo "error: environment values may not contain quotes or newlines" >&2
     exit 2
@@ -64,6 +97,10 @@ done
 }
 [[ $TIMEOUT =~ ^[1-9][0-9]*$ ]] || {
   echo "error: invalid timeout" >&2
+  exit 2
+}
+[[ -z $GID_INDEX || ($GID_INDEX =~ ^[0-9]+$ && GID_INDEX -le 255) ]] || {
+  echo "error: DS4_RDMA_GID_INDEX must be empty or in 0..255" >&2
   exit 2
 }
 [[ $FULL_TRUNK == 0 || $FULL_TRUNK == 1 ]] || {
@@ -177,6 +214,17 @@ SOURCE_DIFF_SHA=$(sha256sum "$OUT/source.diff" | awk '{print $1}')
 
 make -C "$REPO" -j"$(nproc)" tests/test_rocm_glm5_prefix_layer3_tp
 ssh -o BatchMode=yes "$PEER" "mkdir -p -- '$PEER_DIR'; test -f '$PEER_MODEL'"
+if [[ $RDMA_PROFILE == odinlink ]]; then
+  [[ -e /dev/odl_tb5_0 ]] || {
+    echo "error: local OdinLink device is absent" >&2
+    exit 1
+  }
+  ssh -o BatchMode=yes "$PEER" \
+    "test -e /dev/odl_tb5_0; test -f '$PEER_VERBS_LIB'" || {
+      echo "error: peer OdinLink device or provider is absent" >&2
+      exit 1
+    }
+fi
 scp -q -o BatchMode=yes "$BINARY" "$PEER:$PEER_BINARY"
 
 LOCAL_SHA=$(sha256sum "$BINARY" | awk '{print $1}')
@@ -243,11 +291,28 @@ printf '%s\n' \
   "model_sample_sha256=$LOCAL_SAMPLE" \
   "model_full_sha256=$MODEL_FULL_SHA" \
   "source_diff_sha256=$SOURCE_DIFF_SHA" \
+  "rdma_profile=$RDMA_PROFILE" \
   "host=$HOST" \
   "port=$PORT" \
   "local_device=$LOCAL_DEVICE" \
   "peer_device=$PEER_DEVICE" \
+  "rdma_gid_index=$GID_INDEX" \
   "timeout_sec=$TIMEOUT" >"$OUT/run.env"
+if [[ $RDMA_PROFILE == odinlink ]]; then
+  LOCAL_VERBS_SHA=$(sha256sum "$LOCAL_VERBS_LIB" | awk '{print $1}')
+  PEER_VERBS_SHA=$(ssh -o BatchMode=yes "$PEER" \
+    "sha256sum '$PEER_VERBS_LIB'" | awk '{print $1}')
+  [[ $LOCAL_VERBS_SHA == "$PEER_VERBS_SHA" ]] || {
+    echo "error: OdinLink provider checksum mismatch" >&2
+    exit 1
+  }
+  printf '%s\n' \
+    "local_verbs_lib=$LOCAL_VERBS_LIB" \
+    "local_verbs_sha256=$LOCAL_VERBS_SHA" \
+    "peer_verbs_lib=$PEER_VERBS_LIB" \
+    "peer_verbs_sha256=$PEER_VERBS_SHA" \
+    >>"$OUT/run.env"
+fi
 printf 'full_trunk=%s\n' "$FULL_TRUNK" >>"$OUT/run.env"
 printf 'full_tokens=%s\n' "$FULL_TOKENS" >>"$OUT/run.env"
 printf 'text_mode=%s\n' "$([[ -n $TEXT_PROMPT ]] && printf 1 || printf 0)" \
@@ -278,6 +343,16 @@ fi
 common_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 text_env=()
 remote_text_env=
+local_rdma_env=()
+remote_rdma_env=
+if [[ -n $GID_INDEX ]]; then
+  local_rdma_env+=(DS4_GLM5_TP_RDMA_GID_INDEX="$GID_INDEX")
+  remote_rdma_env+=" DS4_GLM5_TP_RDMA_GID_INDEX='$GID_INDEX'"
+fi
+if [[ $RDMA_PROFILE == odinlink ]]; then
+  local_rdma_env+=(DS4_TP_VERBS_LIB="$LOCAL_VERBS_LIB")
+  remote_rdma_env+=" DS4_TP_VERBS_LIB='$PEER_VERBS_LIB'"
+fi
 if [[ -n $TEXT_PROMPT ]]; then
   text_env+=(DS4_GLM5_TEXT_PROMPT="$TEXT_PROMPT")
   text_env+=(DS4_GLM5_TEXT_GENERATE="$TEXT_GENERATE")
@@ -296,11 +371,12 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_TP_CONNECT_TIMEOUT_SEC="$TIMEOUT" \
   DS4_GLM5_FULL_TRUNK="$FULL_TRUNK" \
   DS4_GLM5_FULL_TOKENS="$FULL_TOKENS" \
+  "${local_rdma_env[@]}" \
   "${text_env[@]}" \
   "$BINARY" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS'$remote_text_env '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS'$remote_rdma_env$remote_text_env '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 
@@ -316,9 +392,18 @@ fi
 
 for log in "$OUT/leader.log" "$OUT/worker.log"; do
   grep -q 'transport=rdma' "$log"
-  grep -q 'rdma GID index 3 (RoCE v2)' "$log"
-  grep -q 'mlx5 queue pair uses RC' "$log"
-  grep -q 'registered host slab as 3 MRs' "$log"
+  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+    grep -q "rdma GID index $GID_INDEX (RoCE v2)" "$log"
+    grep -q 'mlx5 queue pair uses RC' "$log"
+    grep -q 'registered host slab as 3 MRs' "$log"
+    ! grep -q 'rdma device odl_tb5_' "$log"
+  else
+    grep -q 'rdma device odl_tb5_0' "$log"
+    grep -q 'provider rejected UC, using RC' "$log"
+    grep -q '"enabled":true' "$log"
+    grep -q '"fallback_calls":0' "$log"
+    ! grep -q 'rdma device mlx5_' "$log"
+  fi
   if [[ -n $TEXT_PROMPT ]]; then
     grep -q 'GLM5 text prompt role=' "$log"
     grep -q 'PASS GLM5 real-text role=' "$log"
@@ -376,12 +461,12 @@ if [[ $FULL_TRUNK == 1 && -z $TEXT_PROMPT ]]; then
   fi
 fi
 
-printf 'PASS GLM5 prefix-layer3 RoCE tag=%s binary_sha256=%s output_fnv=%s\n' \
-  "$TAG" "$LOCAL_SHA" "$LEADER_OUTPUT"
+printf 'PASS GLM5 prefix-layer3 %s tag=%s binary_sha256=%s output_fnv=%s\n' \
+  "$RDMA_PROFILE" "$TAG" "$LOCAL_SHA" "$LEADER_OUTPUT"
 printf '%s\n' \
   "leader_rc=$leader_rc" \
   "worker_rc=$worker_rc" \
-  "transport=roce-v2" \
+  "transport=$RDMA_PROFILE" \
   "output_fnv=$LEADER_OUTPUT" >"$OUT/run.status"
 (cd "$OUT" &&
   find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' |
