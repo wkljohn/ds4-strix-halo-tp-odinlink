@@ -32,6 +32,9 @@ enum {
 };
 
 struct ds4_glm5_next_workspace {
+    ds4_gpu_tensor *hc_mean_weights;
+    ds4_gpu_tensor *output_hidden;
+    ds4_gpu_tensor *output_norm;
     ds4_gpu_tensor *hc_flat;
     ds4_gpu_tensor *hc_mix;
     ds4_gpu_tensor *hc_split;
@@ -80,6 +83,9 @@ static ds4_gpu_tensor *f32(uint64_t count) {
 void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *w) {
     if (!w) return;
     ds4_glm5_kda_workspace_free(&w->kda);
+    ds4_gpu_tensor_free(w->output_norm);
+    ds4_gpu_tensor_free(w->output_hidden);
+    ds4_gpu_tensor_free(w->hc_mean_weights);
     ds4_gpu_tensor_free(w->shared_out);
     ds4_gpu_tensor_free(w->shared_mid);
     ds4_gpu_tensor_free(w->shared_up);
@@ -125,6 +131,9 @@ void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *w) {
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
     ds4_glm5_next_workspace *w = calloc(1u, sizeof(*w));
     if (!w) return NULL;
+    w->hc_mean_weights = f32(GLM5_HC);
+    w->output_hidden = f32(GLM5_WIDTH);
+    w->output_norm = f32(GLM5_WIDTH);
     w->hc_flat = f32(GLM5_HC_WIDTH);
     w->hc_mix = f32(GLM5_HC_MIX);
     w->hc_split = f32(GLM5_HC_MIX);
@@ -165,7 +174,8 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
     w->shared_up = f32(GLM5_RANK_MID);
     w->shared_mid = f32(GLM5_RANK_MID);
     w->shared_out = f32(GLM5_WIDTH);
-    if (!w->hc_flat || !w->hc_mix || !w->hc_split || !w->collapsed ||
+    if (!w->hc_mean_weights || !w->output_hidden || !w->output_norm ||
+        !w->hc_flat || !w->hc_mix || !w->hc_split || !w->collapsed ||
         !w->attention || !w->after_attention || !w->ffn_flat ||
         !w->ffn_mix || !w->ffn_split || !w->ffn_collapsed ||
         !w->ffn_hidden || !w->gate || !w->up || !w->mid || !w->down ||
@@ -178,6 +188,12 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
         !w->routed_experts || !w->routed_out || !w->shared_gate ||
         !w->shared_up || !w->shared_mid || !w->shared_out ||
         !ds4_glm5_kda_workspace_init(&w->kda, 1u)) {
+        ds4_glm5_next_workspace_destroy(w);
+        return NULL;
+    }
+    if (!ds4_gpu_tensor_fill_f32(w->hc_mean_weights,
+                                 1.0f / (float)GLM5_HC,
+                                 GLM5_HC)) {
         ds4_glm5_next_workspace_destroy(w);
         return NULL;
     }
@@ -197,6 +213,30 @@ int ds4_glm5_next_embed_token(const ds4_glm5_next_exec_ctx *ctx,
                hc_out, ctx->model_map, ctx->model_size,
                ctx->model->token_embd, GLM5_VOCAB, token,
                GLM5_WIDTH, GLM5_HC);
+}
+
+int ds4_glm5_next_output_logits(const ds4_glm5_next_exec_ctx *ctx,
+                                ds4_glm5_next_workspace *w,
+                                const ds4_gpu_tensor *hc_hidden,
+                                ds4_gpu_tensor *logits_out) {
+    const uint64_t hc_bytes =
+        (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    const uint64_t logits_bytes =
+        (uint64_t)GLM5_VOCAB * sizeof(float);
+    return context_valid(ctx) && w && hc_hidden && logits_out &&
+           ds4_gpu_tensor_bytes(hc_hidden) >= hc_bytes &&
+           ds4_gpu_tensor_bytes(logits_out) >= logits_bytes &&
+           ds4_gpu_hc_weighted_sum_tensor(
+               w->output_hidden, hc_hidden, w->hc_mean_weights,
+               GLM5_WIDTH, GLM5_HC) &&
+           ds4_gpu_rms_norm_weight_tensor(
+               w->output_norm, w->output_hidden,
+               ctx->model_map, ctx->model_size, ctx->model->output_norm,
+               GLM5_WIDTH, 1.0e-5f) &&
+           ds4_gpu_matmul_bf16_tensor(
+               logits_out, ctx->model_map, ctx->model_size,
+               ctx->model->output, GLM5_WIDTH, GLM5_VOCAB,
+               w->output_norm, 1u);
 }
 
 static int kda_attention_one(const ds4_glm5_next_exec_ctx *ctx,

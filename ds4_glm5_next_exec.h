@@ -36,6 +36,16 @@ int ds4_glm5_next_embed_token(const ds4_glm5_next_exec_ctx *ctx,
                               uint32_t token,
                               ds4_gpu_tensor *hc_out);
 
+/* One-token output head. GLM-5.3 has no learned mHC output combiner: collapse
+ * the four streams by their arithmetic mean, apply the model's F32 RMS norm,
+ * and execute the replicated BF16 vocabulary projection. No TP exchange is
+ * performed. Success means the kernels were launched; synchronize before
+ * consuming logits or before reporting an execution failure. */
+int ds4_glm5_next_output_logits(const ds4_glm5_next_exec_ctx *ctx,
+                                ds4_glm5_next_workspace *workspace,
+                                const ds4_gpu_tensor *hc_hidden,
+                                ds4_gpu_tensor *logits_out);
+
 /* Execute exactly one trunk layer. Unsupported kind combinations fail closed.
  * No workspace allocation is performed inside this call. Preconditions fail
  * without mutation; any backend failure invalidates the complete sequence. */
