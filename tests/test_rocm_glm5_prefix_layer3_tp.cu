@@ -337,6 +337,22 @@ bool run() {
               (kda_batch_rows_long == 3ul || kda_batch_rows_long == 33ul),
           "KDA routed batch rows are the bounded 3 or 33 fixture");
     const uint32_t kda_batch_rows = (uint32_t)kda_batch_rows_long;
+    const char *kda_profile_repeats_env =
+        std::getenv("DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS");
+    char *kda_profile_repeats_end = nullptr;
+    const unsigned long kda_profile_repeats_long =
+        kda_profile_repeats_env ?
+        std::strtoul(kda_profile_repeats_env,
+                     &kda_profile_repeats_end, 10) : 0ul;
+    CHECK((!kda_profile_repeats_env ||
+              (kda_profile_repeats_end &&
+               *kda_profile_repeats_end == '\0')) &&
+              kda_profile_repeats_long <= 16ul &&
+              (kda_profile_repeats_long == 0ul ||
+               (kda_batch_test && kda_batch_rows == 33u)),
+          "KDA routed profile repeats are bounded and use 33 rows");
+    const uint32_t kda_profile_repeats =
+        (uint32_t)kda_profile_repeats_long;
     const char *full_tokens_env = std::getenv("DS4_GLM5_FULL_TOKENS");
     const uint32_t full_tokens = !full_tokens_env ? 1u :
         std::strcmp(full_tokens_env, "1") == 0 ? 1u :
@@ -804,6 +820,45 @@ bool run() {
             sequential_ms, batch_ms, sequential_ms / batch_ms,
             (unsigned long long)sequence,
             (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
+        if (kda_profile_repeats > 0u) {
+            std::vector<double> profile_ms;
+            profile_ms.reserve(kda_profile_repeats > 1u ?
+                               kda_profile_repeats - 1u : 1u);
+            for (uint32_t repeat = 0u; repeat < kda_profile_repeats;
+                 ++repeat) {
+                StateGuard profile_state;
+                CHECK(ds4_glm5_next_state_init(
+                          &profile_state.value, &offsets, rows + 1u,
+                          nullptr),
+                      "allocate isolated KDA+routed profile state");
+                const auto profile_begin = Clock::now();
+                CHECK(ds4_glm5_next_layer_forward_batch(
+                          &exec, 4u, &profile_state.value,
+                          batch_workspace.value, batch_input.value,
+                          batch_output.value, rows),
+                      "execute isolated KDA+routed profile repeat");
+                const double elapsed_ms =
+                    std::chrono::duration<double, std::milli>(
+                        Clock::now() - profile_begin).count();
+                std::fprintf(stderr,
+                    "GLM5 KDA+routed profile role=%s rows=%u "
+                    "repeat=%u warmup=%d elapsed_ms=%.3f tp_seq=%llu\n",
+                    role, rows, repeat, repeat == 0u ? 1 : 0,
+                    elapsed_ms, (unsigned long long)sequence);
+                if (repeat > 0u || kda_profile_repeats == 1u)
+                    profile_ms.push_back(elapsed_ms);
+            }
+            std::sort(profile_ms.begin(), profile_ms.end());
+            const size_t mid = profile_ms.size() / 2u;
+            const double median_ms = profile_ms.size() % 2u ?
+                profile_ms[mid] :
+                0.5 * (profile_ms[mid - 1u] + profile_ms[mid]);
+            std::fprintf(stderr,
+                "GLM5 KDA+routed profile summary role=%s rows=%u "
+                "measured=%zu median_ms=%.3f min_ms=%.3f max_ms=%.3f\n",
+                role, rows, profile_ms.size(), median_ms,
+                profile_ms.front(), profile_ms.back());
+        }
         return true;
     }
 

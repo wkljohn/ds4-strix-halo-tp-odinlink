@@ -73,6 +73,8 @@ TEXT_TEACHER_IDS=${DS4_GLM5_TEXT_TEACHER_IDS:-}
 PERF_MODE=${DS4_GLM5_PERF_MODE:-0}
 KDA_ROUTED_BATCH_TEST=${DS4_GLM5_KDA_ROUTED_BATCH_TEST:-0}
 KDA_ROUTED_BATCH_ROWS=${DS4_GLM5_KDA_ROUTED_BATCH_ROWS:-3}
+KDA_ROUTED_PROFILE_REPEATS=${DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS:-0}
+ROCPROF_RANK=${DS4_GLM5_ROCPROF_RANK:-}
 EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
@@ -138,6 +140,20 @@ done
 }
 [[ $KDA_ROUTED_BATCH_ROWS == 3 || $KDA_ROUTED_BATCH_ROWS == 33 ]] || {
   echo "error: DS4_GLM5_KDA_ROUTED_BATCH_ROWS must be 3 or 33" >&2
+  exit 2
+}
+[[ $KDA_ROUTED_PROFILE_REPEATS =~ ^[0-9]+$ &&
+   $KDA_ROUTED_PROFILE_REPEATS -le 16 ]] || {
+  echo "error: DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS must be 0..16" >&2
+  exit 2
+}
+[[ $KDA_ROUTED_PROFILE_REPEATS == 0 ||
+   ($KDA_ROUTED_BATCH_TEST == 1 && $KDA_ROUTED_BATCH_ROWS == 33) ]] || {
+  echo "error: KDA routed profile repeats require the 33-row batch test" >&2
+  exit 2
+}
+[[ -z $ROCPROF_RANK || $ROCPROF_RANK == leader ]] || {
+  echo "error: DS4_GLM5_ROCPROF_RANK currently supports only leader" >&2
   exit 2
 }
 [[ -z $EXPECTED_GENERATED_FNV ||
@@ -353,6 +369,8 @@ printf 'text_generate=%s\n' "$TEXT_GENERATE" >>"$OUT/run.env"
 printf 'perf_mode=%s\n' "$PERF_MODE" >>"$OUT/run.env"
 printf 'kda_routed_batch_test=%s\n' "$KDA_ROUTED_BATCH_TEST" >>"$OUT/run.env"
 printf 'kda_routed_batch_rows=%s\n' "$KDA_ROUTED_BATCH_ROWS" >>"$OUT/run.env"
+printf 'kda_routed_profile_repeats=%s\n' "$KDA_ROUTED_PROFILE_REPEATS" >>"$OUT/run.env"
+printf 'rocprof_rank=%s\n' "$ROCPROF_RANK" >>"$OUT/run.env"
 printf 'expected_generated_fnv=%s\n' "$EXPECTED_GENERATED_FNV" >>"$OUT/run.env"
 if [[ -n $TEXT_PROMPT ]]; then
   printf 'text_prompt=%s\n' "$TEXT_PROMPT" >>"$OUT/run.env"
@@ -399,6 +417,20 @@ if [[ -n $TEXT_PROMPT ]]; then
     remote_text_env+=" DS4_GLM5_TEXT_TEACHER_IDS='$TEXT_TEACHER_IDS'"
   fi
 fi
+local_command=("$BINARY")
+if [[ $ROCPROF_RANK == leader ]]; then
+  ROCPROF=$REPO/../toolchains/rocm-7.14.0-gfx1151/install/bin/rocprofv3
+  [[ -x $ROCPROF ]] || {
+    echo "error: missing source-pinned ROCm 7.14 rocprofv3: $ROCPROF" >&2
+    exit 1
+  }
+  mkdir "$OUT/rocprof-leader"
+  local_command=(
+    "$ROCPROF" --runtime-trace --stats --summary-per-domain
+    --summary-units msec --output-format csv
+    --output-directory "$OUT/rocprof-leader" -- "$BINARY"
+  )
+fi
 env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_MODEL="$MODEL" \
   DS4_GLM5_TP_ROLE=leader \
@@ -410,12 +442,13 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_FULL_TOKENS="$FULL_TOKENS" \
   DS4_GLM5_KDA_ROUTED_BATCH_TEST="$KDA_ROUTED_BATCH_TEST" \
   DS4_GLM5_KDA_ROUTED_BATCH_ROWS="$KDA_ROUTED_BATCH_ROWS" \
+  DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS="$KDA_ROUTED_PROFILE_REPEATS" \
   "${local_rdma_env[@]}" \
   "${text_env[@]}" \
-  "$BINARY" >"$OUT/leader.log" 2>&1 &
+  "${local_command[@]}" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS'$remote_rdma_env$remote_text_env '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS'$remote_rdma_env$remote_text_env '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 
