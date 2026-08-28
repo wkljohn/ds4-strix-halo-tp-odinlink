@@ -27,8 +27,9 @@ constexpr uint32_t kMix = 24u;
 constexpr uint32_t kDense = 12288u;
 constexpr uint32_t kVocab = 154880u;
 constexpr uint64_t kExpectedBlock0FNV = UINT64_C(0xf055102b4604cdf3);
+constexpr uint64_t kExpectedPrefixFNV = UINT64_C(0xb6c2590232ac924b);
 
-struct Block0Offsets {
+struct DenseOffsets {
     uint64_t embedding = 0u;
     uint64_t attn_hc_fn = 0u, attn_hc_scale = 0u, attn_hc_base = 0u;
     uint64_t ffn_hc_fn = 0u, ffn_hc_scale = 0u, ffn_hc_base = 0u;
@@ -37,34 +38,43 @@ struct Block0Offsets {
     ds4_glm5_kda_weight_offsets kda = {};
 };
 
-bool bind(const Glm5TestGGUF &g, Block0Offsets &w) {
+bool layer_tensor(const Glm5TestGGUF &g, uint32_t layer, const char *suffix,
+                  std::initializer_list<uint64_t> dims, uint32_t type,
+                  uint64_t &offset) {
+    char name[96];
+    const int n = std::snprintf(name, sizeof(name), "blk.%u.%s", layer, suffix);
+    return n > 0 && (size_t)n < sizeof(name) &&
+           g.tensor(name, dims, type, offset);
+}
+
+bool bind(const Glm5TestGGUF &g, uint32_t layer, DenseOffsets &w) {
     return g.tensor("token_embd.weight", {kWidth, kVocab}, 30u, w.embedding) &&
-           g.tensor("blk.0.hc_attn_fn.weight", {kHcWidth, kMix}, 30u, w.attn_hc_fn) &&
-           g.tensor("blk.0.hc_attn_scale.weight", {3u}, 0u, w.attn_hc_scale) &&
-           g.tensor("blk.0.hc_attn_base.weight", {kMix}, 0u, w.attn_hc_base) &&
-           g.tensor("blk.0.hc_ffn_fn.weight", {kHcWidth, kMix}, 30u, w.ffn_hc_fn) &&
-           g.tensor("blk.0.hc_ffn_scale.weight", {3u}, 0u, w.ffn_hc_scale) &&
-           g.tensor("blk.0.hc_ffn_base.weight", {kMix}, 0u, w.ffn_hc_base) &&
-           g.tensor("blk.0.attn_norm.weight", {kWidth}, 0u, w.attn_norm) &&
-           g.tensor("blk.0.ffn_norm.weight", {kWidth}, 0u, w.ffn_norm) &&
-           g.tensor("blk.0.ffn_gate.weight", {kWidth, kDense}, 8u, w.ffn_gate) &&
-           g.tensor("blk.0.ffn_up.weight", {kWidth, kDense}, 8u, w.ffn_up) &&
-           g.tensor("blk.0.ffn_down.weight", {kDense, kWidth}, 8u, w.ffn_down) &&
-           g.tensor("blk.0.kda_q.weight", {kWidth, 8192u}, 30u, w.kda.q) &&
-           g.tensor("blk.0.kda_k.weight", {kWidth, 8192u}, 30u, w.kda.k) &&
-           g.tensor("blk.0.kda_v.weight", {kWidth, 8192u}, 30u, w.kda.v) &&
-           g.tensor("blk.0.kda_output.weight", {8192u, kWidth}, 30u, w.kda.output) &&
-           g.tensor("blk.0.kda_q_conv.weight", {4u, 1u, 8192u}, 0u, w.kda.q_conv) &&
-           g.tensor("blk.0.kda_k_conv.weight", {4u, 1u, 8192u}, 0u, w.kda.k_conv) &&
-           g.tensor("blk.0.kda_v_conv.weight", {4u, 1u, 8192u}, 0u, w.kda.v_conv) &&
-           g.tensor("blk.0.kda_f_a.weight", {kWidth, 128u}, 30u, w.kda.f_a) &&
-           g.tensor("blk.0.kda_f_b.weight", {128u, 8192u}, 30u, w.kda.f_b) &&
-           g.tensor("blk.0.kda_g_a.weight", {kWidth, 128u}, 30u, w.kda.g_a) &&
-           g.tensor("blk.0.kda_g_b.weight", {128u, 8192u}, 30u, w.kda.g_b) &&
-           g.tensor("blk.0.kda_beta.weight", {kWidth, 64u}, 30u, w.kda.beta) &&
-           g.tensor("blk.0.kda_o_norm.weight", {128u}, 0u, w.kda.o_norm) &&
-           g.tensor("blk.0.kda_dt_bias.weight", {8192u}, 0u, w.kda.dt_bias) &&
-           g.tensor("blk.0.kda_a_log.weight", {64u}, 0u, w.kda.a_log) &&
+           layer_tensor(g, layer, "hc_attn_fn.weight", {kHcWidth, kMix}, 30u, w.attn_hc_fn) &&
+           layer_tensor(g, layer, "hc_attn_scale.weight", {3u}, 0u, w.attn_hc_scale) &&
+           layer_tensor(g, layer, "hc_attn_base.weight", {kMix}, 0u, w.attn_hc_base) &&
+           layer_tensor(g, layer, "hc_ffn_fn.weight", {kHcWidth, kMix}, 30u, w.ffn_hc_fn) &&
+           layer_tensor(g, layer, "hc_ffn_scale.weight", {3u}, 0u, w.ffn_hc_scale) &&
+           layer_tensor(g, layer, "hc_ffn_base.weight", {kMix}, 0u, w.ffn_hc_base) &&
+           layer_tensor(g, layer, "attn_norm.weight", {kWidth}, 0u, w.attn_norm) &&
+           layer_tensor(g, layer, "ffn_norm.weight", {kWidth}, 0u, w.ffn_norm) &&
+           layer_tensor(g, layer, "ffn_gate.weight", {kWidth, kDense}, 8u, w.ffn_gate) &&
+           layer_tensor(g, layer, "ffn_up.weight", {kWidth, kDense}, 8u, w.ffn_up) &&
+           layer_tensor(g, layer, "ffn_down.weight", {kDense, kWidth}, 8u, w.ffn_down) &&
+           layer_tensor(g, layer, "kda_q.weight", {kWidth, 8192u}, 30u, w.kda.q) &&
+           layer_tensor(g, layer, "kda_k.weight", {kWidth, 8192u}, 30u, w.kda.k) &&
+           layer_tensor(g, layer, "kda_v.weight", {kWidth, 8192u}, 30u, w.kda.v) &&
+           layer_tensor(g, layer, "kda_output.weight", {8192u, kWidth}, 30u, w.kda.output) &&
+           layer_tensor(g, layer, "kda_q_conv.weight", {4u, 1u, 8192u}, 0u, w.kda.q_conv) &&
+           layer_tensor(g, layer, "kda_k_conv.weight", {4u, 1u, 8192u}, 0u, w.kda.k_conv) &&
+           layer_tensor(g, layer, "kda_v_conv.weight", {4u, 1u, 8192u}, 0u, w.kda.v_conv) &&
+           layer_tensor(g, layer, "kda_f_a.weight", {kWidth, 128u}, 30u, w.kda.f_a) &&
+           layer_tensor(g, layer, "kda_f_b.weight", {128u, 8192u}, 30u, w.kda.f_b) &&
+           layer_tensor(g, layer, "kda_g_a.weight", {kWidth, 128u}, 30u, w.kda.g_a) &&
+           layer_tensor(g, layer, "kda_g_b.weight", {128u, 8192u}, 30u, w.kda.g_b) &&
+           layer_tensor(g, layer, "kda_beta.weight", {kWidth, 64u}, 30u, w.kda.beta) &&
+           layer_tensor(g, layer, "kda_o_norm.weight", {128u}, 0u, w.kda.o_norm) &&
+           layer_tensor(g, layer, "kda_dt_bias.weight", {8192u}, 0u, w.kda.dt_bias) &&
+           layer_tensor(g, layer, "kda_a_log.weight", {64u}, 0u, w.kda.a_log) &&
            (w.kda.attn_norm = w.attn_norm) != 0u;
 }
 
@@ -119,13 +129,11 @@ bool allocate(Tensors &t) {
            t.up && t.mid && t.down && t.out;
 }
 
-bool execute(const Glm5TestGGUF &g, const Block0Offsets &w,
+bool execute(const Glm5TestGGUF &g, const DenseOffsets &w,
              ds4_glm5_kda_layer_state *state,
              ds4_glm5_kda_workspace *workspace, Tensors &t,
-             std::vector<float> &result) {
-    CHECK(ds4_gpu_embed_token_hc_bf16_tensor(
-              t.cur, g.map, g.size, w.embedding, kVocab, 42u, kWidth, kHc) &&
-          ds4_gpu_rms_norm_plain_rows_tensor(
+             std::vector<float> &result, const char *trace_prefix = nullptr) {
+    CHECK(ds4_gpu_rms_norm_plain_rows_tensor(
               t.flat, t.cur, kHcWidth, 1u, 1.0e-5f) &&
           ds4_gpu_matmul_bf16_tensor(
               t.mix, g.map, g.size, w.attn_hc_fn, kHcWidth, kMix,
@@ -163,6 +171,39 @@ bool execute(const Glm5TestGGUF &g, const Block0Offsets &w,
                               (uint64_t)result.size() * sizeof(float)),
           "read complete block-0 state");
     for (float value : result) CHECK(std::isfinite(value), "finite block-0 state");
+    if (trace_prefix) {
+        struct TraceTensor {
+            const char *name;
+            ds4_gpu_tensor *tensor;
+            uint64_t count;
+        } traces[] = {
+            {"input_hc", t.cur, kHcWidth},
+            {"attn_split", t.split, kMix},
+            {"attn_collapsed", t.collapsed, kWidth},
+            {"attn_output", t.attn, kWidth},
+            {"after_attn", t.after_attn, kHcWidth},
+            {"ffn_split", t.ffn_split, kMix},
+            {"ffn_hidden", t.ffn_hidden, kWidth},
+            {"ffn_mid", t.mid, kDense},
+            {"ffn_down", t.down, kWidth},
+            {"output_hc", t.out, kHcWidth},
+        };
+        for (const TraceTensor &trace : traces) {
+            std::vector<float> values(trace.count);
+            char path[512];
+            const int n = std::snprintf(path, sizeof(path), "%s.%s.f32",
+                                        trace_prefix, trace.name);
+            CHECK(n > 0 && (size_t)n < sizeof(path) &&
+                  ds4_gpu_tensor_read(trace.tensor, 0u, values.data(),
+                                      trace.count * sizeof(float)),
+                  "read external-oracle trace tensor");
+            FILE *fp = std::fopen(path, "wb");
+            CHECK(fp && std::fwrite(values.data(), sizeof(float), trace.count,
+                                    fp) == trace.count &&
+                  std::fclose(fp) == 0,
+                  "write external-oracle trace tensor");
+        }
+    }
     return true;
 }
 }  // namespace
@@ -171,9 +212,11 @@ static bool run_test(void) {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     CHECK(model && model[0], "model environment");
     Glm5TestGGUF gguf;
-    Block0Offsets weights;
-    CHECK(gguf.open_file(model) && bind(gguf, weights),
-          "bind complete real-GGUF block 0");
+    DenseOffsets weights[3];
+    CHECK(gguf.open_file(model), "open real-GGUF model");
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(bind(gguf, il, weights[il]), "bind complete dense-prefix layer");
+    }
     ds4_gpu_config config = {};
     config.n_gpus = 1u;
     config.device_indices[0] = 0u;
@@ -183,28 +226,59 @@ static bool run_test(void) {
           "initialize gfx1151 and register model map");
     ds4_tp_test_reset_exchange_calls();
 
-    ds4_glm5_layer_kind schedule = {.layer = 0u, .is_kda = true};
+    ds4_glm5_layer_kind schedule[3] = {
+        {.layer = 0u, .is_kda = true},
+        {.layer = 1u, .is_kda = true},
+        {.layer = 2u, .is_kda = true},
+    };
     ds4_glm5_kda_slot slot = {};
     ds4_glm5_kda_workspace workspace = {};
     Tensors tensors;
-    CHECK(ds4_glm5_kda_slot_init(&slot, &schedule, 1u, 1u, nullptr) &&
+    CHECK(ds4_glm5_kda_slot_init(&slot, schedule, 3u, 1u, nullptr) &&
           ds4_glm5_kda_workspace_init(&workspace, 1u) && allocate(tensors),
-          "allocate complete block-0 state and workspace");
-    std::vector<float> first, second;
-    CHECK(execute(gguf, weights, &slot.layer[0], &workspace, tensors, first) &&
-          slot.layer[0].token_count == 1u &&
-          ds4_glm5_kda_slot_reset(&slot) &&
-          execute(gguf, weights, &slot.layer[0], &workspace, tensors, second),
-          "repeat complete block-0 execution");
-    CHECK(first == second && slot.layer[0].token_count == 1u,
-          "complete block-0 state is deterministic after reset");
+          "allocate complete dense-prefix state and workspace");
+    std::vector<float> block0, first, second;
+    const auto execute_prefix = [&](std::vector<float> &result,
+                                    bool capture_block0) {
+        if (!ds4_gpu_embed_token_hc_bf16_tensor(
+                tensors.cur, gguf.map, gguf.size, weights[0].embedding,
+                kVocab, 42u, kWidth, kHc)) return false;
+        for (uint32_t il = 0u; il < 3u; ++il) {
+            std::vector<float> layer_result;
+            if (!execute(gguf, weights[il], &slot.layer[il], &workspace,
+                         tensors, layer_result,
+                         capture_block0 && il == 0u ?
+                             std::getenv("DS4_GLM5_DENSE_TRACE_PREFIX") :
+                             nullptr)) return false;
+            if (capture_block0 && il == 0u) block0 = layer_result;
+            if (il + 1u < 3u) std::swap(tensors.cur, tensors.out);
+            else result = std::move(layer_result);
+        }
+        return true;
+    };
+    CHECK(execute_prefix(first, true), "execute complete dense prefix");
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(slot.layer[il].token_count == 1u,
+              "dense-prefix KDA layer advances one token");
+    }
+    CHECK(ds4_glm5_kda_slot_reset(&slot) && execute_prefix(second, false),
+          "repeat complete dense-prefix execution");
+    CHECK(first == second, "complete dense prefix is deterministic after reset");
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(slot.layer[il].token_count == 1u,
+              "reset dense-prefix KDA layer advances one token");
+    }
     CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "replicated dense block invokes no TP exchange");
-    const uint64_t hash = fnv64(first);
-    CHECK(hash == kExpectedBlock0FNV,
+    const uint64_t block0_hash = fnv64(block0);
+    CHECK(block0_hash == kExpectedBlock0FNV,
           "complete block-0 output matches the pinned same-GGUF fingerprint");
+    const uint64_t hash = fnv64(first);
+    CHECK(hash == kExpectedPrefixFNV,
+          "complete dense-prefix output matches the pinned same-GGUF fingerprint");
     std::fprintf(stderr,
-                 "PASS same-GGUF GLM5 dense block0 fnv=%016llx\n",
+                 "PASS same-GGUF GLM5 dense prefix block0=%016llx prefix=%016llx\n",
+                 (unsigned long long)block0_hash,
                  (unsigned long long)hash);
     tensors.clear();
     ds4_glm5_kda_workspace_free(&workspace);
