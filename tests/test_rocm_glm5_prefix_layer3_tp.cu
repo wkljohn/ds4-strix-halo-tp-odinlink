@@ -212,9 +212,9 @@ bool run() {
                               result.size() * sizeof(float)) &&
           ds4_gpu_tensor_read(state.value.mla[3].compact_kv, 0u,
                               kv.data(), kv.size() * sizeof(float)) &&
-          ds4_gpu_tensor_read(state.value.mla[3].index_key, 0u,
+          ds4_gpu_tensor_read(state.value.mla[3].index_tail, 0u,
                               index_key.data(), index_key.size() * sizeof(float)) &&
-          ds4_gpu_tensor_read(state.value.mla[3].pool_gate, 0u,
+          ds4_gpu_tensor_read(state.value.mla[3].pool_gate_tail, 0u,
                               pool_gate.data(), pool_gate.size() * sizeof(float)),
           "read committed layer3 output and resident token0 rows");
     const uint64_t output_hash = fnv64(
@@ -273,9 +273,9 @@ bool run() {
                               result1.size() * sizeof(float)) &&
           ds4_gpu_tensor_read(state.value.mla[3].compact_kv, 0u,
                               kv2.data(), kv2.size() * sizeof(float)) &&
-          ds4_gpu_tensor_read(state.value.mla[3].index_key, 0u,
+          ds4_gpu_tensor_read(state.value.mla[3].index_tail, 0u,
                               index2.data(), index2.size() * sizeof(float)) &&
-          ds4_gpu_tensor_read(state.value.mla[3].pool_gate, 0u,
+          ds4_gpu_tensor_read(state.value.mla[3].pool_gate_tail, 0u,
                               pool2.data(), pool2.size() * sizeof(float)),
           "read second-token output and two resident cache rows");
     CHECK(std::memcmp(kv2.data(), kv.data(), kv.size() * sizeof(float)) == 0 &&

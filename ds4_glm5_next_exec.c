@@ -57,6 +57,9 @@ struct ds4_glm5_next_workspace {
     ds4_gpu_tensor *mla_qk_low;
     ds4_gpu_tensor *mla_index_k_raw;
     ds4_gpu_tensor *mla_pool_gate_raw;
+    ds4_gpu_tensor *mla_pool_indices;
+    ds4_gpu_tensor *mla_pool_valid;
+    ds4_gpu_tensor *mla_tail_valid;
     ds4_gpu_tensor *mla_selected_token;
     ds4_gpu_tensor *mla_heads;
     ds4_gpu_tensor *router_logits;
@@ -100,6 +103,9 @@ void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *w) {
     ds4_gpu_tensor_free(w->router_logits);
     ds4_gpu_tensor_free(w->mla_heads);
     ds4_gpu_tensor_free(w->mla_selected_token);
+    ds4_gpu_tensor_free(w->mla_tail_valid);
+    ds4_gpu_tensor_free(w->mla_pool_valid);
+    ds4_gpu_tensor_free(w->mla_pool_indices);
     ds4_gpu_tensor_free(w->mla_pool_gate_raw);
     ds4_gpu_tensor_free(w->mla_index_k_raw);
     ds4_gpu_tensor_free(w->mla_qk_low);
@@ -156,6 +162,9 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
     w->mla_qk_low = f32((uint64_t)GLM5_HEADS * GLM5_KV_LORA);
     w->mla_index_k_raw = f32(GLM5_INDEX_DIM);
     w->mla_pool_gate_raw = f32(GLM5_INDEX_DIM);
+    w->mla_pool_indices = ds4_gpu_tensor_alloc(4u * sizeof(int32_t));
+    w->mla_pool_valid = ds4_gpu_tensor_alloc(sizeof(uint32_t));
+    w->mla_tail_valid = ds4_gpu_tensor_alloc(4u * sizeof(uint32_t));
     w->mla_selected_token = ds4_gpu_tensor_alloc(
         (DS4_GLM5_NEXT_INDEX_TOP_K + 3u) * sizeof(int32_t));
     w->mla_heads = f32((uint64_t)GLM5_HEADS * GLM5_HEAD_DIM);
@@ -181,6 +190,7 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
         !w->mla_q_a || !w->mla_q_resid || !w->mla_query ||
         !w->mla_kv_raw || !w->mla_kv_norm || !w->mla_qk_low ||
         !w->mla_index_k_raw || !w->mla_pool_gate_raw ||
+        !w->mla_pool_indices || !w->mla_pool_valid || !w->mla_tail_valid ||
         !w->mla_selected_token || !w->mla_heads || !w->router_logits ||
         !w->router_probs || !w->router_selected || !w->router_weights ||
         !w->routed_gate || !w->routed_up || !w->routed_mid ||
@@ -190,9 +200,12 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
         ds4_glm5_next_workspace_destroy(w);
         return NULL;
     }
+    const uint32_t tail_valid[4] = {1u, 1u, 1u, 1u};
     if (!ds4_gpu_tensor_fill_f32(w->hc_mean_weights,
                                  1.0f / (float)GLM5_HC,
-                                 GLM5_HC)) {
+                                 GLM5_HC) ||
+        !ds4_gpu_tensor_write(w->mla_tail_valid, 0u, tail_valid,
+                              sizeof(tail_valid))) {
         ds4_glm5_next_workspace_destroy(w);
         return NULL;
     }
@@ -408,6 +421,28 @@ static int declare_local_q4k_half(const ds4_glm5_next_exec_ctx *ctx,
                0u, GLM5_WIDTH, column_base, down_half_bytes);
 }
 
+static int mla_publish_completed_pool(
+        const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_mla_offsets *offsets,
+        ds4_glm5_next_mla_state *mla,
+        ds4_glm5_next_workspace *w,
+        uint32_t pool,
+        bool publish_pool) {
+    if (!publish_pool) return 1;
+    if (!mla->index_pool || pool >= mla->capacity_pools) return 0;
+    const uint64_t row_bytes = (uint64_t)GLM5_INDEX_DIM * sizeof(float);
+    ds4_gpu_tensor *output = ds4_gpu_tensor_view(
+        mla->index_pool, (uint64_t)pool * row_bytes, row_bytes);
+    if (!output) return 0;
+    const int ok = ds4_gpu_glm5_kpool_tensor(
+        output, w->mla_pool_indices, w->mla_pool_valid,
+        mla->index_tail, mla->pool_gate_tail, w->mla_tail_valid,
+        ctx->model_map, ctx->model_size, offsets->index_pool_ape,
+        4u, GLM5_INDEX_DIM, 4u, 0u);
+    ds4_gpu_tensor_free(output);
+    return ok;
+}
+
 /* The official selector uses the full visible range through top-k. Pooled
  * selection begins only when visible exceeds 2048 and is a separate path. */
 static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
@@ -415,7 +450,10 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
                                        ds4_glm5_next_state *state,
                                        ds4_glm5_next_workspace *w,
                                        const ds4_gpu_tensor *hc_in,
-                                       uint32_t visible) {
+                                       uint32_t visible,
+                                       uint32_t tail_slot,
+                                       uint32_t pool_index,
+                                       bool publish_pool) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     const ds4_glm5_next_mla_offsets *m = &layer->mla;
     ds4_glm5_next_mla_state *mla = &state->mla[il];
@@ -463,20 +501,22 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
             GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, 1u) &&
         ds4_gpu_glm_store_indexer_k_tensor(
-            mla->index_key, w->mla_index_k_raw,
+            mla->index_tail, w->mla_index_k_raw,
             ctx->model_map, ctx->model_size,
             m->index_k_norm, m->index_k_norm_b,
-            pos, 1u, mla->capacity_tokens, GLM5_INDEX_DIM,
+            tail_slot, 1u, 4u, GLM5_INDEX_DIM,
             0u, 1u, 1.0e-6f, 1.0f, 1.0f, 0.0f,
             1.0f, 0.0f, 0.0f, false) &&
         ds4_gpu_matmul_bf16_tensor(
             w->mla_pool_gate_raw, ctx->model_map, ctx->model_size,
             m->index_pool_gate, GLM5_WIDTH, GLM5_INDEX_DIM,
             w->ffn_hidden, 1u) &&
-        ds4_gpu_tensor_copy(mla->pool_gate,
-                            (uint64_t)pos * GLM5_INDEX_DIM * sizeof(float),
+        ds4_gpu_tensor_copy(mla->pool_gate_tail,
+                            (uint64_t)tail_slot * GLM5_INDEX_DIM * sizeof(float),
                             w->mla_pool_gate_raw,
                             0u, GLM5_INDEX_DIM * sizeof(float)) &&
+        mla_publish_completed_pool(
+            ctx, m, mla, w, pool_index, publish_pool) &&
         ds4_gpu_glm_fill_selected_range_tensor(w->mla_selected_token,
                                                 visible) &&
         ds4_gpu_glm_attention_indexed_decode_typed_tensor(
@@ -602,19 +642,30 @@ static int mla_routed_dense_selection_forward(const ds4_glm5_next_exec_ctx *ctx,
                                     ds4_gpu_tensor *hc_out) {
     ds4_glm5_next_mla_state *mla = &state->mla[il];
     uint32_t visible = 0u;
+    uint32_t tail_slot = 0u, pool_index = 0u;
+    bool publish_pool = false;
     if (!tp_context_valid(ctx) || !mla->valid || !mla->compact_kv ||
-        !mla->index_key || !mla->pool_gate || mla->owner != state ||
+        !mla->index_pool || !mla->index_tail || !mla->pool_gate_tail ||
+        mla->owner != state || mla->first_valid != 0u ||
+        !ds4_glm5_next_mla_append_plan(
+            mla, &tail_slot, &pool_index, &publish_pool) ||
         !ds4_glm5_next_mla_dense_selection_visible(
             mla->token_count, mla->capacity_tokens, &visible)) return 0;
+    (void)tail_slot;
+    (void)pool_index;
+    (void)publish_pool;
     const int ok = mla_dense_selection_attention(
-                       ctx, il, state, w, hc_in, visible) &&
+                       ctx, il, state, w, hc_in, visible, tail_slot,
+                       pool_index, publish_pool) &&
                    routed_ffn_one(ctx, il, mla->token_count, w, hc_out);
     if (!ok) {
         ds4_glm5_next_state_invalidate(state);
         return 0;
     }
-    if (mla->token_count == 0u) mla->first_valid = 0u;
-    mla->token_count++;
+    if (!ds4_glm5_next_mla_append_commit(mla)) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
     return 1;
 }
 

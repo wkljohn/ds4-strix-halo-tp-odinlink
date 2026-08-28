@@ -84,12 +84,18 @@ struct ds4_glm5_next_state;
 
 typedef struct {
     ds4_gpu_tensor *compact_kv;
-    ds4_gpu_tensor *index_key;
-    ds4_gpu_tensor *pool_gate;
+    /* Completed four-token pools plus one fixed raw four-row tail. The gate
+     * tail is separate so the validated pool kernel can consume tensor views
+     * without retaining the full raw index history. */
+    ds4_gpu_tensor *index_pool;
+    ds4_gpu_tensor *index_tail;
+    ds4_gpu_tensor *pool_gate_tail;
     uint32_t capacity_tokens;
+    uint32_t capacity_pools;
     uint32_t token_count;
-    /* Pool alignment origin for this sequence. Raw key/gate caches are kept
-     * so IndexPool can be rebuilt when this value changes across requests. */
+    uint32_t complete_pools;
+    uint32_t tail_count;
+    /* Compact pooling is valid only for a sequence aligned at row zero. */
     uint32_t first_valid;
     bool valid;
     struct ds4_glm5_next_state *owner;
@@ -132,6 +138,12 @@ int ds4_glm5_next_state_init(ds4_glm5_next_state *state,
 int ds4_glm5_next_state_reset(ds4_glm5_next_state *state);
 void ds4_glm5_next_state_invalidate(ds4_glm5_next_state *state);
 void ds4_glm5_next_state_free(ds4_glm5_next_state *state);
+/* Plan/commit one compact MLA row without mutating state before the GPU work
+ * succeeds. publish_pool is true only for the fourth row of a complete pool. */
+int ds4_glm5_next_mla_append_plan(
+        const ds4_glm5_next_mla_state *mla, uint32_t *tail_slot,
+        uint32_t *pool_index, bool *publish_pool);
+int ds4_glm5_next_mla_append_commit(ds4_glm5_next_mla_state *mla);
 
 #ifdef __cplusplus
 }

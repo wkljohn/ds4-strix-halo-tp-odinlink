@@ -115,10 +115,13 @@ static int test_bytes(void) {
     uint64_t bytes = 0u;
     CHECK(ds4_glm5_next_state_bytes(&model, 8u, &bytes),
           "8-token state size accepted");
-    CHECK(bytes == UINT64_C(152903680), "8-token state size exact");
+    CHECK(bytes == UINT64_C(152869888), "8-token compact state size exact");
+    CHECK(ds4_glm5_next_state_bytes(&model, 9u, &bytes) &&
+          bytes == UINT64_C(152898048),
+          "9-token state uses ceil pool capacity exactly");
     CHECK(ds4_glm5_next_state_bytes(&model, 262144u, &bytes),
           "256K state size accepted");
-    CHECK(bytes == UINT64_C(9011003392), "256K state size exact");
+    CHECK(bytes == UINT64_C(6427357184), "256K compact state size exact");
     CHECK(!ds4_glm5_next_state_bytes(&model, 0u, &bytes),
           "zero context rejected");
     model.layer[3].attention = DS4_GLM5_NEXT_ATTN_KDA;
@@ -141,28 +144,76 @@ static int test_lifecycle(void) {
           "initialize complete mixed-attention state");
     fflush(accounting_stream);
     CHECK(accounting_seen_before_alloc, "accounting precedes allocation");
-    CHECK(strstr(text, "context=8 kda=34 mla=11 bytes=152903680") != NULL,
+    CHECK(strstr(text, "context=8 kda=34 mla=11 bytes=152869888") != NULL,
           "combined accounting exact");
     CHECK(state.valid && state.kda.valid && state.layer_count == 45u &&
           state.mla_count == 11u && state.context_capacity == 8u,
           "complete state starts valid");
-    CHECK(alloc_calls == 169 && fill_calls == 136,
-          "34 KDA and 11 three-buffer MLA states allocated once");
+    CHECK(alloc_calls == 180 && fill_calls == 136,
+          "34 KDA and 11 four-buffer compact MLA states allocated once");
     CHECK(state.mla[3].valid && state.mla[3].owner == &state &&
-          state.mla[3].capacity_tokens == 8u && !state.mla[45].compact_kv,
+          state.mla[3].capacity_tokens == 8u &&
+          state.mla[3].capacity_pools == 2u &&
+          state.mla[3].index_pool && state.mla[3].index_tail &&
+          state.mla[3].pool_gate_tail && !state.mla[45].compact_kv,
           "trunk MLA owned and nextn MLA excluded");
+    uint32_t rejected_tail = 0u, rejected_pool = 0u;
+    bool rejected_publish = false;
+    state.mla[3].first_valid = 1u;
+    CHECK(!ds4_glm5_next_mla_append_plan(
+              &state.mla[3], &rejected_tail, &rejected_pool,
+              &rejected_publish),
+          "compact append rejects a shifted sequence origin");
+    state.mla[3].first_valid = 0u;
+    state.mla[3].tail_count = 1u;
+    CHECK(!ds4_glm5_next_mla_append_plan(
+              &state.mla[3], &rejected_tail, &rejected_pool,
+              &rejected_publish),
+          "compact append rejects inconsistent counters");
+    state.mla[3].tail_count = 0u;
+    ds4_gpu_tensor *append_tail = state.mla[3].index_tail;
+    state.mla[3].index_tail = NULL;
+    CHECK(!ds4_glm5_next_mla_append_plan(
+              &state.mla[3], &rejected_tail, &rejected_pool,
+              &rejected_publish),
+          "compact append rejects a missing tail buffer");
+    state.mla[3].index_tail = append_tail;
+    for (uint32_t pos = 0u; pos < 8u; ++pos) {
+        uint32_t tail_slot = UINT32_MAX, pool_index = UINT32_MAX;
+        bool publish_pool = false;
+        CHECK(ds4_glm5_next_mla_append_plan(
+                  &state.mla[3], &tail_slot, &pool_index, &publish_pool) &&
+              tail_slot == pos % 4u && pool_index == pos / 4u &&
+              publish_pool == (pos % 4u == 3u),
+              "compact MLA append plan follows pool/tail lifecycle");
+        CHECK(ds4_glm5_next_mla_append_commit(&state.mla[3]) &&
+              state.mla[3].token_count == pos + 1u &&
+              state.mla[3].complete_pools == (pos + 1u) / 4u &&
+              state.mla[3].tail_count == (pos + 1u) % 4u,
+              "compact MLA append commits atomically");
+    }
+    uint32_t tail_slot = 0u, pool_index = 0u;
+    bool publish_pool = false;
+    CHECK(!ds4_glm5_next_mla_append_plan(
+              &state.mla[3], &tail_slot, &pool_index, &publish_pool),
+          "compact MLA append fails closed at context capacity");
+    CHECK(ds4_glm5_next_state_reset(&state),
+          "state resets after compact append lifecycle test");
     CHECK(!ds4_glm5_next_state_init(&state, &model, 8u,
                                     accounting_stream),
           "live state cannot be initialized twice");
     state.mla[3].token_count = 7u;
-    state.mla[3].first_valid = 5u;
+    state.mla[3].complete_pools = 1u;
+    state.mla[3].tail_count = 3u;
     ds4_glm5_next_state_invalidate(&state);
     CHECK(!state.valid && !state.kda.valid && !state.mla[3].valid,
           "mixed state invalidates atomically");
     CHECK(ds4_glm5_next_state_reset(&state) && state.valid &&
           state.kda.valid && state.mla[3].valid &&
           state.mla[3].token_count == 0u &&
-          state.mla[3].first_valid == 0u && fill_calls == 272,
+          state.mla[3].complete_pools == 0u &&
+          state.mla[3].tail_count == 0u &&
+          state.mla[3].first_valid == 0u && fill_calls == 408,
           "mixed state resets atomically");
     state.mla[3].owner = NULL;
     CHECK(!ds4_glm5_next_state_reset(&state) && !state.valid,
@@ -175,12 +226,19 @@ static int test_lifecycle(void) {
     CHECK(!ds4_glm5_next_state_reset(&state) && !state.valid,
           "missing MLA buffer fails closed");
     state.mla[3].compact_kv = saved_compact;
+    ds4_gpu_tensor *saved_pool = state.mla[3].index_pool;
+    state.mla[3].index_pool = NULL;
+    CHECK(!ds4_glm5_next_state_reset(&state) && !state.valid,
+          "missing compact MLA pool buffer fails closed");
+    state.mla[3].index_pool = saved_pool;
+    CHECK(ds4_glm5_next_state_reset(&state),
+          "restored compact MLA pool buffer resets");
     ds4_glm5_next_state_free(&state);
-    CHECK(free_calls == 169 && !state.valid && !state.kda.layer &&
+    CHECK(free_calls == 180 && !state.valid && !state.kda.layer &&
           !state.mla[3].compact_kv,
           "complete mixed state freed exactly once");
     ds4_glm5_next_state_free(&state);
-    CHECK(free_calls == 169 && !ds4_glm5_next_state_reset(&state),
+    CHECK(free_calls == 180 && !ds4_glm5_next_state_reset(&state),
           "double free is harmless and reset-after-free fails closed");
     fclose(accounting_stream);
     accounting_stream = NULL;
