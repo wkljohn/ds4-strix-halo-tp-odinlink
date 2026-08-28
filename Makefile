@@ -114,7 +114,7 @@ test-glm5-next-mhc-oracle:
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" python3 tests/test_glm5_mhc_external_reference.py
 
 .PHONY: test-rocm-glm53-expert-window test-rocm-glm5-q4k-shard-compose test-rocm-glm5-router-moe-bridge test-rocm-glm5-router-moe-bridge-seeds test-rocm-glm5-router-moe-dynamic test-rocm-glm5-router-moe-dynamic-seeds
-tests/test_rocm_glm53_expert_window.o: tests/test_rocm_glm53_expert_window.cu tests/glm5_gguf_test.hpp ds4_gpu.h
+tests/test_rocm_glm53_expert_window.o: tests/test_rocm_glm53_expert_window.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
 tests/test_rocm_glm53_expert_window: tests/test_rocm_glm53_expert_window.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o

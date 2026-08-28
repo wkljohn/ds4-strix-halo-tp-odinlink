@@ -3821,6 +3821,9 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
         ds4_gpu_q4k_window_cache *, const int32_t *, uint32_t, int32_t *) {
     return 0;
 }
+extern "C" int ds4_gpu_q4k_window_cache_prepare_device(
+        ds4_gpu_q4k_window_cache *, const ds4_gpu_tensor *,
+        const ds4_gpu_tensor *, uint32_t, ds4_gpu_tensor *) { return 0; }
 extern "C" int ds4_gpu_q4k_window_cache_device_view(
         const ds4_gpu_q4k_window_cache *, const void **, const void **,
         const void **, uint64_t *, uint64_t *) { return 0; }
@@ -3831,6 +3834,10 @@ extern "C" int ds4_gpu_q4k_window_cache_read_slot(
 }
 extern "C" int ds4_gpu_q4k_window_cache_get_stats(
         const ds4_gpu_q4k_window_cache *, ds4_gpu_q4k_window_cache_stats *) {
+    return 0;
+}
+extern "C" int ds4_gpu_q4k_window_cache_get_view(
+        const ds4_gpu_q4k_window_cache *, ds4_gpu_q4k_window_cache_view *) {
     return 0;
 }
 
@@ -27833,6 +27840,14 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, uint64_t,
         uint64_t, uint64_t, uint64_t, uint32_t, uint64_t, uint64_t,
         uint32_t, uint32_t, uint64_t, uint64_t,
+        const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, float,
+        const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t) {
+    return 0;
+}
+
+extern "C" int ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
+        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_q4k_window_cache *,
         const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, float,
         const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t) {
     return 0;

@@ -319,9 +319,31 @@ typedef struct ds4_gpu_q4k_window_cache_stats {
     uint32_t slot_count;
 } ds4_gpu_q4k_window_cache_stats;
 
+typedef struct ds4_gpu_q4k_window_cache_view {
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    const void *gate;
+    const void *up;
+    const void *down;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t gate_row_bytes;
+    uint64_t down_row_bytes;
+    uint32_t row_base;
+    uint32_t row_count;
+    uint32_t slot_count;
+} ds4_gpu_q4k_window_cache_view;
+
 /* Hard-capped cache for one rank-local Q4_K routed-expert window.  prepare()
  * rewrites global expert IDs to compact slot IDs suitable for direct packed
- * MoE indexing.  Entries are published only after all three tensors upload. */
+ * MoE indexing and preserves router padding as -1.  The host-only prepare()
+ * has no paired weights and therefore cannot validate padding weights;
+ * prepare_device() is the fail-closed entry point that requires every -1 to
+ * have an exactly zero finite weight.  Entries are published only after all
+ * three tensors upload. */
 ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
         const ds4_gpu_q4k_window_cache_config *config);
 void ds4_gpu_q4k_window_cache_destroy(ds4_gpu_q4k_window_cache *cache);
@@ -330,6 +352,12 @@ int ds4_gpu_q4k_window_cache_prepare(
         const int32_t             *expert_ids,
         uint32_t                   count,
         int32_t                   *slot_ids);
+int ds4_gpu_q4k_window_cache_prepare_device(
+        ds4_gpu_q4k_window_cache *cache,
+        const ds4_gpu_tensor      *expert_ids,
+        const ds4_gpu_tensor      *weights,
+        uint32_t                   pair_count,
+        ds4_gpu_tensor            *slot_ids);
 int ds4_gpu_q4k_window_cache_device_view(
         const ds4_gpu_q4k_window_cache *cache,
         const void                    **gate,
@@ -349,6 +377,9 @@ int ds4_gpu_q4k_window_cache_read_slot(
 int ds4_gpu_q4k_window_cache_get_stats(
         const ds4_gpu_q4k_window_cache *cache,
         ds4_gpu_q4k_window_cache_stats *stats);
+int ds4_gpu_q4k_window_cache_get_view(
+        const ds4_gpu_q4k_window_cache *cache,
+        ds4_gpu_q4k_window_cache_view  *view);
 
 typedef struct ds4_gpu_q4k_kshard_layer {
     uint64_t gate_offset;
@@ -2813,6 +2844,21 @@ int ds4_gpu_routed_moe_one_packed_q4k_tensor(
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *add_in,
         uint32_t              layer_index);
+
+int ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+        ds4_gpu_tensor                  *out,
+        ds4_gpu_tensor                  *gate,
+        ds4_gpu_tensor                  *up,
+        ds4_gpu_tensor                  *mid,
+        ds4_gpu_tensor                  *experts,
+        ds4_gpu_q4k_window_cache        *cache,
+        const ds4_gpu_tensor            *selected,
+        const ds4_gpu_tensor            *weights,
+        uint32_t                         n_expert,
+        float                            clamp,
+        const ds4_gpu_tensor            *x,
+        const ds4_gpu_tensor            *add_in,
+        uint32_t                         layer_index);
 
 int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         ds4_gpu_tensor       *out,

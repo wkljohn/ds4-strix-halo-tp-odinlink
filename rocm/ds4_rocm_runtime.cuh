@@ -131,6 +131,8 @@ struct ds4_gpu_q4k_window_cache {
     char *gate;
     char *up;
     char *down;
+    int32_t *slot_ids_device;
+    uint64_t slot_ids_capacity;
     uint64_t gate_expert_bytes;
     uint64_t down_expert_bytes;
     uint64_t capacity_bytes;
@@ -977,6 +979,7 @@ static void cuda_q4k_packed_slice_release_all(void) {
     }
     for (ds4_gpu_q4k_window_cache *cache : g_q4k_window_caches) {
         if (!cache) continue;
+        if (cache->slot_ids_device) (void)cudaFree(cache->slot_ids_device);
         if (cache->base) (void)cudaFree(cache->base);
         delete cache;
     }
@@ -6956,6 +6959,8 @@ extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
     cache->n_expert = config->n_expert;
     cache->slots = config->slots;
     cache->base = NULL;
+    cache->slot_ids_device = NULL;
+    cache->slot_ids_capacity = 0u;
     cudaError_t err = cudaMalloc((void **)&cache->base, (size_t)total);
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -6969,6 +6974,12 @@ extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
     cache->gate = cache->base;
     cache->up = cache->gate + gate_slab;
     cache->down = cache->up + gate_slab;
+    if (cudaMemset(cache->base, 0, (size_t)total) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFree(cache->base);
+        delete cache;
+        return NULL;
+    }
     try {
         g_q4k_window_caches.push_back(cache);
     } catch (...) {
@@ -6986,6 +6997,7 @@ extern "C" void ds4_gpu_q4k_window_cache_destroy(
                                  g_q4k_window_caches.end(), cache);
     if (found == g_q4k_window_caches.end()) return;
     (void)cudaDeviceSynchronize();
+    if (cache->slot_ids_device) (void)cudaFree(cache->slot_ids_device);
     if (cache->base) (void)cudaFree(cache->base);
     g_q4k_window_caches.erase(found);
     delete cache;
@@ -7000,8 +7012,7 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
         cache->gate_slice_index >= g_q4k_packed_slices.size() ||
         cache->up_slice_index >= g_q4k_packed_slices.size() ||
         cache->down_slice_index >= g_q4k_packed_slices.size() ||
-        !expert_ids || !slot_ids || count == 0u ||
-        count > cache->n_expert) return 0;
+        !expert_ids || !slot_ids || count == 0u || count > 1048576u) return 0;
     const cuda_q4k_packed_slice &gate_slice =
         g_q4k_packed_slices[cache->gate_slice_index];
     const cuda_q4k_packed_slice &up_slice =
@@ -7018,13 +7029,14 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
     std::vector<int32_t> unique;
     try {
         requested.assign(cache->n_expert, 0u);
-        unique.reserve(count);
+        unique.reserve(cache->slots);
     } catch (...) {
         return 0;
     }
     for (uint32_t i = 0; i < count; ++i) {
         const int32_t expert = expert_ids[i];
-        if (expert < 0 || (uint32_t)expert >= cache->n_expert) return 0;
+        if (expert == -1) continue;
+        if (expert < -1 || (uint32_t)expert >= cache->n_expert) return 0;
         if (!requested[(uint32_t)expert]) {
             requested[(uint32_t)expert] = 1u;
             unique.push_back(expert);
@@ -7115,12 +7127,98 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
         cache->expert_to_slot[(uint32_t)expert] = (int32_t)victim;
     }
     for (uint32_t i = 0; i < count; ++i) {
+        if (expert_ids[i] == -1) {
+            slot_ids[i] = -1;
+            continue;
+        }
         const int32_t slot =
             cache->expert_to_slot[(uint32_t)expert_ids[i]];
         if (slot < 0 || (uint32_t)slot >= cache->slots ||
             !cache->entries[(uint32_t)slot].valid) return 0;
         slot_ids[i] = slot;
     }
+    return 1;
+}
+
+extern "C" int ds4_gpu_q4k_window_cache_prepare_device(
+        ds4_gpu_q4k_window_cache *cache,
+        const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *weights,
+        uint32_t pair_count,
+        ds4_gpu_tensor *slot_ids) {
+    if (slot_ids) memset(slot_ids, 0, sizeof(*slot_ids));
+    if (!cache ||
+        std::find(g_q4k_window_caches.begin(), g_q4k_window_caches.end(),
+                  cache) == g_q4k_window_caches.end() ||
+        !expert_ids || !expert_ids->ptr || !weights || !weights->ptr ||
+        !slot_ids || pair_count == 0u || pair_count > 1048576u) return 0;
+    uint64_t id_bytes = 0, weight_bytes = 0;
+    if (!cuda_u64_mul_checked(pair_count, sizeof(int32_t), &id_bytes) ||
+        !cuda_u64_mul_checked(pair_count, sizeof(float), &weight_bytes) ||
+        expert_ids->bytes < id_bytes || weights->bytes < weight_bytes ||
+        id_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    std::vector<int32_t> host_ids;
+    std::vector<int32_t> host_slots;
+    std::vector<float> host_weights;
+    try {
+        host_ids.resize(pair_count);
+        host_slots.resize(pair_count);
+        host_weights.resize(pair_count);
+    } catch (...) {
+        return 0;
+    }
+    /* Blocking null-stream copies are load-bearing here: the router and the
+     * current Q4_K MoE consumer also use the null stream, so this D2H observes
+     * the producer and the later H2D cannot overtake the previous consumer.
+     * Any future compute/transport overlap must replace this with explicit
+     * events or double-buffered compact IDs before using another stream. */
+    if (cudaMemcpy(host_ids.data(), expert_ids->ptr, (size_t)id_bytes,
+                   cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(host_weights.data(), weights->ptr, (size_t)weight_bytes,
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    for (uint32_t i = 0; i < pair_count; ++i) {
+        uint32_t weight_bits = 0;
+        memcpy(&weight_bits, &host_weights[i], sizeof(weight_bits));
+        const int nonfinite =
+            (weight_bits & UINT32_C(0x7f800000)) == UINT32_C(0x7f800000);
+        if (nonfinite ||
+            (host_ids[i] == -1 && host_weights[i] != 0.0f)) return 0;
+    }
+    if (!ds4_gpu_q4k_window_cache_prepare(
+            cache, host_ids.data(), pair_count, host_slots.data())) return 0;
+    if (id_bytes > cache->slot_ids_capacity) {
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        int32_t *replacement = NULL;
+        if (cudaMalloc((void **)&replacement, (size_t)id_bytes) !=
+                cudaSuccess || !replacement) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        if (cache->slot_ids_device) (void)cudaFree(cache->slot_ids_device);
+        cache->slot_ids_device = replacement;
+        cache->slot_ids_capacity = id_bytes;
+    }
+    /* This blocking H2D is ordered after every prior null-stream MoE read of
+     * the reused ID buffer.  See the D2H comment above before introducing a
+     * non-default compute stream. */
+    if (cudaMemcpy(cache->slot_ids_device, host_slots.data(),
+                   (size_t)id_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    slot_ids->ptr = cache->slot_ids_device;
+    slot_ids->bytes = id_bytes;
+    slot_ids->owner = 0;
+    slot_ids->device_id = expert_ids->device_id;
+    slot_ids->host_ptr = NULL;
     return 1;
 }
 
@@ -7193,6 +7291,69 @@ extern "C" int ds4_gpu_q4k_window_cache_get_stats(
     for (const cuda_q4k_window_cache_entry &entry : cache->entries) {
         if (entry.valid) stats->resident_count++;
     }
+    return 1;
+}
+
+extern "C" int ds4_gpu_q4k_window_cache_get_view(
+        const ds4_gpu_q4k_window_cache *cache,
+        ds4_gpu_q4k_window_cache_view *view) {
+    if (view) memset(view, 0, sizeof(*view));
+    if (!cache ||
+        std::find(g_q4k_window_caches.begin(), g_q4k_window_caches.end(),
+                  cache) == g_q4k_window_caches.end() ||
+        !view || cache->gate_slice_index >= g_q4k_packed_slices.size() ||
+        cache->up_slice_index >= g_q4k_packed_slices.size() ||
+        cache->down_slice_index >= g_q4k_packed_slices.size()) return 0;
+    const cuda_q4k_packed_slice &gate =
+        g_q4k_packed_slices[cache->gate_slice_index];
+    const cuda_q4k_packed_slice &up =
+        g_q4k_packed_slices[cache->up_slice_index];
+    const cuda_q4k_packed_slice &down =
+        g_q4k_packed_slices[cache->down_slice_index];
+    uint64_t expected_down_base = 0, expected_down_count = 0;
+    if (gate.host_base != cache->model_map ||
+        up.host_base != cache->model_map ||
+        down.host_base != cache->model_map ||
+        gate.model_size != up.model_size || gate.model_size != down.model_size ||
+        gate.kind != DS4_GPU_Q4K_PACKED_ROW_RANGE ||
+        up.kind != DS4_GPU_Q4K_PACKED_ROW_RANGE ||
+        down.kind != DS4_GPU_Q4K_PACKED_K_RANGE ||
+        gate.source_rows != up.source_rows ||
+        gate.source_row_bytes != up.source_row_bytes ||
+        gate.row_base != up.row_base || gate.row_count != up.row_count ||
+        gate.column_byte_base != 0u || up.column_byte_base != 0u ||
+        gate.column_byte_count != gate.source_row_bytes ||
+        up.column_byte_count != up.source_row_bytes ||
+        gate.row_count * 2u != gate.source_rows ||
+        (gate.row_base != 0u && gate.row_base != gate.row_count) ||
+        down.row_base != 0u || down.row_count != down.source_rows ||
+        !cuda_u64_mul_checked(gate.row_base / CUDA_QK_K,
+                              sizeof(cuda_block_q4_K),
+                              &expected_down_base) ||
+        !cuda_u64_mul_checked(gate.row_count / CUDA_QK_K,
+                              sizeof(cuda_block_q4_K),
+                              &expected_down_count) ||
+        down.column_byte_base != expected_down_base ||
+        down.column_byte_count != expected_down_count ||
+        gate.packed_expert_bytes != cache->gate_expert_bytes ||
+        up.packed_expert_bytes != cache->gate_expert_bytes ||
+        down.packed_expert_bytes != cache->down_expert_bytes ||
+        !cache->base) return 0;
+    view->model_map = cache->model_map;
+    view->model_size = gate.model_size;
+    view->gate_offset = gate.tensor_offset;
+    view->up_offset = up.tensor_offset;
+    view->down_offset = down.tensor_offset;
+    view->gate = cache->gate;
+    view->up = cache->up;
+    view->down = cache->down;
+    view->gate_expert_bytes = cache->gate_expert_bytes;
+    view->down_expert_bytes = cache->down_expert_bytes;
+    view->gate_row_bytes = gate.column_byte_count;
+    view->down_row_bytes = down.column_byte_count;
+    view->row_base = gate.row_base;
+    view->row_count = gate.row_count;
+    view->slot_count = cache->slots;
     return 1;
 }
 

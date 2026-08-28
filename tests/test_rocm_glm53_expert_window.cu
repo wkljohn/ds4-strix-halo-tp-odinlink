@@ -6,16 +6,26 @@
  * It must never materialize a complete packed expert table. */
 
 #include "ds4_gpu.h"
+#include "ds4_gpu_mgpu.h"
 #include "glm5_gguf_test.hpp"
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
+
+extern "C" int ds4_gpu_routed_moe_batch_q4k_direct_control(
+        ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *,
+        ds4_gpu_tensor *, ds4_gpu_tensor *, const void *, const void *,
+        const void *, uint64_t, uint64_t, uint64_t, uint64_t,
+        const ds4_gpu_tensor *, const ds4_gpu_tensor *, uint32_t, uint32_t,
+        float, const ds4_gpu_tensor *, uint32_t, uint32_t, uint32_t);
 
 namespace {
 
@@ -470,7 +480,7 @@ int main() {
           std::memcmp(view_down_copy.data(), rank0_down.data(),
                       (size_t)kHalfDownBytes) == 0,
           "published slab bases and ordering are byte-exact");
-    const int32_t invalid_low[1] = {-1};
+    const int32_t invalid_low[1] = {-2};
     const int32_t invalid_high[1] = {(int32_t)kExperts};
     const int32_t too_many[9] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
     int32_t negative_slots[9] = {};
@@ -483,6 +493,11 @@ int main() {
           !ds4_gpu_q4k_window_cache_prepare(
               cache0, too_many, 9u, negative_slots),
           "invalid and over-capacity cache routes fail closed");
+    const int32_t host_padding[1] = {-1};
+    CHECK(ds4_gpu_q4k_window_cache_prepare(
+              cache0, host_padding, 1u, negative_slots) &&
+          negative_slots[0] == -1,
+          "host router padding preserves the kernel skip sentinel");
     const int32_t duplicates[8] =
         {12, 12, 13, 13, 100, 100, 103, 103};
     int32_t duplicate_slots[8] = {};
@@ -493,6 +508,290 @@ int main() {
           duplicate_slots[4] == duplicate_slots[5] &&
           duplicate_slots[6] == duplicate_slots[7],
           "duplicate global IDs share their compact slots");
+    std::vector<int32_t> batch_ids(512u);
+    std::vector<float> batch_weights(512u, 0.125f);
+    for (uint32_t i = 0; i < batch_ids.size(); ++i) {
+        batch_ids[i] = route_c[i & 7u];
+        if (i % 17u == 0u) {
+            batch_ids[i] = -1;
+            batch_weights[i] = 0.0f;
+        }
+    }
+    ds4_gpu_tensor *batch_ids_device =
+        ds4_gpu_tensor_alloc(batch_ids.size() * sizeof(int32_t));
+    ds4_gpu_tensor *batch_weights_device =
+        ds4_gpu_tensor_alloc(batch_weights.size() * sizeof(float));
+    ds4_gpu_tensor batch_slots_device = {};
+    std::vector<int32_t> batch_slots(batch_ids.size());
+    CHECK(batch_ids_device && batch_weights_device &&
+          ds4_gpu_tensor_write(batch_ids_device, 0u, batch_ids.data(),
+                               batch_ids.size() * sizeof(int32_t)) &&
+          ds4_gpu_tensor_write(batch_weights_device, 0u,
+                               batch_weights.data(),
+                               batch_weights.size() * sizeof(float)) &&
+          ds4_gpu_q4k_window_cache_prepare_device(
+              cache0, batch_ids_device, batch_weights_device,
+              (uint32_t)batch_ids.size(), &batch_slots_device) &&
+          ds4_gpu_tensor_read(&batch_slots_device, 0u, batch_slots.data(),
+                              batch_slots.size() * sizeof(int32_t)),
+          "pair count is independent from the compact expert count");
+    int32_t batch_expert_slot[kExperts];
+    std::fill_n(batch_expert_slot, kExperts, -2);
+    bool batch_slot_seen[8] = {};
+    for (uint32_t i = 0; i < batch_slots.size(); ++i) {
+        CHECK(batch_ids[i] == -1 ? batch_slots[i] == -1 :
+              (batch_slots[i] >= 0 && batch_slots[i] < 8),
+              "batched compact slot and padding range");
+        if (batch_ids[i] >= 0) {
+            int32_t &known = batch_expert_slot[(uint32_t)batch_ids[i]];
+            CHECK(known == -2 || known == batch_slots[i],
+                  "equal batched expert IDs share one compact slot");
+            known = batch_slots[i];
+            batch_slot_seen[(uint32_t)batch_slots[i]] = true;
+        }
+    }
+    CHECK(std::all_of(batch_slot_seen, batch_slot_seen + 8,
+                      [](bool seen) { return seen; }),
+          "eight batched experts occupy eight distinct compact slots");
+    ds4_gpu_tensor_free(batch_weights_device);
+    ds4_gpu_tensor_free(batch_ids_device);
+
+    /* Drive the real routed-MoE consumer through the same eviction epochs.
+     * Its independent control table is packed directly from the GGUF in route
+     * order; it does not read cache storage or reuse the cache slot mapping. */
+    CHECK(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0,
+          "enable isolated Q4_K consumer control");
+    constexpr uint64_t kPairs = 8u;
+    constexpr uint64_t kMidBytes = kPairs * kHalfFfn * sizeof(float);
+    constexpr uint64_t kDownBytes = kPairs * kEmbed * sizeof(float);
+    constexpr uint64_t kOutBytes = kEmbed * sizeof(float);
+    ds4_gpu_tensor *moe_selected = ds4_gpu_tensor_alloc(
+        kPairs * sizeof(int32_t));
+    ds4_gpu_tensor *moe_weights = ds4_gpu_tensor_alloc(
+        kPairs * sizeof(float));
+    ds4_gpu_tensor *moe_input = ds4_gpu_tensor_alloc(
+        kEmbed * sizeof(float));
+    ds4_gpu_tensor *moe_gate = ds4_gpu_tensor_alloc(kMidBytes);
+    ds4_gpu_tensor *moe_up = ds4_gpu_tensor_alloc(kMidBytes);
+    ds4_gpu_tensor *moe_mid = ds4_gpu_tensor_alloc(kMidBytes);
+    ds4_gpu_tensor *moe_down = ds4_gpu_tensor_alloc(kDownBytes);
+    ds4_gpu_tensor *moe_cached = ds4_gpu_tensor_alloc(kOutBytes);
+    ds4_gpu_tensor *moe_direct = ds4_gpu_tensor_alloc(kOutBytes);
+    CHECK(moe_selected && moe_weights && moe_input && moe_gate && moe_up &&
+          moe_mid && moe_down && moe_cached && moe_direct,
+          "allocate compact-window MoE component tensors");
+    std::vector<float> moe_input_host(kEmbed);
+    for (uint32_t i = 0; i < kEmbed; ++i) {
+        moe_input_host[i] =
+            (float)((int)((i * 29u + 17u) % 251u) - 125) / 512.0f;
+    }
+    const float moe_weight_host[8] = {
+        8.0f / 36.0f, 7.0f / 36.0f, 6.0f / 36.0f, 5.0f / 36.0f,
+        4.0f / 36.0f, 3.0f / 36.0f, 2.0f / 36.0f, 1.0f / 36.0f};
+    CHECK(ds4_gpu_tensor_write(moe_input, 0u, moe_input_host.data(),
+                               kEmbed * sizeof(float)) &&
+          ds4_gpu_tensor_write(moe_weights, 0u, moe_weight_host,
+                               sizeof(moe_weight_host)),
+          "upload compact-window MoE input and route weights");
+    void *direct_gate = nullptr, *direct_up = nullptr, *direct_down = nullptr;
+    const uint64_t direct_table_bytes = 8u * kHalfGateBytes;
+    CHECK(hipMalloc(&direct_gate, direct_table_bytes) == hipSuccess &&
+          hipMalloc(&direct_up, direct_table_bytes) == hipSuccess &&
+          hipMalloc(&direct_down, direct_table_bytes) == hipSuccess,
+          "allocate independent direct-control tables");
+    std::vector<unsigned char> direct_gate_host(direct_table_bytes);
+    std::vector<unsigned char> direct_up_host(direct_table_bytes);
+    std::vector<unsigned char> direct_down_host(direct_table_bytes);
+    std::vector<unsigned char> direct_one(kHalfGateBytes);
+    std::vector<float> cached_output(kEmbed), direct_output(kEmbed);
+    const int32_t *moe_epochs[4] = {route_a, route_a, route_b, route_c};
+    const int32_t compact_ids[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    uint64_t moe_output_fnv = UINT64_C(1469598103934665603);
+    uint64_t first_moe_hash = 0u, moe_nonzero = 0u;
+    bool moe_outputs_changed = false;
+    for (uint32_t half = 0; half < 2u; ++half) {
+        ds4_gpu_q4k_window_cache *cache = half == 0u ? cache0 : cache1;
+        for (uint32_t epoch = 0; epoch < 4u; ++epoch) {
+            const int32_t *route = moe_epochs[epoch];
+            for (uint32_t slot = 0; slot < 8u; ++slot) {
+                expected_row_half(direct_one, gguf, gate_offset,
+                                  (uint32_t)route[slot], half);
+                std::memcpy(direct_gate_host.data() +
+                                (uint64_t)slot * kHalfGateBytes,
+                            direct_one.data(), (size_t)kHalfGateBytes);
+                expected_row_half(direct_one, gguf, up_offset,
+                                  (uint32_t)route[slot], half);
+                std::memcpy(direct_up_host.data() +
+                                (uint64_t)slot * kHalfGateBytes,
+                            direct_one.data(), (size_t)kHalfGateBytes);
+                expected_down_half(direct_one, gguf, down_offset,
+                                   (uint32_t)route[slot], half);
+                std::memcpy(direct_down_host.data() +
+                                (uint64_t)slot * kHalfDownBytes,
+                            direct_one.data(), (size_t)kHalfDownBytes);
+            }
+            CHECK(hipMemcpy(direct_gate, direct_gate_host.data(),
+                            direct_table_bytes,
+                            hipMemcpyHostToDevice) == hipSuccess &&
+                  hipMemcpy(direct_up, direct_up_host.data(),
+                            direct_table_bytes,
+                            hipMemcpyHostToDevice) == hipSuccess &&
+                  hipMemcpy(direct_down, direct_down_host.data(),
+                            direct_table_bytes,
+                            hipMemcpyHostToDevice) == hipSuccess &&
+                  ds4_gpu_tensor_write(moe_selected, 0u, route,
+                                       8u * sizeof(int32_t)),
+                  "upload independent epoch tables and global IDs");
+            CHECK(ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+                      moe_cached, moe_gate, moe_up, moe_mid, moe_down,
+                      cache, moe_selected, moe_weights, 8u, 10.0f,
+                      moe_input, nullptr, 3u) &&
+                  ds4_gpu_synchronize() &&
+                  ds4_gpu_tensor_read(moe_cached, 0u,
+                                      cached_output.data(), kOutBytes),
+                  "execute bounded compact-window routed MoE");
+            CHECK(ds4_gpu_tensor_write(moe_selected, 0u, compact_ids,
+                                       sizeof(compact_ids)) &&
+                  ds4_gpu_routed_moe_batch_q4k_direct_control(
+                      moe_direct, moe_gate, moe_up, moe_mid, moe_down,
+                      direct_gate, direct_up, direct_down,
+                      kHalfGateBytes, kGateRowBytes,
+                      kHalfDownBytes, kHalfDownRowBytes,
+                      moe_selected, moe_weights, 8u, 8u, 10.0f,
+                      moe_input, 3u, 1u, kHalfFfn) &&
+                  ds4_gpu_synchronize() &&
+                  ds4_gpu_tensor_read(moe_direct, 0u,
+                                      direct_output.data(), kOutBytes) &&
+                  std::memcmp(cached_output.data(), direct_output.data(),
+                              (size_t)kOutBytes) == 0,
+                  "compact-window output matches direct packed oracle");
+            const uint64_t output_hash =
+                fnv1a64(cached_output.data(), kOutBytes);
+            if (first_moe_hash == 0u) first_moe_hash = output_hash;
+            else moe_outputs_changed |= output_hash != first_moe_hash;
+            for (float value : cached_output) {
+                CHECK(std::isfinite(value),
+                      "compact-window MoE output remains finite");
+                moe_nonzero += value != 0.0f;
+            }
+            moe_output_fnv ^= output_hash;
+            moe_output_fnv *= UINT64_C(1099511628211);
+        }
+    }
+    CHECK(moe_nonzero != 0u && moe_outputs_changed &&
+          moe_output_fnv == UINT64_C(0x9b64bad7c433cb8f),
+          "MoE epochs are nontrivial, distinct, and deterministic");
+    int32_t padded_route[8];
+    float padded_weights[8];
+    std::memcpy(padded_route, route_c, sizeof(padded_route));
+    std::memcpy(padded_weights, moe_weight_host, sizeof(padded_weights));
+    padded_route[7] = -1;
+    padded_weights[7] = 0.0f;
+    for (uint32_t slot = 0; slot < 8u; ++slot) {
+        expected_row_half(direct_one, gguf, gate_offset,
+                          (uint32_t)route_c[slot], 0u);
+        std::memcpy(direct_gate_host.data() +
+                        (uint64_t)slot * kHalfGateBytes,
+                    direct_one.data(), (size_t)kHalfGateBytes);
+        expected_row_half(direct_one, gguf, up_offset,
+                          (uint32_t)route_c[slot], 0u);
+        std::memcpy(direct_up_host.data() +
+                        (uint64_t)slot * kHalfGateBytes,
+                    direct_one.data(), (size_t)kHalfGateBytes);
+        expected_down_half(direct_one, gguf, down_offset,
+                           (uint32_t)route_c[slot], 0u);
+        std::memcpy(direct_down_host.data() +
+                        (uint64_t)slot * kHalfDownBytes,
+                    direct_one.data(), (size_t)kHalfDownBytes);
+    }
+    CHECK(hipMemcpy(direct_gate, direct_gate_host.data(), direct_table_bytes,
+                    hipMemcpyHostToDevice) == hipSuccess &&
+          hipMemcpy(direct_up, direct_up_host.data(), direct_table_bytes,
+                    hipMemcpyHostToDevice) == hipSuccess &&
+          hipMemcpy(direct_down, direct_down_host.data(), direct_table_bytes,
+                    hipMemcpyHostToDevice) == hipSuccess,
+          "upload half-0 padded-route oracle tables");
+    CHECK(ds4_gpu_tensor_write(moe_selected, 0u, padded_route,
+                               sizeof(padded_route)) &&
+          ds4_gpu_tensor_write(moe_weights, 0u, padded_weights,
+                               sizeof(padded_weights)) &&
+          ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+              moe_cached, moe_gate, moe_up, moe_mid, moe_down,
+              cache0, moe_selected, moe_weights, 8u, 10.0f,
+              moe_input, nullptr, 3u) &&
+          ds4_gpu_synchronize() &&
+          ds4_gpu_tensor_read(moe_cached, 0u, cached_output.data(),
+                              kOutBytes),
+          "zero-weight router padding preserves the kernel skip sentinel");
+    int32_t padded_compact_ids[8];
+    std::memcpy(padded_compact_ids, compact_ids, sizeof(padded_compact_ids));
+    padded_compact_ids[7] = -1;
+    CHECK(ds4_gpu_tensor_write(moe_selected, 0u, padded_compact_ids,
+                               sizeof(padded_compact_ids)) &&
+          ds4_gpu_routed_moe_batch_q4k_direct_control(
+              moe_direct, moe_gate, moe_up, moe_mid, moe_down,
+              direct_gate, direct_up, direct_down,
+              kHalfGateBytes, kGateRowBytes,
+              kHalfDownBytes, kHalfDownRowBytes,
+              moe_selected, moe_weights, 8u, 8u, 10.0f,
+              moe_input, 3u, 1u, kHalfFfn) &&
+          ds4_gpu_synchronize() &&
+          ds4_gpu_tensor_read(moe_direct, 0u, direct_output.data(),
+                              kOutBytes) &&
+          std::memcmp(cached_output.data(), direct_output.data(),
+                      (size_t)kOutBytes) == 0,
+          "zero-weight padding output matches the direct skip oracle");
+    padded_weights[7] = 0.125f;
+    CHECK(ds4_gpu_tensor_write(moe_selected, 0u, padded_route,
+                               sizeof(padded_route)) &&
+          ds4_gpu_tensor_write(moe_weights, 0u, padded_weights,
+                               sizeof(padded_weights)) &&
+          !ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+              moe_cached, moe_gate, moe_up, moe_mid, moe_down,
+              cache0, moe_selected, moe_weights, 8u, 10.0f,
+              moe_input, nullptr, 3u),
+          "nonzero-weight router padding fails closed");
+    std::fill_n(padded_route, 8u, -1);
+    std::fill_n(padded_weights, 8u, 0.0f);
+    CHECK(ds4_gpu_tensor_write(moe_selected, 0u, padded_route,
+                               sizeof(padded_route)) &&
+          ds4_gpu_tensor_write(moe_weights, 0u, padded_weights,
+                               sizeof(padded_weights)) &&
+          ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+              moe_cached, moe_gate, moe_up, moe_mid, moe_down,
+              cache0, moe_selected, moe_weights, 8u, 10.0f,
+              moe_input, nullptr, 3u) &&
+          ds4_gpu_synchronize() &&
+          ds4_gpu_tensor_read(moe_cached, 0u, cached_output.data(),
+                              kOutBytes) &&
+          std::all_of(cached_output.begin(), cached_output.end(),
+                      [](float value) { return value == 0.0f; }),
+          "all-padding route produces an exact zero contribution");
+    std::memcpy(padded_route, route_a, sizeof(padded_route));
+    std::memcpy(padded_weights, moe_weight_host, sizeof(padded_weights));
+    padded_weights[0] = INFINITY;
+    CHECK(ds4_gpu_tensor_write(moe_selected, 0u, padded_route,
+                               sizeof(padded_route)) &&
+          ds4_gpu_tensor_write(moe_weights, 0u, padded_weights,
+                               sizeof(padded_weights)) &&
+          !ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+              moe_cached, moe_gate, moe_up, moe_mid, moe_down,
+              cache0, moe_selected, moe_weights, 8u, 10.0f,
+              moe_input, nullptr, 3u),
+          "non-finite route weight fails closed independently of fast-math");
+    CHECK(hipFree(direct_down) == hipSuccess &&
+          hipFree(direct_up) == hipSuccess &&
+          hipFree(direct_gate) == hipSuccess,
+          "free independent direct-control tables");
+    ds4_gpu_tensor_free(moe_direct);
+    ds4_gpu_tensor_free(moe_cached);
+    ds4_gpu_tensor_free(moe_down);
+    ds4_gpu_tensor_free(moe_mid);
+    ds4_gpu_tensor_free(moe_up);
+    ds4_gpu_tensor_free(moe_gate);
+    ds4_gpu_tensor_free(moe_input);
+    ds4_gpu_tensor_free(moe_weights);
+    ds4_gpu_tensor_free(moe_selected);
     CHECK(ds4_gpu_q4k_packed_slice_bytes() == 0u,
           "window caches retain no full packed table");
     ds4_gpu_q4k_window_cache_destroy(cache1);
@@ -513,10 +812,11 @@ int main() {
                 " cache_bytes=%" PRIu64
                 " measured_cache_bytes=%" PRIu64
                 " cache_fills=%" PRIu64 " cache_evictions=%" PRIu64
-                " rank_half_distinct=1 byte_exact=1\n",
+                " moe_output_fnv=%016" PRIx64
+                " rank_half_distinct=1 byte_exact=1 moe_exact=1\n",
                 aggregate, reusable_device_bytes, device_growth,
                 packed_table_bytes, expected_cache_bytes,
                 measured_cache_bytes,
-                stats0.fills, stats0.evictions);
+                stats0.fills, stats0.evictions, moe_output_fnv);
     return 0;
 }

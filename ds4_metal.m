@@ -10236,6 +10236,13 @@ int ds4_gpu_q4k_window_cache_prepare(
         uint32_t count, int32_t *slot_ids) {
     (void)cache; (void)expert_ids; (void)count; (void)slot_ids; return 0;
 }
+int ds4_gpu_q4k_window_cache_prepare_device(
+        ds4_gpu_q4k_window_cache *cache, const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *weights, uint32_t pair_count,
+        ds4_gpu_tensor *slot_ids) {
+    (void)cache; (void)expert_ids; (void)weights; (void)pair_count;
+    (void)slot_ids; return 0;
+}
 int ds4_gpu_q4k_window_cache_device_view(
         const ds4_gpu_q4k_window_cache *cache, const void **gate,
         const void **up, const void **down, uint64_t *gate_expert_bytes,
@@ -10254,6 +10261,11 @@ int ds4_gpu_q4k_window_cache_get_stats(
         const ds4_gpu_q4k_window_cache *cache,
         ds4_gpu_q4k_window_cache_stats *stats) {
     (void)cache; (void)stats; return 0;
+}
+int ds4_gpu_q4k_window_cache_get_view(
+        const ds4_gpu_q4k_window_cache *cache,
+        ds4_gpu_q4k_window_cache_view *view) {
+    (void)cache; (void)view; return 0;
 }
 
 int ds4_gpu_q4k_packed_slice_resolve(
@@ -39760,6 +39772,19 @@ int ds4_gpu_routed_moe_one_packed_q4k_tensor(
     (void)down_column_byte_base; (void)down_column_byte_count;
     (void)selected; (void)weights; (void)n_expert; (void)clamp;
     (void)x; (void)add_in; (void)layer_index;
+    return 0;
+}
+
+int ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
+        ds4_gpu_q4k_window_cache *cache,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *add_in, uint32_t layer_index) {
+    (void)out; (void)gate; (void)up; (void)mid; (void)experts;
+    (void)cache; (void)selected; (void)weights; (void)n_expert;
+    (void)clamp; (void)x; (void)add_in; (void)layer_index;
     return 0;
 }
 
