@@ -4472,6 +4472,10 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
     w->offsets.layer_count = layer_count;
     w->offsets.trunk_count = trunk_count;
     w->offsets.nextn_count = nextn_count;
+    w->offsets.rms_norm_eps = required_f32(
+        m, "glm5-next.attention.layer_norm_rms_epsilon");
+    w->offsets.hc_eps = required_f32(
+        m, "glm5-next.hyper_connection.epsilon");
 
     bool has_kda_q[DS4_MAX_LAYER] = {false};
     bool has_mla_q[DS4_MAX_LAYER] = {false};
@@ -6155,7 +6159,8 @@ static void config_validate_glm5_next_layer_types(const ds4_model *m) {
  * there would bind tensors with the wrong layer schedule and could produce
  * plausible-looking but invalid output.  This first-stage validator proves
  * only the model contract and then stops before graph construction. */
-static void config_validate_glm5_next_model(const ds4_model *m) {
+static void config_validate_glm5_next_model(const ds4_model *m,
+                                            bool require_executable_engine) {
     g_ds4_shape = DS4_SHAPE_GLM53;
 
     const uint32_t layers = required_u32(m, "glm5-next.block_count");
@@ -6310,14 +6315,16 @@ static void config_validate_glm5_next_model(const ds4_model *m) {
         bound.kda_count == 0u) {
         ds4_die("glm5-next tensor-derived attention schedule was not validated");
     }
-    ds4_die("glm5-next metadata and tensor layouts validated; resident KDA is component-gated only, while sparse MLA/indexer, mHC, FFN, output, and the full TP graph remain unimplemented; refusing inference");
+    if (require_executable_engine) {
+        ds4_die("glm5-next metadata and tensor layouts validated; staged full TP execution is not yet wired into the ordinary engine; refusing inference");
+    }
 }
 
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch) &&
         ds4_streq(arch, "glm5-next")) {
-        config_validate_glm5_next_model(m);
+        config_validate_glm5_next_model(m, true);
         return;
     }
     if (model_get_string(m, "general.architecture", &arch) &&
@@ -38697,6 +38704,12 @@ struct ds4_vocab {
     str_i32_table merge_rank;
 };
 
+struct ds4_glm5_next_text_codec {
+    ds4_model model;
+    ds4_vocab vocab;
+    bool glm_dsa;
+};
+
 /* Engine-side tensor-parallel state.  The transport context is owned by the
  * frontend (CLI leader or ds4_tp_worker_run); the engine owns the GPU slab,
  * the per-slot views and the gate machinery lifetime. */
@@ -39459,8 +39472,11 @@ static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, tok
  * word (for example ">;\n").  Splitting those newlines separately changes the
  * token stream for code prompts and produces wrong long-context logits.
  */
-static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+static void bpe_tokenize_text_for_family(const ds4_vocab *vocab,
+                                         const char *text,
+                                         bool glm_dsa,
+                                         token_vec *out) {
+    if (glm_dsa) {
         bpe_tokenize_text_glm4(vocab, text, out);
         return;
     }
@@ -39532,6 +39548,12 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         if (pos == start) pos = next_utf8_char(text, len, pos);
         bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
     }
+}
+
+static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text,
+                              token_vec *out) {
+    bpe_tokenize_text_for_family(
+        vocab, text, DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA, out);
 }
 
 static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
@@ -39637,12 +39659,66 @@ static void vocab_free(ds4_vocab *vocab) {
     memset(vocab, 0, sizeof(*vocab));
 }
 
+static void encode_chat_prompt(const ds4_vocab *vocab,
+                               const char *system,
+                               const char *prompt,
+                               ds4_think_mode think_mode,
+                               bool glm_dsa,
+                               token_vec *out);
+
+int ds4_glm5_next_text_codec_open(ds4_glm5_next_text_codec **out,
+                                  const char *model_path) {
+    if (!out || !model_path || !model_path[0]) return 1;
+    *out = NULL;
+    ds4_glm5_next_text_codec *codec = xcalloc(1, sizeof(*codec));
+    codec->model.fd = -1;
+    model_open(&codec->model, model_path, false, false);
+
+    ds4_str arch = {0};
+    if (!model_get_string(&codec->model, "general.architecture", &arch) ||
+        !ds4_streq(arch, "glm5-next")) {
+        fprintf(stderr,
+                "ds4: glm5-next text codec requires a glm5-next GGUF\n");
+        model_close(&codec->model);
+        free(codec);
+        return 1;
+    }
+
+    /* This proves the complete metadata/tensor contract but deliberately
+     * omits only the ordinary-engine graph readiness abort. */
+    const ds4_shape previous_shape = g_ds4_shape;
+    config_validate_glm5_next_model(&codec->model, false);
+    vocab_load(&codec->vocab, &codec->model);
+    codec->glm_dsa = true;
+    g_ds4_shape = previous_shape;
+    *out = codec;
+    return 0;
+}
+
+void ds4_glm5_next_text_codec_close(ds4_glm5_next_text_codec *codec) {
+    if (!codec) return;
+    vocab_free(&codec->vocab);
+    model_close(&codec->model);
+    free(codec);
+}
+
+void ds4_glm5_next_text_codec_encode_chat(ds4_glm5_next_text_codec *codec,
+                                          const char *system,
+                                          const char *prompt,
+                                          ds4_think_mode think_mode,
+                                          ds4_tokens *out) {
+    if (!codec || !out) return;
+    encode_chat_prompt(&codec->vocab, system, prompt ? prompt : "",
+                       think_mode, codec->glm_dsa, out);
+}
+
 /* Build the DS4 chat prompt: BOS, optional system text, user prompt, assistant
  * marker, and either <think> or </think> depending on the requested mode.  Max
  * thinking is only a prompt prefix: the model still enters through <think>. */
-static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
+static void chat_push_bos_sequence(const ds4_vocab *vocab, bool glm_dsa,
+                                   token_vec *out) {
     token_vec_push(out, vocab->bos_id);
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->sop_id >= 0)
+    if (glm_dsa && vocab->sop_id >= 0)
         token_vec_push(out, vocab->sop_id);
 }
 
@@ -39657,15 +39733,17 @@ const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
 
 static void chat_push_think_prefix(const ds4_vocab *vocab,
                                    ds4_think_mode   think_mode,
+                                   bool             glm_dsa,
                                    token_vec       *out) {
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (glm_dsa) {
         const char *effort = ds4_glm_reasoning_effort_text(think_mode);
         if (effort) {
             token_vec_push(out, vocab->system_id);
-            bpe_tokenize_text(vocab, effort, out);
+            bpe_tokenize_text_for_family(vocab, effort, glm_dsa, out);
         }
     } else if (think_mode == DS4_THINK_MAX) {
-        bpe_tokenize_text(vocab, DS4_REASONING_EFFORT_MAX_PREFIX, out);
+        bpe_tokenize_text_for_family(
+            vocab, DS4_REASONING_EFFORT_MAX_PREFIX, glm_dsa, out);
     }
 }
 
@@ -39674,32 +39752,32 @@ static void encode_chat_prompt(
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
+        bool             glm_dsa,
         token_vec       *out) {
     const bool need_think_start =
-        ds4_think_mode_enabled(think_mode) ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+        ds4_think_mode_enabled(think_mode) || glm_dsa;
     if (vocab->bos_id < 0 ||
         vocab->user_id < 0 ||
         vocab->assistant_id < 0 ||
         vocab->think_end_id < 0 ||
-        (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && vocab->system_id < 0) ||
+        (glm_dsa && vocab->system_id < 0) ||
         (need_think_start && vocab->think_start_id < 0)) {
         ds4_die("this tokenizer does not provide the DeepSeek chat markers; use raw prompt tokenization");
     }
 
-    chat_push_bos_sequence(vocab, out);
-    chat_push_think_prefix(vocab, think_mode, out);
+    chat_push_bos_sequence(vocab, glm_dsa, out);
+    chat_push_think_prefix(vocab, think_mode, glm_dsa, out);
     if (system && system[0]) {
-        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA)
+        if (glm_dsa)
             token_vec_push(out, vocab->system_id);
-        bpe_tokenize_text(vocab, system, out);
+        bpe_tokenize_text_for_family(vocab, system, glm_dsa, out);
     }
     token_vec_push(out, vocab->user_id);
-    bpe_tokenize_text(vocab, prompt, out);
+    bpe_tokenize_text_for_family(vocab, prompt, glm_dsa, out);
     token_vec_push(out, vocab->assistant_id);
     if (ds4_think_mode_enabled(think_mode)) {
         token_vec_push(out, vocab->think_start_id);
-    } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    } else if (glm_dsa) {
         token_vec_push(out, vocab->think_start_id);
         token_vec_push(out, vocab->think_end_id);
     } else {
@@ -39789,7 +39867,8 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 }
 
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
-    chat_push_bos_sequence(&e->vocab, tokens);
+    chat_push_bos_sequence(
+        &e->vocab, DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA, tokens);
 }
 
 void ds4_encode_chat_prompt(
@@ -39798,7 +39877,8 @@ void ds4_encode_chat_prompt(
         const char *prompt,
         ds4_think_mode think_mode,
         ds4_tokens *out) {
-    encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode, out);
+    encode_chat_prompt(&e->vocab, system, prompt ? prompt : "", think_mode,
+                       DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA, out);
 }
 
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens) {
@@ -39971,8 +40051,7 @@ static bool vocab_token_is_literal_special(ds4_str s) {
     return false;
 }
 
-char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
-    ds4_vocab *vocab = &e->vocab;
+static char *vocab_token_text(ds4_vocab *vocab, int token, size_t *len) {
     if (token < 0 || token >= vocab->n_vocab) {
         if (len) *len = 0;
         char *out = xmalloc(1);
@@ -40001,10 +40080,25 @@ char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
     return out;
 }
 
-static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
+char *ds4_token_text(ds4_engine *e, int token, size_t *len) {
+    return vocab_token_text(&e->vocab, token, len);
+}
+
+char *ds4_glm5_next_text_codec_token_text(ds4_glm5_next_text_codec *codec,
+                                          int token,
+                                          size_t *len) {
+    if (!codec) {
+        if (len) *len = 0;
+        return ds4_strdup("");
+    }
+    return vocab_token_text(&codec->vocab, token, len);
+}
+
+static bool vocab_token_is_generation_stop(const ds4_vocab *vocab,
+                                           bool glm_dsa, int token) {
     if (!vocab || token < 0) return false;
     if (token == vocab->eos_id) return true;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+    if (glm_dsa) {
         return (vocab->system_id >= 0 && token == vocab->system_id) ||
                (vocab->user_id >= 0 && token == vocab->user_id) ||
                (vocab->assistant_id >= 0 && token == vocab->assistant_id) ||
@@ -40013,12 +40107,20 @@ static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
     return false;
 }
 
+bool ds4_glm5_next_text_codec_token_is_stop(
+        ds4_glm5_next_text_codec *codec, int token) {
+    return codec && vocab_token_is_generation_stop(
+        &codec->vocab, codec->glm_dsa, token);
+}
+
 int ds4_token_eos(ds4_engine *e) {
     return e->vocab.eos_id;
 }
 
 bool ds4_token_is_stop(ds4_engine *e, int token) {
-    return e ? vocab_token_is_generation_stop(&e->vocab, token) : false;
+    return e ? vocab_token_is_generation_stop(
+        &e->vocab, DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA, token) :
+        false;
 }
 
 bool ds4_token_is_thinking_control(ds4_engine *e, int token) {
@@ -40585,7 +40687,9 @@ static int generate_raw_swa_cpu(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (vocab_token_is_generation_stop(vocab, token)) break;
+        if (vocab_token_is_generation_stop(
+                vocab, DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA,
+                token)) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;
@@ -49945,7 +50049,9 @@ static DS4_MAYBE_UNUSED int generate_glm_metal_first_token(
         print_top_logits(stderr, "GLM first-token", vocab, logits, DS4_N_VOCAB, 10);
     }
     const int token = sample_argmax(logits, DS4_N_VOCAB);
-    if (!vocab_token_is_generation_stop(vocab, token) && emit) emit(emit_ud, token);
+    if (!vocab_token_is_generation_stop(
+            vocab, DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA, token) &&
+        emit) emit(emit_ud, token);
     if (done) done(emit_ud);
 
     const double eval_s = t1 - t0;
@@ -50100,7 +50206,9 @@ static int generate_glm_metal_argmax(
             print_top_logits(stderr, label, vocab, logits, DS4_N_VOCAB, 10);
         }
         const int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (vocab_token_is_generation_stop(vocab, token)) break;
+        if (vocab_token_is_generation_stop(
+                vocab, DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA,
+                token)) break;
         if (emit) emit(emit_ud, token);
         n_generated++;
 
@@ -50294,7 +50402,9 @@ static int generate_metal_graph_raw_swa(
         }
 
         int token = sample_argmax(logits, DS4_N_VOCAB);
-        if (vocab_token_is_generation_stop(vocab, token)) break;
+        if (vocab_token_is_generation_stop(
+                vocab, DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA,
+                token)) break;
 
         if (emit) emit(emit_ud, token);
         n_generated++;

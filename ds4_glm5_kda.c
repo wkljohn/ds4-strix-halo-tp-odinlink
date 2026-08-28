@@ -279,12 +279,14 @@ int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
                                uint64_t model_size,
                                const ds4_gpu_tensor *input,
                                ds4_gpu_tensor *output,
-                               uint32_t n_tokens) {
+                               uint32_t n_tokens,
+                               float norm_eps) {
     if (!state || !state->valid || !state->q_history || !state->k_history ||
         !state->v_history || !state->recurrent || !workspace || !weights ||
         !model_map || model_size == 0u || !input || !output ||
         n_tokens == 0u || n_tokens > workspace->capacity_tokens ||
-        state->token_count > UINT64_MAX - n_tokens) {
+        state->token_count > UINT64_MAX - n_tokens ||
+        !(norm_eps > 0.0f)) {
         return 0;
     }
     const uint64_t input_bytes =
@@ -302,6 +304,7 @@ int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
         .input = input,
         .output = output,
         .n_tokens = n_tokens,
+        .norm_eps = norm_eps,
     };
     if (!ds4_rocm_glm5_kda_layer_execute(&args)) {
         if (state->owner_slot) ds4_glm5_kda_slot_invalidate(state->owner_slot);

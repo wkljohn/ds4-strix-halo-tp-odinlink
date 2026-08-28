@@ -43,7 +43,7 @@ def skip_value(fp, typ):
         raise ValueError(f"unsupported metadata type {typ}")
 
 
-def load_directory(path):
+def load_directory(path, include_metadata=False):
     with path.open("rb") as fp:
         magic, version, nt, nk = struct.unpack("<IIQQ", fp.read(24))
         if magic != 0x46554747 or version != 3:
@@ -58,6 +58,8 @@ def load_directory(path):
                 if key == "general.alignment" and value:
                     alignment = value
                 meta[key] = value
+            elif typ == 6:
+                meta[key] = struct.unpack("<f", fp.read(4))[0]
             elif typ == 8:
                 meta[key] = read_string(fp)
             else:
@@ -70,6 +72,8 @@ def load_directory(path):
             typ, offset = struct.unpack("<IQ", fp.read(12))
             tensors[name] = (dims, typ, offset)
         data_start = (fp.tell() + alignment - 1) // alignment * alignment
+        if include_metadata:
+            return data_start, tensors, meta
         return data_start, tensors
 
 
@@ -107,9 +111,9 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def write_full_layer_oracle(path, blob, data_start, tensors, output_path,
-                            dump_prefix=None):
-    """Write the two-token, complete layer-0 KDA FP32 oracle payload."""
+def write_full_layer_oracle(path, blob, data_start, tensors, rms_norm_eps,
+                            oracle_tokens, output_path, dump_prefix=None):
+    """Write a complete layer-0 KDA FP32 oracle payload."""
     import numpy as np
 
     def addr(name, shape, typ):
@@ -153,9 +157,11 @@ def write_full_layer_oracle(path, blob, data_start, tensors, output_path,
     }
 
     x = np.asarray([[math.sin(0.013 * (t * 4096 + i + 1)) * 0.25
-                     for i in range(4096)] for t in range(2)], dtype=np.float32)
+                     for i in range(4096)] for t in range(oracle_tokens)],
+                   dtype=np.float32)
     attn_norm = f32_array(offsets["attn_norm"], 4096)
-    rms = np.sqrt(np.mean(x * x, axis=1, keepdims=True) + np.float32(1e-5))
+    rms = np.sqrt(np.mean(x * x, axis=1, keepdims=True) +
+                  np.float32(rms_norm_eps))
     normalized = np.asarray(x / rms * attn_norm[None, :], dtype=np.float32)
 
     q = project(normalized, offsets["q"], 8192, 4096)
@@ -165,7 +171,7 @@ def write_full_layer_oracle(path, blob, data_start, tensors, output_path,
     for projected, key in ((q, "q_conv"), (k, "k_conv"), (v, "v_conv")):
         weight = f32_array(offsets[key], 8192 * 4, (8192, 4))
         history = np.zeros((8192, 3), dtype=np.float32)
-        for token in range(2):
+        for token in range(oracle_tokens):
             current = projected[token].copy()
             raw = (history[:, 0] * weight[:, 0] +
                    history[:, 1] * weight[:, 1] +
@@ -177,17 +183,19 @@ def write_full_layer_oracle(path, blob, data_start, tensors, output_path,
             history[:, 2] = current
         histories.append(history)
 
-    qh = q.reshape(2, 64, 128)
-    kh = k.reshape(2, 64, 128)
-    vh = v.reshape(2, 64, 128)
+    qh = q.reshape(oracle_tokens, 64, 128)
+    kh = k.reshape(oracle_tokens, 64, 128)
+    vh = v.reshape(oracle_tokens, 64, 128)
     qh /= np.sqrt(np.sum(qh * qh, axis=2, keepdims=True) + np.float32(1e-6))
     qh /= np.float32(math.sqrt(128.0))
     kh /= np.sqrt(np.sum(kh * kh, axis=2, keepdims=True) + np.float32(1e-6))
 
     f_low = project(normalized, offsets["f_a"], 128, 4096)
-    forget_projection = project(f_low, offsets["f_b"], 8192, 128).reshape(2, 64, 128)
+    forget_projection = project(f_low, offsets["f_b"], 8192, 128).reshape(
+        oracle_tokens, 64, 128)
     g_low = project(normalized, offsets["g_a"], 128, 4096)
-    out_gate = project(g_low, offsets["g_b"], 8192, 128).reshape(2, 64, 128)
+    out_gate = project(g_low, offsets["g_b"], 8192, 128).reshape(
+        oracle_tokens, 64, 128)
     beta = project(normalized, offsets["beta"], 64, 4096)
     beta = np.asarray(1.0 / (1.0 + np.exp(-beta)), dtype=np.float32)
     dt = f32_array(offsets["dt"], 8192).reshape(64, 128)
@@ -198,8 +206,8 @@ def write_full_layer_oracle(path, blob, data_start, tensors, output_path,
         dtype=np.float32)
 
     state = np.zeros((64, 128, 128), dtype=np.float32)
-    core = np.zeros((2, 64, 128), dtype=np.float32)
-    for token in range(2):
+    core = np.zeros((oracle_tokens, 64, 128), dtype=np.float32)
+    for token in range(oracle_tokens):
         for head in range(64):
             state[head] *= np.exp(forget[token, head])[:, None]
             prediction = kh[token, head] @ state[head]
@@ -209,12 +217,15 @@ def write_full_layer_oracle(path, blob, data_start, tensors, output_path,
             core[token, head] = qh[token, head] @ state[head]
 
     o_norm = f32_array(offsets["o_norm"], 128)
+    # Q/K L2 normalization is eps=1e-6; this gated output is the model
+    # RMSNorm and follows the GGUF model metadata.
     core_rms = np.sqrt(np.mean(core * core, axis=2, keepdims=True) +
-                       np.float32(1e-6))
+                       np.float32(rms_norm_eps))
     gated = np.asarray(
         core / core_rms * o_norm[None, None, :] *
         (1.0 / (1.0 + np.exp(-out_gate))), dtype=np.float32)
-    output = project(gated.reshape(2, 8192), offsets["output"], 4096, 8192)
+    output = project(gated.reshape(oracle_tokens, 8192),
+                     offsets["output"], 4096, 8192)
 
     history_bytes = b"".join(
         np.asarray(history, dtype="<f4").tobytes() for history in histories)
@@ -223,7 +234,8 @@ def write_full_layer_oracle(path, blob, data_start, tensors, output_path,
     document = {
         "model_sha256": sha256_file(path),
         "layer": 0,
-        "tokens": 2,
+        "tokens": oracle_tokens,
+        "rms_norm_eps": rms_norm_eps,
         "output_f32_sha256": hashlib.sha256(output_bytes).hexdigest(),
         "history_f32_sha256": hashlib.sha256(history_bytes).hexdigest(),
         "state_f32_sha256": hashlib.sha256(state_bytes).hexdigest(),
@@ -250,12 +262,22 @@ def main(argv):
     parser.add_argument("--output", type=Path)
     parser.add_argument("--dump-prefix", type=Path,
                         help="optional prefix for input/output/history/state FP32 oracle dumps")
+    parser.add_argument("--oracle-tokens", type=int, default=2,
+                        help="complete-oracle token count (2..64)")
     parser.add_argument("model", type=Path)
     args = parser.parse_args(argv[1:])
     if args.dump_prefix is not None and args.output is None:
         parser.error("--dump-prefix requires --output")
+    if args.oracle_tokens < 2 or args.oracle_tokens > 64:
+        parser.error("--oracle-tokens must be 2..64")
     path = args.model
-    data_start, tensors = load_directory(path)
+    data_start, tensors, metadata = load_directory(path, include_metadata=True)
+    rms_norm_eps = metadata.get(
+        "glm5-next.attention.layer_norm_rms_epsilon")
+    expected_rms_eps = struct.unpack("<f", struct.pack("<f", 1.0e-5))[0]
+    if rms_norm_eps != expected_rms_eps:
+        raise ValueError(
+            f"unexpected GLM5-next RMS epsilon {rms_norm_eps!r}")
     required = [
         "blk.0.kda_q.weight", "blk.0.kda_k.weight", "blk.0.kda_v.weight",
         "blk.0.kda_f_a.weight", "blk.0.kda_f_b.weight",
@@ -325,8 +347,8 @@ def main(argv):
     print(f"sample_channels=8 beta={beta:.8g} output_fnv64={h:016x}")
     if args.output is not None:
         document = write_full_layer_oracle(
-            path, blob, data_start, tensors, args.output,
-            args.dump_prefix)
+            path, blob, data_start, tensors, rms_norm_eps,
+            args.oracle_tokens, args.output, args.dump_prefix)
         print(f"model_sha256={document['model_sha256']}")
         print(f"output_f32_sha256={document['output_f32_sha256']}")
         print(f"history_f32_sha256={document['history_f32_sha256']}")

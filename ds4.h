@@ -58,6 +58,7 @@ typedef struct {
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
+typedef struct ds4_glm5_next_text_codec ds4_glm5_next_text_codec;
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 typedef bool (*ds4_session_cancel_fn)(void *ud);
@@ -296,6 +297,25 @@ void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
+
+/* Metadata-only tokenizer boundary for the staged glm5-next executor.  This
+ * does not construct an inference engine or relax its fail-closed graph gate.
+ * It exists so real-prompt research drivers use the exact production GGUF BPE
+ * and chat protocol while the graph is promoted one validated stage at a
+ * time. */
+int ds4_glm5_next_text_codec_open(ds4_glm5_next_text_codec **out,
+                                  const char *model_path);
+void ds4_glm5_next_text_codec_close(ds4_glm5_next_text_codec *codec);
+void ds4_glm5_next_text_codec_encode_chat(ds4_glm5_next_text_codec *codec,
+                                          const char *system,
+                                          const char *prompt,
+                                          ds4_think_mode think_mode,
+                                          ds4_tokens *out);
+char *ds4_glm5_next_text_codec_token_text(ds4_glm5_next_text_codec *codec,
+                                          int token,
+                                          size_t *len);
+bool ds4_glm5_next_text_codec_token_is_stop(
+        ds4_glm5_next_text_codec *codec, int token);
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);

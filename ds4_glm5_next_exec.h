@@ -22,6 +22,11 @@ typedef struct {
     ds4_gpu_tensor *tp_big_in;
     void *tp_big_out_host;
     void *tp_big_in_host;
+    /* Research-only staged trace selector. NULL keeps the production path
+     * free of device reads and filesystem activity. */
+    const char *trace_prefix;
+    uint32_t trace_layer;
+    uint32_t trace_token;
     /* Transport-global, monotonically increasing big-gate sequence.  It is
      * deliberately not reset with a model sequence while the TP link lives. */
     uint64_t *tp_sequence;

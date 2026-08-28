@@ -99,7 +99,9 @@ int ds4_glm5_next_model_offsets_validate(
     if (!model || model->layer_count != DS4_GLM5_NEXT_LAYER_COUNT ||
         model->trunk_count != DS4_GLM5_NEXT_TRUNK_COUNT ||
         model->nextn_count != 1u || !model->token_embd ||
-        !model->output_norm || !model->output || !model->nextn_eh_proj) {
+        !model->output_norm || !model->output || !model->nextn_eh_proj ||
+        !(model->rms_norm_eps > 0.0f) || model->rms_norm_eps > 1.0f ||
+        !(model->hc_eps > 0.0f) || model->hc_eps > 1.0f) {
         return 0;
     }
     for (uint32_t il = 0u; il < model->layer_count; ++il) {

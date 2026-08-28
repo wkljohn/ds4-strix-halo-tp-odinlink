@@ -66,6 +66,7 @@ typedef struct {
     const ds4_gpu_tensor *input;
     ds4_gpu_tensor *output;
     uint32_t n_tokens;
+    float norm_eps;
 } ds4_glm5_kda_device_args;
 
 /* Test-only state comparison payload. Producing it performs device readback;
@@ -106,7 +107,8 @@ int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
                                uint64_t model_size,
                                const ds4_gpu_tensor *input,
                                ds4_gpu_tensor *output,
-                               uint32_t n_tokens);
+                               uint32_t n_tokens,
+                               float norm_eps);
 int ds4_glm5_kda_layer_digest(const ds4_glm5_kda_layer_state *state,
                               const ds4_gpu_tensor *output,
                               uint64_t output_floats,

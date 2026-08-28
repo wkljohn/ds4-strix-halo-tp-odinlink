@@ -2,6 +2,7 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 extern "C" {
+#include "ds4.h"
 #include "ds4_tp.h"
 }
 #include "tests/glm5_gguf_test.hpp"
@@ -15,6 +16,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -56,6 +58,16 @@ struct WorkspaceGuard {
     ~WorkspaceGuard() { ds4_glm5_next_workspace_destroy(value); }
 };
 
+struct CodecGuard {
+    ds4_glm5_next_text_codec *value = nullptr;
+    ~CodecGuard() { ds4_glm5_next_text_codec_close(value); }
+};
+
+struct TokensGuard {
+    ds4_tokens value = {};
+    ~TokensGuard() { ds4_tokens_free(&value); }
+};
+
 struct TpGuard {
     ds4_tp *tp = nullptr;
     ds4_gpu_tensor *slab = nullptr;
@@ -71,6 +83,7 @@ struct TpGuard {
 
 bool create_tp(const Glm5TestGGUF &gguf, bool leader,
                const char *host, const char *device, int port,
+               uint32_t context_capacity,
                TpGuard &guard, ds4_glm5_next_exec_ctx &exec,
                uint64_t &sequence) {
     CHECK(unsetenv("DS4_TP_VERBS_LIB") == 0 &&
@@ -96,7 +109,7 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
     identity.n_embd = kWidth;
     identity.n_vocab = 154880u;
     identity.quant_bits = 4u;
-    identity.ctx_size = 2u;
+    identity.ctx_size = context_capacity;
     identity.runtime_features =
         DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD;
     identity.gate_slot_start = 3u * DS4_TP_GATES_PER_LAYER;
@@ -137,6 +150,47 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
     return true;
 }
 
+bool execute_full_token(ds4_glm5_next_exec_ctx &exec,
+                        ds4_glm5_next_state &state,
+                        ds4_glm5_next_workspace *workspace,
+                        uint32_t token,
+                        ds4_gpu_tensor *&current,
+                        ds4_gpu_tensor *&output) {
+    CHECK(ds4_glm5_next_embed_token(&exec, token, current),
+          "embed text token");
+    for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        CHECK(ds4_glm5_next_layer_forward(
+                  &exec, il, &state, workspace, current, output),
+              "execute text token through complete trunk");
+        std::swap(current, output);
+    }
+    return true;
+}
+
+bool read_argmax(ds4_glm5_next_exec_ctx &exec,
+                 ds4_glm5_next_workspace *workspace,
+                 ds4_gpu_tensor *current,
+                 ds4_gpu_tensor *logits,
+                 std::vector<float> &host_logits,
+                 uint32_t &argmax,
+                 uint64_t &logits_hash) {
+    CHECK(ds4_glm5_next_output_logits(&exec, workspace, current, logits) &&
+              ds4_gpu_synchronize(),
+          "execute text vocabulary projection");
+    CHECK(ds4_gpu_tensor_read(logits, 0u, host_logits.data(),
+                              host_logits.size() * sizeof(float)),
+          "read text vocabulary logits");
+    logits_hash = fnv64(host_logits.data(),
+                        host_logits.size() * sizeof(float));
+    argmax = 0u;
+    CHECK(std::isfinite(host_logits[0]), "text logits start finite");
+    for (uint32_t token = 1u; token < host_logits.size(); ++token) {
+        CHECK(std::isfinite(host_logits[token]), "all text logits are finite");
+        if (host_logits[token] > host_logits[argmax]) argmax = token;
+    }
+    return true;
+}
+
 bool run() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     const char *role = std::getenv("DS4_GLM5_TP_ROLE");
@@ -168,6 +222,53 @@ bool run() {
     CHECK(full_tokens != 0u &&
               (full_trunk || full_tokens == 1u),
           "full-token count is bounded and requires full-trunk mode");
+    const char *text_prompt = std::getenv("DS4_GLM5_TEXT_PROMPT");
+    const bool text_mode = text_prompt != nullptr;
+    const char *text_generate_env = std::getenv("DS4_GLM5_TEXT_GENERATE");
+    char *text_generate_end = nullptr;
+    const unsigned long text_generate_long = text_generate_env ?
+        std::strtoul(text_generate_env, &text_generate_end, 10) : 4ul;
+    const bool text_generate_valid = !text_generate_env ||
+        (text_generate_end && *text_generate_end == '\0');
+    CHECK(!text_mode ||
+              (full_trunk && text_prompt[0] && text_generate_long >= 1ul &&
+               text_generate_long <= 128ul && text_generate_valid),
+          "real-text mode requires full trunk and 1..128 generated tokens");
+    const uint32_t text_generate = (uint32_t)text_generate_long;
+    const char *teacher_ids_env =
+        std::getenv("DS4_GLM5_TEXT_TEACHER_IDS");
+    std::vector<uint32_t> teacher_ids;
+    if (teacher_ids_env && teacher_ids_env[0]) {
+        const char *cursor = teacher_ids_env;
+        while (*cursor) {
+            char *teacher_end = nullptr;
+            const unsigned long value =
+                std::strtoul(cursor, &teacher_end, 10);
+            CHECK(teacher_end != cursor && value < 154880ul &&
+                      (*teacher_end == ',' || *teacher_end == '\0'),
+                  "teacher token list is comma-separated vocabulary IDs");
+            teacher_ids.push_back((uint32_t)value);
+            cursor = *teacher_end == ',' ? teacher_end + 1 : teacher_end;
+            CHECK(*cursor || *teacher_end == '\0',
+                  "teacher token list has no empty trailing item");
+        }
+        CHECK(text_mode && teacher_ids.size() == text_generate,
+              "teacher token count must equal generated-token bound");
+    }
+    CodecGuard codec;
+    TokensGuard prompt_tokens;
+    if (text_mode) {
+        CHECK(ds4_glm5_next_text_codec_open(&codec.value, model) == 0 &&
+                  codec.value,
+              "open exact same-GGUF GLM5 text codec");
+        ds4_glm5_next_text_codec_encode_chat(
+            codec.value, nullptr, text_prompt, DS4_THINK_MAX,
+            &prompt_tokens.value);
+        CHECK(prompt_tokens.value.len > 0 && prompt_tokens.value.len <= 64,
+              "real chat prompt token count is bounded to 1..64");
+    }
+    const uint32_t context_capacity = text_mode ?
+        (uint32_t)prompt_tokens.value.len + text_generate : 2u;
     Glm5NextKShardPlan kshard;
     CHECK(!full_trunk || glm5_next_build_kshard_plan(gguf, offsets, kshard),
           "build exact full-trunk compact residency plan");
@@ -182,7 +283,8 @@ bool run() {
     StateGuard state;
     WorkspaceGuard workspace;
     TensorGuard current, output, logits;
-    CHECK(ds4_glm5_next_state_init(&state.value, &offsets, 2u, nullptr) &&
+    CHECK(ds4_glm5_next_state_init(&state.value, &offsets,
+                                   context_capacity, nullptr) &&
           (workspace.value = ds4_glm5_next_workspace_create()) != nullptr &&
           (current.value = ds4_gpu_tensor_alloc(
               (uint64_t)kHcWidth * sizeof(float))) != nullptr &&
@@ -197,9 +299,28 @@ bool run() {
     exec.model_map = gguf.map;
     exec.model_size = gguf.size;
     exec.model = &offsets;
+    exec.trace_prefix = std::getenv("DS4_GLM5_NEXT_TRACE_PREFIX");
+    if (exec.trace_prefix) {
+        const char *layer_text = std::getenv("DS4_GLM5_NEXT_TRACE_LAYER");
+        const char *token_text = std::getenv("DS4_GLM5_NEXT_TRACE_TOKEN");
+        char *layer_end = nullptr, *token_end = nullptr;
+        const unsigned long layer = layer_text ?
+            std::strtoul(layer_text, &layer_end, 10) : 3u;
+        const bool trace_all = token_text && std::strcmp(token_text, "all") == 0;
+        const unsigned long token = !token_text || trace_all ? 0u :
+            std::strtoul(token_text, &token_end, 10);
+        CHECK((!layer_text || (layer_end && *layer_end == '\0')) &&
+              (!token_text || trace_all ||
+               (token_end && *token_end == '\0')) &&
+              layer < DS4_GLM5_NEXT_TRUNK_COUNT && token <= UINT32_MAX,
+              "valid staged trace selector");
+        exec.trace_layer = (uint32_t)layer;
+        exec.trace_token = trace_all ? UINT32_MAX : (uint32_t)token;
+    }
     uint64_t sequence = 0u;
     TpGuard tp;
     CHECK(create_tp(gguf, leader, host, device, (int)port_long,
+                    context_capacity,
                     tp, exec, sequence),
           "create persistent GLM5 layer3 RoCE transport");
     char rank_error[256] = {};
@@ -209,11 +330,30 @@ bool run() {
               rank_error, sizeof(rank_error)) == -1,
           "TP roles must prove distinct rank identities");
     char mode_error[256] = {};
+    const uint64_t prompt_hash = text_mode ?
+        fnv64(prompt_tokens.value.v,
+              (uint64_t)prompt_tokens.value.len * sizeof(int)) : 0u;
+    const uint64_t teacher_hash = teacher_ids.empty() ? 0u :
+        fnv64(teacher_ids.data(),
+              teacher_ids.size() * sizeof(teacher_ids[0]));
     const uint64_t mode_hash = UINT64_C(0x474c4d354d4f4400) ^
-        ((uint64_t)full_trunk << 8u) ^ full_tokens;
+        ((uint64_t)full_trunk << 8u) ^ full_tokens ^
+        ((uint64_t)text_mode << 16u) ^ ((uint64_t)text_generate << 24u) ^
+        prompt_hash ^ teacher_hash;
+    if (text_mode) {
+        std::fprintf(stderr,
+            "GLM5 text prompt role=%s tokens=%d token_fnv=%016llx ids=",
+            role, prompt_tokens.value.len,
+            (unsigned long long)prompt_hash);
+        for (int i = 0; i < prompt_tokens.value.len; ++i) {
+            std::fprintf(stderr, "%s%d", i ? "," : "",
+                         prompt_tokens.value.v[i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
     CHECK(ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d354d4f4445),
                             mode_hash, mode_error, sizeof(mode_error)) == 1,
-          "TP roles must negotiate the same full-trunk token count");
+          "TP roles must negotiate the same full-trunk/text mode");
     if (full_trunk) {
         constexpr uint64_t install_headroom = UINT64_C(2) << 30u;
         size_t free_before_install = 0u, total_before_install = 0u;
@@ -282,6 +422,133 @@ bool run() {
             exec.tp_rank, (unsigned long long)free_after_install,
             (unsigned long long)total_after_install,
             (unsigned long long)(free_before_install - free_after_install));
+    }
+
+    if (text_mode) {
+        uint32_t executed = 0u;
+        for (int i = 0; i < prompt_tokens.value.len; ++i) {
+            CHECK(execute_full_token(
+                      exec, state.value, workspace.value,
+                      (uint32_t)prompt_tokens.value.v[i],
+                      current.value, output.value),
+                  "execute exact chat prompt token");
+            executed++;
+        }
+        CHECK(state.value.valid &&
+                  sequence == (uint64_t)executed * 53u,
+              "chat prompt commits one complete TP schedule per token");
+
+        std::vector<float> host_logits(154880u);
+        std::vector<uint32_t> generated;
+        std::string text;
+        double teacher_nll_sum = 0.0;
+        for (uint32_t step = 0u; step < text_generate; ++step) {
+            uint32_t top1 = 0u;
+            uint64_t logits_hash = 0u;
+            CHECK(read_argmax(exec, workspace.value, current.value,
+                              logits.value, host_logits, top1, logits_hash),
+                  "select real-text greedy token");
+            char logits_error[256] = {};
+            CHECK(ds4_tp_hash_check(
+                      tp.tp,
+                      UINT64_C(0x474c4d3554584c00) ^ step,
+                      logits_hash, logits_error,
+                      sizeof(logits_error)) == 1,
+                  logits_error);
+            const uint32_t token = teacher_ids.empty() ?
+                top1 : teacher_ids[step];
+            double teacher_nll = 0.0;
+            if (!teacher_ids.empty()) {
+                const float max_logit = *std::max_element(
+                    host_logits.begin(), host_logits.end());
+                double exp_sum = 0.0;
+                for (float value : host_logits)
+                    exp_sum += std::exp((double)value - max_logit);
+                teacher_nll = (double)max_logit + std::log(exp_sum) -
+                              host_logits[token];
+                CHECK(std::isfinite(teacher_nll) && teacher_nll >= 0.0,
+                      "teacher token has finite nonnegative NLL");
+                teacher_nll_sum += teacher_nll;
+            }
+            generated.push_back(token);
+            const bool stop = ds4_glm5_next_text_codec_token_is_stop(
+                codec.value, (int)token);
+            if (!stop) {
+                size_t piece_len = 0u;
+                char *piece = ds4_glm5_next_text_codec_token_text(
+                    codec.value, (int)token, &piece_len);
+                CHECK(piece != nullptr, "detokenize generated GLM5 token");
+                text.append(piece, piece_len);
+                free(piece);
+            }
+            if (teacher_ids.empty()) {
+                std::fprintf(stderr,
+                    "GLM5 text step role=%s step=%u token=%u top1=%u "
+                    "logits=%016llx\n",
+                    role, step, token, top1,
+                    (unsigned long long)logits_hash);
+            } else {
+                std::fprintf(stderr,
+                    "GLM5 text step role=%s step=%u token=%u top1=%u "
+                    "teacher_nll=%.9g logits=%016llx\n",
+                    role, step, token, top1, teacher_nll,
+                    (unsigned long long)logits_hash);
+            }
+            if (stop) {
+                CHECK(teacher_ids.empty() || step + 1u == teacher_ids.size(),
+                      "teacher stop token must be the final prescribed token");
+                break;
+            }
+            if (step + 1u < text_generate) {
+                CHECK(execute_full_token(exec, state.value, workspace.value,
+                                         token, current.value, output.value),
+                      "feed generated token into recurrent GLM5 state");
+                executed++;
+                CHECK(sequence == (uint64_t)executed * 53u,
+                      "generated token commits one complete TP schedule");
+            }
+        }
+        CHECK(!generated.empty(), "real-text generation produced a token");
+        CHECK(teacher_ids.empty() || generated.size() == teacher_ids.size(),
+              "teacher-forced run consumed every prescribed token");
+        const uint64_t generated_hash = fnv64(
+            generated.data(), generated.size() * sizeof(generated[0]));
+        char generated_error[256] = {};
+        CHECK(ds4_tp_hash_check(tp.tp, UINT64_C(0x474c4d355458544f),
+                                generated_hash, generated_error,
+                                sizeof(generated_error)) == 1,
+              generated_error);
+        if (!teacher_ids.empty()) {
+            const uint64_t teacher_nll_hash =
+                fnv64(&teacher_nll_sum, sizeof(teacher_nll_sum));
+            char teacher_error[256] = {};
+            CHECK(ds4_tp_hash_check(
+                      tp.tp, UINT64_C(0x474c4d35544e4c4c),
+                      teacher_nll_hash, teacher_error,
+                      sizeof(teacher_error)) == 1,
+                  teacher_error);
+            std::fprintf(stderr,
+                "PASS GLM5 teacher-forced role=%s tokens=%zu "
+                "token_fnv=%016llx nll_sum=%.9g nll_mean=%.9g "
+                "nll_fnv=%016llx\n",
+                role, teacher_ids.size(),
+                (unsigned long long)teacher_hash, teacher_nll_sum,
+                teacher_nll_sum / teacher_ids.size(),
+                (unsigned long long)teacher_nll_hash);
+        }
+        if (leader) {
+            std::fprintf(stdout, "%s\n", text.c_str());
+            std::fflush(stdout);
+        }
+        std::fprintf(stderr,
+            "PASS GLM5 real-text role=%s prompt_tokens=%d generated=%zu "
+            "generated_fnv=%016llx tp_seq=%llu packed_q4_bytes=%llu "
+            "rdma=1\n",
+            role, prompt_tokens.value.len, generated.size(),
+            (unsigned long long)generated_hash,
+            (unsigned long long)sequence,
+            (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
+        return true;
     }
 
     CHECK(ds4_glm5_next_embed_token(&exec, 42u, current.value),

@@ -217,6 +217,84 @@ static int context_valid(const ds4_glm5_next_exec_ctx *ctx) {
            ds4_glm5_next_model_offsets_validate(ctx->model);
 }
 
+static int trace_tensor(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
+                        uint32_t token, const char *name,
+                        const ds4_gpu_tensor *tensor, uint64_t bytes) {
+    if (!ctx->trace_prefix || layer != ctx->trace_layer ||
+        (ctx->trace_token != UINT32_MAX && token != ctx->trace_token)) return 1;
+    if (!name || !tensor || ds4_gpu_tensor_bytes(tensor) < bytes ||
+        bytes == 0u || bytes > SIZE_MAX) return 0;
+    void *host = malloc((size_t)bytes);
+    if (!host) return 0;
+    char path[768];
+    const int n = ctx->trace_token == UINT32_MAX ?
+        snprintf(path, sizeof(path), "%s.t%u.%s", ctx->trace_prefix,
+                 token, name) :
+        snprintf(path, sizeof(path), "%s.%s", ctx->trace_prefix, name);
+    int ok = n > 0 && (size_t)n < sizeof(path) &&
+             ds4_gpu_tensor_read(tensor, 0u, host, bytes);
+    FILE *fp = ok ? fopen(path, "wb") : NULL;
+    if (fp) {
+        const size_t written = fwrite(host, 1u, (size_t)bytes, fp);
+        const int close_rc = fclose(fp);
+        ok = written == (size_t)bytes && close_rc == 0;
+    } else {
+        ok = 0;
+    }
+    free(host);
+    return ok;
+}
+
+static int trace_mla_attention(const ds4_glm5_next_exec_ctx *ctx,
+                               uint32_t layer, uint32_t token,
+                               const ds4_gpu_tensor *hc_in,
+                               ds4_glm5_next_workspace *w) {
+    return trace_tensor(ctx, layer, token, "input_hc.f32", hc_in,
+                        (uint64_t)GLM5_HC_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "attn_split.f32", w->hc_split,
+                        (uint64_t)GLM5_HC_MIX * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "attn_collapsed.f32", w->collapsed,
+                        (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "attn_hidden.f32", w->ffn_hidden,
+                        (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "q_resid.f32", w->mla_q_resid,
+                        (uint64_t)GLM5_Q_RANK * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "query.f32", w->mla_query,
+                        (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "kv_norm.f32", w->mla_kv_norm,
+                        (uint64_t)GLM5_KV_LORA * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "qk_low.f32", w->mla_qk_low,
+                        (uint64_t)GLM5_HEADS * GLM5_KV_LORA * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "heads.f32", w->mla_heads,
+                        (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "attn_output.f32", w->attention,
+                        (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "after_attn.f32", w->after_attention,
+                        (uint64_t)GLM5_HC_WIDTH * sizeof(float));
+}
+
+static int trace_routed_ffn(const ds4_glm5_next_exec_ctx *ctx,
+                            uint32_t layer, uint32_t token,
+                            const ds4_gpu_tensor *hc_out,
+                            ds4_glm5_next_workspace *w) {
+    return trace_tensor(ctx, layer, token, "ffn_split.f32", w->ffn_split,
+                        (uint64_t)GLM5_HC_MIX * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "ffn_hidden.f32", w->ffn_hidden,
+                        (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "router_ids.i32", w->router_selected,
+                        (uint64_t)GLM5_EXPERTS_USED * sizeof(int32_t)) &&
+           trace_tensor(ctx, layer, token, "router_weights.f32", w->router_weights,
+                        (uint64_t)GLM5_EXPERTS_USED * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "routed_out.f32", w->routed_out,
+                        (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "shared_out.f32", w->shared_out,
+                        (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "ffn_down.f32", w->down,
+                        (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "output_hc.f32", hc_out,
+                        (uint64_t)GLM5_HC_WIDTH * sizeof(float));
+}
+
 int ds4_glm5_next_embed_token(const ds4_glm5_next_exec_ctx *ctx,
                               uint32_t token,
                               ds4_gpu_tensor *hc_out) {
@@ -244,7 +322,7 @@ int ds4_glm5_next_output_logits(const ds4_glm5_next_exec_ctx *ctx,
            ds4_gpu_rms_norm_weight_tensor(
                w->output_norm, w->output_hidden,
                ctx->model_map, ctx->model_size, ctx->model->output_norm,
-               GLM5_WIDTH, 1.0e-5f) &&
+               GLM5_WIDTH, ctx->model->rms_norm_eps) &&
            ds4_gpu_matmul_bf16_tensor(
                logits_out, ctx->model_map, ctx->model_size,
                ctx->model->output, GLM5_WIDTH, GLM5_VOCAB,
@@ -260,7 +338,8 @@ static int kda_attention_one(const ds4_glm5_next_exec_ctx *ctx,
     ds4_glm5_kda_layer_state *kda = &state->kda.layer[il];
     return
         ds4_gpu_rms_norm_plain_rows_tensor(
-            w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u, 1.0e-5f) &&
+            w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u,
+            ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_bf16_tensor(
             w->hc_mix, ctx->model_map, ctx->model_size,
             layer->hc.attn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
@@ -269,10 +348,11 @@ static int kda_attention_one(const ds4_glm5_next_exec_ctx *ctx,
             w->collapsed, w->hc_split, w->hc_mix, hc_in,
             ctx->model_map, ctx->model_size,
             layer->hc.attn_scale, layer->hc.attn_base,
-            GLM5_WIDTH, GLM5_HC, 20u, 1.0e-6f) &&
+            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps) &&
         ds4_glm5_kda_layer_forward(
             kda, &w->kda, &layer->kda, ctx->model_map, ctx->model_size,
-            w->collapsed, w->attention, 1u) &&
+            w->collapsed, w->attention, 1u,
+            ctx->model->rms_norm_eps) &&
         ds4_gpu_hc_expand_split_tensor(
             w->after_attention, w->attention, hc_in, w->hc_split,
             GLM5_WIDTH, GLM5_HC);
@@ -288,7 +368,8 @@ static int dense_kda_forward(const ds4_glm5_next_exec_ctx *ctx,
     const int ok =
         kda_attention_one(ctx, il, state, w, hc_in) &&
         ds4_gpu_rms_norm_plain_rows_tensor(
-            w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u, 1.0e-5f) &&
+            w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u,
+            ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_bf16_tensor(
             w->ffn_mix, ctx->model_map, ctx->model_size,
             layer->hc.ffn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
@@ -297,7 +378,8 @@ static int dense_kda_forward(const ds4_glm5_next_exec_ctx *ctx,
             w->ffn_collapsed, w->ffn_hidden, w->ffn_split, w->ffn_mix,
             w->after_attention, ctx->model_map, ctx->model_size,
             layer->hc.ffn_scale, layer->hc.ffn_base, layer->ffn_norm,
-            GLM5_WIDTH, GLM5_HC, 20u, 1.0e-6f, 1.0e-5f) &&
+            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
+            ctx->model->rms_norm_eps) &&
         ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
             w->gate, w->up, w->mid, ctx->model_map, ctx->model_size,
             layer->ffn_weight.gate, layer->ffn_weight.up,
@@ -462,7 +544,8 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
         ((uint64_t)GLM5_HEADS * GLM5_HEAD_DIM) / 2u;
     return
         ds4_gpu_rms_norm_plain_rows_tensor(
-            w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u, 1.0e-5f) &&
+            w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u,
+            ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_bf16_tensor(
             w->hc_mix, ctx->model_map, ctx->model_size,
             layer->hc.attn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
@@ -471,13 +554,14 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             w->collapsed, w->ffn_hidden, w->hc_split, w->hc_mix, hc_in,
             ctx->model_map, ctx->model_size,
             layer->hc.attn_scale, layer->hc.attn_base, layer->attn_norm,
-            GLM5_WIDTH, GLM5_HC, 20u, 1.0e-6f, 1.0e-5f) &&
+            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
+            ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_q_a, ctx->model_map, ctx->model_size, m->q_a,
             GLM5_WIDTH, GLM5_Q_RANK, w->ffn_hidden, 1u) &&
         ds4_gpu_rms_norm_weight_tensor(
             w->mla_q_resid, w->mla_q_a, ctx->model_map, ctx->model_size,
-            m->q_a_norm, GLM5_Q_RANK, 1.0e-5f) &&
+            m->q_a_norm, GLM5_Q_RANK, ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_query, ctx->model_map, ctx->model_size, m->q_b,
             GLM5_Q_RANK, GLM5_HEADS * GLM5_HEAD_DIM,
@@ -488,7 +572,8 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
         ds4_gpu_glm_kv_lora_rms_norm_tensor(
             w->mla_kv_norm, w->mla_kv_raw,
             ctx->model_map, ctx->model_size, m->kv_a_norm,
-            1u, GLM5_KV_LORA, GLM5_KV_LORA, 1.0e-5f) &&
+            1u, GLM5_KV_LORA, GLM5_KV_LORA,
+            ctx->model->rms_norm_eps) &&
         ds4_gpu_glm_store_compact_kv_tensor(
             mla->compact_kv, NULL, w->mla_kv_norm, w->mla_kv_raw,
             pos, 1u, mla->capacity_tokens, GLM5_KV_LORA,
@@ -562,7 +647,8 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
         (uint64_t)ctx->tp_rank * q4_down_half_bytes;
     const int ok =
         ds4_gpu_rms_norm_plain_rows_tensor(
-            w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u, 1.0e-5f) &&
+            w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u,
+            ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_bf16_tensor(
             w->ffn_mix, ctx->model_map, ctx->model_size,
             layer->hc.ffn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
@@ -571,7 +657,8 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             w->ffn_collapsed, w->ffn_hidden, w->ffn_split, w->ffn_mix,
             w->after_attention, ctx->model_map, ctx->model_size,
             layer->hc.ffn_scale, layer->hc.ffn_base, layer->ffn_norm,
-            GLM5_WIDTH, GLM5_HC, 20u, 1.0e-6f, 1.0e-5f) &&
+            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
+            ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_f32_tensor(
             w->router_logits, ctx->model_map, ctx->model_size, f->gate_inp,
             GLM5_WIDTH, GLM5_EXPERTS, w->ffn_hidden, 1u) &&
@@ -654,10 +741,13 @@ static int mla_routed_dense_selection_forward(const ds4_glm5_next_exec_ctx *ctx,
     (void)tail_slot;
     (void)pool_index;
     (void)publish_pool;
+    const uint32_t token = mla->token_count;
     const int ok = mla_dense_selection_attention(
                        ctx, il, state, w, hc_in, visible, tail_slot,
                        pool_index, publish_pool) &&
-                   routed_ffn_one(ctx, il, mla->token_count, w, hc_out);
+                   trace_mla_attention(ctx, il, token, hc_in, w) &&
+                   routed_ffn_one(ctx, il, token, w, hc_out) &&
+                   trace_routed_ffn(ctx, il, token, hc_out, w);
     if (!ok) {
         ds4_glm5_next_state_invalidate(state);
         return 0;

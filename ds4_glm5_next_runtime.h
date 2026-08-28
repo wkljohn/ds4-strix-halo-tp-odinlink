@@ -77,6 +77,8 @@ typedef struct {
     uint32_t layer_count;
     uint32_t trunk_count;
     uint32_t nextn_count;
+    float rms_norm_eps;
+    float hc_eps;
     ds4_glm5_next_layer_offsets layer[DS4_GLM5_NEXT_LAYER_COUNT];
 } ds4_glm5_next_model_offsets;
 

@@ -29,6 +29,8 @@ DS4_TEST_MTP ?= gguf/DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf
 DS4_DSPARK_MODEL ?= $(DS4_TEST_MODEL)
 DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support.gguf
 DS4_GLM5_MODEL ?= models/GLM-5.3-Flash-Q4_K.gguf
+DS4_GLM5_KDA_ORACLE_PREFIX ?= $(DS4_RESEARCH_ROOT)/glm5-next-tp2/kda-eps-long64-20260828/kda-layer0-oracle64
+DS4_GLM5_KDA_ORACLE_TOKENS ?= 64
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
@@ -208,7 +210,8 @@ test-rocm-glm5-kda-layer: tests/test_rocm_glm5_kda_layer
 	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "error: set DS4_RESEARCH_ROOT" >&2; exit 2; }
 	env -u DS4_ROCM_DISABLE_BF16_SHAREDX \
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
-	DS4_GLM5_KDA_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/kda-layer0-oracle" \
+	DS4_GLM5_KDA_ORACLE_PREFIX="$(DS4_GLM5_KDA_ORACLE_PREFIX)" \
+	DS4_GLM5_KDA_ORACLE_TOKENS="$(DS4_GLM5_KDA_ORACLE_TOKENS)" \
 		./tests/test_rocm_glm5_kda_layer
 
 .PHONY: test-rocm-glm5-mhc-layer
@@ -249,16 +252,33 @@ test-glm5-dense-block0-external-reference: tests/test_rocm_glm5_dense_block0
 	trace_dir=$$(mktemp -d); \
 	trap 'rm -rf "$$trace_dir"' EXIT; \
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+	DS4_GLM5_DENSE_TOKEN="$${DS4_GLM5_DENSE_TOKEN:-42}" \
+	DS4_GLM5_DENSE_TRACE_LAYER="$${DS4_GLM5_DENSE_TRACE_LAYER:-0}" \
 	DS4_GLM5_DENSE_TRACE_PREFIX="$$trace_dir/block0" \
 		./tests/test_rocm_glm5_dense_block0; \
 	python3 tests/test_glm5_dense_block0_external_reference.py \
-		"$(DS4_GLM5_MODEL)" "$$trace_dir/block0"
+		"$(DS4_GLM5_MODEL)" "$$trace_dir/block0" \
+		--tokens "$${DS4_GLM5_DENSE_TOKEN:-42}$${DS4_GLM5_DENSE_TOKEN2:+,$$DS4_GLM5_DENSE_TOKEN2}" \
+		--layer "$${DS4_GLM5_DENSE_TRACE_LAYER:-0}"
 
-.PHONY: test-rocm-glm5-prefix-layer3-tp
-tests/test_rocm_glm5_prefix_layer3_tp.o: tests/test_rocm_glm5_prefix_layer3_tp.cu tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp ds4_glm5_kda.h ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
+.PHONY: test-rocm-glm5-prefix-layer3-tp test-glm5-next-text-codec
+tests/test_rocm_glm5_prefix_layer3_tp.o: tests/test_rocm_glm5_prefix_layer3_tp.cu tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp ds4.h ds4_glm5_kda.h ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_rocm_glm5_prefix_layer3_tp: tests/test_rocm_glm5_prefix_layer3_tp.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+tests/ds4_glm5_text_codec.o: ds4.c ds4.h
+	$(CC) $(CFLAGS) -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -c -o $@ ds4.c
+
+tests/test_glm5_next_text_codec.o: tests/test_glm5_next_text_codec.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_glm5_next_text_codec: tests/test_glm5_next_text_codec.o tests/ds4_glm5_text_codec.o ds4_glm5_next_runtime.o ds4_glm5_kda_schedule.o
+	$(CC) $(CFLAGS) -Wl,--gc-sections -o $@ $^ $(LDLIBS)
+
+test-glm5-next-text-codec: tests/test_glm5_next_text_codec
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_glm5_next_text_codec
+
+tests/test_rocm_glm5_prefix_layer3_tp: tests/test_rocm_glm5_prefix_layer3_tp.o tests/ds4_glm5_text_codec.o ds4_distributed.o ds4_ssd.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-glm5-prefix-layer3-tp: tests/test_rocm_glm5_prefix_layer3_tp
@@ -463,11 +483,13 @@ test-glm5-resident-kda: test-glm5-next-contract \
 		tests/test_glm5_kda_state \
 		tests/test_glm5_kda_binding \
 		tests/test_glm5_next_runtime_offsets \
-		tests/test_glm5_next_state
+		tests/test_glm5_next_state \
+		tests/test_glm5_next_text_codec
 	./tests/test_glm5_kda_state
 	./tests/test_glm5_kda_binding
 	./tests/test_glm5_next_runtime_offsets
 	./tests/test_glm5_next_state
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_glm5_next_text_codec
 
 tests/test_glm5_kda_state: tests/test_glm5_kda_state.c ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_glm5_kda_state.c ds4_glm5_kda.c $(LDLIBS)
@@ -1228,4 +1250,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_tp_hello tests/test_tp_completion_ordering tests/test_tp_dual_stream_progress tests/test_metal_session_batch tests/test_gpu_xdev tests/test_rocm_attention_output_tp tests/test_rocm_attention_decode_mixed tests/test_rocm_attention_decode_indexed_seqtile tests/test_rocm_attention_prefill_static_flash tests/attn_static_flash_lds_bench tests/test_rocm_q4k_decode_bench tests/test_rocm_shared_routed_overlap tests/test_rocm_q4k_fused_mid tests/test_rocm_q4k_staged_midq_oracle tests/test_rocm_q4k_ffn_row_balance_oracle tests/test_rocm_q4k_packed_slice_registry tests/test_rocm_shared_gu_swiglu_fused tests/test_rocm_q8_pair_pack4 tests/test_rocm_attention_q_b_fused tests/test_rocm_glm5_kda_layer tests/test_rocm_glm5_mhc_layer tests/test_rocm_glm5_bf16_embedding tests/test_rocm_glm53_expert_window tests/test_rocm_glm5_q4k_shard_compose tests/test_rocm_glm5_router_realweight tests/test_glm5_kda_binding tests/test_glm5_kda_state tests/test_glm5_next_runtime_offsets tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/rocm_long_context_smoke tests/rocm_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_tp_hello tests/test_tp_completion_ordering tests/test_tp_dual_stream_progress tests/test_metal_session_batch tests/test_gpu_xdev tests/test_rocm_attention_output_tp tests/test_rocm_attention_decode_mixed tests/test_rocm_attention_decode_indexed_seqtile tests/test_rocm_attention_prefill_static_flash tests/attn_static_flash_lds_bench tests/test_rocm_q4k_decode_bench tests/test_rocm_shared_routed_overlap tests/test_rocm_q4k_fused_mid tests/test_rocm_q4k_staged_midq_oracle tests/test_rocm_q4k_ffn_row_balance_oracle tests/test_rocm_q4k_packed_slice_registry tests/test_rocm_shared_gu_swiglu_fused tests/test_rocm_q8_pair_pack4 tests/test_rocm_attention_q_b_fused tests/test_rocm_glm5_kda_layer tests/test_rocm_glm5_mhc_layer tests/test_rocm_glm5_bf16_embedding tests/test_rocm_glm53_expert_window tests/test_rocm_glm5_q4k_shard_compose tests/test_rocm_glm5_router_realweight tests/test_glm5_kda_binding tests/test_glm5_kda_state tests/test_glm5_next_runtime_offsets tests/test_glm5_next_text_codec tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/rocm_long_context_smoke tests/rocm_long_context_smoke.o

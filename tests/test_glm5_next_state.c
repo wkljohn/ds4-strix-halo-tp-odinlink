@@ -81,6 +81,8 @@ static void make_valid(ds4_glm5_next_model_offsets *model) {
     model->layer_count = DS4_GLM5_NEXT_LAYER_COUNT;
     model->trunk_count = DS4_GLM5_NEXT_TRUNK_COUNT;
     model->nextn_count = 1u;
+    model->rms_norm_eps = 1.0e-5f;
+    model->hc_eps = 1.0e-6f;
     for (uint32_t il = 0u; il < model->layer_count; ++il) {
         ds4_glm5_next_layer_offsets *layer = &model->layer[il];
         layer->layer = il;

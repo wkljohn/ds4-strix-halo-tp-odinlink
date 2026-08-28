@@ -27,7 +27,12 @@ static bool glm5_next_bind_real_offsets(
     model.layer_count = DS4_GLM5_NEXT_LAYER_COUNT;
     model.trunk_count = DS4_GLM5_NEXT_TRUNK_COUNT;
     model.nextn_count = 1u;
-    if (!g.tensor("token_embd.weight", {4096u, 154880u}, 30u,
+    if (!g.metadata("glm5-next.attention.layer_norm_rms_epsilon",
+                    model.rms_norm_eps) ||
+        model.rms_norm_eps != 1.0e-5f ||
+        !g.metadata("glm5-next.hyper_connection.epsilon", model.hc_eps) ||
+        model.hc_eps != 1.0e-6f ||
+        !g.tensor("token_embd.weight", {4096u, 154880u}, 30u,
                   model.token_embd) ||
         !g.tensor("output_norm.weight", {4096u}, 0u, model.output_norm) ||
         !g.tensor("output.weight", {4096u, 154880u}, 30u, model.output) ||

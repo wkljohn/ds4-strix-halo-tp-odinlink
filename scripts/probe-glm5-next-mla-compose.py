@@ -52,13 +52,19 @@ def main() -> int:
     parser.add_argument("--layer", type=int, default=3)
     parser.add_argument("--rows", type=int, default=10)
     parser.add_argument("--first-valid", type=int, default=1)
+    parser.add_argument(
+        "--input-hc", type=Path,
+        help="optional exact FP32 [rows,4,4096] residual stream input")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--dump-prefix", required=True, type=Path)
     args = parser.parse_args()
     if args.layer not in (*range(3, 44, 4), 45):
         parser.error("--layer must be a sparse-MLA layer")
-    if args.rows != 10 or args.first_valid != 1:
+    if args.input_hc is None and (args.rows != 10 or args.first_valid != 1):
         parser.error("the initial composition gate is pinned to rows=10, first-valid=1")
+    if args.rows < 1 or args.rows > 2048 or args.first_valid < 0 or \
+            args.first_valid >= args.rows:
+        parser.error("invalid rows/first-valid range")
 
     torch.set_grad_enabled(False)
     torch.set_num_threads(min(16, max(1, torch.get_num_threads())))
@@ -73,7 +79,16 @@ def main() -> int:
 
     with args.model.open("rb") as fp:
         blob = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
-        hc_residual = mhc.deterministic_hidden(args.rows)
+        if args.input_hc is None:
+            hc_residual = mhc.deterministic_hidden(args.rows)
+        else:
+            values = np.fromfile(args.input_hc, dtype="<f4")
+            expected = args.rows * 4 * 4096
+            if values.size != expected or not np.isfinite(values).all():
+                raise ValueError(
+                    f"{args.input_hc}: expected {expected} finite FP32 values, "
+                    f"got {values.size}")
+            hc_residual = values.reshape(args.rows, 4, 4096).copy()
         hc_fn = mhc.tensor_view(
             blob, data_start, tensors, f"{prefix}.hc_attn_fn.weight",
             (16384, 24), 30).copy()
@@ -208,7 +223,8 @@ def main() -> int:
         if tail_count:
             selected_tokens.extend(visible[-tail_count:].tolist())
         selected_tokens = torch.tensor(selected_tokens, dtype=torch.int32)
-        if selected_tokens.numel() != 9 or torch.any(selected_tokens < 0):
+        if selected_tokens.numel() != args.rows - args.first_valid or \
+                torch.any(selected_tokens < 0):
             raise ValueError(f"unexpected compact selection {selected_tokens.tolist()}")
 
         chosen_kv = kv_norm[selected_tokens.long()]

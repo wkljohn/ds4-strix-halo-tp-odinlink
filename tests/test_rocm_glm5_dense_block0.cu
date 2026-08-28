@@ -9,6 +9,7 @@ extern "C" {
 #include "tests/glm5_next_real_offsets.hpp"
 
 #include <cmath>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,8 +29,38 @@ constexpr uint32_t kHcWidth = kWidth * kHc;
 constexpr uint32_t kMix = 24u;
 constexpr uint32_t kDense = 12288u;
 constexpr uint32_t kVocab = 154880u;
-constexpr uint64_t kExpectedBlock0FNV = UINT64_C(0xf055102b4604cdf3);
-constexpr uint64_t kExpectedPrefixFNV = UINT64_C(0xb6c2590232ac924b);
+/* Lane-C correction: these hashes use model rms_norm_eps=1e-5 in the KDA
+ * gated output.  See the independent same-GGUF evidence before updating. */
+constexpr uint64_t kExpectedBlock0FNV = UINT64_C(0x74ba1355cebb30b3);
+constexpr uint64_t kExpectedPrefixFNV = UINT64_C(0x6b704c8b12a398ef);
+
+bool parse_token_env(const char *name, uint32_t fallback, uint32_t &token,
+                     bool *present = nullptr) {
+    if (present) *present = false;
+    token = fallback;
+    const char *value = std::getenv(name);
+    if (!value || !value[0]) return true;
+    if (present) *present = true;
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (!end || end == value || *end != '\0' || parsed >= kVocab) return false;
+    token = (uint32_t)parsed;
+    return true;
+}
+
+bool selected_tokens(uint32_t &token, uint32_t &token2, bool &has_token2) {
+    token = 42u;
+    token2 = 0u;
+    has_token2 = false;
+    return parse_token_env("DS4_GLM5_DENSE_TOKEN", 42u, token) &&
+           parse_token_env("DS4_GLM5_DENSE_TOKEN2", 0u, token2,
+                           &has_token2);
+}
+
+bool selected_trace_layer(uint32_t &layer) {
+    return parse_token_env("DS4_GLM5_DENSE_TRACE_LAYER", 0u, layer) &&
+           layer < 3u;
+}
 
 struct DenseOffsets {
     uint64_t embedding = 0u;
@@ -134,30 +165,31 @@ bool allocate(Tensors &t) {
 bool execute(const Glm5TestGGUF &g, const DenseOffsets &w,
              ds4_glm5_kda_layer_state *state,
              ds4_glm5_kda_workspace *workspace, Tensors &t,
-             std::vector<float> &result, const char *trace_prefix = nullptr) {
+             std::vector<float> &result, float rms_norm_eps, float hc_eps,
+             const char *trace_prefix = nullptr) {
     CHECK(ds4_gpu_rms_norm_plain_rows_tensor(
-              t.flat, t.cur, kHcWidth, 1u, 1.0e-5f) &&
+              t.flat, t.cur, kHcWidth, 1u, rms_norm_eps) &&
           ds4_gpu_matmul_bf16_tensor(
               t.mix, g.map, g.size, w.attn_hc_fn, kHcWidth, kMix,
               t.flat, 1u) &&
           ds4_gpu_hc_split_weighted_sum_tensor(
               t.collapsed, t.split, t.mix, t.cur,
               g.map, g.size, w.attn_hc_scale, w.attn_hc_base,
-              kWidth, kHc, 20u, 1.0e-6f) &&
+              kWidth, kHc, 20u, hc_eps) &&
           ds4_glm5_kda_layer_forward(
               state, workspace, &w.kda, g.map, g.size,
-              t.collapsed, t.attn, 1u) &&
+              t.collapsed, t.attn, 1u, rms_norm_eps) &&
           ds4_gpu_hc_expand_split_tensor(
               t.after_attn, t.attn, t.cur, t.split, kWidth, kHc) &&
           ds4_gpu_rms_norm_plain_rows_tensor(
-              t.ffn_flat, t.after_attn, kHcWidth, 1u, 1.0e-5f) &&
+              t.ffn_flat, t.after_attn, kHcWidth, 1u, rms_norm_eps) &&
           ds4_gpu_matmul_bf16_tensor(
               t.ffn_mix, g.map, g.size, w.ffn_hc_fn, kHcWidth, kMix,
               t.ffn_flat, 1u) &&
           ds4_gpu_hc_split_weighted_sum_norm_tensor(
               t.ffn_collapsed, t.ffn_hidden, t.ffn_split, t.ffn_mix,
               t.after_attn, g.map, g.size, w.ffn_hc_scale, w.ffn_hc_base,
-              w.ffn_norm, kWidth, kHc, 20u, 1.0e-6f, 1.0e-5f) &&
+              w.ffn_norm, kWidth, kHc, 20u, hc_eps, rms_norm_eps) &&
           ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
               t.gate, t.up, t.mid, g.map, g.size, w.ffn_gate, w.ffn_up,
               kWidth, kDense, t.ffn_hidden, 10.0f) &&
@@ -215,7 +247,22 @@ static bool run_test(void) {
     CHECK(model && model[0], "model environment");
     Glm5TestGGUF gguf;
     DenseOffsets weights[3];
-    CHECK(gguf.open_file(model), "open real-GGUF model");
+    uint32_t token = 0u, token2 = 0u;
+    uint32_t trace_layer = 0u;
+    bool has_token2 = false;
+    float rms_norm_eps = 0.0f;
+    float hc_eps = 0.0f;
+    CHECK(selected_tokens(token, token2, has_token2),
+          "valid dense-prefix token override");
+    CHECK(selected_trace_layer(trace_layer), "valid dense trace layer");
+    CHECK(gguf.open_file(model) &&
+              gguf.metadata(
+                  "glm5-next.attention.layer_norm_rms_epsilon",
+                  rms_norm_eps) &&
+              rms_norm_eps == 1.0e-5f &&
+              gguf.metadata("glm5-next.hyper_connection.epsilon", hc_eps) &&
+              hc_eps == 1.0e-6f,
+          "open real-GGUF model with expected RMS and mHC epsilon");
     for (uint32_t il = 0u; il < 3u; ++il) {
         CHECK(bind(gguf, il, weights[il]), "bind complete dense-prefix layer");
     }
@@ -240,16 +287,17 @@ static bool run_test(void) {
           ds4_glm5_kda_workspace_init(&workspace, 1u) && allocate(tensors),
           "allocate complete dense-prefix state and workspace");
     std::vector<float> block0, first, second;
-    const auto execute_prefix = [&](std::vector<float> &result,
+    const auto execute_prefix = [&](uint32_t input_token,
+                                    std::vector<float> &result,
                                     bool capture_block0) {
         if (!ds4_gpu_embed_token_hc_bf16_tensor(
                 tensors.cur, gguf.map, gguf.size, weights[0].embedding,
-                kVocab, 42u, kWidth, kHc)) return false;
+                kVocab, input_token, kWidth, kHc)) return false;
         for (uint32_t il = 0u; il < 3u; ++il) {
             std::vector<float> layer_result;
             if (!execute(gguf, weights[il], &slot.layer[il], &workspace,
-                         tensors, layer_result,
-                         capture_block0 && il == 0u ?
+                         tensors, layer_result, rms_norm_eps, hc_eps,
+                         capture_block0 && il == trace_layer ?
                              std::getenv("DS4_GLM5_DENSE_TRACE_PREFIX") :
                              nullptr)) return false;
             if (capture_block0 && il == 0u) block0 = layer_result;
@@ -258,26 +306,41 @@ static bool run_test(void) {
         }
         return true;
     };
-    CHECK(execute_prefix(first, true), "execute complete dense prefix");
-    for (uint32_t il = 0u; il < 3u; ++il) {
-        CHECK(slot.layer[il].token_count == 1u,
-              "dense-prefix KDA layer advances one token");
+    CHECK(execute_prefix(token, first, !has_token2),
+          "execute complete dense prefix first token");
+    if (has_token2) {
+        CHECK(execute_prefix(token2, first, true),
+              "execute complete dense prefix second token");
     }
-    CHECK(ds4_glm5_kda_slot_reset(&slot) && execute_prefix(second, false),
-          "repeat complete dense-prefix execution");
+    for (uint32_t il = 0u; il < 3u; ++il) {
+        CHECK(slot.layer[il].token_count == (has_token2 ? 2u : 1u),
+              "dense-prefix KDA layer advances requested tokens");
+    }
+    CHECK(ds4_glm5_kda_slot_reset(&slot) &&
+          execute_prefix(token, second, false) &&
+          (!has_token2 || execute_prefix(token2, second, false)),
+          "repeat complete dense-prefix token sequence");
     CHECK(first == second, "complete dense prefix is deterministic after reset");
     for (uint32_t il = 0u; il < 3u; ++il) {
-        CHECK(slot.layer[il].token_count == 1u,
-              "reset dense-prefix KDA layer advances one token");
+        CHECK(slot.layer[il].token_count == (has_token2 ? 2u : 1u),
+              "reset dense-prefix KDA layer advances requested tokens");
     }
     CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "replicated dense block invokes no TP exchange");
     const uint64_t block0_hash = fnv64(block0);
-    CHECK(block0_hash == kExpectedBlock0FNV,
-          "complete block-0 output matches the pinned same-GGUF fingerprint");
+    if (!has_token2 && token == 42u &&
+        (block0_hash != kExpectedBlock0FNV ||
+         fnv64(first) != kExpectedPrefixFNV)) {
+        std::fprintf(stderr,
+                     "corrected dense fingerprints: block0=%016" PRIx64
+                     " prefix=%016" PRIx64 "\n",
+                     block0_hash, fnv64(first));
+    }
+    CHECK(has_token2 || token != 42u || block0_hash == kExpectedBlock0FNV,
+          "default complete block-0 output matches the pinned same-GGUF fingerprint");
     const uint64_t hash = fnv64(first);
-    CHECK(hash == kExpectedPrefixFNV,
-          "complete dense-prefix output matches the pinned same-GGUF fingerprint");
+    CHECK(has_token2 || token != 42u || hash == kExpectedPrefixFNV,
+          "default complete dense-prefix output matches the pinned same-GGUF fingerprint");
 
     ds4_glm5_next_model_offsets model_offsets = {};
     ds4_glm5_next_state resident = {};
@@ -291,15 +354,16 @@ static bool run_test(void) {
     exec.model_size = gguf.size;
     exec.model = &model_offsets;
     ds4_gpu_tensor *tiny_output = ds4_gpu_tensor_alloc(sizeof(float));
-    CHECK(tiny_output && ds4_glm5_next_embed_token(&exec, 42u, tensors.cur) &&
+    CHECK(tiny_output && ds4_glm5_next_embed_token(&exec, token, tensors.cur) &&
           !ds4_glm5_next_layer_forward(
               &exec, 0u, &resident, runtime_workspace,
               tensors.cur, tiny_output) &&
           resident.valid && resident.kda.layer[0].token_count == 0u,
           "undersized output fails before resident state mutation");
     ds4_gpu_tensor_free(tiny_output);
-    const auto execute_runtime_prefix = [&](std::vector<float> &result) {
-        if (!ds4_glm5_next_embed_token(&exec, 42u, tensors.cur)) return false;
+    const auto execute_runtime_prefix = [&](uint32_t input_token,
+                                            std::vector<float> &result) {
+        if (!ds4_glm5_next_embed_token(&exec, input_token, tensors.cur)) return false;
         for (uint32_t il = 0u; il < 3u; ++il) {
             if (!ds4_glm5_next_layer_forward(
                     &exec, il, &resident, runtime_workspace,
@@ -311,25 +375,35 @@ static bool run_test(void) {
                                    (uint64_t)kHcWidth * sizeof(float)) != 0;
     };
     std::vector<float> runtime_first, runtime_second;
-    CHECK(execute_runtime_prefix(runtime_first) && runtime_first == first,
+    CHECK(execute_runtime_prefix(token, runtime_first) &&
+          (!has_token2 || execute_runtime_prefix(token2, runtime_first)) &&
+          runtime_first == first,
           "production executor matches the independent dense-prefix harness");
     CHECK(ds4_glm5_next_state_reset(&resident) &&
-          execute_runtime_prefix(runtime_second) &&
+          execute_runtime_prefix(token, runtime_second) &&
+          (!has_token2 || execute_runtime_prefix(token2, runtime_second)) &&
           runtime_second == runtime_first,
           "production resident executor is deterministic after atomic reset");
     for (uint32_t il = 0u; il < 3u; ++il) {
-        CHECK(resident.kda.layer[il].token_count == 1u,
-              "production dense-prefix KDA state advances once");
+        CHECK(resident.kda.layer[il].token_count == (has_token2 ? 2u : 1u),
+              "production dense-prefix KDA state advances requested tokens");
     }
     CHECK(!ds4_glm5_next_layer_forward(
               &exec, 3u, &resident, runtime_workspace,
               tensors.cur, tensors.out) && resident.valid &&
           resident.mla[3].token_count == 0u,
           "unimplemented MLA+routed kind fails before resident mutation");
-    std::fprintf(stderr,
-                 "PASS same-GGUF GLM5 dense prefix block0=%016llx prefix=%016llx\n",
-                 (unsigned long long)block0_hash,
-                 (unsigned long long)hash);
+    if (has_token2) {
+        std::fprintf(stderr,
+                     "PASS same-GGUF GLM5 dense prefix tokens=%u,%u block0=%016llx prefix=%016llx\n",
+                     token, token2, (unsigned long long)block0_hash,
+                     (unsigned long long)hash);
+    } else {
+        std::fprintf(stderr,
+                     "PASS same-GGUF GLM5 dense prefix token=%u block0=%016llx prefix=%016llx\n",
+                     token, (unsigned long long)block0_hash,
+                     (unsigned long long)hash);
+    }
     ds4_glm5_next_workspace_destroy(runtime_workspace);
     ds4_glm5_next_state_free(&resident);
     tensors.clear();

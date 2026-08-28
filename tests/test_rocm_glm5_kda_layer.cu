@@ -89,6 +89,7 @@ struct MappedGGUF {
     uint8_t *map = nullptr;
     uint64_t size = 0;
     uint64_t data_start = 0;
+    float rms_norm_eps = 0.0f;
     std::unordered_map<std::string, TensorInfo> tensors;
 
     void close_all() {
@@ -125,6 +126,13 @@ static bool open_gguf(const char *path, MappedGGUF &gguf) {
         if (key == "general.alignment" && type == 4u) {
             CHECK(cursor.u32(alignment) && alignment != 0u,
                   "parse GGUF alignment");
+        } else if (key ==
+                       "glm5-next.attention.layer_norm_rms_epsilon" &&
+                   type == 6u) {
+            CHECK(cursor.take(&gguf.rms_norm_eps,
+                              sizeof(gguf.rms_norm_eps)) &&
+                      gguf.rms_norm_eps == 1.0e-5f,
+                  "parse expected GLM5-next RMS epsilon");
         } else {
             CHECK(skip_metadata(cursor, type), "skip GGUF metadata value");
         }
@@ -147,6 +155,8 @@ static bool open_gguf(const char *path, MappedGGUF &gguf) {
           "GGUF data alignment overflow");
     gguf.data_start = (cursor.pos + alignment - 1u) / alignment * alignment;
     CHECK(gguf.data_start <= gguf.size, "GGUF data section in file");
+    CHECK(gguf.rms_norm_eps == 1.0e-5f,
+          "GLM5-next RMS epsilon metadata is required");
     return true;
 }
 
@@ -293,10 +303,12 @@ static bool handoff_case(uint32_t prefill,
     CHECK(prefill_input && decode_input, "create handoff input views");
     CHECK(ds4_glm5_kda_layer_forward(
               &chunk.layer[0], &chunk_workspace, &weights,
-              gguf.map, gguf.size, prefill_input, chunk_output, prefill) &&
+              gguf.map, gguf.size, prefill_input, chunk_output, prefill,
+              gguf.rms_norm_eps) &&
           ds4_glm5_kda_layer_forward(
               &chunk.layer[0], &token_workspace, &weights,
-              gguf.map, gguf.size, decode_input, chunk_last, 1u),
+              gguf.map, gguf.size, decode_input, chunk_last, 1u,
+              gguf.rms_norm_eps),
           "execute prefill plus decode handoff");
 
     for (uint32_t token = 0; token < total; ++token) {
@@ -310,7 +322,8 @@ static bool handoff_case(uint32_t prefill,
               "create tokenwise input/output views");
         const bool ok = ds4_glm5_kda_layer_forward(
             &tokenwise.layer[0], &token_workspace, &weights,
-            gguf.map, gguf.size, one, one_output, 1u);
+            gguf.map, gguf.size, one, one_output, 1u,
+            gguf.rms_norm_eps);
         ds4_gpu_tensor_free(one_output);
         ds4_gpu_tensor_free(one);
         CHECK(ok, "execute tokenwise comparison");
@@ -375,13 +388,23 @@ static bool failure_invalidation(
         const MappedGGUF &gguf,
         ds4_gpu_tensor *input,
         ds4_gpu_tensor *output) {
+    CHECK(ds4_glm5_kda_slot_reset(&slot),
+          "reset before invalid norm-epsilon case");
+    CHECK(!ds4_glm5_kda_layer_forward(
+              &slot.layer[0], &workspace, &weights,
+              gguf.map, gguf.size, input, output, 2u, 0.0f),
+          "non-positive model norm epsilon fails closed");
+    CHECK(slot.valid && slot.layer[0].valid &&
+              slot.layer[0].token_count == 0u,
+          "invalid model norm epsilon does not mutate resident state");
     for (uint32_t stage = DS4_GLM5_KDA_FAIL_INPUT_NORM;
          stage <= DS4_GLM5_KDA_FAIL_OUTPUT_PROJECTION; ++stage) {
         CHECK(ds4_glm5_kda_slot_reset(&slot), "reset before injected failure");
         ds4_glm5_kda_test_fail_after(stage);
         CHECK(!ds4_glm5_kda_layer_forward(
                   &slot.layer[0], &workspace, &weights,
-                  gguf.map, gguf.size, input, output, 2u),
+                  gguf.map, gguf.size, input, output, 2u,
+                  gguf.rms_norm_eps),
               "injected stage fails forward");
         CHECK(!slot.valid && !slot.layer[0].valid &&
               slot.layer[0].token_count == 0u,
@@ -389,7 +412,8 @@ static bool failure_invalidation(
         ds4_glm5_kda_test_fail_after(DS4_GLM5_KDA_FAIL_NONE);
         CHECK(!ds4_glm5_kda_layer_forward(
                   &slot.layer[0], &workspace, &weights,
-                  gguf.map, gguf.size, input, output, 2u),
+                  gguf.map, gguf.size, input, output, 2u,
+                  gguf.rms_norm_eps),
               "invalid state refuses continuation");
     }
     ds4_glm5_kda_test_fail_after(DS4_GLM5_KDA_FAIL_NONE);
@@ -446,7 +470,17 @@ static bool run_test(void) {
     ds4_glm5_kda_weight_offsets weights = {};
     CHECK(bind_layer0(gguf, weights), "bind real layer-0 offsets");
 
-    constexpr uint32_t tokens = 2u;
+    uint32_t tokens = 2u;
+    if (const char *tokens_env = std::getenv(
+            "DS4_GLM5_KDA_ORACLE_TOKENS")) {
+        char *tokens_end = nullptr;
+        const unsigned long parsed = std::strtoul(
+            tokens_env, &tokens_end, 10);
+        CHECK(tokens_end && *tokens_end == '\0' && parsed >= 2u &&
+                  parsed <= 64u,
+              "oracle token count is 2..64");
+        tokens = (uint32_t)parsed;
+    }
     std::vector<float> input_ref, output_ref, history_ref, state_ref;
     CHECK(read_f32_file(std::string(prefix) + ".input.f32",
                         (uint64_t)tokens * 4096u, input_ref) &&
@@ -488,7 +522,8 @@ static bool run_test(void) {
           "upload deterministic layer input");
     CHECK(ds4_glm5_kda_layer_forward(
               &slot.layer[0], &workspace, &weights,
-              gguf.map, gguf.size, input, output, tokens),
+              gguf.map, gguf.size, input, output, tokens,
+              gguf.rms_norm_eps),
           "execute complete layer-0 KDA adapter");
     CHECK(ds4_gpu_synchronize(), "synchronize complete KDA layer");
     CHECK(slot.layer[0].valid && slot.layer[0].token_count == tokens,
@@ -533,6 +568,37 @@ static bool run_test(void) {
           state_error.max_abs <= 5.0e-5,
           "complete layer resident-state numerical envelope");
 
+    /* Deliberately replay the historical wrong constant.  This is a
+     * discrimination control: the metadata-derived oracle must reject it by
+     * a wide margin, otherwise the test could copy the implementation bug. */
+    ds4_glm5_kda_slot wrong_eps = {};
+    ds4_glm5_kda_workspace wrong_eps_workspace = {};
+    ds4_gpu_tensor *wrong_eps_output = ds4_gpu_tensor_alloc(
+        (uint64_t)output_ref.size() * sizeof(float));
+    CHECK(wrong_eps_output &&
+          ds4_glm5_kda_slot_init(&wrong_eps, &schedule, 1u, 1u, stderr) &&
+          ds4_glm5_kda_workspace_init(&wrong_eps_workspace, tokens) &&
+          ds4_glm5_kda_layer_forward(
+              &wrong_eps.layer[0], &wrong_eps_workspace, &weights,
+              gguf.map, gguf.size, input, wrong_eps_output, tokens, 1.0e-6f) &&
+          ds4_gpu_synchronize(),
+          "execute historical wrong-epsilon negative control");
+    std::vector<float> wrong_eps_got(output_ref.size());
+    CHECK(ds4_gpu_tensor_read(
+              wrong_eps_output, 0, wrong_eps_got.data(),
+              (uint64_t)wrong_eps_got.size() * sizeof(float)),
+          "read wrong-epsilon negative control");
+    const ErrorStats wrong_eps_error = compare(output_ref, wrong_eps_got);
+    std::fprintf(stderr,
+        "GLM5 KDA wrong-eps rejection output_abs=%.9g output_nmse=%.9g\n",
+        wrong_eps_error.max_abs, nmse(wrong_eps_error));
+    CHECK(wrong_eps_error.finite && wrong_eps_error.max_abs > 1.0e-3 &&
+              nmse(wrong_eps_error) > 1.0e-2,
+          "metadata-derived oracle rejects historical 1e-6 epsilon");
+    ds4_gpu_tensor_free(wrong_eps_output);
+    ds4_glm5_kda_workspace_free(&wrong_eps_workspace);
+    ds4_glm5_kda_slot_free(&wrong_eps);
+
     ds4_glm5_kda_slot peer = {};
     ds4_glm5_kda_workspace peer_workspace = {};
     ds4_gpu_tensor *peer_output = ds4_gpu_tensor_alloc(
@@ -542,7 +608,8 @@ static bool run_test(void) {
           ds4_glm5_kda_workspace_init(&peer_workspace, tokens) &&
           ds4_glm5_kda_layer_forward(
               &peer.layer[0], &peer_workspace, &weights,
-              gguf.map, gguf.size, input, peer_output, tokens) &&
+              gguf.map, gguf.size, input, peer_output, tokens,
+              gguf.rms_norm_eps) &&
           ds4_gpu_synchronize(),
           "execute independent replicated rank");
     ds4_glm5_kda_digest local_digest = {}, peer_digest = {};

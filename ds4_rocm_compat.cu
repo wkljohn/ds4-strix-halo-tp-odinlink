@@ -184,7 +184,7 @@ static int rocm_glm5_workspace_fits(
         const ds4_glm5_kda_device_args *args) {
     if (!args || !args->weights || !args->state || !args->workspace ||
         !args->input || !args->output || !args->model_map ||
-        args->n_tokens == 0u ||
+        args->n_tokens == 0u || !(args->norm_eps > 0.0f) ||
         args->n_tokens > args->workspace->capacity_tokens) {
         return 0;
     }
@@ -327,7 +327,7 @@ extern "C" int ds4_rocm_glm5_kda_layer_execute(
         (float *)w->recurrent_out->ptr,
         (const float *)w->recurrent_out->ptr,
         (const float *)w->forget->ptr,
-        (const float *)o_norm.ptr, tokens);
+        (const float *)o_norm.ptr, tokens, args->norm_eps);
     if (hipGetLastError() != hipSuccess ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_GATED_NORM)) return 0;
 

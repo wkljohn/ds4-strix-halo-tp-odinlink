@@ -169,7 +169,8 @@ __global__ static void ds4_glm5_kda_gated_norm_kernel(
         const float *input,
         const float *gate,
         const float *weight,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        float norm_eps) {
     constexpr uint32_t heads = 64u;
     constexpr uint32_t channels = 128u;
     const uint32_t row = blockIdx.x;
@@ -184,7 +185,7 @@ __global__ static void ds4_glm5_kda_gated_norm_kernel(
         if (lane < stride) squares[lane] += squares[lane + stride];
         __syncthreads();
     }
-    const float scale = rsqrtf(squares[0] / (float)channels + 1.0e-6f);
+    const float scale = rsqrtf(squares[0] / (float)channels + norm_eps);
     output[index] = value * scale * weight[lane] *
                     ds4_glm5_sigmoid(gate[index]);
 }

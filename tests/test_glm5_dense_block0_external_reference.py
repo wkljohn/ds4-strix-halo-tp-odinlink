@@ -12,6 +12,7 @@ import argparse
 import importlib.util
 import math
 import mmap
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -93,8 +94,8 @@ def rms_weighted(x, weight, eps):
     return np.asarray(x / scale * weight, dtype=np.float32)
 
 
-def official_mhc(hidden_streams, fn, base, scale, iterations=20,
-                 hc_eps=1.0e-6, rms_eps=1.0e-5):
+def official_mhc(hidden_streams, fn, base, scale, rms_eps, iterations=20,
+                 hc_eps=1.0e-6):
     """Direct transcription of Glm5NextTextHyperConnection.forward."""
     flat = hidden_streams.reshape(hidden_streams.shape[0], -1).astype(np.float32)
     flat /= np.sqrt(np.mean(flat * flat, axis=-1, keepdims=True) +
@@ -119,14 +120,12 @@ def official_mhc(hidden_streams, fn, base, scale, iterations=20,
     return pre, post, np.asarray(comb, dtype=np.float32), collapsed
 
 
-def kda_layer0(x, blob, data_start, tensors):
-    # A one-token, zero-state block oracle covers the current-token KDA update
-    # but not historical decay or the first three causal-convolution taps. The
-    # multi-token KDA external-reference tests own those independent gates.
-    prefix = "blk.0"
+def kda_layer(x, layer, blob, data_start, tensors, rms_norm_eps):
+    """Official sequential KDA equations for one or more dense-layer rows."""
+    prefix = f"blk.{layer}"
     norm = f32_tensor(blob, data_start, tensors,
                       f"{prefix}.attn_norm.weight", (4096,))
-    hidden = rms_weighted(x, norm, 1.0e-5)
+    hidden = rms_weighted(x, norm, rms_norm_eps)
     projected = {}
     for label in ("q", "k", "v"):
         projected[label] = project_bf16(
@@ -135,12 +134,24 @@ def kda_layer0(x, blob, data_start, tensors):
         conv = f32_tensor(blob, data_start, tensors,
                           f"{prefix}.kda_{label}_conv.weight", (4, 1, 8192))
         conv = conv.reshape(8192, 4)
-        raw = np.asarray(projected[label] * conv[:, 3], dtype=np.float32)
-        projected[label] = np.asarray(raw / (1.0 + np.exp(-raw)), dtype=np.float32)
+        history = np.zeros((8192, 3), dtype=np.float32)
+        for token in range(x.shape[0]):
+            current = projected[label][token].copy()
+            raw = np.asarray(
+                history[:, 0] * conv[:, 0] +
+                history[:, 1] * conv[:, 1] +
+                history[:, 2] * conv[:, 2] +
+                current * conv[:, 3], dtype=np.float32)
+            projected[label][token] = np.asarray(
+                raw / (1.0 + np.exp(-raw)), dtype=np.float32)
+            history[:, 0] = history[:, 1]
+            history[:, 1] = history[:, 2]
+            history[:, 2] = current
 
-    q = projected["q"].reshape(1, 64, 128)
-    k = projected["k"].reshape(1, 64, 128)
-    v = projected["v"].reshape(1, 64, 128)
+    rows = x.shape[0]
+    q = projected["q"].reshape(rows, 64, 128)
+    k = projected["k"].reshape(rows, 64, 128)
+    v = projected["v"].reshape(rows, 64, 128)
     q = np.asarray(q / np.sqrt(np.sum(q * q, axis=-1, keepdims=True) +
                                np.float32(1.0e-6)) /
                    np.float32(math.sqrt(128.0)), dtype=np.float32)
@@ -151,12 +162,12 @@ def kda_layer0(x, blob, data_start, tensors):
                          f"{prefix}.kda_f_a.weight", (4096, 128))
     forget_projection = project_bf16(
         f_low, blob, data_start, tensors,
-        f"{prefix}.kda_f_b.weight", (128, 8192)).reshape(1, 64, 128)
+        f"{prefix}.kda_f_b.weight", (128, 8192)).reshape(rows, 64, 128)
     g_low = project_bf16(hidden, blob, data_start, tensors,
                          f"{prefix}.kda_g_a.weight", (4096, 128))
     out_gate = project_bf16(
         g_low, blob, data_start, tensors,
-        f"{prefix}.kda_g_b.weight", (128, 8192)).reshape(1, 64, 128)
+        f"{prefix}.kda_g_b.weight", (128, 8192)).reshape(rows, 64, 128)
     beta = project_bf16(hidden, blob, data_start, tensors,
                         f"{prefix}.kda_beta.weight", (4096, 64))
     beta = np.asarray(1.0 / (1.0 + np.exp(-beta)), dtype=np.float32)
@@ -170,18 +181,23 @@ def kda_layer0(x, blob, data_start, tensors):
         dtype=np.float32)
 
     state = np.zeros((64, 128, 128), dtype=np.float32)
-    state *= np.exp(forget[0])[:, :, None]
-    prediction = np.einsum("hi,hij->hj", k[0], state, optimize=True)
-    delta = (v[0] - prediction) * beta[0, :, None]
-    state += k[0, :, :, None] * delta[:, None, :]
-    core = np.einsum("hi,hij->hj", q[0], state, optimize=True)
+    core = np.zeros((rows, 64, 128), dtype=np.float32)
+    for token in range(rows):
+        state *= np.exp(forget[token])[:, :, None]
+        prediction = np.einsum("hi,hij->hj", k[token], state, optimize=True)
+        delta = (v[token] - prediction) * beta[token, :, None]
+        state += k[token, :, :, None] * delta[:, None, :]
+        core[token] = np.einsum(
+            "hi,hij->hj", q[token], state, optimize=True)
 
     o_norm = f32_tensor(blob, data_start, tensors,
                         f"{prefix}.kda_o_norm.weight", (128,))
-    gated = rms_weighted(core, o_norm, 1.0e-6)
-    gated = np.asarray(gated * (1.0 / (1.0 + np.exp(-out_gate[0]))),
+    # Q/K L2 normalization above is defined with eps=1e-6.  The gated
+    # output is a model RMSNorm and uses config.rms_norm_eps instead.
+    gated = rms_weighted(core, o_norm, rms_norm_eps)
+    gated = np.asarray(gated * (1.0 / (1.0 + np.exp(-out_gate))),
                        dtype=np.float32)
-    return project_bf16(gated.reshape(1, 8192), blob, data_start, tensors,
+    return project_bf16(gated.reshape(rows, 8192), blob, data_start, tensors,
                         f"{prefix}.kda_output.weight", (8192, 4096))
 
 
@@ -212,78 +228,128 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("model", type=Path)
     parser.add_argument("trace_prefix", type=Path)
+    parser.add_argument("--tokens", default="42")
+    parser.add_argument("--layer", type=int, default=0)
     args = parser.parse_args()
+    tokens = [int(value) for value in args.tokens.split(",") if value]
+    if not tokens or len(tokens) > 8 or any(
+            token < 0 or token >= 154880 for token in tokens):
+        raise ValueError(f"invalid token sequence {args.tokens!r}")
+    if args.layer < 0 or args.layer > 2:
+        raise ValueError(f"dense trace layer {args.layer} is out of range")
     root = Path(__file__).parents[1]
     payload = load_module(root / "scripts/probe-glm5-next-kda-payload.py",
                           "glm5_payload")
-    data_start, tensors = payload.load_directory(args.model)
+    data_start, tensors, metadata = payload.load_directory(
+        args.model, include_metadata=True)
+    rms_norm_eps = metadata.get(
+        "glm5-next.attention.layer_norm_rms_epsilon")
+    hc_eps = metadata.get("glm5-next.hyper_connection.epsilon")
+    expected_rms_eps = struct.unpack("<f", struct.pack("<f", 1.0e-5))[0]
+    expected_hc_eps = struct.unpack("<f", struct.pack("<f", 1.0e-6))[0]
+    if rms_norm_eps != expected_rms_eps:
+        raise ValueError(
+            f"unexpected GLM5-next RMS epsilon {rms_norm_eps!r}")
+    if hc_eps != expected_hc_eps:
+        raise ValueError(
+            f"unexpected GLM5-next hyper-connection epsilon {hc_eps!r}")
     with args.model.open("rb") as fp:
         blob = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
-        embedding = bf16_row(blob, data_start, tensors,
-                             "token_embd.weight", (4096, 154880), 42)
-        input_hc = np.repeat(embedding[None, None, :], 4, axis=1)
-        compare("embedding_hc", read_trace(args.trace_prefix, "input_hc",
-                                           (1, 4, 4096)), input_hc, 0.0, 0.0)
+        embedding = np.stack([
+            bf16_row(blob, data_start, tensors,
+                     "token_embd.weight", (4096, 154880), token)
+            for token in tokens])
+        input_hc = np.repeat(embedding[:, None, :], 4, axis=1)
+        last = slice(-1, None)
 
-        def hc_weights(site):
+        def hc_weights(layer, site):
             fn = bf16_matrix(blob, data_start, tensors,
-                             f"blk.0.hc_{site}_fn.weight", (16384, 24))
+                             f"blk.{layer}.hc_{site}_fn.weight", (16384, 24))
             base = f32_tensor(blob, data_start, tensors,
-                              f"blk.0.hc_{site}_base.weight", (24,))
+                              f"blk.{layer}.hc_{site}_base.weight", (24,))
             scale = f32_tensor(blob, data_start, tensors,
-                               f"blk.0.hc_{site}_scale.weight", (3,))
+                               f"blk.{layer}.hc_{site}_scale.weight", (3,))
             return fn, base, scale
 
-        attn_pre, attn_post, attn_comb, collapsed = official_mhc(
-            input_hc, *hc_weights("attn"))
-        attn_split = np.concatenate(
-            (attn_pre, attn_post, attn_comb.reshape(1, 16)), axis=-1)
-        compare("attn_split", read_trace(args.trace_prefix, "attn_split",
-                                         (1, 24)), attn_split)
-        compare("attn_collapsed",
-                read_trace(args.trace_prefix, "attn_collapsed", (1, 4096)),
-                collapsed)
-        attn = kda_layer0(collapsed, blob, data_start, tensors)
-        compare("kda_output", read_trace(args.trace_prefix, "attn_output",
-                                         (1, 4096)), attn)
-        after_attn = (attn_post[..., None] * attn[:, None, :] +
-                      np.matmul(attn_comb.transpose(0, 2, 1), input_hc))
-        after_attn = np.asarray(after_attn, dtype=np.float32)
-        compare("attention_carry", read_trace(args.trace_prefix, "after_attn",
-                                              (1, 4, 4096)), after_attn)
-
-        ffn_pre, ffn_post, ffn_comb, ffn_collapsed = official_mhc(
-            after_attn, *hc_weights("ffn"))
-        ffn_split = np.concatenate(
-            (ffn_pre, ffn_post, ffn_comb.reshape(1, 16)), axis=-1)
-        compare("ffn_split", read_trace(args.trace_prefix, "ffn_split",
-                                        (1, 24)), ffn_split)
-        ffn_norm = f32_tensor(blob, data_start, tensors,
-                              "blk.0.ffn_norm.weight", (4096,))
-        ffn_hidden = rms_weighted(ffn_collapsed, ffn_norm, 1.0e-5)
-        compare("ffn_hidden", read_trace(args.trace_prefix, "ffn_hidden",
-                                         (1, 4096)), ffn_hidden)
-        gate = np.asarray(ffn_hidden @ q8_matrix(
-            blob, data_start, tensors, "blk.0.ffn_gate.weight",
-            (4096, 12288)).T, dtype=np.float32)
-        up = np.asarray(ffn_hidden @ q8_matrix(
-            blob, data_start, tensors, "blk.0.ffn_up.weight",
-            (4096, 12288)).T, dtype=np.float32)
-        gate = np.minimum(gate, np.float32(10.0))
-        up = np.clip(up, np.float32(-10.0), np.float32(10.0))
-        mid = np.asarray((gate / (1.0 + np.exp(-gate))) * up, dtype=np.float32)
-        compare("ffn_mid", read_trace(args.trace_prefix, "ffn_mid",
-                                      (1, 12288)), mid)
-        down = np.asarray(mid @ q8_matrix(
-            blob, data_start, tensors, "blk.0.ffn_down.weight",
-            (12288, 4096)).T, dtype=np.float32)
-        compare("ffn_down", read_trace(args.trace_prefix, "ffn_down",
-                                       (1, 4096)), down)
-        output_hc = (ffn_post[..., None] * down[:, None, :] +
-                     np.matmul(ffn_comb.transpose(0, 2, 1), after_attn))
-        output_hc = np.asarray(output_hc, dtype=np.float32)
-        compare("output_hc", read_trace(args.trace_prefix, "output_hc",
-                                        (1, 4, 4096)), output_hc)
+        for layer in range(args.layer + 1):
+            if layer == args.layer:
+                compare("layer_input_hc", read_trace(
+                    args.trace_prefix, "input_hc", (1, 4, 4096)),
+                    input_hc[last], 0.0 if layer == 0 else 3.0e-4,
+                    0.0 if layer == 0 else 3.0e-5)
+            attn_weights = hc_weights(layer, "attn")
+            attn_pre, attn_post, attn_comb, collapsed = official_mhc(
+                input_hc, *attn_weights, rms_norm_eps, hc_eps=hc_eps)
+            if layer == 0:
+                wrong_pre, _, wrong_comb, _ = official_mhc(
+                    input_hc, *attn_weights, rms_norm_eps, hc_eps=1.0e-5)
+                wrong_delta = max(
+                    float(np.max(np.abs(attn_pre - wrong_pre))),
+                    float(np.max(np.abs(attn_comb - wrong_comb))))
+                if wrong_delta <= 1.0e-7:
+                    raise AssertionError(
+                        "mHC oracle cannot distinguish metadata epsilon "
+                        "from deliberate 1e-5 negative control")
+            attn_split = np.concatenate(
+                (attn_pre, attn_post, attn_comb.reshape(len(tokens), 16)),
+                axis=-1)
+            attn = kda_layer(collapsed, layer, blob, data_start, tensors,
+                             rms_norm_eps)
+            after_attn = (attn_post[..., None] * attn[:, None, :] +
+                          np.matmul(attn_comb.transpose(0, 2, 1), input_hc))
+            after_attn = np.asarray(after_attn, dtype=np.float32)
+            ffn_pre, ffn_post, ffn_comb, ffn_collapsed = official_mhc(
+                after_attn, *hc_weights(layer, "ffn"), rms_norm_eps,
+                hc_eps=hc_eps)
+            ffn_split = np.concatenate(
+                (ffn_pre, ffn_post, ffn_comb.reshape(len(tokens), 16)),
+                axis=-1)
+            ffn_norm = f32_tensor(blob, data_start, tensors,
+                                  f"blk.{layer}.ffn_norm.weight", (4096,))
+            ffn_hidden = rms_weighted(ffn_collapsed, ffn_norm, rms_norm_eps)
+            gate = np.asarray(ffn_hidden @ q8_matrix(
+                blob, data_start, tensors, f"blk.{layer}.ffn_gate.weight",
+                (4096, 12288)).T, dtype=np.float32)
+            up = np.asarray(ffn_hidden @ q8_matrix(
+                blob, data_start, tensors, f"blk.{layer}.ffn_up.weight",
+                (4096, 12288)).T, dtype=np.float32)
+            gate = np.minimum(gate, np.float32(10.0))
+            up = np.clip(up, np.float32(-10.0), np.float32(10.0))
+            mid = np.asarray((gate / (1.0 + np.exp(-gate))) * up,
+                             dtype=np.float32)
+            down = np.asarray(mid @ q8_matrix(
+                blob, data_start, tensors, f"blk.{layer}.ffn_down.weight",
+                (12288, 4096)).T, dtype=np.float32)
+            output_hc = (ffn_post[..., None] * down[:, None, :] +
+                         np.matmul(ffn_comb.transpose(0, 2, 1), after_attn))
+            output_hc = np.asarray(output_hc, dtype=np.float32)
+            if layer == args.layer:
+                compare("attn_split", read_trace(
+                    args.trace_prefix, "attn_split", (1, 24)),
+                    attn_split[last])
+                compare("attn_collapsed", read_trace(
+                    args.trace_prefix, "attn_collapsed", (1, 4096)),
+                    collapsed[last])
+                compare("kda_output", read_trace(
+                    args.trace_prefix, "attn_output", (1, 4096)),
+                    attn[last])
+                compare("attention_carry", read_trace(
+                    args.trace_prefix, "after_attn", (1, 4, 4096)),
+                    after_attn[last])
+                compare("ffn_split", read_trace(
+                    args.trace_prefix, "ffn_split", (1, 24)),
+                    ffn_split[last])
+                compare("ffn_hidden", read_trace(
+                    args.trace_prefix, "ffn_hidden", (1, 4096)),
+                    ffn_hidden[last])
+                compare("ffn_mid", read_trace(
+                    args.trace_prefix, "ffn_mid", (1, 12288)), mid[last])
+                compare("ffn_down", read_trace(
+                    args.trace_prefix, "ffn_down", (1, 4096)), down[last])
+                compare("output_hc", read_trace(
+                    args.trace_prefix, "output_hc", (1, 4, 4096)),
+                    output_hc[last])
+            input_hc = output_hc
         del embedding, input_hc
         blob.close()
     print("PASS independent same-GGUF GLM5 dense block-0 composition oracle")
