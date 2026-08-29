@@ -770,7 +770,8 @@ static int routed_moe_q2_float_down_launch(
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
     const int use_wmma_hot = hot_experts_dev &&
         !g_quality_mode &&
-        (expert_mid_dim % 16u) == 0u && (out_dim % 16u) == 0u;
+        (expert_mid_dim % 16u) == 0u && (out_dim % 16u) == 0u &&
+        !(getenv("DS4_ROCM_Q2_DOWN_FORCE_SCALAR") != NULL);
 #else
     const int use_wmma_hot = 0;
 #endif
