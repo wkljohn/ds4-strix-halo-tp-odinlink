@@ -116,8 +116,19 @@ static bool install_mixed_q2_owned_spans(const Glm5TestGGUF &gguf,
              order[i].second.find(".ffn_down_exps.weight") != std::string::npos);
         uint64_t span_off = off, span_bytes = end - off;
         if (expert) {
-            if (span_bytes % 288u != 0u) return false;
-            const uint64_t one = span_bytes / 288u;
+            const uint64_t block_bytes = info.type == 16u ? 66u :
+                                         info.type == 10u ? 84u : 0u;
+            if (!block_bytes || info.dims[0] == 0u ||
+                info.dims[1] == 0u ||
+                ((info.dims[0] * info.dims[1]) % 256u) != 0u)
+                return false;
+            const uint64_t payload =
+                (info.dims[0] * info.dims[1] / 256u) * block_bytes *
+                info.dims[2];
+            if (payload == 0u || payload > end - off || payload % 288u != 0u)
+                return false;
+            span_bytes = payload;
+            const uint64_t one = payload / 288u;
             span_off += (uint64_t)(rank ? 144u : 0u) * one;
             span_bytes = 144u * one;
         }
@@ -222,6 +233,7 @@ static int test_gpu_tp_exchange(void *ud, uint32_t layer, uint32_t gate,
 bool create_tp(const Glm5TestGGUF &gguf, bool leader,
                const char *host, const char *device, int port,
                uint32_t context_capacity,
+               bool mixed_q2_model,
                TpGuard &guard, ds4_glm5_next_exec_ctx &exec,
                uint64_t &sequence) {
     char direct_rows[32] = {};
@@ -268,8 +280,10 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
     const bool small_gate_enabled = !disable_small_gate ||
         std::strcmp(disable_small_gate, "1") != 0;
     identity.runtime_features =
-        DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD |
+        (mixed_q2_model ? 0u :
+         DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD) |
         (small_gate_enabled ? DS4_TP_FEATURE_GLM5_SMALL_GATE : 0u);
+    identity.quant_bits = mixed_q2_model ? 2u : 4u;
     const char *kda_tp = std::getenv("DS4_GLM5_KDA_TP");
     CHECK(!kda_tp || std::strcmp(kda_tp, "0") == 0 ||
               std::strcmp(kda_tp, "1") == 0,
@@ -894,7 +908,7 @@ bool run() {
     TpGuard tp;
     CHECK(create_tp(gguf, leader, host, device, (int)port_long,
                     context_capacity,
-                    tp, exec, sequence),
+                    mixed_q2_model, tp, exec, sequence),
           "create persistent GLM5 layer3 RoCE transport");
     if (mixed_q2_model && std::getenv("DS4_GLM5_NEXT_RESIDENT_EXPERTS")) {
         CHECK(ds4_gpu_tp_expert_shard_active(),
