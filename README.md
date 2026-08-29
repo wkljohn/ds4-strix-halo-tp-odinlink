@@ -192,6 +192,14 @@ deploy/ds4-tp-caddy.sh status
 See [deploy/README.md](deploy/README.md) for the required Caddy route, RoCE
 memlock handling, logs, and stop/restart commands.
 
+OpenCode can use the deployed DeepSeek service as an OpenAI-compatible provider
+by pointing its base URL at `http://127.0.0.1:8090/v1` (or the Caddy URL),
+selecting the model name returned by `GET /v1/models`, and supplying the server
+API key if authentication is enabled. GLM-5.3 is not selectable from this
+server yet: its staged TP harness is available for development, while ordinary
+GLM5.3 sessions intentionally fail closed until full session integration and
+an end-to-end correctness gate are promoted.
+
 Agent clients should send an explicit completion limit. A practical starting
 point is 4,096–8,192 tokens: if the model leaves a DSML tool call open, DS4
 repairs it at the request limit, so an unnecessarily large limit can look like
