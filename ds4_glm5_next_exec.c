@@ -553,7 +553,7 @@ static int dense_kda_forward_rows(const ds4_glm5_next_exec_ctx *ctx,
                                   ds4_gpu_tensor *hc_out,
                                   uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const int ok =
+    int ok =
         kda_attention_rows(ctx, il, state, w, hc_in, n_tokens) &&
         ds4_gpu_rms_norm_plain_rows_tensor(
             w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, n_tokens,
@@ -1186,7 +1186,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
         (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
     const uint64_t q4_down_base =
         (uint64_t)ctx->tp_rank * q4_down_half_bytes;
-    const int ok =
+    int ok =
         ds4_gpu_rms_norm_plain_rows_tensor(
             w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u,
             ctx->model->rms_norm_eps) &&
@@ -1208,8 +1208,31 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             ctx->model_map, ctx->model_size, f->exp_probs_b,
             w->router_logits, GLM5_EXPERTS, GLM5_EXPERTS_USED, 2.5f) &&
         route_agrees(ctx, il, token_ordinal,
-                     w->router_selected, w->router_weights) &&
-        declare_local_q4k_half(ctx, layer) &&
+                     w->router_selected, w->router_weights);
+    const bool mixed_q2 = f->gate_exps_type == 16u &&
+                          f->up_exps_type == 16u &&
+                          f->down_exps_type == 10u;
+    if (ok && mixed_q2) {
+        /* The mixed GLM Q2 layout is handled by the existing type-aware
+         * routed launcher. It consumes the original GGUF tables and uses
+         * tile-local/staged ranges; this branch must not enter Q4_K slice
+         * declarations, whose 144-byte geometry is incompatible with 66/84.
+         */
+        ok = ds4_gpu_routed_moe_one_tensor(
+            w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
+            w->routed_experts, ctx->model_map, ctx->model_size,
+            f->gate_exps, f->up_exps, f->down_exps,
+            f->gate_exps_type, f->down_exps_type,
+            (uint64_t)GLM5_ROUTED_MID * (GLM5_WIDTH / 256u) * 66u,
+            (GLM5_WIDTH / 256u) * 66u,
+            (uint64_t)GLM5_WIDTH * (GLM5_ROUTED_MID / 256u) * 84u,
+            (GLM5_ROUTED_MID / 256u) * 84u,
+            GLM5_WIDTH, GLM5_ROUTED_MID, GLM5_WIDTH,
+            w->router_selected, w->router_weights,
+            GLM5_EXPERTS, GLM5_EXPERTS_USED, 0.0f,
+            w->ffn_hidden, NULL, il, false);
+    } else if (ok) {
+        ok = declare_local_q4k_half(ctx, layer) &&
         ds4_gpu_routed_moe_one_packed_q4k_tensor(
             w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
             w->routed_experts, ctx->model_map, ctx->model_size,
@@ -1217,7 +1240,9 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             q4_gate_row_bytes, q4_down_row_bytes,
             rank_mid_base, GLM5_RANK_MID, q4_down_base,
             q4_down_half_bytes, w->router_selected, w->router_weights,
-            GLM5_EXPERTS_USED, 10.0f, w->ffn_hidden, NULL, il) &&
+            GLM5_EXPERTS_USED, 10.0f, w->ffn_hidden, NULL, il);
+    }
+    ok = ok &&
         ds4_gpu_matmul_q8_0_tensor(
             w->shared_gate, ctx->model_map, ctx->model_size,
             f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
