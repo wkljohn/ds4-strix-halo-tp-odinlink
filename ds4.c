@@ -38778,6 +38778,12 @@ typedef struct {
     ds4_gpu_tensor **batch_in_views;
     ds4_gpu_tensor *zero_vec;
     uint64_t eval_seq;          /* leader: mirrored eval counter */
+    /* GLM5 gate sequence is a transport-local monotonic counter.  It must not
+     * alias eval_seq: the coordinator increments eval_seq when framing an
+     * EVAL command, while the worker consumes that command without doing the
+     * frame increment.  GLM5 gates themselves are entered symmetrically by
+     * both executors. */
+    uint64_t glm5_gate_seq;
     uint64_t next_session_id;   /* leader: stable worker-session handle */
     int rank;
     bool vocab_split;           /* DS4-only: logits halves cross the wire */
@@ -51336,7 +51342,7 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
             e->tp.slab, ds4_tp_slab_big_out_offset(e->tp.ctx), big_bytes),
         .tp_big_in = ds4_gpu_tensor_view(
             e->tp.slab, ds4_tp_slab_big_in_offset(e->tp.ctx), big_bytes),
-        .tp_sequence = &e->tp.eval_seq,
+        .tp_sequence = &e->tp.glm5_gate_seq,
     };
     if (!s->glm5_next_exec.tp_big_out || !s->glm5_next_exec.tp_big_in) {
         fprintf(stderr, "ds4: GLM5 ordinary executor big-gate views failed\n");
@@ -60813,6 +60819,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
+    e->tp.glm5_gate_seq = 0;
     e->tp.active = true;
     /* Install the negotiated all-expert K-half before the first request.  This
      * keeps representation setup out of prefill timing and makes every prompt,
