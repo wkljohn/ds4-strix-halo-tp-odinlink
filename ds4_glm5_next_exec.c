@@ -378,7 +378,17 @@ static int trace_routed_ffn(const ds4_glm5_next_exec_ctx *ctx,
                             uint32_t layer, uint32_t token,
                             const ds4_gpu_tensor *hc_out,
                             ds4_glm5_next_workspace *w) {
-    return trace_tensor(ctx, layer, token, "ffn_split.f32", w->ffn_split,
+    return trace_tensor(ctx, layer, token, "routed_gate.f32", w->routed_gate,
+                        (uint64_t)GLM5_EXPERTS_USED * GLM5_ROUTED_MID * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "routed_up.f32", w->routed_up,
+                        (uint64_t)GLM5_EXPERTS_USED * GLM5_ROUTED_MID * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "routed_mid.f32", w->routed_mid,
+                        (uint64_t)GLM5_EXPERTS_USED * GLM5_ROUTED_MID * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "routed_experts.f32", w->routed_experts,
+                        (uint64_t)GLM5_EXPERTS_USED * GLM5_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "ffn_down.f32", w->down,
+                        (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+           trace_tensor(ctx, layer, token, "ffn_split.f32", w->ffn_split,
                         (uint64_t)GLM5_HC_MIX * sizeof(float)) &&
            trace_tensor(ctx, layer, token, "ffn_hidden.f32", w->ffn_hidden,
                         (uint64_t)GLM5_WIDTH * sizeof(float)) &&
@@ -1500,7 +1510,52 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
     ds4_gpu_q4k_window_cache *cache = NULL;
     if (ok && mixed_q2) {
         routed_mid_is_f16 = false;
-        ok = ds4_gpu_routed_moe_batch_tensor(
+        if (getenv("DS4_ROCM_GLM5_BATCH_MOE_SERIAL") != NULL) {
+            const uint64_t width_bytes = (uint64_t)GLM5_WIDTH * sizeof(float);
+            const uint64_t mid_bytes = (uint64_t)GLM5_EXPERTS_USED *
+                GLM5_ROUTED_MID * sizeof(float);
+            const uint64_t pair_out_bytes = (uint64_t)GLM5_EXPERTS_USED *
+                GLM5_WIDTH * sizeof(float);
+            for (uint32_t t = 0u; t < n_tokens && ok; ++t) {
+                ds4_gpu_tensor *ov = ds4_gpu_tensor_view(
+                    w->routed_out, (uint64_t)t * width_bytes, width_bytes);
+                ds4_gpu_tensor *gv = ds4_gpu_tensor_view(
+                    w->routed_gate, (uint64_t)t * mid_bytes, mid_bytes);
+                ds4_gpu_tensor *uv = ds4_gpu_tensor_view(
+                    w->routed_up, (uint64_t)t * mid_bytes, mid_bytes);
+                ds4_gpu_tensor *mv = ds4_gpu_tensor_view(
+                    w->routed_mid, (uint64_t)t * mid_bytes, mid_bytes);
+                ds4_gpu_tensor *dv = ds4_gpu_tensor_view(
+                    w->routed_experts, (uint64_t)t * pair_out_bytes,
+                    pair_out_bytes);
+                ds4_gpu_tensor *xv = ds4_gpu_tensor_view(
+                    w->ffn_hidden, (uint64_t)t * width_bytes, width_bytes);
+                ds4_gpu_tensor *sv = ds4_gpu_tensor_view(
+                    w->router_selected,
+                    (uint64_t)t * GLM5_EXPERTS_USED * sizeof(int32_t),
+                    (uint64_t)GLM5_EXPERTS_USED * sizeof(int32_t));
+                ds4_gpu_tensor *wv = ds4_gpu_tensor_view(
+                    w->router_weights,
+                    (uint64_t)t * GLM5_EXPERTS_USED * sizeof(float),
+                    (uint64_t)GLM5_EXPERTS_USED * sizeof(float));
+                ok = ov && gv && uv && mv && dv && xv && sv && wv &&
+                    ds4_gpu_routed_moe_one_tensor(
+                        ov, gv, uv, mv, dv, ctx->model_map, ctx->model_size,
+                        f->gate_exps, f->up_exps, f->down_exps,
+                        f->gate_exps_type, f->down_exps_type,
+                        (uint64_t)GLM5_ROUTED_MID * (GLM5_WIDTH / 256u) * 66u,
+                        (GLM5_WIDTH / 256u) * 66u,
+                        (uint64_t)GLM5_WIDTH * (GLM5_ROUTED_MID / 256u) * 84u,
+                        (GLM5_ROUTED_MID / 256u) * 84u,
+                        GLM5_WIDTH, GLM5_ROUTED_MID, GLM5_WIDTH,
+                        sv, wv, GLM5_EXPERTS, GLM5_EXPERTS_USED, 10.0f,
+                        xv, NULL, il, false);
+                ds4_gpu_tensor_free(ov); ds4_gpu_tensor_free(gv);
+                ds4_gpu_tensor_free(uv); ds4_gpu_tensor_free(mv);
+                ds4_gpu_tensor_free(dv); ds4_gpu_tensor_free(xv);
+                ds4_gpu_tensor_free(sv); ds4_gpu_tensor_free(wv);
+            }
+        } else ok = ds4_gpu_routed_moe_batch_tensor(
             w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
             w->routed_experts, ctx->model_map, ctx->model_size,
             f->gate_exps, f->up_exps, f->down_exps,
@@ -1541,15 +1596,38 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             w->router_weights, GLM5_EXPERTS_USED, 10.0f,
             w->ffn_hidden, il, n_tokens, &routed_mid_is_f16);
     }
-    ok = ok &&
-        !routed_mid_is_f16 &&
-        ds4_gpu_matmul_q8_0_pair_tensor(
+    int shared_projection_ok = 1;
+    if (ok && !routed_mid_is_f16 &&
+        getenv("DS4_ROCM_GLM5_BATCH_SHARED_SERIAL") != NULL) {
+        const uint64_t hc_row_bytes = (uint64_t)GLM5_WIDTH * sizeof(float);
+        const uint64_t mid_row_bytes = (uint64_t)GLM5_RANK_MID * sizeof(float);
+        for (uint32_t t = 0u; t < n_tokens && shared_projection_ok; ++t) {
+            ds4_gpu_tensor *xv = ds4_gpu_tensor_view(
+                w->ffn_hidden, (uint64_t)t * hc_row_bytes, hc_row_bytes);
+            ds4_gpu_tensor *gv = ds4_gpu_tensor_view(
+                w->shared_gate, (uint64_t)t * mid_row_bytes, mid_row_bytes);
+            ds4_gpu_tensor *uv = ds4_gpu_tensor_view(
+                w->shared_up, (uint64_t)t * mid_row_bytes, mid_row_bytes);
+            shared_projection_ok = xv && gv && uv &&
+                ds4_gpu_matmul_q8_0_pair_tensor(
+                    gv, uv, ctx->model_map, ctx->model_size,
+                    f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+                    f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+                    GLM5_WIDTH, GLM5_RANK_MID, GLM5_RANK_MID, xv, 1u);
+            ds4_gpu_tensor_free(xv);
+            ds4_gpu_tensor_free(gv);
+            ds4_gpu_tensor_free(uv);
+        }
+    } else if (ok && !routed_mid_is_f16) {
+        shared_projection_ok = ds4_gpu_matmul_q8_0_pair_tensor(
             w->shared_gate, w->shared_up,
             ctx->model_map, ctx->model_size,
             f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, GLM5_RANK_MID,
-            w->ffn_hidden, n_tokens) &&
+            w->ffn_hidden, n_tokens);
+    }
+    ok = ok && !routed_mid_is_f16 && shared_projection_ok &&
         ds4_gpu_swiglu_tensor(
             w->shared_mid, w->shared_gate, w->shared_up,
             n_tokens * GLM5_RANK_MID, 10.0f, 1.0f) &&
@@ -1700,6 +1778,36 @@ static int mla_routed_dense_selection_rows_forward(
                                 ctx->trace_token == UINT32_MAX ? token_ordinal :
                                 ctx->trace_token, "routed_out.f32",
                                 w->routed_out, n_tokens - 1u,
+                                (uint64_t)GLM5_WIDTH * sizeof(float)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "routed_gate.f32",
+                                w->routed_gate, n_tokens - 1u,
+                                (uint64_t)GLM5_EXPERTS_USED * GLM5_ROUTED_MID * sizeof(float)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "routed_up.f32",
+                                w->routed_up, n_tokens - 1u,
+                                (uint64_t)GLM5_EXPERTS_USED * GLM5_ROUTED_MID * sizeof(float)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "routed_mid.f32",
+                                w->routed_mid, n_tokens - 1u,
+                                (uint64_t)GLM5_EXPERTS_USED * GLM5_ROUTED_MID * sizeof(float)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "routed_experts.f32",
+                                w->routed_experts, n_tokens - 1u,
+                                (uint64_t)GLM5_EXPERTS_USED * GLM5_WIDTH * sizeof(float)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "ffn_down.f32", w->down,
+                                n_tokens - 1u,
                                 (uint64_t)GLM5_WIDTH * sizeof(float)))
         return 0;
     if (ok && !trace_tensor_row(ctx, il,
