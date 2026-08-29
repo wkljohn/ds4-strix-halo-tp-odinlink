@@ -25,7 +25,7 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **233.04 t/s** | **19.17 t/s** | three-run median, exact fingerprint |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **275.58 t/s** | **20.43 t/s** | three-run median, exact fingerprint |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
-| **GLM-5.3 Flash Q4_K over RoCE v2** | KDA-head-sharded TP=2, 121-token prompt + 32 decode | **64.12 t/s** | **9.40 t/s** | two exact-FNV candidate runs; full-logit teacher control passed |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | full-trunk staged TP=2, 33-token diverse prompt + 8 decode | **8.03 t/s** | **8.62 t/s** | complete staged run; cross-rank FNV `e4a64ca66d7bea9e` |
 
 Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
 generated tokens over mandatory RDMA. The current Q4_K rows use the Antirez
@@ -36,9 +36,10 @@ persistent expanded-weight cache.
 The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
 release results.
 
-GLM-5.3 Flash support is an experimental TP=2 path in this branch; it keeps
-the model's KDA state sharded by attention head and does not change the
-validated DeepSeek production path.
+GLM-5.3 Flash support is an experimental TP=2 staged path in this branch; it
+keeps the model's KDA state sharded by attention head and does not change the
+validated DeepSeek production path. The GLM row is not an ordinary server
+benchmark: full session integration remains fail-closed until promoted.
 
 The ordinary benchmark and deployment launchers enable the validated ordered
 ROCm TP callback, temporal-compressor schedule, shape-gated M256/K128 Q8
