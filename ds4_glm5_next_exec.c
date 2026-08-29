@@ -1323,6 +1323,10 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
         state->layer_count != ctx->model->trunk_count ||
         state->kda.layer_count != ctx->model->trunk_count ||
         (n_tokens > 1u && ctx->trace_prefix)) return 0;
+    if (n_tokens == 1u) {
+        return ds4_glm5_next_layer_forward(
+            ctx, il, state, w, hc_in, hc_out);
+    }
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     if (layer->attention == DS4_GLM5_NEXT_ATTN_MLA &&
         layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&

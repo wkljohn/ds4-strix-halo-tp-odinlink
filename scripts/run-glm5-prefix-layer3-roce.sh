@@ -71,6 +71,9 @@ TEXT_PROMPT=${DS4_GLM5_TEXT_PROMPT:-}
 TEXT_GENERATE=${DS4_GLM5_TEXT_GENERATE:-4}
 TEXT_TEACHER_IDS=${DS4_GLM5_TEXT_TEACHER_IDS:-}
 PERF_MODE=${DS4_GLM5_PERF_MODE:-0}
+LAYER_TIMING=${DS4_GLM5_LAYER_TIMING:-0}
+BATCH_PREFILL_TEST=${DS4_GLM5_BATCH_PREFILL_TEST:-0}
+BATCH_PREFILL_COMPARE=${DS4_GLM5_BATCH_PREFILL_COMPARE:-0}
 KDA_ROUTED_BATCH_TEST=${DS4_GLM5_KDA_ROUTED_BATCH_TEST:-0}
 KDA_ROUTED_BATCH_ROWS=${DS4_GLM5_KDA_ROUTED_BATCH_ROWS:-3}
 KDA_ROUTED_PROFILE_REPEATS=${DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS:-0}
@@ -137,6 +140,26 @@ done
   echo "error: DS4_GLM5_PERF_MODE must be 0 or 1" >&2
   exit 2
 }
+[[ $LAYER_TIMING == 0 || $LAYER_TIMING == 1 ]] || {
+  echo "error: DS4_GLM5_LAYER_TIMING must be 0 or 1" >&2
+  exit 2
+}
+[[ $BATCH_PREFILL_TEST == 0 || $BATCH_PREFILL_TEST == 1 ]] || {
+  echo "error: DS4_GLM5_BATCH_PREFILL_TEST must be 0 or 1" >&2
+  exit 2
+}
+[[ $BATCH_PREFILL_TEST == 0 || -n $TEXT_PROMPT ]] || {
+  echo "error: batch prefill test requires DS4_GLM5_TEXT_PROMPT" >&2
+  exit 2
+}
+[[ $BATCH_PREFILL_COMPARE == 0 || $BATCH_PREFILL_COMPARE == 1 ]] || {
+  echo "error: DS4_GLM5_BATCH_PREFILL_COMPARE must be 0 or 1" >&2
+  exit 2
+}
+[[ $BATCH_PREFILL_COMPARE == 0 || $BATCH_PREFILL_TEST == 1 ]] || {
+  echo "error: batch prefill comparison requires batch prefill test" >&2
+  exit 2
+}
 [[ $KDA_ROUTED_BATCH_TEST == 0 || $KDA_ROUTED_BATCH_TEST == 1 ]] || {
   echo "error: DS4_GLM5_KDA_ROUTED_BATCH_TEST must be 0 or 1" >&2
   exit 2
@@ -146,8 +169,9 @@ done
   echo "error: KDA routed batch test requires full trunk and no text prompt" >&2
   exit 2
 }
-[[ $KDA_ROUTED_BATCH_ROWS == 3 || $KDA_ROUTED_BATCH_ROWS == 33 ]] || {
-  echo "error: DS4_GLM5_KDA_ROUTED_BATCH_ROWS must be 3 or 33" >&2
+[[ $KDA_ROUTED_BATCH_ROWS == 1 || $KDA_ROUTED_BATCH_ROWS == 3 ||
+   $KDA_ROUTED_BATCH_ROWS == 33 ]] || {
+  echo "error: DS4_GLM5_KDA_ROUTED_BATCH_ROWS must be 1, 3, or 33" >&2
   exit 2
 }
 [[ $KDA_ROUTED_PROFILE_REPEATS =~ ^[0-9]+$ &&
@@ -454,6 +478,9 @@ printf 'text_mode=%s\n' "$([[ -n $TEXT_PROMPT ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
 printf 'text_generate=%s\n' "$TEXT_GENERATE" >>"$OUT/run.env"
 printf 'perf_mode=%s\n' "$PERF_MODE" >>"$OUT/run.env"
+printf 'layer_timing=%s\n' "$LAYER_TIMING" >>"$OUT/run.env"
+printf 'batch_prefill_test=%s\n' "$BATCH_PREFILL_TEST" >>"$OUT/run.env"
+printf 'batch_prefill_compare=%s\n' "$BATCH_PREFILL_COMPARE" >>"$OUT/run.env"
 printf 'kda_routed_batch_test=%s\n' "$KDA_ROUTED_BATCH_TEST" >>"$OUT/run.env"
 printf 'kda_routed_batch_rows=%s\n' "$KDA_ROUTED_BATCH_ROWS" >>"$OUT/run.env"
 printf 'kda_routed_profile_repeats=%s\n' "$KDA_ROUTED_PROFILE_REPEATS" >>"$OUT/run.env"
@@ -558,13 +585,16 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_MLA_ROUTED_BATCH_ROWS="$MLA_ROUTED_BATCH_ROWS" \
   DS4_GLM5_MLA_ROUTED_PREFIX_ROWS="$MLA_ROUTED_PREFIX_ROWS" \
   DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS="$MLA_ROUTED_CONTINUATION_ROWS" \
+  DS4_GLM5_BATCH_PREFILL_TEST="$BATCH_PREFILL_TEST" \
+  DS4_GLM5_BATCH_PREFILL_COMPARE="$BATCH_PREFILL_COMPARE" \
+  DS4_GLM5_LAYER_TIMING="$LAYER_TIMING" \
   "${local_rdma_env[@]}" \
   "${local_candidate_env[@]}" \
   "${text_env[@]}" \
   "${local_command[@]}" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS' DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS='$KDA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_MLA_ROUTED_BATCH_TEST='$MLA_ROUTED_BATCH_TEST' DS4_GLM5_MLA_ROUTED_BATCH_ROWS='$MLA_ROUTED_BATCH_ROWS' DS4_GLM5_MLA_ROUTED_PREFIX_ROWS='$MLA_ROUTED_PREFIX_ROWS' DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS='$MLA_ROUTED_CONTINUATION_ROWS'$remote_rdma_env$remote_candidate_env$remote_text_env '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS' DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS='$KDA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_MLA_ROUTED_BATCH_TEST='$MLA_ROUTED_BATCH_TEST' DS4_GLM5_MLA_ROUTED_BATCH_ROWS='$MLA_ROUTED_BATCH_ROWS' DS4_GLM5_MLA_ROUTED_PREFIX_ROWS='$MLA_ROUTED_PREFIX_ROWS' DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS='$MLA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_BATCH_PREFILL_TEST='$BATCH_PREFILL_TEST' DS4_GLM5_BATCH_PREFILL_COMPARE='$BATCH_PREFILL_COMPARE' DS4_GLM5_LAYER_TIMING='$LAYER_TIMING'$remote_rdma_env$remote_candidate_env$remote_text_env '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 
@@ -599,6 +629,13 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
   elif [[ -n $TEXT_PROMPT ]]; then
     grep -q 'GLM5 text prompt role=' "$log"
     grep -q 'PASS GLM5 real-text role=' "$log"
+    if [[ $BATCH_PREFILL_TEST == 1 ]]; then
+      grep -q 'batch_prefill=1' "$log"
+    fi
+    if [[ $BATCH_PREFILL_COMPARE == 1 ]]; then
+      grep -q 'GLM5 complete batch prompt comparison role=' "$log"
+      grep -q 'PASS GLM5 complete batch state comparison role=' "$log"
+    fi
     if [[ $PERF_MODE == 1 ]]; then
       grep -q 'GLM5 staged timing role=' "$log"
       grep -q 'full_logit_validation=0' "$log"

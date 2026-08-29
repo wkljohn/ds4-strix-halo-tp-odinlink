@@ -257,6 +257,207 @@ bool execute_full_token(ds4_glm5_next_exec_ctx &exec,
     return true;
 }
 
+bool execute_full_batch(ds4_glm5_next_exec_ctx &exec,
+                        ds4_glm5_next_state &state,
+                        ds4_glm5_next_workspace *workspace,
+                        const ds4_gpu_tensor *tokens,
+                        uint32_t n_tokens,
+                        ds4_gpu_tensor *&current,
+                        ds4_gpu_tensor *&output,
+                        LayerTiming *timing = nullptr) {
+    CHECK(ds4_glm5_next_embed_tokens(
+              &exec, tokens, n_tokens, current),
+          "embed text prompt batch");
+    for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        const auto begin = std::chrono::steady_clock::now();
+        CHECK(ds4_glm5_next_layer_forward_batch(
+                  &exec, il, &state, workspace, current, output, n_tokens),
+              "execute text prompt batch through complete trunk");
+        if (timing) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - begin).count();
+            const ds4_glm5_next_layer_offsets &layer = exec.model->layer[il];
+            if (layer.attention == DS4_GLM5_NEXT_ATTN_KDA &&
+                layer.ffn == DS4_GLM5_NEXT_FFN_DENSE) {
+                timing->kda_dense_ms += ms;
+                timing->kda_dense_calls++;
+            } else if (layer.attention == DS4_GLM5_NEXT_ATTN_KDA &&
+                       layer.ffn == DS4_GLM5_NEXT_FFN_ROUTED) {
+                timing->kda_routed_ms += ms;
+                timing->kda_routed_calls++;
+            } else if (layer.attention == DS4_GLM5_NEXT_ATTN_MLA &&
+                       layer.ffn == DS4_GLM5_NEXT_FFN_ROUTED) {
+                timing->mla_routed_ms += ms;
+                timing->mla_routed_calls++;
+            }
+        }
+        std::swap(current, output);
+    }
+    return true;
+}
+
+bool finite_error(const VectorError &error) {
+    return std::isfinite(error.nrmse) && std::isfinite(error.cosine) &&
+           std::isfinite(error.max_abs);
+}
+
+bool finite_nonzero_vector(const std::vector<float> &values) {
+    bool nonzero = false;
+    for (float value : values) {
+        if (!std::isfinite(value)) return false;
+        nonzero = nonzero || value != 0.0f;
+    }
+    return nonzero;
+}
+
+bool compare_full_prompt_states(const char *role,
+                                const ds4_glm5_next_state &reference,
+                                const ds4_glm5_next_state &candidate,
+                                uint32_t n_tokens) {
+    CHECK(reference.valid && candidate.valid,
+          "scalar and batch prompt states remain valid");
+    constexpr uint32_t kKdaLayers[] = {0u, 20u};
+    constexpr uint64_t kHistoryFloats =
+        (uint64_t)DS4_GLM5_KDA_HISTORY * DS4_GLM5_KDA_CHANNELS;
+    constexpr uint64_t kRecurrentFloats =
+        (uint64_t)DS4_GLM5_KDA_HEADS * DS4_GLM5_KDA_HEAD_DIM *
+        DS4_GLM5_KDA_HEAD_DIM;
+    for (uint32_t il : kKdaLayers) {
+        const ds4_glm5_kda_layer_state &ref = reference.kda.layer[il];
+        const ds4_glm5_kda_layer_state &got = candidate.kda.layer[il];
+        CHECK(ref.valid && got.valid && ref.token_count == n_tokens &&
+                  got.token_count == n_tokens,
+              "selected KDA prompt state has the complete token count");
+        std::vector<float> ref_q(kHistoryFloats), got_q(kHistoryFloats);
+        std::vector<float> ref_k(kHistoryFloats), got_k(kHistoryFloats);
+        std::vector<float> ref_v(kHistoryFloats), got_v(kHistoryFloats);
+        std::vector<float> ref_recurrent(kRecurrentFloats);
+        std::vector<float> got_recurrent(kRecurrentFloats);
+        CHECK(ds4_gpu_tensor_read(ref.q_history, 0u, ref_q.data(),
+                                   ref_q.size() * sizeof(float)) &&
+                  ds4_gpu_tensor_read(got.q_history, 0u, got_q.data(),
+                                       got_q.size() * sizeof(float)) &&
+                  ds4_gpu_tensor_read(ref.k_history, 0u, ref_k.data(),
+                                       ref_k.size() * sizeof(float)) &&
+                  ds4_gpu_tensor_read(got.k_history, 0u, got_k.data(),
+                                       got_k.size() * sizeof(float)) &&
+                  ds4_gpu_tensor_read(ref.v_history, 0u, ref_v.data(),
+                                       ref_v.size() * sizeof(float)) &&
+                  ds4_gpu_tensor_read(got.v_history, 0u, got_v.data(),
+                                       got_v.size() * sizeof(float)) &&
+                  ds4_gpu_tensor_read(ref.recurrent, 0u,
+                                       ref_recurrent.data(),
+                                       ref_recurrent.size() * sizeof(float)) &&
+                  ds4_gpu_tensor_read(got.recurrent, 0u,
+                                       got_recurrent.data(),
+                                       got_recurrent.size() * sizeof(float)),
+              "read selected scalar and batch KDA prompt state");
+        const VectorError q_error = vector_error(ref_q, got_q);
+        const VectorError k_error = vector_error(ref_k, got_k);
+        const VectorError v_error = vector_error(ref_v, got_v);
+        const VectorError recurrent_error =
+            vector_error(ref_recurrent, got_recurrent);
+        std::fprintf(stderr,
+            "GLM5 complete batch KDA state role=%s layer=%u "
+            "q_nrmse=%.9g k_nrmse=%.9g v_nrmse=%.9g "
+            "recurrent_nrmse=%.9g recurrent_cosine=%.12g "
+            "recurrent_max_abs=%.9g\n",
+            role, il, q_error.nrmse, k_error.nrmse, v_error.nrmse,
+            recurrent_error.nrmse, recurrent_error.cosine,
+            recurrent_error.max_abs);
+        /* Layer zero checks the batch KDA state almost directly. Layer 20
+         * also contains the cumulative Lane-B drift from all preceding Q4
+         * routed layers, so freeze a wider but still bounded envelope there. */
+        const double history_nrmse_bound = il == 0u ? 1.0e-5 : 8.0e-2;
+        const double recurrent_nrmse_bound = il == 0u ? 1.0e-5 : 5.5e-2;
+        const double recurrent_cosine_bound = il == 0u ? 0.999999 : 0.9985;
+        const double recurrent_max_abs_bound = il == 0u ? 1.0e-5 : 5.0e-2;
+        CHECK(finite_error(q_error) && finite_error(k_error) &&
+                  finite_error(v_error) && finite_error(recurrent_error) &&
+                  q_error.nrmse <= history_nrmse_bound &&
+                  k_error.nrmse <= history_nrmse_bound &&
+                  v_error.nrmse <= history_nrmse_bound &&
+                  recurrent_error.nrmse <= recurrent_nrmse_bound &&
+                  recurrent_error.cosine >= recurrent_cosine_bound &&
+                  recurrent_error.max_abs <= recurrent_max_abs_bound,
+              "selected batch KDA prompt state stays in its Lane-B envelope");
+    }
+
+    constexpr uint32_t kMlaLayer = 3u;
+    const ds4_glm5_next_mla_state &ref_mla = reference.mla[kMlaLayer];
+    const ds4_glm5_next_mla_state &got_mla = candidate.mla[kMlaLayer];
+    const uint64_t kv_count =
+        (uint64_t)n_tokens * DS4_GLM5_NEXT_MLA_KV_WIDTH;
+    const uint64_t pool_count =
+        (uint64_t)(n_tokens / 4u) * DS4_GLM5_NEXT_INDEX_WIDTH;
+    const uint64_t tail_count =
+        (uint64_t)(n_tokens % 4u) * DS4_GLM5_NEXT_INDEX_WIDTH;
+    CHECK(ref_mla.valid && got_mla.valid &&
+              ref_mla.token_count == n_tokens &&
+              got_mla.token_count == n_tokens &&
+              ref_mla.complete_pools == n_tokens / 4u &&
+              got_mla.complete_pools == n_tokens / 4u &&
+              ref_mla.tail_count == n_tokens % 4u &&
+              got_mla.tail_count == n_tokens % 4u,
+          "selected MLA prompt state has exact counters");
+    std::vector<float> ref_kv(kv_count), got_kv(kv_count);
+    std::vector<float> ref_pool(pool_count), got_pool(pool_count);
+    std::vector<float> ref_tail(tail_count), got_tail(tail_count);
+    std::vector<float> ref_gate(tail_count), got_gate(tail_count);
+    CHECK(ds4_gpu_tensor_read(ref_mla.compact_kv, 0u, ref_kv.data(),
+                               ref_kv.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(got_mla.compact_kv, 0u, got_kv.data(),
+                                   got_kv.size() * sizeof(float)) &&
+              (pool_count == 0u ||
+               (ds4_gpu_tensor_read(ref_mla.index_pool, 0u,
+                                     ref_pool.data(),
+                                     ref_pool.size() * sizeof(float)) &&
+                ds4_gpu_tensor_read(got_mla.index_pool, 0u,
+                                     got_pool.data(),
+                                     got_pool.size() * sizeof(float)))) &&
+              (tail_count == 0u ||
+               (ds4_gpu_tensor_read(ref_mla.index_tail, 0u,
+                                     ref_tail.data(),
+                                     ref_tail.size() * sizeof(float)) &&
+                ds4_gpu_tensor_read(got_mla.index_tail, 0u,
+                                     got_tail.data(),
+                                     got_tail.size() * sizeof(float)) &&
+                ds4_gpu_tensor_read(ref_mla.pool_gate_tail, 0u,
+                                     ref_gate.data(),
+                                     ref_gate.size() * sizeof(float)) &&
+                ds4_gpu_tensor_read(got_mla.pool_gate_tail, 0u,
+                                     got_gate.data(),
+                                     got_gate.size() * sizeof(float)))),
+          "read selected scalar and batch MLA prompt state");
+    const VectorError kv_error = vector_error(ref_kv, got_kv);
+    const VectorError pool_error = pool_count ?
+        vector_error(ref_pool, got_pool) : VectorError{};
+    const VectorError tail_error = tail_count ?
+        vector_error(ref_tail, got_tail) : VectorError{};
+    const VectorError gate_error = tail_count ?
+        vector_error(ref_gate, got_gate) : VectorError{};
+    std::fprintf(stderr,
+        "GLM5 complete batch MLA state role=%s layer=%u "
+        "kv_nrmse=%.9g pool_nrmse=%.9g tail_nrmse=%.9g "
+        "gate_nrmse=%.9g\n",
+        role, kMlaLayer, kv_error.nrmse, pool_error.nrmse,
+        tail_error.nrmse, gate_error.nrmse);
+    const double pool_nrmse_bound = n_tokens > 64u ? 5.0e-5 : 1.0e-5;
+    CHECK(finite_error(kv_error) && kv_error.nrmse <= 1.0e-5 &&
+              (!pool_count ||
+               (finite_nonzero_vector(ref_pool) &&
+                finite_error(pool_error) &&
+                pool_error.nrmse <= pool_nrmse_bound)) &&
+              (!tail_count ||
+               (finite_error(tail_error) && tail_error.nrmse <= 1.0e-5 &&
+                finite_error(gate_error) && gate_error.nrmse <= 1.0e-5)),
+          "selected batch MLA prompt state stays in its Lane-B envelope");
+    std::fprintf(stderr,
+        "PASS GLM5 complete batch state comparison role=%s tokens=%u\n",
+        role, n_tokens);
+    return true;
+}
+
 bool read_argmax(ds4_glm5_next_exec_ctx &exec,
                  ds4_glm5_next_workspace *workspace,
                  ds4_gpu_tensor *current,
@@ -334,8 +535,9 @@ bool run() {
         std::strtoul(kda_batch_rows_env, &kda_batch_rows_end, 10) : 3ul;
     CHECK((!kda_batch_rows_env ||
               (kda_batch_rows_end && *kda_batch_rows_end == '\0')) &&
-              (kda_batch_rows_long == 3ul || kda_batch_rows_long == 33ul),
-          "KDA routed batch rows are the bounded 3 or 33 fixture");
+              (kda_batch_rows_long == 1ul ||
+               kda_batch_rows_long == 3ul || kda_batch_rows_long == 33ul),
+          "KDA routed batch rows are the bounded 1, 3, or 33 fixture");
     const uint32_t kda_batch_rows = (uint32_t)kda_batch_rows_long;
     const char *kda_profile_repeats_env =
         std::getenv("DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS");
@@ -424,6 +626,20 @@ bool run() {
           "full-token count is bounded and requires full-trunk mode");
     const char *text_prompt = std::getenv("DS4_GLM5_TEXT_PROMPT");
     const bool text_mode = text_prompt != nullptr;
+    const char *batch_prefill_env =
+        std::getenv("DS4_GLM5_BATCH_PREFILL_TEST");
+    const bool batch_prefill = batch_prefill_env &&
+        std::strcmp(batch_prefill_env, "1") == 0;
+    CHECK(!batch_prefill_env || batch_prefill ||
+              std::strcmp(batch_prefill_env, "0") == 0,
+          "batch prefill test selector is exactly 0 or 1");
+    const char *batch_prefill_compare_env =
+        std::getenv("DS4_GLM5_BATCH_PREFILL_COMPARE");
+    const bool batch_prefill_compare = batch_prefill_compare_env &&
+        std::strcmp(batch_prefill_compare_env, "1") == 0;
+    CHECK(!batch_prefill_compare_env || batch_prefill_compare ||
+              std::strcmp(batch_prefill_compare_env, "0") == 0,
+          "batch prefill comparison selector is exactly 0 or 1");
     const char *perf_mode_env = std::getenv("DS4_GLM5_PERF_MODE");
     const bool perf_mode = perf_mode_env &&
                            std::strcmp(perf_mode_env, "1") == 0;
@@ -468,6 +684,10 @@ bool run() {
     }
     CHECK(!perf_mode || (text_mode && teacher_ids.empty()),
           "performance mode requires greedy text generation");
+    CHECK(!batch_prefill || text_mode,
+          "batch prefill test requires real-text mode");
+    CHECK(!batch_prefill_compare || batch_prefill,
+          "batch prefill comparison requires the batch path");
     CHECK(!kda_batch_test || (full_trunk && !text_mode),
           "KDA routed batch test requires full trunk and no text mode");
     CHECK(!mla_batch_test || (full_trunk && !text_mode),
@@ -483,8 +703,8 @@ bool run() {
         ds4_glm5_next_text_codec_encode_chat(
             codec.value, nullptr, text_prompt, DS4_THINK_MAX,
             &prompt_tokens.value);
-        CHECK(prompt_tokens.value.len > 0 && prompt_tokens.value.len <= 64,
-              "real chat prompt token count is bounded to 1..64");
+        CHECK(prompt_tokens.value.len > 0 && prompt_tokens.value.len <= 128,
+              "real chat prompt token count is bounded to tested 1..128");
     }
     const uint32_t context_capacity = text_mode ?
         (uint32_t)prompt_tokens.value.len + text_generate :
@@ -578,6 +798,8 @@ bool run() {
         (uint64_t)mla_batch_rows,
         (uint64_t)mla_prefix_rows,
         (uint64_t)mla_continuation_rows,
+        (uint64_t)batch_prefill,
+        (uint64_t)batch_prefill_compare,
         prompt_hash,
         teacher_hash,
     };
@@ -1055,7 +1277,9 @@ bool run() {
         using Clock = std::chrono::steady_clock;
         const uint32_t rows = kda_batch_rows;
         std::vector<uint32_t> ids;
-        if (rows == 3u) {
+        if (rows == 1u) {
+            ids = {42u};
+        } else if (rows == 3u) {
             ids = {42u, 154822u, 154824u};
         } else {
             ids = {
@@ -1362,21 +1586,183 @@ bool run() {
 
     if (text_mode) {
         using Clock = std::chrono::steady_clock;
+        WorkspaceGuard prompt_workspace;
+        TensorGuard prompt_ids, prompt_current_guard, prompt_output_guard;
+        StateGuard prompt_reference_state;
+        TensorGuard reference_current_guard, reference_output_guard;
+        TensorGuard reference_logits_guard;
+        ds4_gpu_tensor *prompt_current = nullptr;
+        ds4_gpu_tensor *prompt_output = nullptr;
+        ds4_gpu_tensor *reference_current = nullptr;
+        ds4_gpu_tensor *reference_output = nullptr;
+        std::vector<float> reference_hidden;
+        std::vector<float> reference_logits;
+        if (batch_prefill) {
+            const uint32_t prompt_rows =
+                (uint32_t)prompt_tokens.value.len;
+            /* NoPE prefill remains dense only while every row is inside the
+             * model's 2048-row index-selection boundary. */
+            CHECK(prompt_rows <= context_capacity &&
+                  prompt_rows <= DS4_GLM5_NEXT_INDEX_TOP_K &&
+                  (prompt_workspace.value =
+                       ds4_glm5_next_workspace_create_capacity(
+                           prompt_rows)) != nullptr &&
+                  (prompt_ids.value = ds4_gpu_tensor_alloc(
+                       (uint64_t)prompt_rows * sizeof(uint32_t))) != nullptr &&
+                  (prompt_current_guard.value = ds4_gpu_tensor_alloc(
+                       (uint64_t)prompt_rows * kHcWidth *
+                       sizeof(float))) != nullptr &&
+                  (prompt_output_guard.value = ds4_gpu_tensor_alloc(
+                       (uint64_t)prompt_rows * kHcWidth *
+                       sizeof(float))) != nullptr &&
+                  ds4_gpu_tensor_write(
+                      prompt_ids.value, 0u, prompt_tokens.value.v,
+                      (uint64_t)prompt_rows * sizeof(uint32_t)),
+                  "allocate exact-capacity complete prompt batch");
+            prompt_current = prompt_current_guard.value;
+            prompt_output = prompt_output_guard.value;
+        }
+        if (batch_prefill_compare) {
+            CHECK(ds4_glm5_next_state_init(
+                      &prompt_reference_state.value, &offsets,
+                      context_capacity, nullptr) &&
+                  (reference_current_guard.value = ds4_gpu_tensor_alloc(
+                       (uint64_t)kHcWidth * sizeof(float))) != nullptr &&
+                  (reference_output_guard.value = ds4_gpu_tensor_alloc(
+                       (uint64_t)kHcWidth * sizeof(float))) != nullptr &&
+                  (reference_logits_guard.value = ds4_gpu_tensor_alloc(
+                       (uint64_t)154880u * sizeof(float))) != nullptr,
+                  "allocate scalar prompt reference");
+            reference_current = reference_current_guard.value;
+            reference_output = reference_output_guard.value;
+            const uint64_t reference_sequence_begin = sequence;
+            for (int i = 0; i < prompt_tokens.value.len; ++i) {
+                CHECK(execute_full_token(
+                          exec, prompt_reference_state.value,
+                          workspace.value,
+                          (uint32_t)prompt_tokens.value.v[i],
+                          reference_current, reference_output),
+                      "execute scalar prompt reference");
+            }
+            reference_hidden.resize(kHcWidth);
+            reference_logits.resize(154880u);
+            CHECK(sequence == reference_sequence_begin +
+                                  (uint64_t)prompt_tokens.value.len * 53u &&
+                  ds4_gpu_tensor_read(
+                      reference_current, 0u, reference_hidden.data(),
+                      reference_hidden.size() * sizeof(float)) &&
+                  ds4_glm5_next_output_logits(
+                      &exec, workspace.value, reference_current,
+                      reference_logits_guard.value) &&
+                  ds4_gpu_synchronize() &&
+                  ds4_gpu_tensor_read(
+                      reference_logits_guard.value, 0u,
+                      reference_logits.data(),
+                      reference_logits.size() * sizeof(float)),
+                  "capture scalar prompt hidden state and logits");
+        }
         const auto prompt_begin = Clock::now();
         uint32_t executed = 0u;
+        uint64_t expected_sequence = sequence;
         LayerTiming prompt_layer_timing;
-        for (int i = 0; i < prompt_tokens.value.len; ++i) {
-            CHECK(execute_full_token(
-                      exec, state.value, workspace.value,
-                      (uint32_t)prompt_tokens.value.v[i],
-                      current.value, output.value,
-                      layer_timing ? &prompt_layer_timing : nullptr),
-                  "execute exact chat prompt token");
-            executed++;
+        if (batch_prefill) {
+            CHECK(execute_full_batch(
+                      exec, state.value, prompt_workspace.value,
+                      prompt_ids.value,
+                      (uint32_t)prompt_tokens.value.len,
+                      prompt_current, prompt_output,
+                      layer_timing ? &prompt_layer_timing : nullptr) &&
+                  ds4_gpu_tensor_copy(
+                      current.value, 0u, prompt_current,
+                      (uint64_t)(prompt_tokens.value.len - 1) *
+                          kHcWidth * sizeof(float),
+                      (uint64_t)kHcWidth * sizeof(float)) &&
+                  ds4_gpu_synchronize(),
+                  "execute complete batched chat prompt and retain last row");
+            executed = (uint32_t)prompt_tokens.value.len;
+            expected_sequence += 53u;
+        } else {
+            for (int i = 0; i < prompt_tokens.value.len; ++i) {
+                CHECK(execute_full_token(
+                          exec, state.value, workspace.value,
+                          (uint32_t)prompt_tokens.value.v[i],
+                          current.value, output.value,
+                          layer_timing ? &prompt_layer_timing : nullptr),
+                      "execute exact chat prompt token");
+                executed++;
+                expected_sequence += 53u;
+            }
+        }
+        if (batch_prefill_compare) {
+            std::vector<float> batch_hidden(kHcWidth);
+            std::vector<float> batch_logits(154880u);
+            CHECK(ds4_gpu_tensor_read(
+                      current.value, 0u, batch_hidden.data(),
+                      batch_hidden.size() * sizeof(float)) &&
+                  ds4_glm5_next_output_logits(
+                      &exec, workspace.value, current.value, logits.value) &&
+                  ds4_gpu_synchronize() &&
+                  ds4_gpu_tensor_read(
+                      logits.value, 0u, batch_logits.data(),
+                      batch_logits.size() * sizeof(float)),
+                  "capture complete batch prompt hidden state and logits");
+            const VectorError hidden_error =
+                vector_error(reference_hidden, batch_hidden);
+            const VectorError logits_error =
+                vector_error(reference_logits, batch_logits);
+            const uint32_t reference_top1 = (uint32_t)std::distance(
+                reference_logits.begin(),
+                std::max_element(reference_logits.begin(),
+                                 reference_logits.end()));
+            const uint32_t batch_top1 = (uint32_t)std::distance(
+                batch_logits.begin(),
+                std::max_element(batch_logits.begin(), batch_logits.end()));
+            std::fprintf(stderr,
+                "GLM5 complete batch prompt comparison role=%s rows=%d "
+                "hidden_nrmse=%.9g hidden_cosine=%.12g "
+                "hidden_max_abs=%.9g logits_nrmse=%.9g "
+                "logits_cosine=%.12g logits_max_abs=%.9g "
+                "reference_top1=%u batch_top1=%u\n",
+                role, prompt_tokens.value.len,
+                hidden_error.nrmse, hidden_error.cosine,
+                hidden_error.max_abs, logits_error.nrmse,
+                logits_error.cosine, logits_error.max_abs,
+                reference_top1, batch_top1);
+            /* Keep independent short and length-screen envelopes. The legal
+             * batch reduction drift accumulates through the routed stack and
+             * is measurably larger at 121 rows. These are research regression
+             * ceilings, not production quality thresholds. */
+            const bool long_compare = prompt_tokens.value.len > 64;
+            const double prompt_nrmse_bound = long_compare ? 0.22 : 0.15;
+            const double prompt_cosine_bound = long_compare ? 0.98 : 0.99;
+            const double prompt_max_abs_bound = long_compare ? 2.5 : 2.0;
+            CHECK(finite_error(hidden_error) &&
+                      finite_error(logits_error) &&
+                      hidden_error.nrmse <= prompt_nrmse_bound &&
+                      hidden_error.cosine >= prompt_cosine_bound &&
+                      hidden_error.max_abs <= prompt_max_abs_bound &&
+                      logits_error.nrmse <= prompt_nrmse_bound &&
+                      logits_error.cosine >= prompt_cosine_bound &&
+                      logits_error.max_abs <= prompt_max_abs_bound &&
+                      reference_top1 == batch_top1,
+                  "batch prompt stays inside its provisional Lane-B envelope");
+            CHECK(compare_full_prompt_states(
+                      role, prompt_reference_state.value, state.value,
+                      (uint32_t)prompt_tokens.value.len),
+                  "batch prompt preserves selected recurrent states");
         }
         CHECK(state.value.valid &&
-                  sequence == (uint64_t)executed * 53u,
+                  sequence == expected_sequence,
               "chat prompt commits one complete TP schedule per token");
+        if (batch_prefill) {
+            for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+                const ds4_glm5_next_layer_offsets &layer = offsets.layer[il];
+                CHECK(layer.attention == DS4_GLM5_NEXT_ATTN_MLA ?
+                          state.value.mla[il].token_count == executed :
+                          state.value.kda.layer[il].token_count == executed,
+                      "complete prompt batch commits every layer state");
+            }
+        }
         const auto prompt_end = Clock::now();
         if (layer_timing) {
             const double classified = prompt_layer_timing.kda_dense_ms +
@@ -1476,7 +1862,8 @@ bool run() {
                 recurrent_ms += std::chrono::duration<double, std::milli>(
                     recurrent_end - recurrent_begin).count();
                 executed++;
-                CHECK(sequence == (uint64_t)executed * 53u,
+                expected_sequence += 53u;
+                CHECK(sequence == expected_sequence,
                       "generated token commits one complete TP schedule");
             }
         }
@@ -1499,12 +1886,12 @@ bool run() {
                 decode_end - decode_begin).count();
         std::fprintf(stderr,
             "GLM5 staged timing role=%s prompt_tokens=%d "
-            "prompt_ms=%.3f prefill_tps=%.6f generated=%zu "
+            "prompt_ms=%.3f prefill_tps=%.6f batch_prefill=%d generated=%zu "
             "decode_ms=%.3f decode_tps=%.6f projection_ms=%.3f "
             "recurrent_ms=%.3f full_logit_validation=%d\n",
             role, prompt_tokens.value.len, prompt_ms,
             prompt_tokens.value.len * 1000.0 / prompt_ms,
-            generated.size(), decode_ms,
+            batch_prefill ? 1 : 0, generated.size(), decode_ms,
             generated.size() * 1000.0 / decode_ms,
             projection_ms, recurrent_ms, perf_mode ? 0 : 1);
         if (!teacher_ids.empty()) {
