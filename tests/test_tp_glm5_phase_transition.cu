@@ -47,13 +47,15 @@ static void hip_check(hipError_t rc, const char *what) {
     std::exit(1);
 }
 
-static std::vector<Gate> glm_schedule() {
+static std::vector<Gate> glm_schedule(bool kda_tp) {
     std::vector<Gate> gates;
-    for (uint32_t layer = DS4_GLM5_NEXT_LEADING_DENSE;
+    for (uint32_t layer = 0u;
          layer < DS4_GLM5_NEXT_TRUNK_COUNT; ++layer) {
-        if (ds4_glm5_next_layer_is_mla(layer))
+        const bool routed = layer >= DS4_GLM5_NEXT_LEADING_DENSE;
+        if ((kda_tp && !ds4_glm5_next_layer_is_mla(layer)) ||
+            (routed && ds4_glm5_next_layer_is_mla(layer)))
             gates.push_back({layer, DS4_TP_GATE_ATTN});
-        gates.push_back({layer, DS4_TP_GATE_FFN});
+        if (routed) gates.push_back({layer, DS4_TP_GATE_FFN});
     }
     return gates;
 }
@@ -123,17 +125,25 @@ int main(int argc, char **argv) {
     identity.quant_bits = 4u;
     identity.ctx_size = 16u;
     identity.runtime_features = DS4_TP_FEATURE_GLM5_SMALL_GATE;
-    identity.gate_slot_start =
+    const char *kda_tp_env = std::getenv("DS4_GLM5_KDA_TP");
+    const bool kda_tp = kda_tp_env && std::strcmp(kda_tp_env, "1") == 0;
+    if (kda_tp_env && !kda_tp && std::strcmp(kda_tp_env, "0") != 0) {
+        std::fprintf(stderr, "FAIL DS4_GLM5_KDA_TP must be 0 or 1\n");
+        return 1;
+    }
+    if (kda_tp) identity.runtime_features |= DS4_TP_FEATURE_GLM5_KDA_TP;
+    identity.gate_slot_start = kda_tp ? 0u :
         DS4_GLM5_NEXT_LEADING_DENSE * DS4_TP_GATES_PER_LAYER;
     identity.gate_slot_step = 1u;
     if (!ds4_glm5_next_build_tp_gate_mask(identity.gate_slot_mask,
-                                           &identity.gates_per_token)) {
+                                           &identity.gates_per_token,
+                                           identity.runtime_features)) {
         std::fprintf(stderr, "FAIL build GLM gate schedule\n");
         return 1;
     }
-    const std::vector<Gate> schedule = glm_schedule();
+    const std::vector<Gate> schedule = glm_schedule(kda_tp);
     if (schedule.size() != identity.gates_per_token ||
-        schedule.size() != 53u) {
+        schedule.size() != (kda_tp ? 87u : 53u)) {
         std::fprintf(stderr, "FAIL schedule size=%zu\n", schedule.size());
         return 1;
     }

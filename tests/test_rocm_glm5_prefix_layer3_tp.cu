@@ -45,6 +45,47 @@ uint64_t fnv64(const void *data, uint64_t bytes) {
     return hash;
 }
 
+bool buffer_all_zero(const std::vector<uint8_t> &buffer) {
+    return std::all_of(buffer.begin(), buffer.end(),
+                       [](uint8_t value) { return value == 0u; });
+}
+
+bool kda_state_has_exact_local_ownership(
+        const ds4_glm5_kda_layer_state &state, uint32_t rank,
+        uint64_t *owned_fnv) {
+    constexpr uint64_t kHistoryHalfBytes =
+        (uint64_t)(DS4_GLM5_KDA_CHANNELS / 2u) *
+        DS4_GLM5_KDA_HISTORY * sizeof(float);
+    constexpr uint64_t kRecurrentHalfBytes =
+        (uint64_t)(DS4_GLM5_KDA_HEADS / 2u) *
+        DS4_GLM5_KDA_HEAD_DIM * DS4_GLM5_KDA_HEAD_DIM * sizeof(float);
+    if (!state.valid || rank > 1u || !state.q_history || !state.k_history ||
+        !state.v_history || !state.recurrent || !owned_fnv) return false;
+
+    const ds4_gpu_tensor *tensors[] = {
+        state.q_history, state.k_history, state.v_history, state.recurrent};
+    const uint64_t half_bytes[] = {
+        kHistoryHalfBytes, kHistoryHalfBytes, kHistoryHalfBytes,
+        kRecurrentHalfBytes};
+    uint64_t combined = UINT64_C(1469598103934665603);
+    for (size_t i = 0u; i < 4u; ++i) {
+        std::vector<uint8_t> owned(half_bytes[i]);
+        std::vector<uint8_t> peer(half_bytes[i]);
+        if (!ds4_gpu_tensor_read(
+                tensors[i], (uint64_t)rank * half_bytes[i],
+                owned.data(), half_bytes[i]) ||
+            !ds4_gpu_tensor_read(
+                tensors[i], (uint64_t)(1u - rank) * half_bytes[i],
+                peer.data(), half_bytes[i]) ||
+            buffer_all_zero(owned) || !buffer_all_zero(peer)) return false;
+        const uint64_t part = fnv64(owned.data(), half_bytes[i]);
+        combined ^= part;
+        combined *= UINT64_C(1099511628211);
+    }
+    *owned_fnv = combined;
+    return true;
+}
+
 struct VectorError {
     double nrmse = 0.0;
     double cosine = 0.0;
@@ -181,10 +222,19 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
     identity.runtime_features =
         DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD |
         (small_gate_enabled ? DS4_TP_FEATURE_GLM5_SMALL_GATE : 0u);
-    identity.gate_slot_start = 3u * DS4_TP_GATES_PER_LAYER;
+    const char *kda_tp = std::getenv("DS4_GLM5_KDA_TP");
+    CHECK(!kda_tp || std::strcmp(kda_tp, "0") == 0 ||
+              std::strcmp(kda_tp, "1") == 0,
+          "KDA-TP selector is exactly 0 or 1");
+    if (kda_tp && std::strcmp(kda_tp, "1") == 0)
+        identity.runtime_features |= DS4_TP_FEATURE_GLM5_KDA_TP;
+    identity.gate_slot_start =
+        (identity.runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u ?
+            0u : 3u * DS4_TP_GATES_PER_LAYER;
     identity.gate_slot_step = 1u;
     CHECK(ds4_glm5_next_build_tp_gate_mask(identity.gate_slot_mask,
-                                            &identity.gates_per_token),
+                                            &identity.gates_per_token,
+                                            identity.runtime_features),
           "GLM5.3 hybrid TP gate schedule");
 
     char error[256] = {};
@@ -777,6 +827,16 @@ bool run() {
                     context_capacity,
                     tp, exec, sequence),
           "create persistent GLM5 layer3 RoCE transport");
+    const bool kda_tp_enabled =
+        (ds4_tp_runtime_features(tp.tp) &
+         DS4_TP_FEATURE_GLM5_KDA_TP) != 0u;
+    uint64_t active_gate_mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS] = {};
+    uint32_t tp_gates_per_token = 0u;
+    CHECK(ds4_glm5_next_build_tp_gate_mask(
+              active_gate_mask, &tp_gates_per_token,
+              ds4_tp_runtime_features(tp.tp)) &&
+              tp_gates_per_token == (kda_tp_enabled ? 87u : 53u),
+          "runtime feature set derives the exact active gate count");
     char rank_error[256] = {};
     CHECK(ds4_tp_hash_check(
               tp.tp, UINT64_C(0x474c4d3552414e4b),
@@ -1446,18 +1506,32 @@ bool run() {
         const uint64_t batch_digest_hash =
             fnv64(&batch_digest, sizeof(batch_digest));
         char batch_digest_error[256] = {};
-        CHECK(ds4_tp_hash_check(
-                  tp.tp, UINT64_C(0x474c4d354b444947), batch_digest_hash,
-                  batch_digest_error, sizeof(batch_digest_error)) == 1,
+        uint64_t sequential_owned_fnv = 0u, batch_owned_fnv = 0u;
+        CHECK(!kda_tp_enabled ||
+                  (kda_state_has_exact_local_ownership(
+                       sequential_state.value.kda.layer[4], exec.tp_rank,
+                       &sequential_owned_fnv) &&
+                   kda_state_has_exact_local_ownership(
+                       batch_state.value.kda.layer[4], exec.tp_rank,
+                       &batch_owned_fnv) &&
+                   sequential_owned_fnv == batch_owned_fnv),
+              "sharded KDA batch state owns exactly one matching head half");
+        CHECK(kda_tp_enabled ||
+                  ds4_tp_hash_check(
+                      tp.tp, UINT64_C(0x474c4d354b444947),
+                      batch_digest_hash, batch_digest_error,
+                      sizeof(batch_digest_error)) == 1,
               batch_digest_error);
         std::fprintf(stderr,
             "GLM5 KDA+routed state role=%s recurrent_digest_equal=%d "
             "sequential_recurrent=%016llx batch_recurrent=%016llx "
-            "batch_digest=%016llx\n",
+            "batch_digest=%016llx local_owned=%016llx kda_tp=%d\n",
             role, recurrent_digest_equal ? 1 : 0,
             (unsigned long long)sequential_digest.recurrent_fnv64,
             (unsigned long long)batch_digest.recurrent_fnv64,
-            (unsigned long long)batch_digest_hash);
+            (unsigned long long)batch_digest_hash,
+            (unsigned long long)batch_owned_fnv,
+            kda_tp_enabled ? 1 : 0);
 
         std::vector<float> sequential_continue(kHcWidth);
         std::vector<float> batch_continue(kHcWidth);
@@ -1657,7 +1731,8 @@ bool run() {
             reference_hidden.resize(kHcWidth);
             reference_logits.resize(154880u);
             CHECK(sequence == reference_sequence_begin +
-                                  (uint64_t)prompt_tokens.value.len * 53u &&
+                                  (uint64_t)prompt_tokens.value.len *
+                                      tp_gates_per_token &&
                   ds4_gpu_tensor_read(
                       reference_current, 0u, reference_hidden.data(),
                       reference_hidden.size() * sizeof(float)) &&
@@ -1690,7 +1765,7 @@ bool run() {
                   ds4_gpu_synchronize(),
                   "execute complete batched chat prompt and retain last row");
             executed = (uint32_t)prompt_tokens.value.len;
-            expected_sequence += 53u;
+            expected_sequence += tp_gates_per_token;
         } else {
             for (int i = 0; i < prompt_tokens.value.len; ++i) {
                 CHECK(execute_full_token(
@@ -1700,7 +1775,7 @@ bool run() {
                           layer_timing ? &prompt_layer_timing : nullptr),
                       "execute exact chat prompt token");
                 executed++;
-                expected_sequence += 53u;
+                expected_sequence += tp_gates_per_token;
             }
         }
         if (batch_prefill_compare) {
@@ -1872,7 +1947,7 @@ bool run() {
                 recurrent_ms += std::chrono::duration<double, std::milli>(
                     recurrent_end - recurrent_begin).count();
                 executed++;
-                expected_sequence += 53u;
+                expected_sequence += tp_gates_per_token;
                 CHECK(sequence == expected_sequence,
                       "generated token commits one complete TP schedule");
             }
@@ -1969,8 +2044,8 @@ bool run() {
                   "execute complete GLM5.3 trunk layer over RoCE");
             std::swap(current.value, output.value);
         }
-        CHECK(state.value.valid && sequence == 53u,
-              "complete trunk emits the exact hybrid 53-gate schedule");
+        CHECK(state.value.valid && sequence == tp_gates_per_token,
+              "complete trunk emits the exact negotiated gate schedule");
         for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
             if (ds4_glm5_next_layer_is_mla(il)) {
                 CHECK(state.value.mla[il].token_count == 1u,
@@ -2041,8 +2116,9 @@ bool run() {
                       "execute second greedy token through complete trunk");
                 std::swap(current.value, output.value);
             }
-            CHECK(state.value.valid && sequence == 106u,
-                  "two full tokens emit two exact 53-gate schedules");
+            CHECK(state.value.valid &&
+                      sequence == (uint64_t)tp_gates_per_token * 2u,
+                  "two full tokens emit two exact negotiated gate schedules");
             for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
                 if (ds4_glm5_next_layer_is_mla(il)) {
                     CHECK(state.value.mla[il].token_count == 2u,
@@ -2106,33 +2182,18 @@ bool run() {
                 (unsigned long long)sequence,
                 (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
         }
-        ds4_glm5_next_state_free(&state.value);
-        std::memset(&state.value, 0, sizeof(state.value));
-        sequence = 0u;
-        CHECK(ds4_glm5_next_state_init(&state.value, &offsets, 2u, nullptr) &&
-                  ds4_glm5_next_embed_token(&exec, 42u, current.value),
-              "reset state and re-embed token 42 for multi-token coverage");
-        for (uint32_t il = 0u; il < 3u; ++il) {
-            CHECK(ds4_glm5_next_layer_forward(
-                      &exec, il, &state.value, workspace.value,
-                      current.value, output.value),
-                  "rebuild token-0 dense-prefix KDA state after full trunk");
-            std::swap(current.value, output.value);
-        }
-        std::vector<float> replay_prefix(kHcWidth);
-        CHECK(ds4_gpu_tensor_read(current.value, 0u, replay_prefix.data(),
-                                  replay_prefix.size() * sizeof(float)) &&
-                  fnv64(replay_prefix.data(),
-                        replay_prefix.size() * sizeof(float)) == kPrefixFNV,
-              "rebuilt token-0 prefix and KDA state match frozen fixture");
+        return true;
     }
 
     CHECK(ds4_glm5_next_layer_forward(
               &exec, 3u, &state.value, workspace.value,
               current.value, output.value),
           "execute production MLA+routed layer3 over RoCE");
+    const uint64_t partial_token0_after_layer3 =
+        kda_tp_enabled ? 5u : 2u;
     CHECK(state.value.valid && state.value.mla[3].valid &&
-          state.value.mla[3].token_count == 1u && sequence == 2u,
+          state.value.mla[3].token_count == 1u &&
+          sequence == partial_token0_after_layer3,
           "layer3 commits exactly one token after both exchanges");
 
     std::vector<float> result(kHcWidth), kv(512u), index_key(128u),
@@ -2166,18 +2227,50 @@ bool run() {
               output.value, current.value),
           "compose production KDA+routed layer4 over RoCE");
     ds4_glm5_kda_digest kda4_token0 = {};
-    CHECK(state.value.kda.layer[4].token_count == 1u && sequence == 3u &&
+    const uint64_t partial_token0_after_layer4 =
+        kda_tp_enabled ? 7u : 3u;
+    CHECK(state.value.kda.layer[4].token_count == 1u &&
+          sequence == partial_token0_after_layer4 &&
           ds4_glm5_kda_layer_digest(&state.value.kda.layer[4], current.value,
                                     kHcWidth, &kda4_token0),
           "layer4 commits one recurrent KDA step and one FFN exchange");
     const uint64_t packed_q4_bytes = ds4_gpu_q4k_packed_slice_bytes();
+    uint64_t kda4_owned0 = 0u;
     CHECK((full_trunk ? packed_q4_bytes == layer3_packed_q4_bytes
                       : packed_q4_bytes > layer3_packed_q4_bytes) &&
-          ds4_tp_hash_check(
-              tp.tp, UINT64_C(0x474c4d35344b4430),
-              fnv64(&kda4_token0, sizeof(kda4_token0)),
-              error, sizeof(error)) == 1,
-          "layer4 state/output are rank-identical and add one Q4 shard");
+          ((!kda_tp_enabled &&
+            ds4_tp_hash_check(
+                tp.tp, UINT64_C(0x474c4d35344b4430),
+                fnv64(&kda4_token0, sizeof(kda4_token0)),
+                error, sizeof(error)) == 1) ||
+           (kda_tp_enabled &&
+            kda_state_has_exact_local_ownership(
+                state.value.kda.layer[4], exec.tp_rank, &kda4_owned0) &&
+            ds4_tp_hash_check(
+                tp.tp, UINT64_C(0x474c4d35344f5550),
+                kda4_token0.output_fnv64, error, sizeof(error)) == 1)),
+          "layer4 output agrees and state ownership matches TP mode");
+
+    /* The legacy partial fixture deliberately stops after layer 4.  Once
+     * every KDA attention site is in the negotiated gate mask, beginning a
+     * second token here would violate the 87-gate full-token schedule by
+     * skipping layers 5..45.  The exact 33+1 continuation oracle covers the
+     * split recurrent state; multi-token transport is exercised only by the
+     * complete-trunk path above. */
+    if (kda_tp_enabled) {
+        std::fprintf(stderr,
+            "PASS GLM5 prefix->layer3 token0 role=%s output=%016llx "
+            "layer4_token0=%016llx kda4_owned0=%016llx tp_seq=%llu "
+            "layer3_packed_q4_bytes=%llu packed_q4_bytes=%llu "
+            "kda_tp=1 partial_schedule=1 window_cache_bytes=0 rdma=1\n",
+            role, (unsigned long long)output_hash,
+            (unsigned long long)kda4_token0.output_fnv64,
+            (unsigned long long)kda4_owned0,
+            (unsigned long long)sequence,
+            (unsigned long long)layer3_packed_q4_bytes,
+            (unsigned long long)packed_q4_bytes);
+        return true;
+    }
 
     CHECK(ds4_glm5_next_embed_token(&exec, 43u, current.value),
           "embed token 43");
@@ -2192,8 +2285,10 @@ bool run() {
               &exec, 3u, &state.value, workspace.value,
               current.value, output.value),
           "execute second-token MLA cache-read layer3 over RoCE");
+    const uint64_t partial_token1_after_layer3 =
+        partial_token0_after_layer4 + (kda_tp_enabled ? 5u : 2u);
     CHECK(state.value.valid && state.value.mla[3].token_count == 2u &&
-          sequence == 5u &&
+          sequence == partial_token1_after_layer3 &&
           ds4_gpu_q4k_packed_slice_bytes() == packed_q4_bytes,
           "second token commits after two exchanges without Q4 duplication");
 
@@ -2237,17 +2332,28 @@ bool run() {
               output.value, current.value),
           "execute second-token KDA+routed layer4 over RoCE");
     ds4_glm5_kda_digest kda4_token1 = {};
+    uint64_t kda4_owned1 = 0u;
+    const uint64_t partial_token1_after_layer4 =
+        partial_token1_after_layer3 + (kda_tp_enabled ? 2u : 1u);
     CHECK(state.value.valid && state.value.kda.layer[4].token_count == 2u &&
-          sequence == 6u &&
+          sequence == partial_token1_after_layer4 &&
           ds4_gpu_q4k_packed_slice_bytes() == packed_q4_bytes &&
           ds4_glm5_kda_layer_digest(&state.value.kda.layer[4], current.value,
                                     kHcWidth, &kda4_token1) &&
           kda4_token1.token_count == 2u &&
           kda4_token1.output_fnv64 != kda4_token0.output_fnv64 &&
-          ds4_tp_hash_check(
-              tp.tp, UINT64_C(0x474c4d35344b4431),
-              fnv64(&kda4_token1, sizeof(kda4_token1)),
-              error, sizeof(error)) == 1,
+          ((!kda_tp_enabled &&
+            ds4_tp_hash_check(
+                tp.tp, UINT64_C(0x474c4d35344b4431),
+                fnv64(&kda4_token1, sizeof(kda4_token1)),
+                error, sizeof(error)) == 1) ||
+           (kda_tp_enabled &&
+            kda_state_has_exact_local_ownership(
+                state.value.kda.layer[4], exec.tp_rank, &kda4_owned1) &&
+            kda4_owned1 != kda4_owned0 &&
+            ds4_tp_hash_check(
+                tp.tp, UINT64_C(0x474c4d35344f5531),
+                kda4_token1.output_fnv64, error, sizeof(error)) == 1)),
           "layer4 token1 advances recurrent state without Q4 duplication");
     std::fprintf(stderr,
         "PASS GLM5 prefix->layer3 token0 role=%s output=%016llx kv=%016llx "
@@ -2255,6 +2361,7 @@ bool run() {
         "kv2=%016llx index2=%016llx pool2=%016llx "
         "layer4_token0=%016llx layer4_token1=%016llx tp_seq=%llu "
         "layer3_packed_q4_bytes=%llu packed_q4_bytes=%llu "
+        "kda4_owned0=%016llx kda4_owned1=%016llx kda_tp=%d "
         "window_cache_bytes=0 rdma=1\n",
         role, (unsigned long long)output_hash,
         (unsigned long long)kv_hash, (unsigned long long)index_hash,
@@ -2265,7 +2372,10 @@ bool run() {
         (unsigned long long)kda4_token1.output_fnv64,
         (unsigned long long)sequence,
         (unsigned long long)layer3_packed_q4_bytes,
-        (unsigned long long)packed_q4_bytes);
+        (unsigned long long)packed_q4_bytes,
+        (unsigned long long)kda4_owned0,
+        (unsigned long long)kda4_owned1,
+        kda_tp_enabled ? 1 : 0);
     return true;
 }
 

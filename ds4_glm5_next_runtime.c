@@ -1,4 +1,5 @@
 #include "ds4_glm5_next_runtime.h"
+#include "ds4_tp.h"
 
 #include <string.h>
 
@@ -23,24 +24,30 @@ int ds4_glm5_next_mla_dense_selection_visible(
 
 int ds4_glm5_next_build_tp_gate_mask(
         uint64_t mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS],
-        uint32_t *gate_count) {
+        uint32_t *gate_count,
+        uint32_t runtime_features) {
     if (!mask || !gate_count) return 0;
     memset(mask, 0,
            sizeof(uint64_t) * DS4_GLM5_NEXT_TP_GATE_MASK_WORDS);
     uint32_t count = 0;
-    for (uint32_t il = DS4_GLM5_NEXT_LEADING_DENSE;
-         il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
-        if (ds4_glm5_next_layer_is_mla(il)) {
+    const bool kda_tp =
+        (runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u;
+    for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        const bool routed = il >= DS4_GLM5_NEXT_LEADING_DENSE;
+        if ((kda_tp && !ds4_glm5_next_layer_is_mla(il)) ||
+            (routed && ds4_glm5_next_layer_is_mla(il))) {
             const uint32_t slot = il * 2u;
             mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
             count++;
         }
-        const uint32_t slot = il * 2u + 1u;
-        mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
-        count++;
+        if (routed) {
+            const uint32_t slot = il * 2u + 1u;
+            mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
+            count++;
+        }
     }
     *gate_count = count;
-    return count == 53u;
+    return count == (kda_tp ? 87u : 53u);
 }
 
 static int kda_complete(const ds4_glm5_kda_weight_offsets *w) {

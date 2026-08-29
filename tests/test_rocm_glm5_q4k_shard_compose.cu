@@ -833,7 +833,8 @@ bool run_roce_composition(const Glm5TestGGUF &gguf,
     identity.gate_slot_start = 3u * DS4_TP_GATES_PER_LAYER;
     identity.gate_slot_step = 1u;
     CHECK(ds4_glm5_next_build_tp_gate_mask(identity.gate_slot_mask,
-                                            &identity.gates_per_token),
+                                            &identity.gates_per_token,
+                                            identity.runtime_features),
           "GLM5.3 hybrid TP gate schedule");
 
     TpGuard transport;

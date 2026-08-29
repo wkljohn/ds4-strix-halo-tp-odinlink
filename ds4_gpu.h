@@ -1297,10 +1297,9 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
         uint32_t                rows,
         float                   eps);
 
-/* Fixed-shape GLM-5 KDA depthwise causal convolution. All tensors are F32:
- * input/output [n_tokens, 8192], weight [8192, 4], and mutable history
- * [8192, 3]. Exact input/output aliasing is supported for in-place execution;
- * unsupported sizes and every other overlapping range fail without launching. */
+/* GLM-5 KDA depthwise causal convolution for either the full 8192 channels or
+ * one canonical 4096-channel TP half. All tensors are F32. Exact input/output
+ * aliasing is supported; unsupported sizes and every other overlap fail. */
 int ds4_gpu_glm5_causal_conv4_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *history,
@@ -1309,9 +1308,9 @@ int ds4_gpu_glm5_causal_conv4_tensor(
         uint32_t              n_tokens,
         uint32_t              channels);
 
-/* Fixed-shape GLM-5 KDA sequential recurrence. q/k/v/gate and output are
- * F32 [n_tokens, 64, 128], beta is F32 [n_tokens, 64], and mutable state is
- * F32 [64, 128, 128]. Unsupported sizes and aliases fail without launching. */
+/* GLM-5 KDA sequential recurrence for 64 full heads or one 32-head TP half.
+ * q/k/v/gate and output are F32 [n_tokens,n_heads,128], beta is
+ * [n_tokens,n_heads], and mutable state is [n_heads,128,128]. */
 int ds4_gpu_glm5_kda_recurrent_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *state,

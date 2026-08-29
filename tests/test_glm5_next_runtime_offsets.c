@@ -1,4 +1,5 @@
 #include "ds4_glm5_next_runtime.h"
+#include "ds4_tp.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -79,7 +80,7 @@ static int test_contract(void) {
           "scaled policy rejects a zero top-k");
     uint64_t gate_mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS] = {0};
     uint32_t gate_count = 0;
-    CHECK(ds4_glm5_next_build_tp_gate_mask(gate_mask, &gate_count) &&
+    CHECK(ds4_glm5_next_build_tp_gate_mask(gate_mask, &gate_count, 0u) &&
           gate_count == 53u,
           "shared GLM5.3 53-gate TP schedule");
     CHECK((gate_mask[0] & (UINT64_C(1) << 6u)) != 0u &&
@@ -87,6 +88,26 @@ static int test_contract(void) {
           (gate_mask[0] & (UINT64_C(1) << 8u)) == 0u &&
           (gate_mask[1] & (UINT64_C(1) << (89u - 64u))) != 0u,
           "GLM5.3 TP mask covers MLA+FFN and final trunk FFN");
+    uint64_t kda_gate_mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS] = {0};
+    uint32_t kda_gate_count = 0;
+    CHECK(ds4_glm5_next_build_tp_gate_mask(
+              kda_gate_mask, &kda_gate_count,
+              DS4_TP_FEATURE_GLM5_KDA_TP) &&
+          kda_gate_count == 87u,
+          "shared GLM5.3 87-gate KDA-TP schedule");
+    for (uint32_t word = 0u; word < DS4_GLM5_NEXT_TP_GATE_MASK_WORDS; ++word)
+        CHECK((kda_gate_mask[word] & gate_mask[word]) == gate_mask[word],
+              "KDA-TP schedule is a strict superset of baseline schedule");
+    for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        const uint32_t slot = il * 2u;
+        const bool added =
+            (kda_gate_mask[slot / 64u] &
+             (UINT64_C(1) << (slot % 64u))) != 0u &&
+            (gate_mask[slot / 64u] &
+             (UINT64_C(1) << (slot % 64u))) == 0u;
+        CHECK(added == !ds4_glm5_next_layer_is_mla(il),
+              "KDA-TP adds exactly the KDA attention slots");
+    }
     ds4_glm5_next_model_offsets model;
     make_valid(&model);
     CHECK(ds4_glm5_next_model_offsets_validate(&model),

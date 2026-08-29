@@ -60241,9 +60241,14 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
                            (int)DS4_GLM5_NEXT_TP_GATE_MASK_WORDS,
                            "GLM5.3 TP mask width mismatch");
             uint32_t count = 0;
-            if (!ds4_glm5_next_build_tp_gate_mask(mask, &count))
+            const uint32_t runtime_features =
+                ds4_engine_tp_runtime_features(e);
+            if (!ds4_glm5_next_build_tp_gate_mask(
+                    mask, &count, runtime_features))
                 ds4_die("glm5-next TP gate schedule is invalid");
-            *start = DS4_N_LEADING_DENSE * DS4_TP_GATES_PER_LAYER;
+            *start =
+                (runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u ?
+                    0u : DS4_N_LEADING_DENSE * DS4_TP_GATES_PER_LAYER;
             *step = 1;
             *per_token = count;
         } else {

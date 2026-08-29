@@ -78,14 +78,15 @@ static int check_connect_timeout(const char *name, const char *value,
 }
 
 static void build_glm53_mask(uint64_t mask[DS4_TP_GATE_MASK_WORDS],
-                             uint32_t *count) {
-    if (!ds4_glm5_next_build_tp_gate_mask(mask, count)) *count = 0;
+                             uint32_t *count,
+                             uint32_t features) {
+    if (!ds4_glm5_next_build_tp_gate_mask(mask, count, features)) *count = 0;
 }
 
 static int check_glm53_gate_schedule(void) {
     uint64_t mask[DS4_TP_GATE_MASK_WORDS];
     uint32_t count = 0;
-    build_glm53_mask(mask, &count);
+    build_glm53_mask(mask, &count, 0u);
     char err[160] = "";
     if (count != 53u ||
         !ds4_tp_test_gate_schedule_validate(mask, count, 92u,
@@ -111,14 +112,41 @@ static int check_glm53_gate_schedule(void) {
         fprintf(stderr, "FAIL GLM53 gate wrap got=%u want=6\n", wrap);
         return 0;
     }
+    build_glm53_mask(mask, &count, DS4_TP_FEATURE_GLM5_KDA_TP);
+    err[0] = '\0';
+    if (count != 87u ||
+        !ds4_tp_test_gate_schedule_validate(mask, count, 92u,
+                                            err, sizeof(err))) {
+        fprintf(stderr, "FAIL GLM53 KDA-TP gate mask: count=%u error='%s'\n",
+                count, err);
+        return 0;
+    }
+    static const uint32_t kda_want[] = {0u, 2u, 4u, 6u, 7u, 8u, 9u};
+    for (uint32_t i = 0; i < sizeof(kda_want) / sizeof(kda_want[0]); ++i) {
+        const uint32_t got = ds4_tp_test_gate_slot(
+            mask, 0u, 1u, count, 92u, (uint64_t)i + 1u);
+        if (got != kda_want[i]) {
+            fprintf(stderr,
+                    "FAIL GLM53 KDA-TP order seq=%u got=%u want=%u\n",
+                    i + 1u, got, kda_want[i]);
+            return 0;
+        }
+    }
+    const uint32_t kda_wrap = ds4_tp_test_gate_slot(
+        mask, 0u, 1u, count, 92u, (uint64_t)count + 1u);
+    if (kda_wrap != 0u) {
+        fprintf(stderr, "FAIL GLM53 KDA-TP wrap got=%u want=0\n", kda_wrap);
+        return 0;
+    }
     fprintf(stderr, "PASS GLM53 53-gate hybrid schedule\n");
+    fprintf(stderr, "PASS GLM53 87-gate KDA-TP schedule\n");
     return 1;
 }
 
 static int check_invalid_gate_schedules(void) {
     uint64_t mask[DS4_TP_GATE_MASK_WORDS];
     uint32_t count = 0;
-    build_glm53_mask(mask, &count);
+    build_glm53_mask(mask, &count, 0u);
     char err[160] = "";
     int ok = !ds4_tp_test_gate_schedule_validate(mask, count - 1u, 92u,
                                                   err, sizeof(err));
@@ -200,6 +228,12 @@ int main(void) {
     ok &= check("hello mismatched-glm5-small-gate",
                 DS4_TP_FEATURE_GLM5_SMALL_GATE, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00200000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-kda-tp",
+                DS4_TP_FEATURE_GLM5_KDA_TP,
+                DS4_TP_FEATURE_GLM5_KDA_TP, 1, NULL);
+    ok &= check("hello mismatched-glm5-kda-tp",
+                DS4_TP_FEATURE_GLM5_KDA_TP, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00400000 peer=0x00000000)");
     ok &= check("hello q4k-wmma-kshard mismatch",
                 DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD,
                 DS4_TP_FEATURE_Q4K_WMMA, 0,
@@ -245,12 +279,13 @@ int main(void) {
         DS4_TP_FEATURE_HC_STAGE_EXACT_COOP |
         DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE |
         DS4_TP_FEATURE_Q4K_KSHARD |
-        DS4_TP_FEATURE_GLM5_RESIDENT_KDA;
-    if ((DS4_TP_FEATURE_GLM5_SMALL_GATE & prior_features) != 0u) {
-        fprintf(stderr, "FAIL GLM5 small-gate feature overlaps prior bits\n");
+        DS4_TP_FEATURE_GLM5_RESIDENT_KDA |
+        DS4_TP_FEATURE_GLM5_SMALL_GATE;
+    if ((DS4_TP_FEATURE_GLM5_KDA_TP & prior_features) != 0u) {
+        fprintf(stderr, "FAIL GLM5 KDA-TP feature overlaps prior bits\n");
         ok = 0;
     } else {
-        fprintf(stderr, "PASS GLM5 small-gate feature is disjoint\n");
+        fprintf(stderr, "PASS GLM5 KDA-TP feature is disjoint\n");
     }
     if (ds4_tp_glm5_resident_kda_feature(1, 1, 1, 1) !=
             DS4_TP_FEATURE_GLM5_RESIDENT_KDA ||
@@ -262,6 +297,20 @@ int main(void) {
         ok = 0;
     } else {
         fprintf(stderr, "PASS GLM5 resident KDA advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_kda_tp_feature("1", 1, 1, 0, 1) !=
+            DS4_TP_FEATURE_GLM5_KDA_TP ||
+        ds4_tp_glm5_kda_tp_feature(NULL, 1, 1, 0, 1) != 0u ||
+        ds4_tp_glm5_kda_tp_feature("0", 1, 1, 0, 1) != 0u ||
+        ds4_tp_glm5_kda_tp_feature("true", 1, 1, 0, 1) != 0u ||
+        ds4_tp_glm5_kda_tp_feature("1", 0, 1, 0, 1) != 0u ||
+        ds4_tp_glm5_kda_tp_feature("1", 1, 0, 0, 1) != 0u ||
+        ds4_tp_glm5_kda_tp_feature("1", 1, 1, 1, 1) != 0u ||
+        ds4_tp_glm5_kda_tp_feature("1", 1, 1, 0, 0) != 0u) {
+        fprintf(stderr, "FAIL GLM5 KDA-TP advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS GLM5 KDA-TP advertisement predicate\n");
     }
     const char *invalid_kshard_env[] = {
         NULL, "", "0", "true", "10", "1 ", "1\n"

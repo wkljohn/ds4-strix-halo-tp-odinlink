@@ -50,8 +50,8 @@ __global__ static void ds4_glm5_kda_wave32_kernel(
         const float *v,
         const float *gate,
         const float *beta,
-        uint32_t n_tokens) {
-    constexpr uint32_t heads = 64u;
+        uint32_t n_tokens,
+        uint32_t heads) {
     constexpr uint32_t channels = 128u;
     const uint32_t head = blockIdx.y;
     const uint32_t lane = threadIdx.x;
@@ -116,8 +116,8 @@ __device__ static inline float ds4_glm5_sigmoid(float value) {
 __global__ static void ds4_glm5_kda_qk_norm_kernel(
         float *q,
         float *k,
-        uint32_t n_tokens) {
-    constexpr uint32_t heads = 64u;
+        uint32_t n_tokens,
+        uint32_t heads) {
     constexpr uint32_t channels = 128u;
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x;
@@ -146,12 +146,13 @@ __global__ static void ds4_glm5_kda_forget_kernel(
         float *forget,
         const float *dt_bias,
         const float *a_log,
-        uint64_t values) {
+        uint64_t values,
+        uint32_t heads) {
     constexpr uint32_t channels = 128u;
     const uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= values) return;
     const uint32_t channel = (uint32_t)(index % channels);
-    const uint32_t head = (uint32_t)((index / channels) % 64u);
+    const uint32_t head = (uint32_t)((index / channels) % heads);
     const float scaled = expf(a_log[head]) *
                          (forget[index] + dt_bias[(uint64_t)head * channels +
                                                   channel]);
@@ -170,8 +171,8 @@ __global__ static void ds4_glm5_kda_gated_norm_kernel(
         const float *gate,
         const float *weight,
         uint32_t n_tokens,
+        uint32_t heads,
         float norm_eps) {
-    constexpr uint32_t heads = 64u;
     constexpr uint32_t channels = 128u;
     const uint32_t row = blockIdx.x;
     const uint32_t lane = threadIdx.x;
@@ -188,4 +189,22 @@ __global__ static void ds4_glm5_kda_gated_norm_kernel(
     const float scale = rsqrtf(squares[0] / (float)channels + norm_eps);
     output[index] = value * scale * weight[lane] *
                     ds4_glm5_sigmoid(gate[index]);
+}
+
+/* Compose the two canonical 32-head rank halves into token-major 64-head
+ * order without changing any floating-point value. */
+__global__ static void ds4_glm5_kda_compose_head_halves_kernel(
+        float *full,
+        const float *rank0,
+        const float *rank1,
+        uint64_t values) {
+    constexpr uint32_t half = 4096u;
+    constexpr uint32_t full_width = 8192u;
+    const uint64_t index = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= values) return;
+    const uint32_t column = (uint32_t)(index % full_width);
+    const uint64_t token = index / full_width;
+    full[index] = column < half
+        ? rank0[token * half + column]
+        : rank1[token * half + column - half];
 }

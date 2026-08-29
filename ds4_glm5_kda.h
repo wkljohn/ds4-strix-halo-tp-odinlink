@@ -32,6 +32,7 @@ typedef struct {
     ds4_gpu_tensor *v_history;
     ds4_gpu_tensor *recurrent;
     uint64_t token_count;
+    uint32_t pending_tokens;
     bool valid;
     struct ds4_glm5_kda_slot *owner_slot;
 } ds4_glm5_kda_layer_state;
@@ -64,8 +65,11 @@ typedef struct {
     ds4_glm5_kda_layer_state *state;
     ds4_glm5_kda_workspace *workspace;
     const ds4_gpu_tensor *input;
+    ds4_gpu_tensor *gated_output;
     ds4_gpu_tensor *output;
     uint32_t n_tokens;
+    uint32_t head_start;
+    uint32_t n_heads;
     float norm_eps;
 } ds4_glm5_kda_device_args;
 
@@ -109,6 +113,35 @@ int ds4_glm5_kda_layer_forward(ds4_glm5_kda_layer_state *state,
                                ds4_gpu_tensor *output,
                                uint32_t n_tokens,
                                float norm_eps);
+/* Split execution boundary used by exact TP head sharding. begin() mutates
+ * only the supplied head-local recurrent state and writes packed
+ * [n_tokens, n_heads*128] gated-normalized rows. finish() applies the
+ * unchanged full 8192->4096 output projection and commits token_count.
+ * Exactly one matching finish() is required after each successful begin();
+ * a caller that cannot reach finish() must abort() the state. */
+int ds4_glm5_kda_layer_begin(ds4_glm5_kda_layer_state *state,
+                             ds4_glm5_kda_workspace *workspace,
+                             const ds4_glm5_kda_weight_offsets *weights,
+                             const void *model_map,
+                             uint64_t model_size,
+                             const ds4_gpu_tensor *input,
+                             ds4_gpu_tensor *gated_output,
+                             uint32_t n_tokens,
+                             float norm_eps,
+                             uint32_t head_start,
+                             uint32_t n_heads);
+int ds4_glm5_kda_layer_finish(ds4_glm5_kda_layer_state *state,
+                              const ds4_glm5_kda_weight_offsets *weights,
+                              const void *model_map,
+                              uint64_t model_size,
+                              const ds4_gpu_tensor *full_gated,
+                              ds4_gpu_tensor *output,
+                              uint32_t n_tokens);
+void ds4_glm5_kda_layer_abort(ds4_glm5_kda_layer_state *state);
+int ds4_glm5_kda_compose_head_halves(ds4_gpu_tensor *full,
+                                     const ds4_gpu_tensor *rank0,
+                                     const ds4_gpu_tensor *rank1,
+                                     uint32_t n_tokens);
 int ds4_glm5_kda_layer_digest(const ds4_glm5_kda_layer_state *state,
                               const ds4_gpu_tensor *output,
                               uint64_t output_floats,
@@ -118,8 +151,16 @@ int ds4_glm5_kda_digest_equal(const ds4_glm5_kda_digest *rank0,
 
 /* Internal backend adapter. Non-ROCm builds resolve the weak fail-closed
  * implementation in ds4_glm5_kda.c. */
-int ds4_rocm_glm5_kda_layer_execute(
+int ds4_rocm_glm5_kda_layer_begin(
         const ds4_glm5_kda_device_args *args);
+int ds4_rocm_glm5_kda_layer_finish(
+        const ds4_glm5_kda_device_args *args,
+        const ds4_gpu_tensor *full_gated);
+int ds4_rocm_glm5_kda_compose_head_halves(
+        ds4_gpu_tensor *full,
+        const ds4_gpu_tensor *rank0,
+        const ds4_gpu_tensor *rank1,
+        uint32_t n_tokens);
 
 #if defined(DS4_GLM5_KDA_TEST_HOOKS)
 enum {

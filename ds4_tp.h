@@ -97,7 +97,22 @@ enum {
      * The choice changes the RDMA gate schedule, so independently launched
      * ranks must negotiate it before either rank enters the graph. */
     DS4_TP_FEATURE_GLM5_SMALL_GATE = UINT32_C(1) << 21,
+    /* GLM-5.3 KDA assigns one canonical 32-head half to each TP rank and
+     * inserts an attention gate before the unchanged output projection.
+     * The bit changes both state ownership and the 53->87 gate schedule. */
+    DS4_TP_FEATURE_GLM5_KDA_TP = UINT32_C(1) << 22,
 };
+
+static inline uint32_t ds4_tp_glm5_kda_tp_feature(
+        const char *env,
+        int glm5_next,
+        int rocm_ready,
+        int mtp_or_dspark,
+        int all_kda_layouts_valid) {
+    return env && env[0] == '1' && env[1] == '\0' && glm5_next &&
+           rocm_ready && !mtp_or_dspark && all_kda_layouts_valid
+        ? DS4_TP_FEATURE_GLM5_KDA_TP : 0u;
+}
 
 static inline uint32_t ds4_tp_glm5_resident_kda_feature(
         int glm5_next,

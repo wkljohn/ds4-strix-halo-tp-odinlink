@@ -264,6 +264,8 @@ static bool read_state(const ds4_glm5_kda_layer_state &state,
                                recurrent * sizeof(float));
 }
 
+static uint64_t fnv64(const std::vector<float> &values);
+
 static bool handoff_case(uint32_t prefill,
                          const ds4_glm5_kda_weight_offsets &weights,
                          const MappedGGUF &gguf) {
@@ -366,6 +368,281 @@ static bool handoff_case(uint32_t prefill,
     ds4_gpu_tensor_free(token_output);
     ds4_gpu_tensor_free(chunk_last);
     ds4_gpu_tensor_free(chunk_output);
+    ds4_gpu_tensor_free(input);
+    return true;
+}
+
+static bool head_slice_case(const ds4_glm5_kda_weight_offsets &weights,
+                            const MappedGGUF &gguf) {
+    constexpr uint32_t prefill = 33u;
+    constexpr uint32_t total = prefill + 1u;
+    constexpr uint32_t local_heads = DS4_GLM5_KDA_HEADS / 2u;
+    constexpr uint32_t local_channels =
+        local_heads * DS4_GLM5_KDA_HEAD_DIM;
+    const uint64_t history_half_bytes =
+        (uint64_t)local_channels * DS4_GLM5_KDA_HISTORY * sizeof(float);
+    const uint64_t recurrent_half_bytes =
+        (uint64_t)local_heads * DS4_GLM5_KDA_HEAD_DIM *
+        DS4_GLM5_KDA_HEAD_DIM * sizeof(float);
+
+    std::vector<float> host_input((size_t)total * 4096u);
+    for (uint64_t i = 0; i < host_input.size(); ++i) {
+        const int32_t centered = (int32_t)((i * 43u + 71u) % 521u) - 260;
+        host_input[(size_t)i] = (float)centered * (1.0f / 1536.0f) +
+            0.015625f * std::sin((double)(i % 4093u) * 0.019);
+    }
+    ds4_gpu_tensor *input = ds4_gpu_tensor_alloc(
+        (uint64_t)host_input.size() * sizeof(float));
+    ds4_gpu_tensor *full_gated = ds4_gpu_tensor_alloc(
+        (uint64_t)prefill * DS4_GLM5_KDA_CHANNELS * sizeof(float));
+    ds4_gpu_tensor *half_gated[2] = {
+        ds4_gpu_tensor_alloc((uint64_t)prefill * local_channels *
+                             sizeof(float)),
+        ds4_gpu_tensor_alloc((uint64_t)prefill * local_channels *
+                             sizeof(float)),
+    };
+    ds4_gpu_tensor *composed = ds4_gpu_tensor_alloc(
+        (uint64_t)prefill * DS4_GLM5_KDA_CHANNELS * sizeof(float));
+    ds4_gpu_tensor *full_output = ds4_gpu_tensor_alloc(
+        (uint64_t)prefill * 4096u * sizeof(float));
+    ds4_gpu_tensor *half_output[2] = {
+        ds4_gpu_tensor_alloc((uint64_t)prefill * 4096u * sizeof(float)),
+        ds4_gpu_tensor_alloc((uint64_t)prefill * 4096u * sizeof(float)),
+    };
+    CHECK(input && full_gated && half_gated[0] && half_gated[1] && composed &&
+          full_output && half_output[0] && half_output[1] &&
+          ds4_gpu_tensor_write(input, 0u, host_input.data(),
+                               (uint64_t)host_input.size() * sizeof(float)),
+          "allocate head-slice inputs and outputs");
+
+    ds4_glm5_layer_kind schedule = {.layer = 0u, .is_kda = true};
+    ds4_glm5_kda_slot full = {}, split = {};
+    ds4_glm5_kda_workspace full_workspace = {}, split_workspace = {};
+    CHECK(ds4_glm5_kda_slot_init(&full, &schedule, 1u, 1u, nullptr) &&
+          ds4_glm5_kda_slot_init(&split, &schedule, 1u, 1u, nullptr) &&
+          ds4_glm5_kda_workspace_init(&full_workspace, prefill) &&
+          ds4_glm5_kda_workspace_init(&split_workspace, prefill),
+          "allocate full and head-sliced KDA states");
+
+    ds4_glm5_kda_layer_state half_state[2] = {};
+    for (uint32_t rank = 0u; rank < 2u; ++rank) {
+        const uint64_t history_offset = (uint64_t)rank * history_half_bytes;
+        const uint64_t recurrent_offset =
+            (uint64_t)rank * recurrent_half_bytes;
+        half_state[rank].q_history = ds4_gpu_tensor_view(
+            split.layer[0].q_history, history_offset, history_half_bytes);
+        half_state[rank].k_history = ds4_gpu_tensor_view(
+            split.layer[0].k_history, history_offset, history_half_bytes);
+        half_state[rank].v_history = ds4_gpu_tensor_view(
+            split.layer[0].v_history, history_offset, history_half_bytes);
+        half_state[rank].recurrent = ds4_gpu_tensor_view(
+            split.layer[0].recurrent, recurrent_offset,
+            recurrent_half_bytes);
+        half_state[rank].valid = true;
+        half_state[rank].owner_slot = &split;
+        CHECK(half_state[rank].q_history && half_state[rank].k_history &&
+              half_state[rank].v_history && half_state[rank].recurrent,
+              "create canonical KDA half-state views");
+    }
+
+    const auto reset_split_state = [&]() {
+        CHECK(ds4_glm5_kda_slot_reset(&split),
+              "reset split KDA state after fail-closed probe");
+        for (uint32_t rank = 0u; rank < 2u; ++rank) {
+            half_state[rank].token_count = 0u;
+            half_state[rank].pending_tokens = 0u;
+            half_state[rank].valid = true;
+        }
+        return true;
+    };
+
+    /* A 32-head call must receive a canonical half-state view.  Silently
+     * accepting the full allocation with head_start=32 would overwrite the
+     * rank-0 recurrent half. */
+    CHECK(!ds4_glm5_kda_layer_begin(
+              &full.layer[0], &full_workspace, &weights,
+              gguf.map, gguf.size, input, half_gated[1], 1u,
+              gguf.rms_norm_eps, local_heads, local_heads) &&
+              !full.valid && !full.layer[0].valid &&
+              full.layer[0].token_count == 0u,
+          "32-head API rejects and invalidates a full-state allocation");
+    CHECK(ds4_glm5_kda_slot_reset(&full),
+          "reset full state after shape-misuse rejection");
+
+    ds4_glm5_kda_test_fail_after(DS4_GLM5_KDA_FAIL_Q_PROJECTION);
+    CHECK(!ds4_glm5_kda_layer_begin(
+              &half_state[0], &split_workspace, &weights,
+              gguf.map, gguf.size, input, half_gated[0], 1u,
+              gguf.rms_norm_eps, 0u, local_heads) &&
+              !split.valid && !split.layer[0].valid &&
+              split.layer[0].token_count == 0u &&
+              half_state[0].token_count == 0u,
+          "injected 32-head begin failure invalidates its owning slot");
+    ds4_glm5_kda_test_fail_after(DS4_GLM5_KDA_FAIL_NONE);
+    CHECK(reset_split_state(), "restore split state after begin failure");
+
+    CHECK(ds4_glm5_kda_layer_begin(
+              &half_state[0], &split_workspace, &weights,
+              gguf.map, gguf.size, input, half_gated[0], 1u,
+              gguf.rms_norm_eps, 0u, local_heads) &&
+              half_state[0].pending_tokens == 1u &&
+              !ds4_glm5_kda_layer_begin(
+                  &half_state[0], &split_workspace, &weights,
+                  gguf.map, gguf.size, input, half_gated[0], 1u,
+                  gguf.rms_norm_eps, 0u, local_heads) &&
+              split.valid && half_state[0].valid &&
+              half_state[0].pending_tokens == 1u,
+          "execute 32-head begin before finish failure");
+    ds4_glm5_kda_test_fail_after(DS4_GLM5_KDA_FAIL_OUTPUT_PROJECTION);
+    CHECK(!ds4_glm5_kda_layer_finish(
+              &half_state[0], &weights, gguf.map, gguf.size,
+              full_gated, half_output[0], 1u) &&
+              !split.valid && !split.layer[0].valid &&
+              split.layer[0].token_count == 0u &&
+              half_state[0].token_count == 0u &&
+              half_state[0].pending_tokens == 0u,
+          "injected 32-head finish failure invalidates without commit");
+    ds4_glm5_kda_test_fail_after(DS4_GLM5_KDA_FAIL_NONE);
+    CHECK(reset_split_state(), "restore split state after finish failure");
+    CHECK(!ds4_glm5_kda_compose_head_halves(
+              half_gated[0], half_gated[0], half_gated[1], 1u),
+          "compose refuses overlapping destination and rank half");
+
+    const auto execute = [&](uint32_t input_token, uint32_t tokens) {
+        const uint64_t input_offset =
+            (uint64_t)input_token * 4096u * sizeof(float);
+        const uint64_t input_bytes =
+            (uint64_t)tokens * 4096u * sizeof(float);
+        const uint64_t gated_bytes =
+            (uint64_t)tokens * DS4_GLM5_KDA_CHANNELS * sizeof(float);
+        const uint64_t half_bytes = gated_bytes / 2u;
+        ds4_gpu_tensor *input_view = ds4_gpu_tensor_view(
+            input, input_offset, input_bytes);
+        ds4_gpu_tensor *full_gated_view = ds4_gpu_tensor_view(
+            full_gated, 0u, gated_bytes);
+        ds4_gpu_tensor *composed_view = ds4_gpu_tensor_view(
+            composed, 0u, gated_bytes);
+        ds4_gpu_tensor *full_output_view = ds4_gpu_tensor_view(
+            full_output, 0u, input_bytes);
+        ds4_gpu_tensor *half_gated_view[2] = {
+            ds4_gpu_tensor_view(half_gated[0], 0u, half_bytes),
+            ds4_gpu_tensor_view(half_gated[1], 0u, half_bytes),
+        };
+        ds4_gpu_tensor *half_output_view[2] = {
+            ds4_gpu_tensor_view(half_output[0], 0u, input_bytes),
+            ds4_gpu_tensor_view(half_output[1], 0u, input_bytes),
+        };
+        CHECK(input_view && full_gated_view && composed_view &&
+              full_output_view && half_gated_view[0] && half_gated_view[1] &&
+              half_output_view[0] && half_output_view[1],
+              "create bounded head-slice call views");
+
+        CHECK(ds4_glm5_kda_layer_begin(
+                  &full.layer[0], &full_workspace, &weights,
+                  gguf.map, gguf.size, input_view, full_gated_view, tokens,
+                  gguf.rms_norm_eps, 0u, DS4_GLM5_KDA_HEADS) &&
+              ds4_glm5_kda_layer_finish(
+                  &full.layer[0], &weights, gguf.map, gguf.size,
+                  full_gated_view, full_output_view, tokens),
+              "execute full 64-head KDA control");
+        for (uint32_t rank = 0u; rank < 2u; ++rank) {
+            CHECK(ds4_glm5_kda_layer_begin(
+                      &half_state[rank], &split_workspace, &weights,
+                      gguf.map, gguf.size, input_view,
+                      half_gated_view[rank], tokens, gguf.rms_norm_eps,
+                      rank * local_heads, local_heads),
+                  "execute one 32-head KDA local stage");
+        }
+        CHECK(ds4_glm5_kda_compose_head_halves(
+                  composed_view, half_gated_view[0], half_gated_view[1],
+                  tokens),
+              "compose canonical KDA head halves");
+        for (uint32_t rank = 0u; rank < 2u; ++rank) {
+            CHECK(ds4_glm5_kda_layer_finish(
+                      &half_state[rank], &weights, gguf.map, gguf.size,
+                      composed_view, half_output_view[rank], tokens),
+                  "finish one composed KDA rank");
+        }
+        CHECK(ds4_gpu_synchronize(), "synchronize head-slice call");
+
+        std::vector<float> full_gated_host((size_t)tokens *
+                                           DS4_GLM5_KDA_CHANNELS);
+        std::vector<float> composed_host(full_gated_host.size());
+        std::vector<float> full_output_host((size_t)tokens * 4096u);
+        std::vector<float> half_output_host[2] = {
+            std::vector<float>(full_output_host.size()),
+            std::vector<float>(full_output_host.size()),
+        };
+        CHECK(ds4_gpu_tensor_read(full_gated_view, 0u,
+                                  full_gated_host.data(), gated_bytes) &&
+              ds4_gpu_tensor_read(composed_view, 0u,
+                                  composed_host.data(), gated_bytes) &&
+              ds4_gpu_tensor_read(full_output_view, 0u,
+                                  full_output_host.data(), input_bytes) &&
+              ds4_gpu_tensor_read(half_output_view[0], 0u,
+                                  half_output_host[0].data(), input_bytes) &&
+              ds4_gpu_tensor_read(half_output_view[1], 0u,
+                                  half_output_host[1].data(), input_bytes),
+              "read head-slice call outputs");
+        CHECK(std::memcmp(full_gated_host.data(), composed_host.data(),
+                          (size_t)gated_bytes) == 0 &&
+              std::memcmp(full_output_host.data(), half_output_host[0].data(),
+                          (size_t)input_bytes) == 0 &&
+              std::memcmp(full_output_host.data(), half_output_host[1].data(),
+                          (size_t)input_bytes) == 0,
+              "two 32-head calls bit-match full KDA output chain");
+        std::fprintf(stderr,
+                     "PASS GLM5 KDA head-slice call tokens=%u input_token=%u "
+                     "gated_fnv=%016llx output_fnv=%016llx\n",
+                     tokens, input_token,
+                     (unsigned long long)fnv64(full_gated_host),
+                     (unsigned long long)fnv64(full_output_host));
+
+        for (uint32_t rank = 0u; rank < 2u; ++rank) {
+            ds4_gpu_tensor_free(half_output_view[rank]);
+            ds4_gpu_tensor_free(half_gated_view[rank]);
+        }
+        ds4_gpu_tensor_free(full_output_view);
+        ds4_gpu_tensor_free(composed_view);
+        ds4_gpu_tensor_free(full_gated_view);
+        ds4_gpu_tensor_free(input_view);
+        return true;
+    };
+
+    CHECK(execute(0u, prefill) && execute(prefill, 1u),
+          "prefill plus continuation head-slice calls");
+    std::vector<float> full_state, split_state;
+    CHECK(read_state(full.layer[0], full_state) &&
+          read_state(split.layer[0], split_state),
+          "read full and head-sliced continuation state");
+    CHECK(std::memcmp(full_state.data(), split_state.data(),
+                      full_state.size() * sizeof(float)) == 0,
+          "two KDA state halves bit-match full continuation state");
+    CHECK(full.layer[0].token_count == total &&
+          half_state[0].token_count == total &&
+          half_state[1].token_count == total,
+          "full and half KDA token counts agree");
+    std::fprintf(stderr,
+                 "PASS GLM5 KDA 64-vs-2x32 continuation state fnv=%016llx\n",
+                 (unsigned long long)fnv64(full_state));
+
+    for (uint32_t rank = 0u; rank < 2u; ++rank) {
+        ds4_gpu_tensor_free(half_state[rank].recurrent);
+        ds4_gpu_tensor_free(half_state[rank].v_history);
+        ds4_gpu_tensor_free(half_state[rank].k_history);
+        ds4_gpu_tensor_free(half_state[rank].q_history);
+    }
+    ds4_glm5_kda_workspace_free(&split_workspace);
+    ds4_glm5_kda_workspace_free(&full_workspace);
+    ds4_glm5_kda_slot_free(&split);
+    ds4_glm5_kda_slot_free(&full);
+    ds4_gpu_tensor_free(half_output[1]);
+    ds4_gpu_tensor_free(half_output[0]);
+    ds4_gpu_tensor_free(full_output);
+    ds4_gpu_tensor_free(composed);
+    ds4_gpu_tensor_free(half_gated[1]);
+    ds4_gpu_tensor_free(half_gated[0]);
+    ds4_gpu_tensor_free(full_gated);
     ds4_gpu_tensor_free(input);
     return true;
 }
@@ -504,6 +781,8 @@ static bool run_test(void) {
           "register GLM5 GGUF map");
     CHECK(full_model_residency(gguf),
           "full same-GGUF KDA residency allocation");
+    CHECK(head_slice_case(weights, gguf),
+          "full-vs-head-sliced KDA continuation gate");
 
     ds4_glm5_layer_kind schedule = {.layer = 0u, .is_kda = true};
     ds4_glm5_kda_slot slot = {};

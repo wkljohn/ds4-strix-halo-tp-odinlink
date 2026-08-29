@@ -90,6 +90,7 @@ BF16_TOKTILE_VERBOSE=${DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE:-}
 Q4K_WMMA_MIN_COUNT=${DS4_ROCM_Q4K_WMMA_MIN_COUNT:-}
 BIGGATE_PROFILE=${DS4_TP_BIGGATE_PROFILE:-}
 SMALL_GATE_DISABLE=${DS4_GLM5_DISABLE_SMALL_GATE:-}
+KDA_TP=${DS4_GLM5_KDA_TP:-}
 EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
@@ -265,6 +266,10 @@ done
   echo "error: DS4_GLM5_DISABLE_SMALL_GATE must be empty or 1" >&2
   exit 2
 }
+[[ -z $KDA_TP || $KDA_TP == 1 ]] || {
+  echo "error: DS4_GLM5_KDA_TP must be empty or 1" >&2
+  exit 2
+}
 [[ -z $EXPECTED_GENERATED_FNV ||
    $EXPECTED_GENERATED_FNV =~ ^[0-9a-f]{16}$ ]] || {
   echo "error: DS4_GLM5_EXPECT_GENERATED_FNV must be a 16-digit lowercase FNV64" >&2
@@ -370,7 +375,11 @@ SOURCE_FILES=(
   scripts/run-glm5-prefix-layer3-roce.sh
   tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp
   tests/test_rocm_bf16_batch_gemm.cu
+  tests/test_glm5_next_runtime_offsets.c
+  tests/test_rocm_glm5_kda_bf16_rowslice.cu
+  tests/test_rocm_glm5_kda_layer.cu
   tests/test_rocm_glm5_prefix_layer3_tp.cu
+  tests/test_tp_glm5_phase_transition.cu tests/test_tp_hello.c
 )
 (cd "$REPO" && sha256sum "${SOURCE_FILES[@]}") >"$OUT/source-files.sha256"
 (cd "$REPO" && git status --short) >"$OUT/source.status"
@@ -524,6 +533,8 @@ printf 'biggate_profile=%s\n' "$([[ -n $BIGGATE_PROFILE ]] && printf 1 || printf
 printf 'small_gate_disabled=%s\n' \
   "$([[ -n $SMALL_GATE_DISABLE ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
+printf 'kda_tp=%s\n' "$([[ -n $KDA_TP ]] && printf 1 || printf 0)" \
+  >>"$OUT/run.env"
 printf 'expected_generated_fnv=%s\n' "$EXPECTED_GENERATED_FNV" >>"$OUT/run.env"
 if [[ -n $TEXT_PROMPT ]]; then
   printf 'text_prompt=%s\n' "$TEXT_PROMPT" >>"$OUT/run.env"
@@ -590,6 +601,10 @@ fi
 if [[ -n $SMALL_GATE_DISABLE ]]; then
   local_candidate_env+=(DS4_GLM5_DISABLE_SMALL_GATE=1)
   remote_candidate_env+=' DS4_GLM5_DISABLE_SMALL_GATE=1'
+fi
+if [[ -n $KDA_TP ]]; then
+  local_candidate_env+=(DS4_GLM5_KDA_TP=1)
+  remote_candidate_env+=' DS4_GLM5_KDA_TP=1'
 fi
 if [[ -n $TEXT_PROMPT ]]; then
   text_env+=(DS4_GLM5_TEXT_PROMPT="$TEXT_PROMPT")
@@ -736,8 +751,13 @@ elif [[ -n $TEXT_PROMPT ]]; then
     exit 1
   }
 else
-  LEADER_OUTPUT=$(sed -n 's/.* token0 role=.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
-  WORKER_OUTPUT=$(sed -n 's/.* token0 role=.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  if [[ $FULL_TRUNK == 1 ]]; then
+    LEADER_OUTPUT=$(sed -n 's/.* trunk_output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+    WORKER_OUTPUT=$(sed -n 's/.* trunk_output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  else
+    LEADER_OUTPUT=$(sed -n 's/.* token0 role=.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+    WORKER_OUTPUT=$(sed -n 's/.* token0 role=.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  fi
   [[ -n $LEADER_OUTPUT && $LEADER_OUTPUT == "$WORKER_OUTPUT" ]] || {
     echo "error: all-rank layer3 output hashes differ" >&2
     exit 1
