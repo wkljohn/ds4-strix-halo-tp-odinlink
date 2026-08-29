@@ -51411,6 +51411,73 @@ static int ds4_session_glm5_next_forward_token(ds4_session *s, int token,
     s->checkpoint_valid = true;
     return 0;
 }
+
+/* Prompt-only layer-major path.  The original staged integration drove the
+ * GLM5 executor one token at a time, which reloaded every routed Q4_K expert
+ * slice for every token.  Keep decode on the proven scalar path, but process
+ * a prompt tile through all layers before releasing the layer-local packed
+ * slices.  The temporary tensors/workspace are tile-scoped and never become
+ * a persistent weight cache. */
+static int ds4_session_glm5_next_forward_rows(ds4_session *s,
+                                              const int *tokens,
+                                              uint32_t n_tokens,
+                                              uint32_t pos0,
+                                              char *err, size_t errlen) {
+    if (!s || !s->glm5_next_ready || !tokens || n_tokens == 0u ||
+        pos0 != (uint32_t)s->checkpoint.len ||
+        pos0 > (uint32_t)s->ctx_size || n_tokens > (uint32_t)s->ctx_size - pos0) {
+        if (errlen) snprintf(err, errlen, "GLM5 prompt tile is not ready");
+        return 1;
+    }
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    ds4_glm5_next_workspace *w =
+        ds4_glm5_next_workspace_create_capacity(n_tokens);
+    ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc((uint64_t)n_tokens * sizeof(uint32_t));
+    ds4_gpu_tensor *cur = ds4_gpu_tensor_alloc((uint64_t)n_tokens * row_bytes * 4u);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * row_bytes * 4u);
+    if (!w || !ids || !cur || !out) {
+        if (errlen) snprintf(err, errlen, "GLM5 prompt tile allocation failed");
+        ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(cur); ds4_gpu_tensor_free(ids);
+        ds4_glm5_next_workspace_destroy(w);
+        return 1;
+    }
+    uint32_t *id_host = calloc(n_tokens, sizeof(*id_host));
+    int ok = id_host != NULL;
+    for (uint32_t i = 0u; ok && i < n_tokens; ++i) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) ok = 0;
+        else id_host[i] = (uint32_t)tokens[i];
+    }
+    if (ok) ok = ds4_gpu_tensor_write(ids, 0u, id_host,
+                                      (uint64_t)n_tokens * sizeof(*id_host));
+    if (ok) ok = ds4_glm5_next_embed_tokens(&s->glm5_next_exec, ids,
+                                             n_tokens, cur);
+    for (uint32_t il = 0u; ok && il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        ok = ds4_glm5_next_layer_forward_batch(
+            &s->glm5_next_exec, il, &s->glm5_next_state, w,
+            cur, out, n_tokens);
+        ds4_gpu_tensor *tmp = cur; cur = out; out = tmp;
+    }
+    if (ok) {
+        ds4_gpu_tensor *last = ds4_gpu_tensor_view(
+            cur, (uint64_t)(n_tokens - 1u) * row_bytes * 4u, row_bytes * 4u);
+        ok = last && ds4_glm5_next_output_logits(
+            &s->glm5_next_exec, w, last, s->glm5_next_logits) &&
+             ds4_gpu_synchronize() &&
+             ds4_gpu_tensor_read(s->glm5_next_logits, 0u, s->logits,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float));
+        ds4_gpu_tensor_free(last);
+    }
+    if (ok) {
+        for (uint32_t i = 0u; i < n_tokens; ++i) token_vec_push(&s->checkpoint, tokens[i]);
+        s->checkpoint_valid = true;
+    } else if (errlen) {
+        snprintf(err, errlen, "GLM5 prompt tile failed at position %u", pos0);
+    }
+    free(id_host);
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(cur); ds4_gpu_tensor_free(ids);
+    ds4_glm5_next_workspace_destroy(w);
+    return ok ? 0 : 1;
+}
 #endif
 
 #ifndef DS4_NO_GPU
@@ -62715,14 +62782,27 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
         }
-        for (int i = start; i < prompt->len; ++i) {
+        const char *batch_env = getenv("DS4_GLM5_NEXT_PREFILL_BATCH");
+        /* Batch prefill remains an explicit experiment until the packed
+         * loader's residency behavior is bounded on a full prompt. */
+        uint32_t batch = batch_env && batch_env[0] ? (uint32_t)strtoul(batch_env, NULL, 10) : 1u;
+        if (batch < 2u) batch = 1u;
+        if (batch > 32u) batch = 32u;
+        for (int i = start; i < prompt->len; ) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
-            if (ds4_session_glm5_next_forward_token(s, prompt->v[i], err, errlen))
+            const uint32_t remaining = (uint32_t)(prompt->len - i);
+            const uint32_t chunk = remaining < batch ? remaining : batch;
+            const int rc = chunk > 1u ?
+                ds4_session_glm5_next_forward_rows(
+                    s, prompt->v + i, chunk, (uint32_t)i, err, errlen) :
+                ds4_session_glm5_next_forward_token(s, prompt->v[i], err, errlen);
+            if (rc)
                 return 1;
-            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            i += (int)chunk;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
         return 0;
     }
