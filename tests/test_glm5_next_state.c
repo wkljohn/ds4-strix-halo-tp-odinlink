@@ -164,7 +164,8 @@ static int test_lifecycle(void) {
           state.mla[3].capacity_tokens == 8u &&
           state.mla[3].capacity_pools == 2u &&
           state.mla[3].index_pool && state.mla[3].index_tail &&
-          state.mla[3].pool_gate_tail && !state.mla[45].compact_kv,
+          state.mla[3].pool_gate_tail && state.mla[3].index_valid_keys &&
+          !state.mla[45].compact_kv,
           "trunk MLA owned and nextn MLA excluded");
     uint32_t rejected_tail = 0u, rejected_pool = 0u;
     bool rejected_publish = false;
