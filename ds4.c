@@ -59496,7 +59496,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
-    if (opt->warm_weights) model_warm_weights(&e->model);
+    if (opt->warm_weights &&
+        !(DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 &&
+          opt->tp.role != DS4_TP_NONE)) {
+        model_warm_weights(&e->model);
+    } else if (opt->warm_weights && DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
+        fprintf(stderr,
+                "ds4: GLM5.3 TP keeps mapped weights lazy; ignoring "
+                "--warm-weights\n");
+    }
     config_validate_model(&e->model);
     if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
         e->glm5_next = xcalloc(1, sizeof(*e->glm5_next));
