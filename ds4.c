@@ -60481,7 +60481,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        const bool glm5_tp_warm = tp_shard &&
+            DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 &&
+            getenv("DS4_GLM5_NEXT_WARM_RESIDENT") != NULL;
         if (tp_shard && DS4_MODEL_VARIANT != DS4_VARIANT_GLM53) {
+            model_warm_weights_sharded(&e->model, &e->weights,
+                                       tp_shard_rank);
+        } else if (glm5_tp_warm) {
+            fprintf(stderr,
+                    "ds4: GLM5.3 TP warming owned mapped tensor pages (opt-in)\n");
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
         } else if (tp_shard && DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
