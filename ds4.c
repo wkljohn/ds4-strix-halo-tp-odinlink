@@ -7067,7 +7067,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
 /* GLM5.3 has a tensor-derived weight table rather than ds4_weights.  Build
  * the resident-map contract used by the ordinary executor.  Its TP split is
  * over the intermediate rows of gate/up and over the K columns of down for
- * every expert; it is not an expert-id split.  Routed Q4 tensors are omitted
+ * every expert; it is not an expert-id split.  Routed quantized tensors are omitted
  * from this linear map: the executor owns their packed, tile-local residency
  * and mapping them here would duplicate tens of GiB before first execution. */
 static bool glm5_next_model_map_sharded_spans(
@@ -7079,13 +7079,23 @@ static bool glm5_next_model_map_sharded_spans(
     for (uint64_t i = 0u; i < m->n_tensors; ++i) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->ndim == 3u && t->dim[2] == DS4_N_EXPERT) {
-            if (t->type != DS4_TENSOR_Q4_K ||
-                !((t->dim[0] == glm5_width && t->dim[1] == glm5_routed_mid) ||
-                  (t->dim[0] == glm5_routed_mid && t->dim[1] == glm5_width))) {
+            const bool gate_or_up_shape =
+                t->dim[0] == glm5_width && t->dim[1] == glm5_routed_mid;
+            const bool down_shape =
+                t->dim[0] == glm5_routed_mid && t->dim[1] == glm5_width;
+            const bool gate_or_up_type =
+                t->type == DS4_TENSOR_Q4_K ||
+                t->type == DS4_TENSOR_IQ2_XXS;
+            const bool down_type =
+                t->type == DS4_TENSOR_Q4_K ||
+                t->type == DS4_TENSOR_Q2_K;
+            if ((!gate_or_up_shape && !down_shape) ||
+                (gate_or_up_shape ? !gate_or_up_type : !down_type)) {
                 return false;
             }
-            /* Packed-slice declaration/load is the sole owner of these
-             * routed weights.  Do not add a linear map span. */
+            /* Routed weights remain lazy and are loaded by a type-aware
+             * executor.  Do not add a linear map span: mapping a complete
+             * expert table would defeat the cache-free TP residency budget. */
             continue;
         } else {
             model_map_span_vec_include_one(spans, t);
