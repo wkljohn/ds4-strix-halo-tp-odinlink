@@ -1357,7 +1357,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             (GLM5_ROUTED_MID / 256u) * 84u,
             GLM5_WIDTH, GLM5_ROUTED_MID, GLM5_WIDTH,
             w->router_selected, w->router_weights,
-            GLM5_EXPERTS, GLM5_EXPERTS_USED, 0.0f,
+            GLM5_EXPERTS, GLM5_EXPERTS_USED, 10.0f,
             w->ffn_hidden, NULL, il, false);
     } else if (ok) {
         ok = declare_local_q4k_half(ctx, layer) &&
@@ -1485,7 +1485,7 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             (GLM5_ROUTED_MID / 256u) * 84u,
             GLM5_WIDTH, GLM5_ROUTED_MID, GLM5_WIDTH,
             w->router_selected, w->router_weights,
-            GLM5_EXPERTS, GLM5_EXPERTS_USED, 0.0f,
+            GLM5_EXPERTS, GLM5_EXPERTS_USED, 10.0f,
             w->ffn_hidden, il, n_tokens, &routed_mid_is_f16, false);
     } else if (ok) {
         ok = declare_local_q4k_half_only(ctx, layer);
