@@ -44,6 +44,7 @@
 #include "ds4_distributed.h"
 #include "ds4_glm5_kda.h"
 #include "ds4_glm5_next_runtime.h"
+#include "ds4_glm5_next_exec.h"
 #include "ds4_tp.h"
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
@@ -51171,6 +51172,16 @@ struct ds4_session {
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
+    /* GLM5.3 staged executor ownership.  These fields are initialized only
+     * under the explicit ordinary-engine opt-in; DeepSeek and legacy GLM
+     * sessions never touch them. */
+    ds4_glm5_next_state glm5_next_state;
+    ds4_glm5_next_workspace *glm5_next_ws;
+    ds4_glm5_next_exec_ctx glm5_next_exec;
+    ds4_gpu_tensor *glm5_next_cur;
+    ds4_gpu_tensor *glm5_next_out;
+    ds4_gpu_tensor *glm5_next_logits;
+    bool glm5_next_ready;
     bool glm_graph_ready;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state (--glm-mtp, greedy only). */
@@ -51242,6 +51253,135 @@ struct ds4_session {
     double tp_phase_merge_ms;
     double tp_phase_total_ms;
 };
+
+#ifndef DS4_NO_GPU
+/* Initialize the session-owned GLM5 executor only for the explicit research
+ * opt-in.  The staged executor uses the same mapped GGUF and TP slab as the
+ * validated harness; no weight expansion or private transport allocation is
+ * introduced here. */
+static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
+                                      int ctx_size) {
+    if (!s || !e || !e->glm5_next || !e->model.map || e->model.size == 0u ||
+        !e->tp.active || !e->tp.ctx || e->tp.rank < 0 || e->tp.rank > 1 ||
+        !ds4_tp_is_rdma(e->tp.ctx) || !ds4_tp_requires_host_slab(e->tp.ctx)) {
+        fprintf(stderr,
+                "ds4: GLM5 ordinary opt-in requires a two-rank RDMA TP session\n");
+        return 0;
+    }
+    const uint32_t capacity = (uint32_t)ctx_size;
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint32_t big_capacity = ds4_tp_big_capacity_rows(e->tp.ctx);
+    if (big_capacity < capacity || !e->tp.slab) {
+        fprintf(stderr,
+                "ds4: GLM5 ordinary opt-in requires DS4_TP_BIG_DIRECT=1 "
+                "with capacity >= context (%u, have %u)\n",
+                capacity, big_capacity);
+        return 0;
+    }
+    s->glm5_next_ws = ds4_glm5_next_workspace_create_capacity(1u);
+    if (!s->glm5_next_ws ||
+        !ds4_glm5_next_state_init(&s->glm5_next_state,
+                                  &e->glm5_next->offsets,
+                                  capacity, stderr)) {
+        fprintf(stderr, "ds4: GLM5 ordinary executor state allocation failed\n");
+        return 0;
+    }
+    s->glm5_next_cur = ds4_gpu_tensor_alloc(row_bytes * 4u);
+    s->glm5_next_out = ds4_gpu_tensor_alloc(row_bytes * 4u);
+    s->glm5_next_logits = ds4_gpu_tensor_alloc(
+        (uint64_t)DS4_N_VOCAB * sizeof(float));
+    const uint64_t big_bytes = row_bytes * capacity;
+    if (!s->glm5_next_cur || !s->glm5_next_out || !s->glm5_next_logits) {
+        fprintf(stderr, "ds4: GLM5 ordinary executor tensor allocation failed\n");
+        return 0;
+    }
+    s->glm5_next_exec = (ds4_glm5_next_exec_ctx) {
+        .model_map = e->model.map,
+        .model_size = e->model.size,
+        .model = &e->glm5_next->offsets,
+        .tp = e->tp.ctx,
+        .tp_rank = (uint32_t)e->tp.rank,
+        .tp_slab = e->tp.slab,
+        .tp_big_out = ds4_gpu_tensor_view(
+            e->tp.slab, ds4_tp_slab_big_out_offset(e->tp.ctx), big_bytes),
+        .tp_big_in = ds4_gpu_tensor_view(
+            e->tp.slab, ds4_tp_slab_big_in_offset(e->tp.ctx), big_bytes),
+        .tp_sequence = &e->tp.eval_seq,
+    };
+    if (!s->glm5_next_exec.tp_big_out || !s->glm5_next_exec.tp_big_in) {
+        fprintf(stderr, "ds4: GLM5 ordinary executor big-gate views failed\n");
+        return 0;
+    }
+    s->glm5_next_exec.tp_big_out_host =
+        ds4_gpu_tensor_contents(s->glm5_next_exec.tp_big_out);
+    s->glm5_next_exec.tp_big_in_host =
+        ds4_gpu_tensor_contents(s->glm5_next_exec.tp_big_in);
+    if (!s->glm5_next_exec.tp_big_out_host ||
+        !s->glm5_next_exec.tp_big_in_host ||
+        !ds4_tp_big_gate_is_direct(e->tp.ctx,
+                                   s->glm5_next_exec.tp_big_out_host,
+                                   s->glm5_next_exec.tp_big_in_host,
+                                   row_bytes)) {
+        fprintf(stderr, "ds4: GLM5 ordinary executor direct RDMA views failed\n");
+        return 0;
+    }
+    s->glm5_next_ready = true;
+    fprintf(stderr, "ds4: GLM5 ordinary executor enabled (experimental, TP/RDMA)\n");
+    return 1;
+}
+
+static void ds4_session_glm5_next_release(ds4_session *s) {
+    if (!s) return;
+    ds4_gpu_tensor_free(s->glm5_next_logits);
+    ds4_gpu_tensor_free(s->glm5_next_out);
+    ds4_gpu_tensor_free(s->glm5_next_cur);
+    ds4_glm5_next_workspace_destroy(s->glm5_next_ws);
+    ds4_glm5_next_state_free(&s->glm5_next_state);
+    memset(&s->glm5_next_exec, 0, sizeof(s->glm5_next_exec));
+    s->glm5_next_logits = NULL;
+    s->glm5_next_out = NULL;
+    s->glm5_next_cur = NULL;
+    s->glm5_next_ws = NULL;
+    s->glm5_next_ready = false;
+}
+
+static int ds4_session_glm5_next_forward_token(ds4_session *s, int token,
+                                               char *err, size_t errlen) {
+    if (!s || !s->glm5_next_ready || !s->engine || token < 0 ||
+        (uint32_t)s->checkpoint.len >= (uint32_t)s->ctx_size) {
+        snprintf(err, errlen, "GLM5 ordinary executor is not ready or context is full");
+        return 1;
+    }
+    ds4_glm5_next_exec_ctx *x = &s->glm5_next_exec;
+    if (!ds4_glm5_next_embed_token(x, (uint32_t)token, s->glm5_next_cur)) {
+        snprintf(err, errlen, "GLM5 embedding failed");
+        return 1;
+    }
+    for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        if (!ds4_glm5_next_layer_forward(x, il, &s->glm5_next_state,
+                                         s->glm5_next_ws,
+                                         s->glm5_next_cur,
+                                         s->glm5_next_out)) {
+            snprintf(err, errlen, "GLM5 trunk layer %u failed", il);
+            return 1;
+        }
+        ds4_gpu_tensor *tmp = s->glm5_next_cur;
+        s->glm5_next_cur = s->glm5_next_out;
+        s->glm5_next_out = tmp;
+    }
+    if (!ds4_glm5_next_output_logits(x, s->glm5_next_ws,
+                                     s->glm5_next_cur, s->glm5_next_logits) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(s->glm5_next_logits, 0u, s->logits,
+                             (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        snprintf(err, errlen, "GLM5 output projection failed");
+        return 1;
+    }
+    token_vec_push(&s->checkpoint, token);
+    s->checkpoint_valid = true;
+    return 0;
+}
+#endif
 
 #ifndef DS4_NO_GPU
 static bool ds4_dspark_stats_enabled(void);
@@ -60931,10 +61071,32 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
      * instead of attempting a partial allocation when an explicit research
      * opt-in reaches session creation before staged wiring is complete. */
     if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
-        fprintf(stderr,
-                "ds4: GLM5.3 ordinary session execution is not wired; "
-                "use the staged TP harness until promotion\n");
-        return 1;
+        if (!getenv("DS4_GLM5_NEXT_ENABLE_ORDINARY")) {
+            fprintf(stderr,
+                    "ds4: GLM5.3 ordinary session execution is experimental; "
+                    "set DS4_GLM5_NEXT_ENABLE_ORDINARY=1 to test it\n");
+            return 1;
+        }
+        ds4_session *s = xcalloc(1, sizeof(*s));
+        s->engine = e;
+        s->ctx_size = ctx_size;
+        s->prefill_cap = 1u;
+        if (!ds4_session_glm5_next_init(s, e, ctx_size)) {
+            ds4_session_glm5_next_release(s);
+            free(s);
+            return 1;
+        }
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        if (!s->logits || !s->sample_probs || !ds4_session_tp_register(s)) {
+            ds4_session_glm5_next_release(s);
+            free(s->logits);
+            free(s->sample_probs);
+            free(s);
+            return 1;
+        }
+        *out = s;
+        return 0;
     }
 
     ds4_session *s = xcalloc(1, sizeof(*s));
@@ -61344,7 +61506,9 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
-        if (ds4_session_is_glm(s)) {
+        if (s->glm5_next_ready) {
+            ds4_session_glm5_next_release(s);
+        } else if (ds4_session_is_glm(s)) {
             glm_graph_free(&s->glm_graph);
         } else {
             metal_graph_free(&s->graph);
@@ -62455,6 +62619,30 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
+    if (s->glm5_next_ready) {
+        int start = 0;
+        if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            start = s->checkpoint.len;
+        } else {
+            if (!ds4_glm5_next_state_reset(&s->glm5_next_state)) {
+                snprintf(err, errlen, "GLM5 state reset failed");
+                return 1;
+            }
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        for (int i = start; i < prompt->len; ++i) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (ds4_session_glm5_next_forward_token(s, prompt->v[i], err, errlen))
+                return 1;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+        }
+        return 0;
+    }
     if (ds4_session_is_glm(s)) {
         /* Debug: truncate the prompt so the dumped prefill logits line up
          * with the CPU first-token reference (DS4_GLM_LOGIT_DUMP). */
@@ -64300,6 +64488,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+    if (s->glm5_next_ready) {
+        (void)probe_mtp;
+        return ds4_session_glm5_next_forward_token(s, token, err, errlen);
+    }
     if (ds4_session_is_glm(s)) {
         /* TP worker under GLM MTP: run the full speculative cycle off the
          * mirrored EVAL frame so drafts, verify batches, and gate traffic
