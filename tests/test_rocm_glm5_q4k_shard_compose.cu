@@ -1744,6 +1744,40 @@ bool run_test() {
     const double one_token_nmse = one_token_reference_sq == 0.0L
         ? (double)one_token_error_sq
         : (double)(one_token_error_sq / one_token_reference_sq);
+    long double batch_decode_error_sq = 0.0L;
+    long double batch_decode_reference_sq = 0.0L;
+    long double batch_decode_dot = 0.0L;
+    long double batch_decode_candidate_sq = 0.0L;
+    double batch_decode_max_abs = 0.0;
+    for (uint32_t row = 0; row < kOutput; ++row) {
+        const long double batch_value = reference[row];
+        const long double decode_value = one_token_full[row];
+        const long double error = batch_value - decode_value;
+        batch_decode_error_sq += error * error;
+        batch_decode_reference_sq += decode_value * decode_value;
+        batch_decode_candidate_sq += batch_value * batch_value;
+        batch_decode_dot += batch_value * decode_value;
+        batch_decode_max_abs = std::max(
+            batch_decode_max_abs, (double)std::fabs(error));
+    }
+    const double batch_decode_nrmse = std::sqrt(
+        (double)(batch_decode_error_sq / batch_decode_reference_sq));
+    const double batch_decode_cosine = (double)(batch_decode_dot /
+        std::sqrt(batch_decode_reference_sq * batch_decode_candidate_sq));
+    std::fprintf(stderr,
+        "GLM5 Q4_K batch-row0/decode seam nrmse=%.9g cosine=%.12g "
+        "max_abs=%.9g batch_fnv=%016llx decode_fnv=%016llx\n",
+        batch_decode_nrmse, batch_decode_cosine, batch_decode_max_abs,
+        (unsigned long long)fnv1a64(
+            reference.data(), (uint64_t)kOutput * sizeof(float)),
+        (unsigned long long)fnv1a64(
+            one_token_full.data(), (uint64_t)kOutput * sizeof(float)));
+    CHECK(std::isfinite(batch_decode_nrmse) &&
+              std::isfinite(batch_decode_cosine) &&
+              std::isfinite(batch_decode_max_abs) &&
+              batch_decode_reference_sq > 1.0e-12L &&
+              batch_decode_candidate_sq > 1.0e-12L,
+          "Q4_K batch/decode arithmetic seam remains finite and nonzero");
     std::fprintf(stderr,
         "GLM5 one-token Q4_K full/split oracle bad=%llu nonfinite=%llu "
         "max_abs=%.9g max_rel=%.9g scaled_rel=%.9g nmse=%.9g "

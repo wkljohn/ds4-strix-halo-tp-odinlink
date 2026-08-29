@@ -1987,14 +1987,18 @@ extern "C" int ds4_rocm_q8_kslice_f32_rows_strided(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t full_in_dim, uint64_t out_dim,
         uint64_t in_start, uint64_t in_count, const ds4_gpu_tensor *x,
-        uint64_t n_tokens, uint64_t x_token_stride) {
-    if (!out || !x || !model_map || n_tokens <= 1u ||
+        uint64_t x_elem_start, uint64_t n_tokens,
+        uint64_t x_token_stride) {
+    if (!out || !x || !model_map ||
         full_in_dim == 0u || out_dim == 0u || in_count == 0u ||
         (in_start & 31u) != 0u || (in_count & 31u) != 0u ||
         in_start > full_in_dim || in_count > full_in_dim - in_start ||
-        x_token_stride < in_start + in_count || n_tokens > UINT32_MAX ||
+        x_token_stride < x_elem_start + in_count || n_tokens > UINT32_MAX ||
         out_dim > UINT32_MAX || in_count > UINT32_MAX ||
         x_token_stride > UINT32_MAX) return 0;
+    /* This entry point is a multi-row accelerator. Let callers preserve the
+     * established one-row backend path instead of treating it as a failure. */
+    if (n_tokens <= 1u) return -1;
     const uint64_t full_blocks = (full_in_dim + 31u) / 32u;
     const uint64_t block_start = in_start / 32u;
     const uint64_t slice_blocks = in_count / 32u;
@@ -2007,14 +2011,14 @@ extern "C" int ds4_rocm_q8_kslice_f32_rows_strided(
         out_elements > UINT64_MAX / sizeof(float) ||
         out->bytes < out_elements * sizeof(float) ||
         !cuda_u64_mul_checked(n_tokens - 1u, x_token_stride, &last_x) ||
-        last_x > UINT64_MAX - in_start - in_count ||
-        x->bytes < (last_x + in_start + in_count) * sizeof(float)) return 0;
+        last_x > UINT64_MAX - x_elem_start - in_count ||
+        x->bytes < (last_x + x_elem_start + in_count) * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "q8_0_kslice_strided");
     if (!wptr) return 0;
     const unsigned char *slice_w =
         reinterpret_cast<const unsigned char *>(wptr) + block_start * 34u;
-    const float *slice_x = (const float *)x->ptr + in_start;
+    const float *slice_x = (const float *)x->ptr + x_elem_start;
     /* BT=16 and tile_m=32 consume exactly 64 KiB of dynamic LDS. Keep these
      * launch constants paired; increasing either requires a new LDS audit. */
     cuda_launch_grouped_q8_a_sharedx_strided(

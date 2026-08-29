@@ -730,6 +730,7 @@ int ds4_rocm_q8_kslice_f32_rows_strided(
         uint64_t              in_start,
         uint64_t              in_count,
         const ds4_gpu_tensor *x,
+        uint64_t              x_elem_start,
         uint64_t              n_tokens,
         uint64_t              x_token_stride);
 int ds4_gpu_matmul_quant_kslice_tensor(

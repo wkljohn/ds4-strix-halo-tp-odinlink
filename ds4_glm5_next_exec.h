@@ -82,6 +82,17 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
                                       uint32_t n_tokens);
 
 #ifdef DS4_TP_TEST_HOOKS
+/* Test-only decomposition gate for KDA batch recurrence. It commits exactly
+ * the KDA attention half and copies the expanded mHC rows to hc_out. */
+int ds4_glm5_next_kda_attention_forward_test(
+        const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t layer,
+        ds4_glm5_next_state *state,
+        ds4_glm5_next_workspace *workspace,
+        const ds4_gpu_tensor *hc_in,
+        ds4_gpu_tensor *hc_out,
+        uint32_t n_tokens);
+
 /* Test-only decomposition gate. Executes and commits exactly the MLA
  * attention half of a metadata-validated MLA layer, copying the expanded mHC
  * result to hc_out. Production callers must use the complete layer entries. */

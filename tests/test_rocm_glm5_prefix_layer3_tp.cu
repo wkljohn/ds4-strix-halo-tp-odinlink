@@ -706,6 +706,15 @@ bool run() {
     CHECK(!kda_batch_env || kda_batch_test ||
               std::strcmp(kda_batch_env, "0") == 0,
           "KDA routed batch test selector is exactly 0 or 1");
+    const char *kda_attention_only_env =
+        std::getenv("DS4_GLM5_KDA_ATTENTION_ONLY_TEST");
+    const bool kda_attention_only = kda_attention_only_env &&
+        std::strcmp(kda_attention_only_env, "1") == 0;
+    CHECK(!kda_attention_only_env || kda_attention_only ||
+              std::strcmp(kda_attention_only_env, "0") == 0,
+          "KDA attention-only selector is exactly 0 or 1");
+    CHECK(!kda_attention_only || kda_batch_test,
+          "KDA attention-only gate requires the KDA batch fixture");
     const char *kda_batch_rows_env =
         std::getenv("DS4_GLM5_KDA_ROUTED_BATCH_ROWS");
     char *kda_batch_rows_end = nullptr;
@@ -1499,12 +1508,20 @@ bool run() {
             6623u, 323u, 25u, 7487u, 558u, 369u, 11478u, 7735u,
         };
         StateGuard sequential_state, batch_state;
+        StateGuard attention_sequential_state, attention_batch_state;
         WorkspaceGuard batch_workspace;
         TensorGuard batch_ids, batch_input, batch_output, sequential_output;
+        TensorGuard attention_batch_output, attention_sequential_output;
         CHECK(ds4_glm5_next_state_init(
                   &sequential_state.value, &offsets, rows + 1u, nullptr) &&
               ds4_glm5_next_state_init(
                   &batch_state.value, &offsets, rows + 1u, nullptr) &&
+              ds4_glm5_next_state_init(
+                  &attention_sequential_state.value, &offsets,
+                  rows + 1u, nullptr) &&
+              ds4_glm5_next_state_init(
+                  &attention_batch_state.value, &offsets,
+                  rows + 1u, nullptr) &&
               (batch_workspace.value =
                    ds4_glm5_next_workspace_create_capacity(rows)) != nullptr &&
               (batch_ids.value = ds4_gpu_tensor_alloc(
@@ -1515,11 +1532,77 @@ bool run() {
                    (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
               (sequential_output.value = ds4_gpu_tensor_alloc(
                    (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              (attention_batch_output.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              (attention_sequential_output.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
               ds4_gpu_tensor_write(batch_ids.value, 0u, ids.data(),
                                     (uint64_t)rows * sizeof(uint32_t)) &&
               ds4_glm5_next_embed_tokens(
                   &exec, batch_ids.value, rows, batch_input.value),
               "allocate exact KDA+routed row comparison");
+
+        for (uint32_t row = 0u; row < rows; ++row) {
+            ds4_gpu_tensor *row_input = ds4_gpu_tensor_view(
+                batch_input.value,
+                (uint64_t)row * kHcWidth * sizeof(float),
+                (uint64_t)kHcWidth * sizeof(float));
+            ds4_gpu_tensor *row_output = ds4_gpu_tensor_view(
+                attention_sequential_output.value,
+                (uint64_t)row * kHcWidth * sizeof(float),
+                (uint64_t)kHcWidth * sizeof(float));
+            const bool row_ok = row_input && row_output &&
+                ds4_glm5_next_kda_attention_forward_test(
+                    &exec, 4u, &attention_sequential_state.value,
+                    workspace.value, row_input, row_output, 1u);
+            ds4_gpu_tensor_free(row_output);
+            ds4_gpu_tensor_free(row_input);
+            CHECK(row_ok, "execute sequential KDA-attention comparison row");
+        }
+        CHECK(ds4_glm5_next_kda_attention_forward_test(
+                  &exec, 4u, &attention_batch_state.value,
+                  batch_workspace.value, batch_input.value,
+                  attention_batch_output.value, rows),
+              "execute production KDA-attention batch");
+        std::vector<float> attention_sequential(
+            (uint64_t)rows * kHcWidth);
+        std::vector<float> attention_batch((uint64_t)rows * kHcWidth);
+        CHECK(ds4_gpu_tensor_read(
+                  attention_sequential_output.value, 0u,
+                  attention_sequential.data(),
+                  attention_sequential.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  attention_batch_output.value, 0u,
+                  attention_batch.data(),
+                  attention_batch.size() * sizeof(float)),
+              "read sequential and production KDA-attention rows");
+        const VectorError attention_error =
+            vector_error(attention_sequential, attention_batch);
+        std::fprintf(stderr,
+            "GLM5 KDA-attention identical-input measurement role=%s "
+            "rows=%u nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+            role, rows, attention_error.nrmse, attention_error.cosine,
+            attention_error.max_abs);
+        CHECK(attention_error.nrmse <= 1.0e-7 &&
+                  attention_error.cosine >= 0.999999999999 &&
+                  attention_error.max_abs <= 1.0e-7,
+              "KDA attention batch preserves tokenwise recurrence");
+        if (kda_attention_only) {
+            const uint64_t attention_hash = fnv64(
+                attention_batch.data(),
+                attention_batch.size() * sizeof(float));
+            char attention_hash_error[256] = {};
+            CHECK(ds4_tp_hash_check(
+                      tp.tp, UINT64_C(0x474c4d354b444154),
+                      attention_hash, attention_hash_error,
+                      sizeof(attention_hash_error)) == 1,
+                  attention_hash_error);
+            std::fprintf(stderr,
+                "PASS GLM5 KDA-attention batch role=%s rows=%u "
+                "output=%016llx rdma=1\n",
+                role, rows, (unsigned long long)attention_hash);
+            return true;
+        }
 
         const auto sequential_begin = Clock::now();
         for (uint32_t row = 0u; row < rows; ++row) {

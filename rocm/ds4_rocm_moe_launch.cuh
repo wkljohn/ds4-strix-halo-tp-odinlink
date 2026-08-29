@@ -2558,9 +2558,12 @@ static int routed_moe_launch(
             }
 #endif
         }
+        const uint32_t force_iq2_q2_q8_mid_down =
+            getenv("DS4_ROCM_GLM5_BATCH_Q8_MID_DOWN") != NULL;
         const uint32_t use_iq2_q2_float_down =
             ok && iq2_path && n_tokens > 1u &&
             n_expert <= DS4_ROCM_N_EXPERT_USED &&
+            !force_iq2_q2_q8_mid_down &&
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts;
         if (ok && !use_iq2_q2_float_down) {
             dim3 midq_grid(midq_blocks, pair_count, 1);

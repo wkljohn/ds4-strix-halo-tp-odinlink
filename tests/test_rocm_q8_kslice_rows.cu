@@ -195,7 +195,10 @@ int main() {
         (uint64_t)rows3 * out_dim * sizeof(float));
     ds4_gpu_tensor *strided_candidate = ds4_gpu_tensor_alloc(
         (uint64_t)rows3 * out_dim * sizeof(float));
+    ds4_gpu_tensor *compact_candidate = ds4_gpu_tensor_alloc(
+        (uint64_t)rows3 * out_dim * sizeof(float));
     CHECK(x_strided && strided_reference && strided_candidate &&
+              compact_candidate &&
               ds4_gpu_tensor_write(x_strided, 0u, input_strided.data(),
                                     input_strided.size() * sizeof(float)),
           "allocate physical-stride K-slice fixture");
@@ -213,20 +216,32 @@ int main() {
     CHECK(ds4_rocm_q8_kslice_f32_rows_strided(
               strided_candidate, model.data(), model.size(), 0u,
               full_in, out_dim, slice_begin, slice_dim, x_strided,
-              rows3, full_in) == 1 &&
+              slice_begin, rows3, full_in) == 1 &&
               !ds4_rocm_q8_kslice_f32_rows_strided(
                   strided_candidate, model.data(), model.size(), 0u,
                   full_in, out_dim, slice_begin, slice_dim, x_strided,
-                  rows3, slice_begin + slice_dim - 1u),
-          "run strided F32 token tile and reject an undersized row stride");
+                  slice_begin, rows3, slice_begin + slice_dim - 1u) &&
+              ds4_rocm_q8_kslice_f32_rows_strided(
+                  compact_candidate, model.data(), model.size(), 0u,
+                  full_in, out_dim, slice_begin, slice_dim, x3,
+                  0u, rows3, slice_dim) == 1 &&
+              ds4_rocm_q8_kslice_f32_rows_strided(
+                  compact_candidate, model.data(), model.size(), 0u,
+                  full_in, out_dim, slice_begin, slice_dim, x3,
+                  0u, 1u, slice_dim) == -1,
+          "run F32 tiles, reject undersized stride, and defer one-row fallback");
     std::vector<float> host_strided_reference((uint64_t)rows3 * out_dim);
     std::vector<float> host_strided_candidate((uint64_t)rows3 * out_dim);
+    std::vector<float> host_compact_candidate((uint64_t)rows3 * out_dim);
     CHECK(ds4_gpu_tensor_read(
               strided_reference, 0u, host_strided_reference.data(),
               host_strided_reference.size() * sizeof(float)) &&
               ds4_gpu_tensor_read(
                   strided_candidate, 0u, host_strided_candidate.data(),
-                  host_strided_candidate.size() * sizeof(float)),
+                  host_strided_candidate.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  compact_candidate, 0u, host_compact_candidate.data(),
+                  host_compact_candidate.size() * sizeof(float)),
           "read physical-stride F32 token-tile comparison");
     double strided_diff2 = 0.0, strided_ref2 = 0.0;
     double strided_max_abs = 0.0;
@@ -241,6 +256,9 @@ int main() {
     CHECK(std::isfinite(strided_nrmse) &&
               std::memcmp(host_strided_candidate.data(),
                           host_strided_reference.data(),
+                          host_strided_reference.size() * sizeof(float)) == 0 &&
+              std::memcmp(host_compact_candidate.data(),
+                          host_strided_reference.data(),
                           host_strided_reference.size() * sizeof(float)) == 0,
           "strided F32 token tile bit-matches one-row F32 K-slice arithmetic");
 
@@ -253,6 +271,7 @@ int main() {
                  seam_nrmse, seam_max_abs,
                  strided_nrmse, strided_max_abs);
     ds4_gpu_tensor_free(strided_candidate);
+    ds4_gpu_tensor_free(compact_candidate);
     ds4_gpu_tensor_free(strided_reference);
     ds4_gpu_tensor_free(x_strided);
     ds4_gpu_tensor_free(out2);

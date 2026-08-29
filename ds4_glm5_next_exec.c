@@ -41,7 +41,8 @@ int ds4_rocm_q8_kslice_f32_rows_strided(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t full_in_dim, uint64_t out_dim,
         uint64_t in_start, uint64_t in_count, const ds4_gpu_tensor *x,
-        uint64_t n_tokens, uint64_t x_token_stride) {
+        uint64_t x_elem_start, uint64_t n_tokens,
+        uint64_t x_token_stride) {
     (void)out;
     (void)model_map;
     (void)model_size;
@@ -51,6 +52,7 @@ int ds4_rocm_q8_kslice_f32_rows_strided(
     (void)in_start;
     (void)in_count;
     (void)x;
+    (void)x_elem_start;
     (void)n_tokens;
     (void)x_token_stride;
     return -1;
@@ -1205,7 +1207,7 @@ static int mla_output_project_rows_batch(
     const int batch = ds4_rocm_q8_kslice_f32_rows_strided(
         ctx->tp_big_out, ctx->model_map, ctx->model_size, offsets->output,
         full_heads, GLM5_WIDTH, in_start, half_heads, w->mla_heads,
-        n_tokens, full_heads);
+        in_start, n_tokens, full_heads);
     if (batch >= 0) return batch;
     /* Preserve the exact one-row implementation on backends without the
      * strided token-tile entry point. */
@@ -1453,6 +1455,40 @@ routed_one_done:
     return ok;
 }
 
+#ifdef DS4_TP_TEST_HOOKS
+static int trace_same_input_routed_ffn(
+        const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t il,
+        uint32_t token_ordinal,
+        const ds4_gpu_tensor *after_attention_rows,
+        uint32_t row) {
+    if (!ctx->trace_prefix || il != ctx->trace_layer ||
+        getenv("DS4_GLM5_TRACE_FFN_SAME_INPUT") == NULL) return 1;
+    const uint64_t hc_row_bytes =
+        (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    ds4_glm5_next_workspace *probe =
+        ds4_glm5_next_workspace_create_capacity(1u);
+    ds4_gpu_tensor *probe_out = ds4_gpu_tensor_alloc(hc_row_bytes);
+    char prefix[640];
+    const int prefix_len = snprintf(
+        prefix, sizeof(prefix), "%s.same_input", ctx->trace_prefix);
+    ds4_glm5_next_exec_ctx probe_ctx = *ctx;
+    probe_ctx.trace_prefix = prefix;
+    int ok = probe && probe_out && prefix_len > 0 &&
+        (size_t)prefix_len < sizeof(prefix) &&
+        ds4_gpu_tensor_copy(probe->after_attention, 0u,
+                            after_attention_rows,
+                            (uint64_t)row * hc_row_bytes,
+                            hc_row_bytes) &&
+        routed_ffn_one(&probe_ctx, il, token_ordinal, probe, probe_out) &&
+        trace_routed_ffn(
+            &probe_ctx, il, token_ordinal, probe_out, probe);
+    ds4_gpu_tensor_free(probe_out);
+    ds4_glm5_next_workspace_destroy(probe);
+    return ok;
+}
+#endif
+
 static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
                            uint32_t il,
                            uint32_t token_ordinal,
@@ -1630,11 +1666,67 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
     ok = ok && !routed_mid_is_f16 && shared_projection_ok &&
         ds4_gpu_swiglu_tensor(
             w->shared_mid, w->shared_gate, w->shared_up,
-            n_tokens * GLM5_RANK_MID, 10.0f, 1.0f) &&
-        ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+            n_tokens * GLM5_RANK_MID, 10.0f, 1.0f);
+    int shared_down_ok = ok;
+    if (shared_down_ok &&
+        getenv("DS4_ROCM_GLM5_BATCH_SHARED_DOWN_SERIAL") != NULL) {
+        const uint64_t mid_row_bytes =
+            (uint64_t)GLM5_RANK_MID * sizeof(float);
+        const uint64_t out_row_bytes =
+            (uint64_t)GLM5_WIDTH * sizeof(float);
+        for (uint32_t t = 0u; t < n_tokens && shared_down_ok; ++t) {
+            ds4_gpu_tensor *xv = ds4_gpu_tensor_view(
+                w->shared_mid, (uint64_t)t * mid_row_bytes, mid_row_bytes);
+            ds4_gpu_tensor *ov = ds4_gpu_tensor_view(
+                w->shared_out, (uint64_t)t * out_row_bytes, out_row_bytes);
+            shared_down_ok = xv && ov &&
+                ds4_gpu_matmul_q8_0_kslice_tensor(
+                    ov, ctx->model_map, ctx->model_size, f->down_shexp,
+                    GLM5_ROUTED_MID, rank_mid_base, GLM5_RANK_MID,
+                    GLM5_WIDTH, xv, 0u);
+            ds4_gpu_tensor_free(xv);
+            ds4_gpu_tensor_free(ov);
+        }
+    } else if (shared_down_ok &&
+               getenv("DS4_ROCM_GLM5_DISABLE_SHARED_DOWN_F32") == NULL) {
+        const int batch = ds4_rocm_q8_kslice_f32_rows_strided(
             w->shared_out, ctx->model_map, ctx->model_size,
             f->down_shexp, GLM5_ROUTED_MID, GLM5_WIDTH,
-            rank_mid_base, GLM5_RANK_MID, w->shared_mid, n_tokens) &&
+            rank_mid_base, GLM5_RANK_MID, w->shared_mid,
+            0u, n_tokens, GLM5_RANK_MID);
+        if (batch >= 0) {
+            shared_down_ok = batch;
+        } else {
+            /* A backend may not expose the multi-row F32 entry point. Keep
+             * the established scalar-F32 arithmetic rather than failing the
+             * whole GLM-5 batch or silently switching to Q8 activations. */
+            const uint64_t mid_row_bytes =
+                (uint64_t)GLM5_RANK_MID * sizeof(float);
+            const uint64_t out_row_bytes =
+                (uint64_t)GLM5_WIDTH * sizeof(float);
+            for (uint32_t t = 0u; t < n_tokens && shared_down_ok; ++t) {
+                ds4_gpu_tensor *xv = ds4_gpu_tensor_view(
+                    w->shared_mid, (uint64_t)t * mid_row_bytes,
+                    mid_row_bytes);
+                ds4_gpu_tensor *ov = ds4_gpu_tensor_view(
+                    w->shared_out, (uint64_t)t * out_row_bytes,
+                    out_row_bytes);
+                shared_down_ok = xv && ov &&
+                    ds4_gpu_matmul_q8_0_kslice_tensor(
+                        ov, ctx->model_map, ctx->model_size,
+                        f->down_shexp, GLM5_ROUTED_MID, rank_mid_base,
+                        GLM5_RANK_MID, GLM5_WIDTH, xv, 0u);
+                ds4_gpu_tensor_free(xv);
+                ds4_gpu_tensor_free(ov);
+            }
+        }
+    } else if (shared_down_ok) {
+        shared_down_ok = ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+            w->shared_out, ctx->model_map, ctx->model_size,
+            f->down_shexp, GLM5_ROUTED_MID, GLM5_WIDTH,
+            rank_mid_base, GLM5_RANK_MID, w->shared_mid, n_tokens);
+    }
+    ok = ok && shared_down_ok &&
         ds4_gpu_add_tensor(ctx->tp_big_out, w->routed_out, w->shared_out,
                            (uint32_t)elements) &&
         tp_exchange_rows(ctx, il, DS4_TP_GATE_FFN, n_tokens) &&
@@ -1661,8 +1753,20 @@ static int kda_routed_one_forward(const ds4_glm5_next_exec_ctx *ctx,
     if (!tp_context_valid(ctx) || !kda->valid || !kda->recurrent ||
         kda->token_count > UINT32_MAX) return 0;
     const uint32_t token_ordinal = (uint32_t)kda->token_count;
-    const int ok = kda_attention_one(ctx, il, state, w, hc_in) &&
-                   routed_ffn_one(ctx, il, token_ordinal, w, hc_out);
+    int ok = kda_attention_one(ctx, il, state, w, hc_in);
+#ifdef DS4_TP_TEST_HOOKS
+    if (ok) ok =
+        trace_tensor(ctx, il, token_ordinal, "input_hc.f32", hc_in,
+                     (uint64_t)GLM5_HC_WIDTH * sizeof(float)) &&
+        trace_tensor(ctx, il, token_ordinal, "after_attn.f32",
+                     w->after_attention,
+                     (uint64_t)GLM5_HC_WIDTH * sizeof(float));
+#endif
+    if (ok) ok = routed_ffn_one(ctx, il, token_ordinal, w, hc_out);
+#ifdef DS4_TP_TEST_HOOKS
+    if (ok) ok = trace_routed_ffn(
+        ctx, il, token_ordinal, hc_out, w);
+#endif
     if (!ok) {
         route_failure_stats("layer_hc_in", hc_in, GLM5_HC_WIDTH);
         route_failure_stats("attention_local", w->attention, GLM5_WIDTH);
@@ -1687,9 +1791,60 @@ static int kda_routed_rows_forward(const ds4_glm5_next_exec_ctx *ctx,
         kda->token_count > UINT32_MAX ||
         n_tokens > UINT32_MAX - (uint32_t)kda->token_count) return 0;
     const uint32_t token_ordinal = (uint32_t)kda->token_count;
-    const int ok =
-        kda_attention_rows(ctx, il, state, w, hc_in, n_tokens) &&
-        routed_ffn_rows(ctx, il, token_ordinal, w, hc_out, n_tokens);
+    int ok = kda_attention_rows(ctx, il, state, w, hc_in, n_tokens);
+#ifdef DS4_TP_TEST_HOOKS
+    const uint32_t trace_token = ctx->trace_token == UINT32_MAX ?
+        token_ordinal + n_tokens - 1u : ctx->trace_token;
+    if (ok) ok =
+        trace_tensor_row(ctx, il, trace_token, "input_hc.f32", hc_in,
+                         n_tokens - 1u,
+                         (uint64_t)GLM5_HC_WIDTH * sizeof(float)) &&
+        trace_tensor_row(ctx, il, trace_token, "after_attn.f32",
+                         w->after_attention, n_tokens - 1u,
+                         (uint64_t)GLM5_HC_WIDTH * sizeof(float));
+    if (ok) ok = trace_same_input_routed_ffn(
+        ctx, il, token_ordinal + n_tokens - 1u,
+        w->after_attention, n_tokens - 1u);
+#endif
+    if (ok) ok = routed_ffn_rows(
+        ctx, il, token_ordinal, w, hc_out, n_tokens);
+#ifdef DS4_TP_TEST_HOOKS
+    if (ok) ok =
+        trace_tensor_row(ctx, il, trace_token, "ffn_hidden.f32",
+                         w->ffn_hidden, n_tokens - 1u,
+                         (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+        trace_tensor_row(ctx, il, trace_token, "routed_gate.f32",
+                         w->routed_gate, n_tokens - 1u,
+                         (uint64_t)GLM5_EXPERTS_USED * GLM5_ROUTED_MID *
+                             sizeof(float)) &&
+        trace_tensor_row(ctx, il, trace_token, "routed_up.f32",
+                         w->routed_up, n_tokens - 1u,
+                         (uint64_t)GLM5_EXPERTS_USED * GLM5_ROUTED_MID *
+                             sizeof(float)) &&
+        trace_tensor_row(ctx, il, trace_token, "routed_mid.f32",
+                         w->routed_mid, n_tokens - 1u,
+                         (uint64_t)GLM5_EXPERTS_USED * GLM5_ROUTED_MID *
+                             sizeof(float)) &&
+        trace_tensor_row(ctx, il, trace_token, "routed_experts.f32",
+                         w->routed_experts, n_tokens - 1u,
+                         (uint64_t)GLM5_EXPERTS_USED * GLM5_WIDTH *
+                             sizeof(float)) &&
+        trace_tensor_row(ctx, il, trace_token, "router_ids.i32",
+                         w->router_selected, n_tokens - 1u,
+                         (uint64_t)GLM5_EXPERTS_USED * sizeof(int32_t)) &&
+        trace_tensor_row(ctx, il, trace_token, "router_weights.f32",
+                         w->router_weights, n_tokens - 1u,
+                         (uint64_t)GLM5_EXPERTS_USED * sizeof(float)) &&
+        trace_tensor_row(ctx, il, trace_token, "routed_out.f32",
+                         w->routed_out, n_tokens - 1u,
+                         (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+        trace_tensor_row(ctx, il, trace_token, "shared_out.f32",
+                         w->shared_out, n_tokens - 1u,
+                         (uint64_t)GLM5_WIDTH * sizeof(float)) &&
+        trace_tensor_row(ctx, il, trace_token, "output_hc.f32", hc_out,
+                         n_tokens - 1u,
+                         (uint64_t)GLM5_HC_WIDTH * sizeof(float));
+#endif
     if (!ok) ds4_glm5_next_state_invalidate(state);
     return ok;
 }
@@ -1928,6 +2083,34 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
 }
 
 #ifdef DS4_TP_TEST_HOOKS
+int ds4_glm5_next_kda_attention_forward_test(
+        const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t il,
+        ds4_glm5_next_state *state,
+        ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *hc_in,
+        ds4_gpu_tensor *hc_out,
+        uint32_t n_tokens) {
+    const uint64_t row_bytes =
+        (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+        !hc_out || hc_in == hc_out || n_tokens == 0u ||
+        w->capacity_tokens != n_tokens || il >= ctx->model->trunk_count ||
+        ctx->model->layer[il].attention != DS4_GLM5_NEXT_ATTN_KDA ||
+        !state->kda.layer[il].recurrent || state->mla[il].compact_kv ||
+        ds4_gpu_tensor_bytes(hc_in) != (uint64_t)n_tokens * row_bytes ||
+        ds4_gpu_tensor_bytes(hc_out) != (uint64_t)n_tokens * row_bytes) {
+        return 0;
+    }
+    const int ok = kda_attention_rows(
+        ctx, il, state, w, hc_in, n_tokens) &&
+        ds4_gpu_tensor_copy(hc_out, 0u, w->after_attention, 0u,
+                            (uint64_t)n_tokens * row_bytes) &&
+        ds4_gpu_synchronize();
+    if (!ok) ds4_glm5_next_state_invalidate(state);
+    return ok;
+}
+
 int ds4_glm5_next_mla_attention_forward_test(
         const ds4_glm5_next_exec_ctx *ctx,
         uint32_t il,

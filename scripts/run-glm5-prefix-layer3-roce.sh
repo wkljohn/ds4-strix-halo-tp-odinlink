@@ -75,6 +75,7 @@ LAYER_TIMING=${DS4_GLM5_LAYER_TIMING:-0}
 BATCH_PREFILL_TEST=${DS4_GLM5_BATCH_PREFILL_TEST:-0}
 BATCH_PREFILL_COMPARE=${DS4_GLM5_BATCH_PREFILL_COMPARE:-0}
 KDA_ROUTED_BATCH_TEST=${DS4_GLM5_KDA_ROUTED_BATCH_TEST:-0}
+KDA_ATTENTION_ONLY_TEST=${DS4_GLM5_KDA_ATTENTION_ONLY_TEST:-0}
 KDA_ROUTED_BATCH_ROWS=${DS4_GLM5_KDA_ROUTED_BATCH_ROWS:-3}
 KDA_ROUTED_PROFILE_REPEATS=${DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS:-0}
 KDA_ROUTED_CONTINUATION_ROWS=${DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS:-1}
@@ -98,14 +99,19 @@ TP_SKIP_UNOWNED=${DS4_ROCM_TP_PREFILL_SKIP_UNOWNED:-}
 Q2_DOWN_FORCE_SCALAR=${DS4_ROCM_Q2_DOWN_FORCE_SCALAR:-}
 EXPERT_TILE_M=${DS4_ROCM_EXPERT_TILE_M:-}
 SHARED_SERIAL=${DS4_ROCM_GLM5_BATCH_SHARED_SERIAL:-}
+SHARED_DOWN_SERIAL=${DS4_ROCM_GLM5_BATCH_SHARED_DOWN_SERIAL:-}
+SHARED_DOWN_F32_DISABLE=${DS4_ROCM_GLM5_DISABLE_SHARED_DOWN_F32:-}
 MOE_SERIAL=${DS4_ROCM_GLM5_BATCH_MOE_SERIAL:-}
 IQ2_SORTED_DISABLE=${DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED:-}
+Q8_MID_DOWN=${DS4_ROCM_GLM5_BATCH_Q8_MID_DOWN:-}
 BATCH_LAYER_TRACE=${DS4_GLM5_BATCH_LAYER_TRACE:-}
 TRACE_PREFIX=${DS4_GLM5_NEXT_TRACE_PREFIX:-}
 TRACE_LAYER=${DS4_GLM5_NEXT_TRACE_LAYER:-}
 TRACE_TOKEN=${DS4_GLM5_NEXT_TRACE_TOKEN:-}
+TRACE_FFN_SAME_INPUT=${DS4_GLM5_TRACE_FFN_SAME_INPUT:-}
 EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
+PEER_RESEARCH_ROOT=${DS4_GLM5_PEER_RESEARCH_ROOT:-$DS4_RESEARCH_ROOT}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
 PEER_BINARY=$PEER_DIR/test_rocm_glm5_prefix_layer3_tp
 OUT=$DS4_RESEARCH_ROOT/glm5-next-tp2/$TAG
@@ -114,8 +120,10 @@ LOCAL_HOME=${HOME:?HOME is required}
 PEER_HOME=$(ssh -o BatchMode=yes "$PEER" 'printf %s "$HOME"')
 
 for value in "$HOST" "$LOCAL_DEVICE" "$PEER_DEVICE" "$PEER_DIR" \
+             "$PEER_RESEARCH_ROOT" \
              "$LOCAL_HOME" "$PEER_HOME" "$TEXT_PROMPT" \
-             "$LOCAL_VERBS_LIB" "$PEER_VERBS_LIB"; do
+             "$LOCAL_VERBS_LIB" "$PEER_VERBS_LIB" "$TRACE_PREFIX" \
+             "$TRACE_LAYER" "$TRACE_TOKEN" "$TRACE_FFN_SAME_INPUT"; do
   [[ $value != *"'"* && $value != *$'\n'* ]] || {
     echo "error: environment values may not contain quotes or newlines" >&2
     exit 2
@@ -180,6 +188,14 @@ done
 }
 [[ $KDA_ROUTED_BATCH_TEST == 0 || $KDA_ROUTED_BATCH_TEST == 1 ]] || {
   echo "error: DS4_GLM5_KDA_ROUTED_BATCH_TEST must be 0 or 1" >&2
+  exit 2
+}
+[[ $KDA_ATTENTION_ONLY_TEST == 0 || $KDA_ATTENTION_ONLY_TEST == 1 ]] || {
+  echo "error: DS4_GLM5_KDA_ATTENTION_ONLY_TEST must be 0 or 1" >&2
+  exit 2
+}
+[[ $KDA_ATTENTION_ONLY_TEST == 0 || $KDA_ROUTED_BATCH_TEST == 1 ]] || {
+  echo "error: KDA attention-only mode requires the KDA batch fixture" >&2
   exit 2
 }
 [[ $KDA_ROUTED_BATCH_TEST == 0 ||
@@ -415,7 +431,8 @@ done
 SOURCE_DIFF_SHA=$(sha256sum "$OUT/source.diff" | awk '{print $1}')
 
 make -C "$REPO" -j"$(nproc)" tests/test_rocm_glm5_prefix_layer3_tp
-ssh -o BatchMode=yes "$PEER" "mkdir -p -- '$PEER_DIR'; test -f '$PEER_MODEL'"
+ssh -o BatchMode=yes "$PEER" \
+  "mkdir -p -- '$PEER_DIR' '$PEER_RESEARCH_ROOT/glm5-next-tp2/$TAG'; test -f '$PEER_MODEL'"
 if [[ $RDMA_PROFILE == odinlink ]]; then
   [[ -e /dev/odl_tb5_0 ]] || {
     echo "error: local OdinLink device is absent" >&2
@@ -525,6 +542,7 @@ printf 'layer_timing=%s\n' "$LAYER_TIMING" >>"$OUT/run.env"
 printf 'batch_prefill_test=%s\n' "$BATCH_PREFILL_TEST" >>"$OUT/run.env"
 printf 'batch_prefill_compare=%s\n' "$BATCH_PREFILL_COMPARE" >>"$OUT/run.env"
 printf 'kda_routed_batch_test=%s\n' "$KDA_ROUTED_BATCH_TEST" >>"$OUT/run.env"
+printf 'kda_attention_only_test=%s\n' "$KDA_ATTENTION_ONLY_TEST" >>"$OUT/run.env"
 printf 'kda_routed_batch_rows=%s\n' "$KDA_ROUTED_BATCH_ROWS" >>"$OUT/run.env"
 printf 'kda_routed_profile_repeats=%s\n' "$KDA_ROUTED_PROFILE_REPEATS" >>"$OUT/run.env"
 printf 'kda_routed_continuation_rows=%s\n' "$KDA_ROUTED_CONTINUATION_ROWS" >>"$OUT/run.env"
@@ -550,6 +568,23 @@ printf 'small_gate_disabled=%s\n' \
   "$([[ -n $SMALL_GATE_DISABLE ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
 printf 'kda_tp=%s\n' "$([[ -n $KDA_TP ]] && printf 1 || printf 0)" \
+  >>"$OUT/run.env"
+printf 'resident_experts=%s\n' \
+  "$([[ -n $RESIDENT_EXPERTS ]] && printf 1 || printf 0)" >>"$OUT/run.env"
+printf 'warm_resident=%s\n' \
+  "$([[ -n $WARM_RESIDENT ]] && printf 1 || printf 0)" >>"$OUT/run.env"
+printf 'tp_skip_unowned=%s\n' \
+  "$([[ -n $TP_SKIP_UNOWNED ]] && printf 1 || printf 0)" >>"$OUT/run.env"
+printf 'q8_mid_down=%s\n' \
+  "$([[ -n $Q8_MID_DOWN ]] && printf 1 || printf 0)" >>"$OUT/run.env"
+printf 'shared_down_f32_disabled=%s\n' \
+  "$([[ -n $SHARED_DOWN_F32_DISABLE ]] && printf 1 || printf 0)" \
+  >>"$OUT/run.env"
+printf 'batch_layer_trace=%s\ntrace_layer=%s\ntrace_token=%s\n' \
+  "$([[ -n $BATCH_LAYER_TRACE ]] && printf 1 || printf 0)" \
+  "$TRACE_LAYER" "$TRACE_TOKEN" >>"$OUT/run.env"
+printf 'trace_ffn_same_input=%s\n' \
+  "$([[ -n $TRACE_FFN_SAME_INPUT ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
 printf 'expected_generated_fnv=%s\n' "$EXPECTED_GENERATED_FNV" >>"$OUT/run.env"
 if [[ -n $TEXT_PROMPT ]]; then
@@ -654,14 +689,30 @@ if [[ -n $IQ2_SORTED_DISABLE ]]; then
   local_candidate_env+=(DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED="$IQ2_SORTED_DISABLE")
   remote_candidate_env+=" DS4_ROCM_DISABLE_RESIDENT_IQ2_SORTED='$IQ2_SORTED_DISABLE'"
 fi
+if [[ -n $Q8_MID_DOWN ]]; then
+  local_candidate_env+=(DS4_ROCM_GLM5_BATCH_Q8_MID_DOWN="$Q8_MID_DOWN")
+  remote_candidate_env+=" DS4_ROCM_GLM5_BATCH_Q8_MID_DOWN='$Q8_MID_DOWN'"
+fi
+if [[ -n $SHARED_DOWN_SERIAL ]]; then
+  local_candidate_env+=(DS4_ROCM_GLM5_BATCH_SHARED_DOWN_SERIAL="$SHARED_DOWN_SERIAL")
+  remote_candidate_env+=" DS4_ROCM_GLM5_BATCH_SHARED_DOWN_SERIAL='$SHARED_DOWN_SERIAL'"
+fi
+if [[ -n $SHARED_DOWN_F32_DISABLE ]]; then
+  local_candidate_env+=(DS4_ROCM_GLM5_DISABLE_SHARED_DOWN_F32="$SHARED_DOWN_F32_DISABLE")
+  remote_candidate_env+=" DS4_ROCM_GLM5_DISABLE_SHARED_DOWN_F32='$SHARED_DOWN_F32_DISABLE'"
+fi
 if [[ -n $BATCH_LAYER_TRACE ]]; then
   local_candidate_env+=(DS4_GLM5_BATCH_LAYER_TRACE="$BATCH_LAYER_TRACE")
   remote_candidate_env+=" DS4_GLM5_BATCH_LAYER_TRACE='$BATCH_LAYER_TRACE'"
   if [[ -n $TRACE_PREFIX ]]; then
     local_candidate_env+=(DS4_GLM5_NEXT_TRACE_PREFIX="$OUT/trace")
-    remote_candidate_env+=" DS4_GLM5_NEXT_TRACE_PREFIX='$PEER_DIR/trace'"
+    remote_candidate_env+=" DS4_GLM5_NEXT_TRACE_PREFIX='$PEER_RESEARCH_ROOT/glm5-next-tp2/$TAG/trace'"
     local_candidate_env+=(DS4_GLM5_NEXT_TRACE_LAYER="$TRACE_LAYER" DS4_GLM5_NEXT_TRACE_TOKEN="$TRACE_TOKEN")
     remote_candidate_env+=" DS4_GLM5_NEXT_TRACE_LAYER='$TRACE_LAYER' DS4_GLM5_NEXT_TRACE_TOKEN='$TRACE_TOKEN'"
+    if [[ -n $TRACE_FFN_SAME_INPUT ]]; then
+      local_candidate_env+=(DS4_GLM5_TRACE_FFN_SAME_INPUT="$TRACE_FFN_SAME_INPUT")
+      remote_candidate_env+=" DS4_GLM5_TRACE_FFN_SAME_INPUT='$TRACE_FFN_SAME_INPUT'"
+    fi
   fi
 fi
 if [[ -n $WARM_RESIDENT ]]; then
@@ -702,6 +753,7 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_FULL_TRUNK="$FULL_TRUNK" \
   DS4_GLM5_FULL_TOKENS="$FULL_TOKENS" \
   DS4_GLM5_KDA_ROUTED_BATCH_TEST="$KDA_ROUTED_BATCH_TEST" \
+  DS4_GLM5_KDA_ATTENTION_ONLY_TEST="$KDA_ATTENTION_ONLY_TEST" \
   DS4_GLM5_KDA_ROUTED_BATCH_ROWS="$KDA_ROUTED_BATCH_ROWS" \
   DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS="$KDA_ROUTED_PROFILE_REPEATS" \
   DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS="$KDA_ROUTED_CONTINUATION_ROWS" \
@@ -718,7 +770,7 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   "${local_command[@]}" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS' DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS='$KDA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_MLA_ROUTED_BATCH_TEST='$MLA_ROUTED_BATCH_TEST' DS4_GLM5_MLA_ROUTED_BATCH_ROWS='$MLA_ROUTED_BATCH_ROWS' DS4_GLM5_MLA_ROUTED_PREFIX_ROWS='$MLA_ROUTED_PREFIX_ROWS' DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS='$MLA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_BATCH_PREFILL_TEST='$BATCH_PREFILL_TEST' DS4_GLM5_BATCH_PREFILL_COMPARE='$BATCH_PREFILL_COMPARE' DS4_GLM5_LAYER_TIMING='$LAYER_TIMING'$remote_rdma_env$remote_candidate_env$remote_text_env '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ATTENTION_ONLY_TEST='$KDA_ATTENTION_ONLY_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS' DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS='$KDA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_MLA_ROUTED_BATCH_TEST='$MLA_ROUTED_BATCH_TEST' DS4_GLM5_MLA_ROUTED_BATCH_ROWS='$MLA_ROUTED_BATCH_ROWS' DS4_GLM5_MLA_ROUTED_PREFIX_ROWS='$MLA_ROUTED_PREFIX_ROWS' DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS='$MLA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_BATCH_PREFILL_TEST='$BATCH_PREFILL_TEST' DS4_GLM5_BATCH_PREFILL_COMPARE='$BATCH_PREFILL_COMPARE' DS4_GLM5_LAYER_TIMING='$LAYER_TIMING'$remote_rdma_env$remote_candidate_env$remote_text_env '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 
@@ -746,7 +798,9 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
     grep -q '"fallback_calls":0' "$log"
     ! grep -q 'rdma device mlx5_' "$log"
   fi
-  if [[ $KDA_ROUTED_BATCH_TEST == 1 ]]; then
+  if [[ $KDA_ATTENTION_ONLY_TEST == 1 ]]; then
+    grep -q 'PASS GLM5 KDA-attention batch role=' "$log"
+  elif [[ $KDA_ROUTED_BATCH_TEST == 1 ]]; then
     grep -q 'PASS GLM5 KDA+routed batch role=' "$log"
   elif [[ $MLA_ROUTED_BATCH_TEST == 1 ]]; then
     grep -q 'PASS GLM5 MLA+routed batch role=' "$log"
@@ -771,13 +825,25 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
     grep -q 'PASS GLM5 prefix->layer3' "$log"
   fi
   if [[ $FULL_TRUNK == 1 ]]; then
-    grep -q 'packed_q4_bytes=85614133248 rdma=1' "$log"
+    if grep -q 'GLM5 mixed-Q2 typed residency oracle' "$log"; then
+      grep -q 'packed_q4_bytes=0' "$log"
+      ! grep -Eq 'packed_q4_bytes=[1-9][0-9]*' "$log"
+    else
+      grep -q 'packed_q4_bytes=85614133248 rdma=1' "$log"
+    fi
     grep -q 'GLM5 full-trunk post-install' "$log"
   else
     grep -q 'window_cache_bytes=0 rdma=1' "$log"
   fi
 done
-if [[ $KDA_ROUTED_BATCH_TEST == 1 ]]; then
+if [[ $KDA_ATTENTION_ONLY_TEST == 1 ]]; then
+  LEADER_OUTPUT=$(sed -n '/PASS GLM5 KDA-attention batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+  WORKER_OUTPUT=$(sed -n '/PASS GLM5 KDA-attention batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  [[ -n $LEADER_OUTPUT && $LEADER_OUTPUT == "$WORKER_OUTPUT" ]] || {
+    echo "error: all-rank KDA-attention hashes differ" >&2
+    exit 1
+  }
+elif [[ $KDA_ROUTED_BATCH_TEST == 1 ]]; then
   LEADER_OUTPUT=$(sed -n '/PASS GLM5 KDA+routed batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
   WORKER_OUTPUT=$(sed -n '/PASS GLM5 KDA+routed batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
   LEADER_CONT=$(sed -n '/PASS GLM5 KDA+routed batch role=/s/.* continuation=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
