@@ -18,6 +18,7 @@ typedef struct {
     const ds4_glm5_next_model_offsets *model;
     struct ds4_tp *tp;
     uint32_t tp_rank;
+    ds4_gpu_tensor *tp_slab;
     ds4_gpu_tensor *tp_big_out;
     ds4_gpu_tensor *tp_big_in;
     void *tp_big_out_host;

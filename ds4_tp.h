@@ -92,6 +92,11 @@ enum {
      * layer.  Exact negotiation prevents independently loaded ranks from
      * entering different attention families or state schedules. */
     DS4_TP_FEATURE_GLM5_RESIDENT_KDA = UINT32_C(1) << 20,
+    /* GLM-5.3 one-token reductions use the latency slab and its persistent
+     * preposted receive window instead of the synchronous bulk channel.
+     * The choice changes the RDMA gate schedule, so independently launched
+     * ranks must negotiate it before either rank enters the graph. */
+    DS4_TP_FEATURE_GLM5_SMALL_GATE = UINT32_C(1) << 21,
 };
 
 static inline uint32_t ds4_tp_glm5_resident_kda_feature(
@@ -226,6 +231,7 @@ bool ds4_tp_big_gate_is_direct(const ds4_tp *tp, const void *out,
 bool ds4_tp_requires_host_slab(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 uint32_t ds4_tp_runtime_features(const ds4_tp *tp);
+uint64_t ds4_tp_vec_bytes(const ds4_tp *tp);
 #ifdef DS4_TP_TEST_HOOKS
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
                                                 char *err, size_t errlen);

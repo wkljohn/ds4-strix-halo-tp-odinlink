@@ -518,12 +518,56 @@ static int tp_context_valid(const ds4_glm5_next_exec_ctx *ctx) {
 }
 
 static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
-                            uint32_t layer, uint32_t n_tokens) {
+                            uint32_t layer, uint32_t gate,
+                            uint32_t n_tokens) {
     if (n_tokens == 0u) return 0;
     const uint64_t bytes =
         (uint64_t)n_tokens * GLM5_WIDTH * sizeof(float);
-    if (!tp_context_valid_bytes(ctx, bytes) ||
-        *ctx->tp_sequence == UINT64_MAX || !ds4_gpu_synchronize()) return 0;
+    if (!tp_context_valid_bytes(ctx, bytes) || gate >= DS4_TP_GATES_PER_LAYER ||
+        *ctx->tp_sequence == UINT64_MAX) return 0;
+
+    const int small_gate_requested = n_tokens == 1u &&
+        (ds4_tp_runtime_features(ctx->tp) &
+         DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u;
+    if (small_gate_requested) {
+        if (!ctx->tp_slab || bytes != ds4_tp_vec_bytes(ctx->tp)) {
+            ds4_tp_mark_failed(ctx->tp);
+            return 0;
+        }
+        const uint64_t out_off =
+            ds4_tp_slab_out_offset(ctx->tp, layer, gate);
+        const uint64_t in_off =
+            ds4_tp_slab_in_offset(ctx->tp, layer, gate);
+        if (ds4_gpu_tensor_bytes(ctx->tp_slab) < out_off + bytes ||
+            ds4_gpu_tensor_bytes(ctx->tp_slab) < in_off + bytes ||
+            !ds4_gpu_tensor_copy(ctx->tp_slab, out_off,
+                                 ctx->tp_big_out, 0u, bytes) ||
+            !ds4_gpu_synchronize()) {
+            ds4_tp_mark_failed(ctx->tp);
+            return 0;
+        }
+        const uint64_t sequence = ++*ctx->tp_sequence;
+        if (!ds4_tp_gate_exchange(ctx->tp, layer, gate, sequence)) {
+            ds4_tp_mark_failed(ctx->tp);
+            return 0;
+        }
+        if (!ds4_gpu_tensor_copy(ctx->tp_big_in, 0u,
+                                 ctx->tp_slab, in_off, bytes)) {
+            ds4_tp_mark_failed(ctx->tp);
+            return 0;
+        }
+        static int reported;
+        if (!reported) {
+            fprintf(stderr,
+                    "ds4: GLM5 one-token TP reductions use the "
+                    "preposted latency gate (%llu bytes)\n",
+                    (unsigned long long)bytes);
+            reported = 1;
+        }
+        return 1;
+    }
+
+    if (!ds4_gpu_synchronize()) return 0;
     const uint64_t sequence = ++*ctx->tp_sequence;
     if (!ds4_tp_big_gate_exchange(ctx->tp, layer, sequence,
                                   ctx->tp_big_out_host,
@@ -534,8 +578,9 @@ static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
     return 1;
 }
 
-static int tp_exchange(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer) {
-    return tp_exchange_rows(ctx, layer, 1u);
+static int tp_exchange(const ds4_glm5_next_exec_ctx *ctx,
+                       uint32_t layer, uint32_t gate) {
+    return tp_exchange_rows(ctx, layer, gate, 1u);
 }
 
 static uint64_t fnv64_continue(uint64_t hash, const void *data,
@@ -823,7 +868,7 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             (uint64_t)ctx->tp_rank * half_heads, half_heads,
             GLM5_WIDTH, w->mla_heads,
             (uint64_t)ctx->tp_rank * half_heads) &&
-        tp_exchange(ctx, il) &&
+        tp_exchange(ctx, il, DS4_TP_GATE_ATTN) &&
         ds4_gpu_add_tensor(w->attention, ctx->tp_big_out, ctx->tp_big_in,
                            GLM5_WIDTH) &&
         ds4_gpu_hc_expand_split_tensor(
@@ -1006,7 +1051,7 @@ static int mla_dense_selection_attention_rows(
         mla_value_project_rows_batch(ctx, m, w, n_tokens) &&
         mla_output_project_rows_batch(ctx, m, w, n_tokens);
     return ok &&
-        tp_exchange_rows(ctx, il, n_tokens) &&
+        tp_exchange_rows(ctx, il, DS4_TP_GATE_ATTN, n_tokens) &&
         ds4_gpu_add_tensor(w->attention, ctx->tp_big_out, ctx->tp_big_in,
                            (uint32_t)elements) &&
         ds4_gpu_hc_expand_split_tensor(
@@ -1083,7 +1128,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             GLM5_WIDTH, w->shared_mid, 0u) &&
         ds4_gpu_add_tensor(ctx->tp_big_out, w->routed_out, w->shared_out,
                            GLM5_WIDTH) &&
-        tp_exchange(ctx, il) &&
+        tp_exchange(ctx, il, DS4_TP_GATE_FFN) &&
         ds4_gpu_add_tensor(w->down, ctx->tp_big_out, ctx->tp_big_in,
                            GLM5_WIDTH) &&
         ds4_gpu_hc_expand_split_tensor(
@@ -1174,7 +1219,7 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             rank_mid_base, GLM5_RANK_MID, w->shared_mid, n_tokens) &&
         ds4_gpu_add_tensor(ctx->tp_big_out, w->routed_out, w->shared_out,
                            (uint32_t)elements) &&
-        tp_exchange_rows(ctx, il, n_tokens) &&
+        tp_exchange_rows(ctx, il, DS4_TP_GATE_FFN, n_tokens) &&
         ds4_gpu_add_tensor(w->down, ctx->tp_big_out, ctx->tp_big_in,
                            (uint32_t)elements) &&
         ds4_gpu_hc_expand_split_tensor(

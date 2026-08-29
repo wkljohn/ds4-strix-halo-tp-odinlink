@@ -194,6 +194,12 @@ int main(void) {
     ok &= check("hello mismatched-glm5-resident-kda",
                 DS4_TP_FEATURE_GLM5_RESIDENT_KDA, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00100000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-small-gate",
+                DS4_TP_FEATURE_GLM5_SMALL_GATE,
+                DS4_TP_FEATURE_GLM5_SMALL_GATE, 1, NULL);
+    ok &= check("hello mismatched-glm5-small-gate",
+                DS4_TP_FEATURE_GLM5_SMALL_GATE, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00200000 peer=0x00000000)");
     ok &= check("hello q4k-wmma-kshard mismatch",
                 DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD,
                 DS4_TP_FEATURE_Q4K_WMMA, 0,
@@ -238,12 +244,13 @@ int main(void) {
         DS4_TP_FEATURE_Q4K_FUSED_MID |
         DS4_TP_FEATURE_HC_STAGE_EXACT_COOP |
         DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE |
-        DS4_TP_FEATURE_Q4K_KSHARD;
-    if ((DS4_TP_FEATURE_GLM5_RESIDENT_KDA & prior_features) != 0u) {
-        fprintf(stderr, "FAIL GLM5 resident KDA feature overlaps prior bits\n");
+        DS4_TP_FEATURE_Q4K_KSHARD |
+        DS4_TP_FEATURE_GLM5_RESIDENT_KDA;
+    if ((DS4_TP_FEATURE_GLM5_SMALL_GATE & prior_features) != 0u) {
+        fprintf(stderr, "FAIL GLM5 small-gate feature overlaps prior bits\n");
         ok = 0;
     } else {
-        fprintf(stderr, "PASS GLM5 resident KDA feature is disjoint\n");
+        fprintf(stderr, "PASS GLM5 small-gate feature is disjoint\n");
     }
     if (ds4_tp_glm5_resident_kda_feature(1, 1, 1, 1) !=
             DS4_TP_FEATURE_GLM5_RESIDENT_KDA ||

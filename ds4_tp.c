@@ -2392,6 +2392,9 @@ uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 uint32_t ds4_tp_runtime_features(const ds4_tp *tp) {
     return tp ? tp->runtime_features : 0;
 }
+uint64_t ds4_tp_vec_bytes(const ds4_tp *tp) {
+    return tp ? tp->vec_bytes : 0u;
+}
 bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
 }
@@ -2531,10 +2534,47 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
  * (the 4MB socket buffers absorb one round). */
 #define DS4_TP_BIG_CHUNK (2ull * 1024ull * 1024ull)
 
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+static uint64_t g_tp_big_gate_profile_gates;
+static double g_tp_big_gate_profile_barrier_s;
+static double g_tp_big_gate_profile_payload_s;
+static double g_tp_big_gate_profile_total_s;
+
+static int tp_big_gate_profile_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("DS4_TP_BIGGATE_PROFILE") ? 1 : 0;
+    return enabled;
+}
+
+static void tp_big_gate_profile_record(const char *payload_kind,
+                                       double begin, double barrier_done) {
+    const double done = tp_now_sec();
+    g_tp_big_gate_profile_barrier_s += barrier_done - begin;
+    g_tp_big_gate_profile_payload_s += done - barrier_done;
+    g_tp_big_gate_profile_total_s += done - begin;
+    const uint64_t gates = ++g_tp_big_gate_profile_gates;
+    if (gates % 16u != 0u) return;
+    fprintf(stderr,
+            "ds4-tp: big-gate control %llu gates | tcp-barrier "
+            "%.1f us/gate | %s-payload %.1f us/gate | total "
+            "%.1f us/gate\n",
+            (unsigned long long)gates,
+            g_tp_big_gate_profile_barrier_s * 1e6 / (double)gates,
+            payload_kind,
+            g_tp_big_gate_profile_payload_s * 1e6 / (double)gates,
+            g_tp_big_gate_profile_total_s * 1e6 / (double)gates);
+}
+#endif
+
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     DS4_TP_TEST_COUNT_EXCHANGE();
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const int profile_enabled = tp_big_gate_profile_enabled();
+    const double profile_t0 = profile_enabled ? tp_now_sec() : 0.0;
+#endif
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
@@ -2547,11 +2587,20 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                 layer, (unsigned long long)seq);
         return 0;
     }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const double profile_barrier_done = profile_enabled ? tp_now_sec() : 0.0;
+#endif
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
         if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(tp, out, in, bytes,
-                                         0u, 0u, NULL, NULL);
+        const int ok = tp_rdma_big_gate_exchange(tp, out, in, bytes,
+                                                 0u, 0u, NULL, NULL);
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+        if (ok && profile_enabled)
+            tp_big_gate_profile_record("rdma", profile_t0,
+                                       profile_barrier_done);
+#endif
+        return ok;
     }
 #endif
     uint64_t off = 0;
@@ -2562,6 +2611,11 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         if (!tp_read_full(tp->data_fd, (char *)in + off, n)) return 0;
         off += n;
     }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    if (profile_enabled)
+        tp_big_gate_profile_record("tcp", profile_t0,
+                                   profile_barrier_done);
+#endif
     static int glm_tp_debug = -1;   /* patch 17: cached, per-gate path */
     if (glm_tp_debug < 0) glm_tp_debug = getenv("DS4_GLM_TP_DEBUG") ? 1 : 0;
     if (glm_tp_debug) {

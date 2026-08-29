@@ -170,8 +170,17 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
     identity.n_vocab = 154880u;
     identity.quant_bits = 4u;
     identity.ctx_size = context_capacity;
+    const char *disable_small_gate =
+        std::getenv("DS4_GLM5_DISABLE_SMALL_GATE");
+    CHECK(!disable_small_gate ||
+              std::strcmp(disable_small_gate, "0") == 0 ||
+              std::strcmp(disable_small_gate, "1") == 0,
+          "small-gate rollback selector is exactly 0 or 1");
+    const bool small_gate_enabled = !disable_small_gate ||
+        std::strcmp(disable_small_gate, "1") != 0;
     identity.runtime_features =
-        DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD;
+        DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD |
+        (small_gate_enabled ? DS4_TP_FEATURE_GLM5_SMALL_GATE : 0u);
     identity.gate_slot_start = 3u * DS4_TP_GATES_PER_LAYER;
     identity.gate_slot_step = 1u;
     CHECK(ds4_glm5_next_build_tp_gate_mask(identity.gate_slot_mask,
@@ -203,6 +212,7 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
 
     exec.tp = guard.tp;
     exec.tp_rank = leader ? 0u : 1u;
+    exec.tp_slab = guard.slab;
     exec.tp_big_out = guard.big_out;
     exec.tp_big_in = guard.big_in;
     exec.tp_big_out_host = ds4_gpu_tensor_contents(guard.big_out);
