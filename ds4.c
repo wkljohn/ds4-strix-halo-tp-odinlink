@@ -6315,8 +6315,19 @@ static void config_validate_glm5_next_model(const ds4_model *m,
         bound.kda_count == 0u) {
         ds4_die("glm5-next tensor-derived attention schedule was not validated");
     }
-    if (require_executable_engine) {
+    /* GLM5.3 ordinary-engine wiring is still being validated against the
+     * staged TP executor. Keep the production default fail-closed; an
+     * explicit process-local opt-in permits integration smoke tests without
+     * silently exposing an unvalidated execution path. */
+    const bool ordinary_opt_in =
+        getenv("DS4_GLM5_NEXT_ENABLE_ORDINARY") != NULL;
+    if (require_executable_engine && !ordinary_opt_in) {
         ds4_die("glm5-next metadata and tensor layouts validated; staged full TP execution is not yet wired into the ordinary engine; refusing inference");
+    }
+    if (require_executable_engine && ordinary_opt_in) {
+        fprintf(stderr,
+                "warning: GLM5.3 ordinary engine opt-in is experimental; "
+                "staged TP equivalence is not yet promoted\n");
     }
 }
 
