@@ -51394,10 +51394,25 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
     const uint32_t capacity = (uint32_t)ctx_size;
     const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint32_t big_capacity = ds4_tp_big_capacity_rows(e->tp.ctx);
-    if (big_capacity < capacity || !e->tp.slab) {
+    /* The current metadata-validated NoPE indexer keeps a bounded 2048-row
+     * history.  Reject larger contexts before loading a session; accepting
+     * them would let prefill run until the first out-of-window tile and then
+     * fail after doing observable work.  A paged/segmented index history is a
+     * separate correctness-gated stage, not an implicit fallback. */
+    if (capacity > DS4_GLM5_NEXT_INDEX_TOP_K) {
+        fprintf(stderr,
+                "ds4: GLM5 ordinary executor currently supports context "
+                "<= %u (requested %u; indexed history is bounded)\n",
+                DS4_GLM5_NEXT_INDEX_TOP_K, capacity);
+        return 0;
+    }
+    /* The mlx5 provider deliberately caps the registered direct slab at
+     * 2048 rows.  That is a transport-buffer limit, not a model/KV context
+     * limit: batch execution exchanges long prefills in bounded chunks. */
+    if (big_capacity == 0u || !e->tp.slab) {
         fprintf(stderr,
                 "ds4: GLM5 ordinary opt-in requires DS4_TP_BIG_DIRECT=1 "
-                "with capacity >= context (%u, have %u)\n",
+                "with a nonzero direct transport capacity (context %u, have %u)\n",
                 capacity, big_capacity);
         return 0;
     }
@@ -51413,7 +51428,7 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
     s->glm5_next_out = ds4_gpu_tensor_alloc(row_bytes * 4u);
     s->glm5_next_logits = ds4_gpu_tensor_alloc(
         (uint64_t)DS4_N_VOCAB * sizeof(float));
-    const uint64_t big_bytes = row_bytes * capacity;
+    const uint64_t big_bytes = row_bytes * big_capacity;
     if (!s->glm5_next_cur || !s->glm5_next_out || !s->glm5_next_logits) {
         fprintf(stderr, "ds4: GLM5 ordinary executor tensor allocation failed\n");
         return 0;
