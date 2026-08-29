@@ -399,6 +399,10 @@ int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float top_p, float min_p, uint64_t *rng,
                            float *prob_scratch);
 uint64_t ds4_test_mixed_native_count(void);
+/* Stable diagnostic for the staged GLM5.3 GGUF binding.  This hashes only
+ * the offset/schedule contract, never model payloads, and is available to
+ * metadata-only parity tests. */
+uint64_t ds4_test_glm5_next_offset_hash(ds4_engine *e);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);

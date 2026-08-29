@@ -4445,6 +4445,16 @@ typedef struct {
     ds4_glm5_next_model_offsets offsets;
 } ds4_glm5_next_weights;
 
+static uint64_t glm5_next_offset_hash(const ds4_glm5_next_model_offsets *o) {
+    const uint8_t *p = (const uint8_t *)o;
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (size_t i = 0u; i < sizeof(*o); ++i) {
+        h ^= p[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
 static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
                                    const ds4_model *m,
                                    uint32_t layer_count,
@@ -38813,6 +38823,12 @@ struct ds4_engine {
     int            placement_ctx_hint;
 };
 
+#ifdef DS4_TEST_HOOKS
+uint64_t ds4_test_glm5_next_offset_hash(ds4_engine *e) {
+    return e && e->glm5_next ? glm5_next_offset_hash(&e->glm5_next->offsets) : 0u;
+}
+#endif
+
 static uint64_t ds4_engine_dynamic_expert_cache_bytes(
         const ds4_engine *e) {
     if (!e || !e->ssd_streaming) return 0;
@@ -59348,6 +59364,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                DS4_GLM5_NEXT_LAYER_COUNT,
                                DS4_GLM5_NEXT_TRUNK_COUNT,
                                1u);
+        if (getenv("DS4_GLM5_NEXT_PRINT_OFFSET_HASH"))
+            fprintf(stderr, "ds4: glm5-next offset hash %016llx\n",
+                    (unsigned long long)glm5_next_offset_hash(&e->glm5_next->offsets));
     }
     if (load_slice && load_layer_end == UINT32_MAX) {
         const uint32_t normal_layers = ds4_model_normal_layer_count();
