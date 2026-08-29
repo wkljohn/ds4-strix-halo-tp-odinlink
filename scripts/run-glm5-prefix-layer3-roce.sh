@@ -92,6 +92,8 @@ Q4K_WMMA_MIN_COUNT=${DS4_ROCM_Q4K_WMMA_MIN_COUNT:-}
 BIGGATE_PROFILE=${DS4_TP_BIGGATE_PROFILE:-}
 SMALL_GATE_DISABLE=${DS4_GLM5_DISABLE_SMALL_GATE:-}
 KDA_TP=${DS4_GLM5_KDA_TP:-}
+RESIDENT_EXPERTS=${DS4_GLM5_NEXT_RESIDENT_EXPERTS:-}
+WARM_RESIDENT=${DS4_GLM5_NEXT_WARM_RESIDENT:-}
 EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
 PEER_DIR=${DS4_GLM5_PEER_TEST_DIR:-/home/wkljohn/Desktop/cc/glm5-node2-test/prefix-layer3}
 BINARY=$REPO/tests/test_rocm_glm5_prefix_layer3_tp
@@ -613,6 +615,14 @@ fi
 if [[ -n $KDA_TP ]]; then
   local_candidate_env+=(DS4_GLM5_KDA_TP=1)
   remote_candidate_env+=' DS4_GLM5_KDA_TP=1'
+fi
+if [[ -n $RESIDENT_EXPERTS ]]; then
+  local_candidate_env+=(DS4_GLM5_NEXT_RESIDENT_EXPERTS="$RESIDENT_EXPERTS")
+  remote_candidate_env+=" DS4_GLM5_NEXT_RESIDENT_EXPERTS='$RESIDENT_EXPERTS'"
+fi
+if [[ -n $WARM_RESIDENT ]]; then
+  local_candidate_env+=(DS4_GLM5_NEXT_WARM_RESIDENT="$WARM_RESIDENT")
+  remote_candidate_env+=" DS4_GLM5_NEXT_WARM_RESIDENT='$WARM_RESIDENT'"
 fi
 if [[ -n $TEXT_PROMPT ]]; then
   text_env+=(DS4_GLM5_TEXT_PROMPT="$TEXT_PROMPT")
