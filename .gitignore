@@ -79,6 +79,7 @@
 /tests/test_tp_dual_stream_progress
 /tests/roce_v2_mr_probe
 *.o
+tests/test_glm5_next_real_offset_hash
 *.dSYM/
 /build/
 /build-*/
