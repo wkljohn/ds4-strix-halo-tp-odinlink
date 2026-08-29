@@ -7027,6 +7027,38 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
     return model_map_span_vec_finish(spans);
 }
 
+/* GLM5.3 has a tensor-derived weight table rather than ds4_weights.  Build
+ * the same resident-map contract for it: every replicated tensor is mapped,
+ * while the three routed expert blobs are restricted to this rank's
+ * contiguous expert range.  Do not use name or filename guesses for other
+ * tensors; the GGUF dimensional contract identifies expert blobs. */
+static bool glm5_next_model_map_sharded_spans(
+        const ds4_model *m, int rank, ds4_model_map_span_vec *spans) {
+    if (!m || !spans || (rank != 0 && rank != 1)) return false;
+    memset(spans, 0, sizeof(*spans));
+    const uint64_t split = ds4_tp_expert_split_boundary();
+    for (uint64_t i = 0u; i < m->n_tensors; ++i) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->ndim == 3u && t->dim[2] == DS4_N_EXPERT) {
+            uint64_t in_dim = 0u, out_dim = 0u, row_bytes = 0u;
+            if (!tensor_expert_bytes(m, t, 0u, &in_dim, &out_dim,
+                                     &row_bytes) || row_bytes == 0u) {
+                return false;
+            }
+            const uint64_t expert_bytes = out_dim * row_bytes;
+            const uint64_t first = rank == 1 ? split : 0u;
+            const uint64_t count = rank == 1 ? DS4_N_EXPERT - split : split;
+            const uint64_t lo = t->abs_offset + first * expert_bytes;
+            const uint64_t bytes = count * expert_bytes;
+            model_map_span_vec_append(spans, lo, lo + bytes, true);
+            if (bytes > spans->max_tensor_bytes) spans->max_tensor_bytes = bytes;
+        } else {
+            model_map_span_vec_include_one(spans, t);
+        }
+    }
+    return model_map_span_vec_finish(spans);
+}
+
 static DS4_MAYBE_UNUSED bool weights_model_map_decode_layer_spans(
         const ds4_weights *w,
         uint32_t il,
@@ -60169,13 +60201,34 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         spans.max_tensor_bytes);
             free(spans.v);
         } else if (tp_shard && DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
-            /* GLM5.3 has its own tensor-derived binding table; the legacy
-             * ds4_weights shard-span builder cannot describe KDA layer 0 or
-             * the mixed expert tensor names.  Keep the mmap complete and let
-             * the staged executor touch only rank-owned expert ranges.  This
-             * is virtual/lazy mapping, not a second resident weight copy. */
-            e->startup_model_span_bytes = e->model.size / 2u;
-            model_map_ok = ds4_gpu_set_model_map(e->model.map, e->model.size);
+            ds4_model_map_span_vec spans;
+            if (!glm5_next_model_map_sharded_spans(&e->model,
+                                                   tp_shard_rank, &spans)) {
+                fprintf(stderr, "ds4: GLM5.3 sharded model span build failed\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+            uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+            uint64_t span_bytes = 0u;
+            for (uint32_t i = 0u; i < spans.len; ++i) {
+                offsets[i] = spans.v[i].off;
+                sizes[i] = spans.v[i].end - spans.v[i].off;
+                span_bytes += sizes[i];
+            }
+            load_offsets = offsets;
+            load_sizes = sizes;
+            load_span_count = spans.len;
+            e->startup_model_span_bytes = span_bytes;
+            fprintf(stderr,
+                    "ds4: GLM5.3 TP rank %d maps %u spans, %.2f GiB\n",
+                    tp_shard_rank, spans.len,
+                    (double)span_bytes / 1073741824.0);
+            model_map_ok = ds4_gpu_set_model_map_spans(
+                e->model.map, e->model.size, load_offsets, load_sizes,
+                load_span_count, spans.max_tensor_bytes);
+            free(spans.v);
         } else if (tp_shard) {
             ds4_model_map_span_vec spans;
             if (!weights_model_map_sharded_spans(&e->weights, &e->model,
