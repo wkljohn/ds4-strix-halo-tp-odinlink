@@ -75,6 +75,10 @@ KDA_ROUTED_BATCH_TEST=${DS4_GLM5_KDA_ROUTED_BATCH_TEST:-0}
 KDA_ROUTED_BATCH_ROWS=${DS4_GLM5_KDA_ROUTED_BATCH_ROWS:-3}
 KDA_ROUTED_PROFILE_REPEATS=${DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS:-0}
 KDA_ROUTED_CONTINUATION_ROWS=${DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS:-1}
+MLA_ROUTED_BATCH_TEST=${DS4_GLM5_MLA_ROUTED_BATCH_TEST:-0}
+MLA_ROUTED_BATCH_ROWS=${DS4_GLM5_MLA_ROUTED_BATCH_ROWS:-3}
+MLA_ROUTED_PREFIX_ROWS=${DS4_GLM5_MLA_ROUTED_PREFIX_ROWS:-0}
+MLA_ROUTED_CONTINUATION_ROWS=${DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS:-1}
 ROCPROF_RANK=${DS4_GLM5_ROCPROF_RANK:-}
 BF16_TOKTILE_DISABLE=${DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE:-}
 BF16_TOKTILE_VERBOSE=${DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE:-}
@@ -159,6 +163,38 @@ done
 [[ $KDA_ROUTED_CONTINUATION_ROWS == 1 ||
    $KDA_ROUTED_CONTINUATION_ROWS == 16 ]] || {
   echo "error: DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS must be 1 or 16" >&2
+  exit 2
+}
+[[ $MLA_ROUTED_BATCH_TEST == 0 || $MLA_ROUTED_BATCH_TEST == 1 ]] || {
+  echo "error: DS4_GLM5_MLA_ROUTED_BATCH_TEST must be 0 or 1" >&2
+  exit 2
+}
+[[ $MLA_ROUTED_BATCH_TEST == 0 ||
+   ($FULL_TRUNK == 1 && -z $TEXT_PROMPT) ]] || {
+  echo "error: MLA routed batch test requires full trunk and no text prompt" >&2
+  exit 2
+}
+[[ $MLA_ROUTED_BATCH_ROWS == 3 || $MLA_ROUTED_BATCH_ROWS == 5 ||
+   $MLA_ROUTED_BATCH_ROWS == 33 ]] || {
+  echo "error: DS4_GLM5_MLA_ROUTED_BATCH_ROWS must be 3, 5, or 33" >&2
+  exit 2
+}
+[[ $MLA_ROUTED_PREFIX_ROWS =~ ^[0-3]$ ]] || {
+  echo "error: DS4_GLM5_MLA_ROUTED_PREFIX_ROWS must be 0, 1, 2, or 3" >&2
+  exit 2
+}
+[[ $MLA_ROUTED_CONTINUATION_ROWS == 1 ||
+   $MLA_ROUTED_CONTINUATION_ROWS == 16 ]] || {
+  echo "error: DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS must be 1 or 16" >&2
+  exit 2
+}
+[[ $MLA_ROUTED_CONTINUATION_ROWS == 1 ||
+   ($MLA_ROUTED_BATCH_TEST == 1 && $MLA_ROUTED_BATCH_ROWS == 33) ]] || {
+  echo "error: 16 MLA continuation rows require the 33-row batch test" >&2
+  exit 2
+}
+[[ $KDA_ROUTED_BATCH_TEST == 0 || $MLA_ROUTED_BATCH_TEST == 0 ]] || {
+  echo "error: select only one isolated routed batch test" >&2
   exit 2
 }
 [[ $KDA_ROUTED_CONTINUATION_ROWS == 1 ||
@@ -276,12 +312,14 @@ mkdir "$OUT"
 
 SOURCE_FILES=(
   Makefile .gitignore
-  ds4.c ds4.h ds4_glm5_kda.c ds4_glm5_kda.h
+  ds4.c ds4.h ds4_gpu.h ds4_tp.c ds4_tp.h
+  ds4_glm5_kda.c ds4_glm5_kda.h
   ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h
   ds4_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_next_exec.h
   ds4_rocm_compat.cu rocm/ds4_rocm_common.cuh
   rocm/ds4_rocm_bf16_toktile.cuh
-  rocm/ds4_rocm_matmul.cuh rocm/ds4_rocm_glm5_kda.cuh
+  rocm/ds4_rocm_matmul.cuh rocm/ds4_rocm_glm.cuh
+  rocm/ds4_rocm_glm5_kda.cuh
   rocm/ds4_rocm_moe.cuh rocm/ds4_rocm_moe_launch.cuh
   rocm/ds4_rocm_runtime.cuh
   scripts/run-glm5-prefix-layer3-roce.sh
@@ -420,6 +458,10 @@ printf 'kda_routed_batch_test=%s\n' "$KDA_ROUTED_BATCH_TEST" >>"$OUT/run.env"
 printf 'kda_routed_batch_rows=%s\n' "$KDA_ROUTED_BATCH_ROWS" >>"$OUT/run.env"
 printf 'kda_routed_profile_repeats=%s\n' "$KDA_ROUTED_PROFILE_REPEATS" >>"$OUT/run.env"
 printf 'kda_routed_continuation_rows=%s\n' "$KDA_ROUTED_CONTINUATION_ROWS" >>"$OUT/run.env"
+printf 'mla_routed_batch_test=%s\n' "$MLA_ROUTED_BATCH_TEST" >>"$OUT/run.env"
+printf 'mla_routed_batch_rows=%s\n' "$MLA_ROUTED_BATCH_ROWS" >>"$OUT/run.env"
+printf 'mla_routed_prefix_rows=%s\n' "$MLA_ROUTED_PREFIX_ROWS" >>"$OUT/run.env"
+printf 'mla_routed_continuation_rows=%s\n' "$MLA_ROUTED_CONTINUATION_ROWS" >>"$OUT/run.env"
 printf 'rocprof_rank=%s\n' "$ROCPROF_RANK" >>"$OUT/run.env"
 printf 'bf16_toktile_disabled=%s\n' "$([[ -n $BF16_TOKTILE_DISABLE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
 printf 'bf16_toktile_verbose=%s\n' "$([[ -n $BF16_TOKTILE_VERBOSE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
@@ -512,13 +554,17 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_KDA_ROUTED_BATCH_ROWS="$KDA_ROUTED_BATCH_ROWS" \
   DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS="$KDA_ROUTED_PROFILE_REPEATS" \
   DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS="$KDA_ROUTED_CONTINUATION_ROWS" \
+  DS4_GLM5_MLA_ROUTED_BATCH_TEST="$MLA_ROUTED_BATCH_TEST" \
+  DS4_GLM5_MLA_ROUTED_BATCH_ROWS="$MLA_ROUTED_BATCH_ROWS" \
+  DS4_GLM5_MLA_ROUTED_PREFIX_ROWS="$MLA_ROUTED_PREFIX_ROWS" \
+  DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS="$MLA_ROUTED_CONTINUATION_ROWS" \
   "${local_rdma_env[@]}" \
   "${local_candidate_env[@]}" \
   "${text_env[@]}" \
   "${local_command[@]}" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS' DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS='$KDA_ROUTED_CONTINUATION_ROWS'$remote_rdma_env$remote_candidate_env$remote_text_env '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS' DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS='$KDA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_MLA_ROUTED_BATCH_TEST='$MLA_ROUTED_BATCH_TEST' DS4_GLM5_MLA_ROUTED_BATCH_ROWS='$MLA_ROUTED_BATCH_ROWS' DS4_GLM5_MLA_ROUTED_PREFIX_ROWS='$MLA_ROUTED_PREFIX_ROWS' DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS='$MLA_ROUTED_CONTINUATION_ROWS'$remote_rdma_env$remote_candidate_env$remote_text_env '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 
@@ -548,6 +594,8 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
   fi
   if [[ $KDA_ROUTED_BATCH_TEST == 1 ]]; then
     grep -q 'PASS GLM5 KDA+routed batch role=' "$log"
+  elif [[ $MLA_ROUTED_BATCH_TEST == 1 ]]; then
+    grep -q 'PASS GLM5 MLA+routed batch role=' "$log"
   elif [[ -n $TEXT_PROMPT ]]; then
     grep -q 'GLM5 text prompt role=' "$log"
     grep -q 'PASS GLM5 real-text role=' "$log"
@@ -578,6 +626,16 @@ if [[ $KDA_ROUTED_BATCH_TEST == 1 ]]; then
     echo "error: all-rank KDA+routed batch or continuation hashes differ" >&2
     exit 1
   }
+elif [[ $MLA_ROUTED_BATCH_TEST == 1 ]]; then
+  LEADER_OUTPUT=$(sed -n '/PASS GLM5 MLA+routed batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+  WORKER_OUTPUT=$(sed -n '/PASS GLM5 MLA+routed batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  LEADER_CONT=$(sed -n '/PASS GLM5 MLA+routed batch role=/s/.* continuation=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+  WORKER_CONT=$(sed -n '/PASS GLM5 MLA+routed batch role=/s/.* continuation=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  [[ -n $LEADER_OUTPUT && $LEADER_OUTPUT == "$WORKER_OUTPUT" &&
+     -n $LEADER_CONT && $LEADER_CONT == "$WORKER_CONT" ]] || {
+    echo "error: all-rank MLA+routed batch or continuation hashes differ" >&2
+    exit 1
+  }
 elif [[ -n $TEXT_PROMPT ]]; then
   LEADER_OUTPUT=$(sed -n 's/.* generated_fnv=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
   WORKER_OUTPUT=$(sed -n 's/.* generated_fnv=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
@@ -602,7 +660,7 @@ else
   }
 fi
 if [[ $FULL_TRUNK == 1 && -z $TEXT_PROMPT &&
-      $KDA_ROUTED_BATCH_TEST == 0 ]]; then
+      $KDA_ROUTED_BATCH_TEST == 0 && $MLA_ROUTED_BATCH_TEST == 0 ]]; then
   LEADER_TRUNK=$(sed -n 's/.* trunk_output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
   WORKER_TRUNK=$(sed -n 's/.* trunk_output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
   LEADER_LOGITS=$(sed -n 's/.* logits=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)

@@ -3620,7 +3620,6 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         float attn_factor,
         float beta_fast,
         float beta_slow) {
-    if (qk_rope == 0u) return 0;
     return glm_attention_indexed_lora_launch(lora_out, q, qk_low, kv_lora_cache,
                                              k_rope_cache, NULL, n_tokens, pos0,
                                              n_selected, cache_cap, cache_f16,

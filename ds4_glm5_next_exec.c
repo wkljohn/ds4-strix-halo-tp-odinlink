@@ -30,6 +30,13 @@ enum {
     GLM5_Q8_QK = 32,
 };
 
+/* The MLA batch path temporarily aliases routed_experts as its
+ * [token][head][kv_lora] attention output.  Keep that reuse fail-closed if
+ * either model geometry changes. */
+_Static_assert(GLM5_EXPERTS_USED * GLM5_WIDTH >=
+                   GLM5_HEADS * GLM5_KV_LORA,
+               "MLA attention alias exceeds routed expert workspace");
+
 struct ds4_glm5_next_workspace {
     uint32_t capacity_tokens;
     ds4_gpu_tensor *hc_mean_weights;
@@ -57,6 +64,7 @@ struct ds4_glm5_next_workspace {
     ds4_gpu_tensor *mla_kv_norm;
     ds4_gpu_tensor *mla_qk_low;
     ds4_gpu_tensor *mla_index_k_raw;
+    ds4_gpu_tensor *mla_index_k_norm;
     ds4_gpu_tensor *mla_pool_gate_raw;
     ds4_gpu_tensor *mla_pool_indices;
     ds4_gpu_tensor *mla_pool_valid;
@@ -120,6 +128,7 @@ void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *w) {
     ds4_gpu_tensor_free(w->mla_pool_valid);
     ds4_gpu_tensor_free(w->mla_pool_indices);
     ds4_gpu_tensor_free(w->mla_pool_gate_raw);
+    ds4_gpu_tensor_free(w->mla_index_k_norm);
     ds4_gpu_tensor_free(w->mla_index_k_raw);
     ds4_gpu_tensor_free(w->mla_qk_low);
     ds4_gpu_tensor_free(w->mla_kv_norm);
@@ -179,6 +188,7 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity(
     w->mla_qk_low = f32_rows(capacity_tokens,
                              (uint64_t)GLM5_HEADS * GLM5_KV_LORA);
     w->mla_index_k_raw = f32_rows(capacity_tokens, GLM5_INDEX_DIM);
+    w->mla_index_k_norm = f32_rows(capacity_tokens, GLM5_INDEX_DIM);
     w->mla_pool_gate_raw = f32_rows(capacity_tokens, GLM5_INDEX_DIM);
     w->mla_pool_indices = bytes_rows(capacity_tokens,
                                      4u * sizeof(int32_t));
@@ -215,7 +225,8 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity(
         !w->ffn_hidden || !w->gate || !w->up || !w->mid || !w->down ||
         !w->mla_q_a || !w->mla_q_resid || !w->mla_query ||
         !w->mla_kv_raw || !w->mla_kv_norm || !w->mla_qk_low ||
-        !w->mla_index_k_raw || !w->mla_pool_gate_raw ||
+        !w->mla_index_k_raw || !w->mla_index_k_norm ||
+        !w->mla_pool_gate_raw ||
         !w->mla_pool_indices || !w->mla_pool_valid || !w->mla_tail_valid ||
         !w->mla_selected_token || !w->mla_heads || !w->router_logits ||
         !w->router_probs || !w->router_selected || !w->router_weights ||
@@ -530,8 +541,16 @@ static int route_agrees(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
     uint64_t hash = UINT64_C(1469598103934665603);
     hash = fnv64_continue(hash, ids, sizeof(ids));
     hash = fnv64_continue(hash, route_weights, sizeof(route_weights));
-    const uint64_t check_sequence = UINT64_C(0x474c4d3500000000) ^
-        (*ctx->tp_sequence << 16u) ^ ((uint64_t)layer << 8u) ^ token_ordinal;
+    const uint64_t sequence_fields[] = {
+        UINT64_C(0x474c4d3500000000),
+        *ctx->tp_sequence,
+        (uint64_t)layer,
+        (uint64_t)token_ordinal,
+        UINT64_C(1),
+    };
+    const uint64_t check_sequence = fnv64_continue(
+        UINT64_C(1469598103934665603), sequence_fields,
+        sizeof(sequence_fields));
     char error[256] = {0};
     const int rc = ds4_tp_hash_check(ctx->tp, check_sequence, hash,
                                      error, sizeof(error));
@@ -606,9 +625,16 @@ static int route_batch_agrees(const ds4_glm5_next_exec_ctx *ctx,
         ds4_tp_mark_failed(ctx->tp);
         return 0;
     }
-    const uint64_t check_sequence = UINT64_C(0x474c4d3542415400) ^
-        (*ctx->tp_sequence << 16u) ^ ((uint64_t)layer << 8u) ^
-        token_ordinal ^ ((uint64_t)n_tokens << 32u);
+    const uint64_t sequence_fields[] = {
+        UINT64_C(0x474c4d3542415400),
+        *ctx->tp_sequence,
+        (uint64_t)layer,
+        (uint64_t)token_ordinal,
+        (uint64_t)n_tokens,
+    };
+    const uint64_t check_sequence = fnv64_continue(
+        UINT64_C(1469598103934665603), sequence_fields,
+        sizeof(sequence_fields));
     char error[256] = {0};
     const int rc = ds4_tp_hash_check(ctx->tp, check_sequence, hash,
                                      error, sizeof(error));
@@ -779,6 +805,186 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             GLM5_WIDTH, GLM5_HC);
 }
 
+/* Preserve the scalar four-row pool state machine while the expensive MLA
+ * projections execute as one row batch.  The normalized key and pool-gate
+ * rows are copied into the resident tail in token order; every fourth row is
+ * published before its slot can be reused.  State counters are committed only
+ * after the complete attention+FFN stage succeeds. */
+static int mla_stage_index_rows(const ds4_glm5_next_exec_ctx *ctx,
+                                const ds4_glm5_next_mla_offsets *offsets,
+                                ds4_glm5_next_mla_state *mla,
+                                ds4_glm5_next_workspace *w,
+                                uint32_t pos0,
+                                uint32_t n_tokens) {
+    const uint64_t row_bytes =
+        (uint64_t)GLM5_INDEX_DIM * sizeof(float);
+    if (!ctx || !offsets || !mla || !w || n_tokens == 0u ||
+        mla->token_count != pos0 || mla->complete_pools != pos0 / 4u ||
+        mla->tail_count != pos0 % 4u) return 0;
+    for (uint32_t t = 0u; t < n_tokens; ++t) {
+        const uint32_t token = pos0 + t;
+        const uint32_t tail_slot = token % 4u;
+        const uint32_t pool_index = token / 4u;
+        const bool publish_pool = tail_slot == 3u;
+        if (!ds4_gpu_tensor_copy(
+                mla->index_tail, (uint64_t)tail_slot * row_bytes,
+                w->mla_index_k_norm, (uint64_t)t * row_bytes, row_bytes) ||
+            !ds4_gpu_tensor_copy(
+                mla->pool_gate_tail, (uint64_t)tail_slot * row_bytes,
+                w->mla_pool_gate_raw, (uint64_t)t * row_bytes, row_bytes) ||
+            !mla_publish_completed_pool(ctx, offsets, mla, w, pool_index,
+                                        publish_pool)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int mla_value_project_rows_decode_exact(
+        const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_mla_offsets *offsets,
+        ds4_glm5_next_workspace *w,
+        uint32_t n_tokens) {
+    const uint64_t lora_row =
+        (uint64_t)GLM5_HEADS * GLM5_KV_LORA;
+    const uint64_t heads_row =
+        (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
+    for (uint32_t t = 0u; t < n_tokens; ++t) {
+        ds4_gpu_tensor *lora = ds4_gpu_tensor_view(
+            w->routed_experts, (uint64_t)t * lora_row * sizeof(float),
+            lora_row * sizeof(float));
+        ds4_gpu_tensor *heads = ds4_gpu_tensor_view(
+            w->mla_heads, (uint64_t)t * heads_row * sizeof(float),
+            heads_row * sizeof(float));
+        const int ok = lora && heads &&
+            ds4_gpu_glm_value_project_typed_batch_heads_tensor(
+                heads, lora, ctx->model_map, ctx->model_size,
+                offsets->v_b, 8u, 1u, GLM5_HEADS,
+                GLM5_KV_LORA, GLM5_HEAD_DIM);
+        ds4_gpu_tensor_free(heads);
+        ds4_gpu_tensor_free(lora);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+static int mla_output_project_rows_decode_exact(
+        const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_mla_offsets *offsets,
+        ds4_glm5_next_workspace *w,
+        uint32_t n_tokens) {
+    const uint64_t full_heads =
+        (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
+    const uint64_t half_heads = full_heads / 2u;
+    for (uint32_t t = 0u; t < n_tokens; ++t) {
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(
+            ctx->tp_big_out,
+            (uint64_t)t * GLM5_WIDTH * sizeof(float),
+            (uint64_t)GLM5_WIDTH * sizeof(float));
+        const int ok = out && ds4_gpu_matmul_q8_0_kslice_tensor(
+            out, ctx->model_map, ctx->model_size, offsets->output,
+            full_heads, (uint64_t)ctx->tp_rank * half_heads, half_heads,
+            GLM5_WIDTH, w->mla_heads,
+            (uint64_t)t * full_heads +
+                (uint64_t)ctx->tp_rank * half_heads);
+        ds4_gpu_tensor_free(out);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+static int mla_dense_selection_attention_rows(
+        const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t il,
+        ds4_glm5_next_state *state,
+        ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *hc_in,
+        uint32_t n_tokens) {
+    const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+    const ds4_glm5_next_mla_offsets *m = &layer->mla;
+    ds4_glm5_next_mla_state *mla = &state->mla[il];
+    const uint32_t pos0 = mla->token_count;
+    const uint32_t n_selected = pos0 + n_tokens;
+    const uint64_t full_heads =
+        (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
+    const uint64_t elements = (uint64_t)n_tokens * GLM5_WIDTH;
+    if (n_tokens == 0u || n_selected < pos0 ||
+        n_selected > DS4_GLM5_NEXT_INDEX_TOP_K ||
+        n_selected > mla->capacity_tokens ||
+        elements > UINT32_MAX) return 0;
+
+    int ok =
+        ds4_gpu_rms_norm_plain_rows_tensor(
+            w->hc_flat, hc_in, GLM5_HC_WIDTH, n_tokens,
+            ctx->model->rms_norm_eps) &&
+        ds4_gpu_matmul_bf16_tensor(
+            w->hc_mix, ctx->model_map, ctx->model_size,
+            layer->hc.attn_fn, GLM5_HC_WIDTH, GLM5_HC_MIX,
+            w->hc_flat, n_tokens) &&
+        ds4_gpu_hc_split_weighted_sum_norm_tensor(
+            w->collapsed, w->ffn_hidden, w->hc_split, w->hc_mix, hc_in,
+            ctx->model_map, ctx->model_size,
+            layer->hc.attn_scale, layer->hc.attn_base, layer->attn_norm,
+            GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps,
+            ctx->model->rms_norm_eps) &&
+        ds4_gpu_matmul_q8_0_tensor(
+            w->mla_q_a, ctx->model_map, ctx->model_size, m->q_a,
+            GLM5_WIDTH, GLM5_Q_RANK, w->ffn_hidden, n_tokens) &&
+        ds4_gpu_rms_norm_weight_rows_tensor(
+            w->mla_q_resid, w->mla_q_a, ctx->model_map, ctx->model_size,
+            m->q_a_norm, GLM5_Q_RANK, n_tokens,
+            ctx->model->rms_norm_eps) &&
+        ds4_gpu_matmul_q8_0_tensor(
+            w->mla_query, ctx->model_map, ctx->model_size, m->q_b,
+            GLM5_Q_RANK, full_heads, w->mla_q_resid, n_tokens) &&
+        ds4_gpu_matmul_q8_0_tensor(
+            w->mla_kv_raw, ctx->model_map, ctx->model_size, m->kv_a_mqa,
+            GLM5_WIDTH, GLM5_KV_LORA, w->ffn_hidden, n_tokens) &&
+        ds4_gpu_glm_kv_lora_rms_norm_tensor(
+            w->mla_kv_norm, w->mla_kv_raw,
+            ctx->model_map, ctx->model_size, m->kv_a_norm,
+            n_tokens, GLM5_KV_LORA, GLM5_KV_LORA,
+            ctx->model->rms_norm_eps) &&
+        ds4_gpu_glm_store_compact_kv_tensor(
+            mla->compact_kv, NULL, w->mla_kv_norm, w->mla_kv_raw,
+            pos0, n_tokens, mla->capacity_tokens, GLM5_KV_LORA,
+            GLM5_KV_LORA, 0u, false) &&
+        ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
+            w->mla_qk_low, w->mla_query,
+            ctx->model_map, ctx->model_size, m->k_b, 8u, n_tokens,
+            GLM5_HEADS, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+        ds4_gpu_matmul_bf16_tensor(
+            w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
+            GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, n_tokens) &&
+        ds4_gpu_glm_store_indexer_k_tensor(
+            w->mla_index_k_norm, w->mla_index_k_raw,
+            ctx->model_map, ctx->model_size,
+            m->index_k_norm, m->index_k_norm_b,
+            0u, n_tokens, n_tokens, GLM5_INDEX_DIM,
+            0u, 1u, 1.0e-6f, 1.0f, 1.0f, 0.0f,
+            1.0f, 0.0f, 0.0f, false) &&
+        ds4_gpu_matmul_bf16_tensor(
+            w->mla_pool_gate_raw, ctx->model_map, ctx->model_size,
+            m->index_pool_gate, GLM5_WIDTH, GLM5_INDEX_DIM,
+            w->ffn_hidden, n_tokens) &&
+        mla_stage_index_rows(ctx, m, mla, w, pos0, n_tokens) &&
+        ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+            w->routed_experts, w->mla_query, w->mla_qk_low,
+            mla->compact_kv, NULL, n_tokens, pos0, n_selected,
+            mla->capacity_tokens, false, GLM5_HEADS, GLM5_KV_LORA,
+            GLM5_HEAD_DIM, 0u, 0u,
+            1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+        mla_value_project_rows_decode_exact(ctx, m, w, n_tokens) &&
+        mla_output_project_rows_decode_exact(ctx, m, w, n_tokens);
+    return ok &&
+        tp_exchange_rows(ctx, il, n_tokens) &&
+        ds4_gpu_add_tensor(w->attention, ctx->tp_big_out, ctx->tp_big_in,
+                           (uint32_t)elements) &&
+        ds4_gpu_hc_expand_split_tensor(
+            w->after_attention, w->attention, hc_in, w->hc_split,
+            GLM5_WIDTH, GLM5_HC);
+}
+
 static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                           uint32_t il,
                           uint32_t token_ordinal,
@@ -922,6 +1128,7 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             q4_down_half_bytes, w->router_selected, w->router_weights,
             GLM5_EXPERTS_USED, 10.0f, w->ffn_hidden, il, n_tokens,
             &routed_mid_is_f16) &&
+        !routed_mid_is_f16 &&
         ds4_gpu_matmul_q8_0_pair_tensor(
             w->shared_gate, w->shared_up,
             ctx->model_map, ctx->model_size,
@@ -945,7 +1152,6 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             hc_out, w->down, w->after_attention, w->ffn_split,
             GLM5_WIDTH, GLM5_HC) &&
         ds4_gpu_synchronize();
-    (void)routed_mid_is_f16;
     return ok;
 }
 
@@ -1024,6 +1230,46 @@ static int mla_routed_dense_selection_forward(const ds4_glm5_next_exec_ctx *ctx,
     return 1;
 }
 
+static int mla_routed_dense_selection_rows_forward(
+        const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t il,
+        ds4_glm5_next_state *state,
+        ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *hc_in,
+        ds4_gpu_tensor *hc_out,
+        uint32_t n_tokens) {
+    ds4_glm5_next_mla_state *mla = &state->mla[il];
+    if (!tp_context_valid_bytes(
+            ctx, (uint64_t)n_tokens * GLM5_WIDTH * sizeof(float)) ||
+        !mla->valid || !mla->compact_kv || !mla->index_pool ||
+        !mla->index_tail || !mla->pool_gate_tail || mla->owner != state ||
+        mla->first_valid != 0u || mla->token_count > UINT32_MAX ||
+        mla->token_count > mla->capacity_tokens ||
+        mla->token_count > DS4_GLM5_NEXT_INDEX_TOP_K ||
+        n_tokens == 0u ||
+        n_tokens > mla->capacity_tokens - mla->token_count ||
+        n_tokens > DS4_GLM5_NEXT_INDEX_TOP_K - mla->token_count) {
+        return 0;
+    }
+    const uint32_t token_ordinal = mla->token_count;
+    const int ok =
+        mla_dense_selection_attention_rows(
+            ctx, il, state, w, hc_in, n_tokens) &&
+        routed_ffn_rows(
+            ctx, il, token_ordinal, w, hc_out, n_tokens);
+    if (!ok) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
+    for (uint32_t t = 0u; t < n_tokens; ++t) {
+        if (!ds4_glm5_next_mla_append_commit(mla)) {
+            ds4_glm5_next_state_invalidate(state);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int ds4_glm5_next_layer_forward(const ds4_glm5_next_exec_ctx *ctx,
                                 uint32_t il,
                                 ds4_glm5_next_state *state,
@@ -1078,10 +1324,15 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
         state->kda.layer_count != ctx->model->trunk_count ||
         (n_tokens > 1u && ctx->trace_prefix)) return 0;
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    if (layer->attention != DS4_GLM5_NEXT_ATTN_KDA ||
-        !state->kda.layer[il].recurrent || state->mla[il].compact_kv) {
-        return 0;
+    if (layer->attention == DS4_GLM5_NEXT_ATTN_MLA &&
+        layer->ffn == DS4_GLM5_NEXT_FFN_ROUTED &&
+        state->mla[il].compact_kv && !state->kda.layer[il].recurrent) {
+        return mla_routed_dense_selection_rows_forward(
+            ctx, il, state, w, hc_in, hc_out, n_tokens);
     }
+    if (layer->attention != DS4_GLM5_NEXT_ATTN_KDA ||
+        !state->kda.layer[il].recurrent || state->mla[il].compact_kv)
+        return 0;
     if (layer->ffn == DS4_GLM5_NEXT_FFN_DENSE) {
         return dense_kda_forward_rows(
             ctx, il, state, w, hc_in, hc_out, n_tokens);
@@ -1092,3 +1343,60 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
     }
     return 0;
 }
+
+#ifdef DS4_TP_TEST_HOOKS
+int ds4_glm5_next_mla_attention_forward_test(
+        const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t il,
+        ds4_glm5_next_state *state,
+        ds4_glm5_next_workspace *w,
+        const ds4_gpu_tensor *hc_in,
+        ds4_gpu_tensor *hc_out,
+        uint32_t n_tokens) {
+    const uint64_t row_bytes =
+        (uint64_t)GLM5_HC_WIDTH * sizeof(float);
+    if (!context_valid(ctx) || !state || !state->valid || !w || !hc_in ||
+        !hc_out || hc_in == hc_out || n_tokens == 0u ||
+        w->capacity_tokens != n_tokens ||
+        il >= ctx->model->trunk_count ||
+        ctx->model->layer[il].attention != DS4_GLM5_NEXT_ATTN_MLA ||
+        !state->mla[il].compact_kv || state->kda.layer[il].recurrent ||
+        ds4_gpu_tensor_bytes(hc_in) != (uint64_t)n_tokens * row_bytes ||
+        ds4_gpu_tensor_bytes(hc_out) != (uint64_t)n_tokens * row_bytes) {
+        return 0;
+    }
+    ds4_glm5_next_mla_state *mla = &state->mla[il];
+    int ok = 0;
+    if (n_tokens == 1u) {
+        uint32_t visible = 0u, tail_slot = 0u, pool_index = 0u;
+        bool publish_pool = false;
+        ok = ds4_glm5_next_mla_append_plan(
+                 mla, &tail_slot, &pool_index, &publish_pool) &&
+             ds4_glm5_next_mla_dense_selection_visible(
+                 mla->token_count, mla->capacity_tokens, &visible) &&
+             mla_dense_selection_attention(
+                 ctx, il, state, w, hc_in, visible, tail_slot,
+                 pool_index, publish_pool);
+    } else {
+        ok = mla_dense_selection_attention_rows(
+            ctx, il, state, w, hc_in, n_tokens);
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_copy(
+                 hc_out, 0u, w->after_attention, 0u,
+                 (uint64_t)n_tokens * row_bytes) &&
+             ds4_gpu_synchronize();
+    }
+    if (!ok) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
+    for (uint32_t t = 0u; t < n_tokens; ++t) {
+        if (!ds4_glm5_next_mla_append_commit(mla)) {
+            ds4_glm5_next_state_invalidate(state);
+            return 0;
+        }
+    }
+    return 1;
+}
+#endif

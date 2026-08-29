@@ -270,6 +270,9 @@ test-glm5-dense-block0-external-reference: tests/test_rocm_glm5_dense_block0
 tests/test_rocm_glm5_prefix_layer3_tp.o: tests/test_rocm_glm5_prefix_layer3_tp.cu tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp ds4.h ds4_glm5_kda.h ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
+tests/ds4_glm5_next_exec_test.o: ds4_glm5_next_exec.c ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
+	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -c -o $@ $<
+
 tests/ds4_glm5_text_codec.o: ds4.c ds4.h
 	$(CC) $(CFLAGS) -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -c -o $@ ds4.c
 
@@ -283,7 +286,7 @@ test-glm5-next-text-codec: tests/test_glm5_next_text_codec
 	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_glm5_next_text_codec
 
-tests/test_rocm_glm5_prefix_layer3_tp: tests/test_rocm_glm5_prefix_layer3_tp.o tests/ds4_glm5_text_codec.o ds4_distributed.o ds4_ssd.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+tests/test_rocm_glm5_prefix_layer3_tp: tests/test_rocm_glm5_prefix_layer3_tp.o tests/ds4_glm5_text_codec.o ds4_distributed.o ds4_ssd.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o tests/ds4_glm5_next_exec_test.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-glm5-prefix-layer3-tp: tests/test_rocm_glm5_prefix_layer3_tp

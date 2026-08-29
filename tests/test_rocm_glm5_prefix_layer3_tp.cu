@@ -370,6 +370,51 @@ bool run() {
           "KDA routed continuation rows are the bounded 1 or 16 fixture");
     const uint32_t kda_continuation_rows =
         (uint32_t)kda_continuation_rows_long;
+    const char *mla_batch_env =
+        std::getenv("DS4_GLM5_MLA_ROUTED_BATCH_TEST");
+    const bool mla_batch_test = mla_batch_env &&
+        std::strcmp(mla_batch_env, "1") == 0;
+    CHECK(!mla_batch_env || mla_batch_test ||
+              std::strcmp(mla_batch_env, "0") == 0,
+          "MLA routed batch test selector is exactly 0 or 1");
+    const char *mla_batch_rows_env =
+        std::getenv("DS4_GLM5_MLA_ROUTED_BATCH_ROWS");
+    char *mla_batch_rows_end = nullptr;
+    const unsigned long mla_batch_rows_long = mla_batch_rows_env ?
+        std::strtoul(mla_batch_rows_env, &mla_batch_rows_end, 10) : 3ul;
+    CHECK((!mla_batch_rows_env ||
+              (mla_batch_rows_end && *mla_batch_rows_end == '\0')) &&
+              (mla_batch_rows_long == 3ul || mla_batch_rows_long == 5ul ||
+               mla_batch_rows_long == 33ul),
+          "MLA routed batch rows are the bounded 3, 5, or 33 fixture");
+    const uint32_t mla_batch_rows = (uint32_t)mla_batch_rows_long;
+    const char *mla_prefix_rows_env =
+        std::getenv("DS4_GLM5_MLA_ROUTED_PREFIX_ROWS");
+    char *mla_prefix_rows_end = nullptr;
+    const unsigned long mla_prefix_rows_long = mla_prefix_rows_env ?
+        std::strtoul(mla_prefix_rows_env, &mla_prefix_rows_end, 10) : 0ul;
+    CHECK((!mla_prefix_rows_env ||
+              (mla_prefix_rows_end && *mla_prefix_rows_end == '\0')) &&
+              mla_prefix_rows_long <= 3ul,
+          "MLA routed scalar prefix is bounded to 0..3 rows");
+    const uint32_t mla_prefix_rows = (uint32_t)mla_prefix_rows_long;
+    const char *mla_continuation_rows_env =
+        std::getenv("DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS");
+    char *mla_continuation_rows_end = nullptr;
+    const unsigned long mla_continuation_rows_long =
+        mla_continuation_rows_env ?
+        std::strtoul(mla_continuation_rows_env,
+                     &mla_continuation_rows_end, 10) : 1ul;
+    CHECK((!mla_continuation_rows_env ||
+              (mla_continuation_rows_end &&
+               *mla_continuation_rows_end == '\0')) &&
+              (mla_continuation_rows_long == 1ul ||
+               mla_continuation_rows_long == 16ul) &&
+              (mla_continuation_rows_long == 1ul ||
+               (mla_batch_test && mla_batch_rows == 33u)),
+          "MLA routed continuation rows are the bounded 1 or 16 fixture");
+    const uint32_t mla_continuation_rows =
+        (uint32_t)mla_continuation_rows_long;
     const char *full_tokens_env = std::getenv("DS4_GLM5_FULL_TOKENS");
     const uint32_t full_tokens = !full_tokens_env ? 1u :
         std::strcmp(full_tokens_env, "1") == 0 ? 1u :
@@ -425,6 +470,10 @@ bool run() {
           "performance mode requires greedy text generation");
     CHECK(!kda_batch_test || (full_trunk && !text_mode),
           "KDA routed batch test requires full trunk and no text mode");
+    CHECK(!mla_batch_test || (full_trunk && !text_mode),
+          "MLA routed batch test requires full trunk and no text mode");
+    CHECK(!(kda_batch_test && mla_batch_test),
+          "select only one isolated routed batch gate");
     CodecGuard codec;
     TokensGuard prompt_tokens;
     if (text_mode) {
@@ -439,7 +488,9 @@ bool run() {
     }
     const uint32_t context_capacity = text_mode ?
         (uint32_t)prompt_tokens.value.len + text_generate :
-        kda_batch_test ? kda_batch_rows + kda_continuation_rows : 2u;
+        kda_batch_test ? kda_batch_rows + kda_continuation_rows :
+        mla_batch_test ? mla_prefix_rows + mla_batch_rows +
+                         mla_continuation_rows : 2u;
     Glm5NextKShardPlan kshard;
     CHECK(!full_trunk || glm5_next_build_kshard_plan(gguf, offsets, kshard),
           "build exact full-trunk compact residency plan");
@@ -509,15 +560,28 @@ bool run() {
     const uint64_t teacher_hash = teacher_ids.empty() ? 0u :
         fnv64(teacher_ids.data(),
               teacher_ids.size() * sizeof(teacher_ids[0]));
-    const uint64_t mode_hash = UINT64_C(0x474c4d354d4f4400) ^
-        ((uint64_t)full_trunk << 8u) ^ full_tokens ^
-        ((uint64_t)text_mode << 16u) ^ ((uint64_t)text_generate << 24u) ^
-        ((uint64_t)perf_mode << 56u) ^
-        ((uint64_t)layer_timing << 57u) ^
-        ((uint64_t)kda_batch_test << 58u) ^
-        ((uint64_t)kda_batch_rows << 32u) ^
-        ((uint64_t)kda_continuation_rows << 40u) ^
-        prompt_hash ^ teacher_hash;
+    /* Hash complete, independently sized fields.  A packed XOR encoding can
+     * silently collide when a row count overlaps a neighbouring mode bit,
+     * defeating the fail-closed two-rank configuration check. */
+    const uint64_t mode_fields[] = {
+        UINT64_C(0x474c4d354d4f4400),
+        (uint64_t)full_trunk,
+        (uint64_t)full_tokens,
+        (uint64_t)text_mode,
+        (uint64_t)text_generate,
+        (uint64_t)perf_mode,
+        (uint64_t)layer_timing,
+        (uint64_t)kda_batch_test,
+        (uint64_t)kda_batch_rows,
+        (uint64_t)kda_continuation_rows,
+        (uint64_t)mla_batch_test,
+        (uint64_t)mla_batch_rows,
+        (uint64_t)mla_prefix_rows,
+        (uint64_t)mla_continuation_rows,
+        prompt_hash,
+        teacher_hash,
+    };
+    const uint64_t mode_hash = fnv64(mode_fields, sizeof(mode_fields));
     if (text_mode) {
         std::fprintf(stderr,
             "GLM5 text prompt role=%s tokens=%d token_fnv=%016llx ids=",
@@ -602,7 +666,7 @@ bool run() {
             (unsigned long long)(free_before_install - free_after_install));
     }
 
-    if (text_mode || kda_batch_test) {
+    if (text_mode || kda_batch_test || mla_batch_test) {
         char ready_error[256] = {};
         CHECK(ds4_gpu_synchronize() &&
                   ds4_tp_hash_check(
@@ -611,6 +675,380 @@ bool run() {
                       sizeof(ready_error)) == 1,
               ready_error[0] ? ready_error :
                   "both ranks ready after full-trunk residency");
+    }
+
+    if (mla_batch_test) {
+        using Clock = std::chrono::steady_clock;
+        const uint32_t rows = mla_batch_rows;
+        const uint32_t prefix_rows = mla_prefix_rows;
+        const uint32_t committed_rows = prefix_rows + rows;
+        const std::vector<uint32_t> ids = {
+            42u, 154822u, 154824u, 154826u, 25062u, 287u, 29905u, 371u,
+            25u, 7487u, 154827u, 675u, 279u, 11478u, 7735u, 369u,
+            6623u, 323u, 279u, 3150u, 315u, 41907u, 323u, 4968u,
+            18110u, 558u, 13u, 21754u, 304u, 825u, 11646u, 13u,
+            154828u, 154841u, 17u, 287u,
+        };
+        CHECK(committed_rows <= ids.size(),
+              "select exact MLA routed token fixture");
+        constexpr uint32_t continuation_ids[16] = {
+            17u, 287u, 315u, 279u, 371u, 13u, 825u, 304u,
+            6623u, 323u, 25u, 7487u, 558u, 369u, 11478u, 7735u,
+        };
+        StateGuard sequential_state, batch_state, topk_reject_state;
+        StateGuard attention_sequential_state, attention_batch_state;
+        WorkspaceGuard batch_workspace;
+        TensorGuard batch_ids, batch_input, batch_output, sequential_output;
+        TensorGuard attention_batch_output, attention_sequential_output;
+        TensorGuard continuation_input, sequential_continuation;
+        TensorGuard batch_continuation;
+        TensorGuard nope_reject_lora, nope_reject_q, nope_reject_qk;
+        CHECK(ds4_glm5_next_state_init(
+                  &sequential_state.value, &offsets,
+                  committed_rows + mla_continuation_rows, nullptr) &&
+              ds4_glm5_next_state_init(
+                  &batch_state.value, &offsets,
+                  committed_rows + mla_continuation_rows, nullptr) &&
+              ds4_glm5_next_state_init(
+                  &attention_sequential_state.value, &offsets,
+                  committed_rows, nullptr) &&
+              ds4_glm5_next_state_init(
+                  &attention_batch_state.value, &offsets,
+                  committed_rows, nullptr) &&
+              ds4_glm5_next_state_init(
+                  &topk_reject_state.value, &offsets,
+                  DS4_GLM5_NEXT_INDEX_TOP_K + 1u, nullptr) &&
+              (batch_workspace.value =
+                   ds4_glm5_next_workspace_create_capacity(rows)) != nullptr &&
+              (batch_ids.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * sizeof(uint32_t))) != nullptr &&
+              (batch_input.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              (batch_output.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              (sequential_output.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              (attention_batch_output.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              (attention_sequential_output.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)rows * kHcWidth * sizeof(float))) != nullptr &&
+              (continuation_input.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)kHcWidth * sizeof(float))) != nullptr &&
+              (sequential_continuation.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)kHcWidth * sizeof(float))) != nullptr &&
+              (batch_continuation.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)kHcWidth * sizeof(float))) != nullptr &&
+              (nope_reject_lora.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)64u * 512u * sizeof(float))) != nullptr &&
+              (nope_reject_q.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)64u * 256u * sizeof(float))) != nullptr &&
+              (nope_reject_qk.value = ds4_gpu_tensor_alloc(
+                   (uint64_t)64u * 512u * sizeof(float))) != nullptr &&
+              ds4_gpu_tensor_write(batch_ids.value, 0u,
+                                    ids.data() + prefix_rows,
+                                    (uint64_t)rows * sizeof(uint32_t)) &&
+              ds4_glm5_next_embed_tokens(
+                  &exec, batch_ids.value, rows, batch_input.value),
+              "allocate exact MLA+routed row comparison");
+
+        /* Public batch and NoPE entry points must reject malformed geometry
+         * before mutating an otherwise reusable state. */
+        CHECK(!ds4_glm5_next_layer_forward_batch(
+                  &exec, 3u, &batch_state.value, workspace.value,
+                  batch_input.value, batch_output.value, rows) &&
+              batch_state.value.valid,
+              "reject MLA batch workspace capacity mismatch");
+        CHECK(!ds4_glm5_next_layer_forward_batch(
+                  &exec, 3u, &batch_state.value, batch_workspace.value,
+                  continuation_input.value, batch_continuation.value, rows) &&
+              batch_state.value.valid,
+              "reject MLA batch HC byte-size mismatch");
+        ds4_gpu_tensor *saved_kda_mla =
+            batch_state.value.mla[0].compact_kv;
+        batch_state.value.mla[0].compact_kv =
+            batch_state.value.mla[3].compact_kv;
+        const int kda_with_mla = ds4_glm5_next_layer_forward_batch(
+            &exec, 0u, &batch_state.value, batch_workspace.value,
+            batch_input.value, batch_output.value, rows);
+        batch_state.value.mla[0].compact_kv = saved_kda_mla;
+        CHECK(!kda_with_mla && batch_state.value.valid,
+              "reject KDA layer carrying contradictory MLA state");
+        topk_reject_state.value.mla[3].token_count =
+            DS4_GLM5_NEXT_INDEX_TOP_K;
+        topk_reject_state.value.mla[3].complete_pools =
+            DS4_GLM5_NEXT_INDEX_TOP_K / 4u;
+        topk_reject_state.value.mla[3].tail_count = 0u;
+        CHECK(!ds4_glm5_next_layer_forward_batch(
+                  &exec, 3u, &topk_reject_state.value,
+                  batch_workspace.value, batch_input.value,
+                  batch_output.value, rows) &&
+              topk_reject_state.value.valid,
+              "reject dense-selection MLA batch beyond top-k boundary");
+        CHECK(!ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+                  nope_reject_lora.value, nope_reject_q.value,
+                  nope_reject_qk.value,
+                  batch_state.value.mla[3].compact_kv,
+                  batch_state.value.mla[3].compact_kv,
+                  1u, 0u, 1u, committed_rows + mla_continuation_rows,
+                  false, 64u, 512u, 256u, 0u, 0u,
+                  10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+              "reject NoPE causal batch with non-NULL rope cache");
+
+        for (uint32_t row = 0u; row < prefix_rows; ++row) {
+            CHECK(ds4_glm5_next_embed_token(
+                      &exec, ids[row], continuation_input.value) &&
+                  ds4_glm5_next_mla_attention_forward_test(
+                      &exec, 3u, &attention_sequential_state.value,
+                      workspace.value, continuation_input.value,
+                      sequential_continuation.value, 1u) &&
+                  ds4_glm5_next_mla_attention_forward_test(
+                      &exec, 3u, &attention_batch_state.value,
+                      workspace.value, continuation_input.value,
+                      batch_continuation.value, 1u) &&
+                  ds4_glm5_next_layer_forward(
+                      &exec, 3u, &sequential_state.value, workspace.value,
+                      continuation_input.value,
+                      sequential_continuation.value) &&
+                  ds4_glm5_next_layer_forward(
+                      &exec, 3u, &batch_state.value, workspace.value,
+                      continuation_input.value, batch_continuation.value),
+                  "seed identical scalar MLA tail before batch");
+        }
+
+        for (uint32_t row = 0u; row < rows; ++row) {
+            ds4_gpu_tensor *row_input = ds4_gpu_tensor_view(
+                batch_input.value,
+                (uint64_t)row * kHcWidth * sizeof(float),
+                (uint64_t)kHcWidth * sizeof(float));
+            ds4_gpu_tensor *row_output = ds4_gpu_tensor_view(
+                attention_sequential_output.value,
+                (uint64_t)row * kHcWidth * sizeof(float),
+                (uint64_t)kHcWidth * sizeof(float));
+            const bool row_ok = row_input && row_output &&
+                ds4_glm5_next_mla_attention_forward_test(
+                    &exec, 3u, &attention_sequential_state.value,
+                    workspace.value, row_input, row_output, 1u);
+            ds4_gpu_tensor_free(row_output);
+            ds4_gpu_tensor_free(row_input);
+            CHECK(row_ok, "execute sequential MLA attention oracle row");
+        }
+        CHECK(ds4_glm5_next_mla_attention_forward_test(
+                  &exec, 3u, &attention_batch_state.value,
+                  batch_workspace.value, batch_input.value,
+                  attention_batch_output.value, rows),
+              "execute production MLA attention batch oracle");
+        std::vector<float> attention_sequential(
+            (uint64_t)rows * kHcWidth);
+        std::vector<float> attention_batch((uint64_t)rows * kHcWidth);
+        CHECK(ds4_gpu_tensor_read(
+                  attention_sequential_output.value, 0u,
+                  attention_sequential.data(),
+                  attention_sequential.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  attention_batch_output.value, 0u,
+                  attention_batch.data(),
+                  attention_batch.size() * sizeof(float)),
+              "read decomposed MLA attention outputs");
+        const VectorError attention_error =
+            vector_error(attention_sequential, attention_batch);
+        std::fprintf(stderr,
+            "GLM5 MLA attention batch measurement role=%s prefix=%u rows=%u "
+            "nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+            role, prefix_rows, rows, attention_error.nrmse,
+            attention_error.cosine,
+            attention_error.max_abs);
+        CHECK(attention_error.nrmse <= 1.0e-6 &&
+                  attention_error.cosine >= 0.999999999 &&
+                  attention_error.max_abs <= 2.0e-6,
+              "MLA attention batch matches sequential same-GGUF execution");
+
+        const auto sequential_begin = Clock::now();
+        for (uint32_t row = 0u; row < rows; ++row) {
+            ds4_gpu_tensor *row_input = ds4_gpu_tensor_view(
+                batch_input.value,
+                (uint64_t)row * kHcWidth * sizeof(float),
+                (uint64_t)kHcWidth * sizeof(float));
+            ds4_gpu_tensor *row_output = ds4_gpu_tensor_view(
+                sequential_output.value,
+                (uint64_t)row * kHcWidth * sizeof(float),
+                (uint64_t)kHcWidth * sizeof(float));
+            const bool row_ok = row_input && row_output &&
+                ds4_glm5_next_layer_forward(
+                    &exec, 3u, &sequential_state.value,
+                    workspace.value, row_input, row_output);
+            ds4_gpu_tensor_free(row_output);
+            ds4_gpu_tensor_free(row_input);
+            CHECK(row_ok, "execute sequential MLA+routed comparison row");
+        }
+        const auto sequential_end = Clock::now();
+
+        const auto batch_begin = Clock::now();
+        CHECK(ds4_glm5_next_layer_forward_batch(
+                  &exec, 3u, &batch_state.value, batch_workspace.value,
+                  batch_input.value, batch_output.value, rows),
+              "execute production MLA+routed batch");
+        const auto batch_end = Clock::now();
+        const double sequential_ms =
+            std::chrono::duration<double, std::milli>(
+                sequential_end - sequential_begin).count();
+        const double batch_ms =
+            std::chrono::duration<double, std::milli>(
+                batch_end - batch_begin).count();
+
+        std::vector<float> sequential((uint64_t)rows * kHcWidth);
+        std::vector<float> batch((uint64_t)rows * kHcWidth);
+        CHECK(ds4_gpu_tensor_read(
+                  sequential_output.value, 0u, sequential.data(),
+                  sequential.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(batch_output.value, 0u, batch.data(),
+                                  batch.size() * sizeof(float)),
+              "read sequential and production MLA+routed rows");
+        const VectorError output_error = vector_error(sequential, batch);
+
+        const uint64_t kv_count = (uint64_t)committed_rows * 512u;
+        const uint64_t pool_count =
+            (uint64_t)(committed_rows / 4u) * 128u;
+        const uint64_t tail_count =
+            (uint64_t)(committed_rows % 4u) * 128u;
+        std::vector<float> sequential_kv(kv_count), batch_kv(kv_count);
+        std::vector<float> sequential_pool(pool_count), batch_pool(pool_count);
+        std::vector<float> sequential_tail(tail_count), batch_tail(tail_count);
+        std::vector<float> sequential_gate(tail_count), batch_gate(tail_count);
+        CHECK(ds4_gpu_tensor_read(
+                  sequential_state.value.mla[3].compact_kv, 0u,
+                  sequential_kv.data(), kv_count * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  batch_state.value.mla[3].compact_kv, 0u,
+                  batch_kv.data(), kv_count * sizeof(float)) &&
+              (pool_count == 0u ||
+               (ds4_gpu_tensor_read(
+                    sequential_state.value.mla[3].index_pool, 0u,
+                    sequential_pool.data(), pool_count * sizeof(float)) &&
+                ds4_gpu_tensor_read(
+                    batch_state.value.mla[3].index_pool, 0u,
+                    batch_pool.data(), pool_count * sizeof(float)))) &&
+              (tail_count == 0u ||
+               (ds4_gpu_tensor_read(
+                    sequential_state.value.mla[3].index_tail, 0u,
+                    sequential_tail.data(), tail_count * sizeof(float)) &&
+                ds4_gpu_tensor_read(
+                    batch_state.value.mla[3].index_tail, 0u,
+                    batch_tail.data(), tail_count * sizeof(float)) &&
+                ds4_gpu_tensor_read(
+                    sequential_state.value.mla[3].pool_gate_tail, 0u,
+                    sequential_gate.data(), tail_count * sizeof(float)) &&
+                ds4_gpu_tensor_read(
+                    batch_state.value.mla[3].pool_gate_tail, 0u,
+                    batch_gate.data(), tail_count * sizeof(float)))),
+              "read sequential and batch MLA resident state");
+        const VectorError kv_error = vector_error(sequential_kv, batch_kv);
+        const VectorError pool_error = pool_count ?
+            vector_error(sequential_pool, batch_pool) : VectorError{};
+        const VectorError tail_error = tail_count ?
+            vector_error(sequential_tail, batch_tail) : VectorError{};
+        const VectorError gate_error = tail_count ?
+            vector_error(sequential_gate, batch_gate) : VectorError{};
+        CHECK(sequential_state.value.mla[3].token_count == committed_rows &&
+                  batch_state.value.mla[3].token_count == committed_rows &&
+                  sequential_state.value.mla[3].complete_pools ==
+                      committed_rows / 4u &&
+                  batch_state.value.mla[3].complete_pools ==
+                      committed_rows / 4u &&
+                  sequential_state.value.mla[3].tail_count ==
+                      committed_rows % 4u &&
+                  batch_state.value.mla[3].tail_count ==
+                      committed_rows % 4u,
+              "MLA batch commits the exact pool/tail counters");
+        std::fprintf(stderr,
+            "GLM5 MLA+routed batch measurement role=%s prefix=%u rows=%u "
+            "output_nrmse=%.9g output_cosine=%.12g output_max_abs=%.9g "
+            "kv_nrmse=%.9g pool_nrmse=%.9g tail_nrmse=%.9g "
+            "gate_nrmse=%.9g sequential_ms=%.3f batch_ms=%.3f "
+            "speedup=%.3fx\n",
+            role, prefix_rows, rows, output_error.nrmse, output_error.cosine,
+            output_error.max_abs, kv_error.nrmse, pool_error.nrmse,
+            tail_error.nrmse, gate_error.nrmse, sequential_ms, batch_ms,
+            sequential_ms / batch_ms);
+        /* Attention above has a scalar-equivalence envelope.  The routed-Q4
+         * batch deliberately uses different reduction order than one-row
+         * decode, so this layer-level bound is only a provisional Lane-B
+         * containment gate.  Full-logit, teacher-forced, semantic and long
+         * prompt gates decide whether that arithmetic can be promoted. */
+        const double output_nrmse_bound = 1.0e-2;
+        const double output_cosine_bound = 0.99995;
+        const double output_max_abs_bound = 6.0e-2;
+        CHECK(output_error.nrmse <= output_nrmse_bound &&
+                  output_error.cosine >= output_cosine_bound &&
+                  output_error.max_abs <= output_max_abs_bound &&
+                  kv_error.nrmse <= 1.0e-5 &&
+                  (!pool_count || pool_error.nrmse <= 1.0e-5) &&
+                  (!tail_count || (tail_error.nrmse <= 1.0e-5 &&
+                                   gate_error.nrmse <= 1.0e-5)),
+              "MLA+routed batch matches sequential same-GGUF execution");
+
+        std::vector<float> sequential_cont(
+            (uint64_t)mla_continuation_rows * kHcWidth);
+        std::vector<float> batch_cont(
+            (uint64_t)mla_continuation_rows * kHcWidth);
+        for (uint32_t step = 0u; step < mla_continuation_rows; ++step) {
+            CHECK(ds4_glm5_next_embed_token(
+                      &exec, continuation_ids[step],
+                      continuation_input.value) &&
+                  ds4_glm5_next_layer_forward(
+                      &exec, 3u, &sequential_state.value, workspace.value,
+                      continuation_input.value, sequential_continuation.value) &&
+                  ds4_glm5_next_layer_forward(
+                      &exec, 3u, &batch_state.value, workspace.value,
+                      continuation_input.value, batch_continuation.value) &&
+                  ds4_gpu_tensor_read(
+                      sequential_continuation.value, 0u,
+                      sequential_cont.data() + (uint64_t)step * kHcWidth,
+                      (uint64_t)kHcWidth * sizeof(float)) &&
+                  ds4_gpu_tensor_read(
+                      batch_continuation.value, 0u,
+                      batch_cont.data() + (uint64_t)step * kHcWidth,
+                      (uint64_t)kHcWidth * sizeof(float)),
+                  "ordinary scalar decode continues from MLA batch state");
+        }
+        const VectorError continuation_error =
+            vector_error(sequential_cont, batch_cont);
+        CHECK(continuation_error.nrmse <= 1.0e-2 &&
+                  continuation_error.cosine >= 0.9999 &&
+                  continuation_error.max_abs <= 1.0e-2 &&
+                  sequential_state.value.mla[3].token_count ==
+                      committed_rows + mla_continuation_rows &&
+                  batch_state.value.mla[3].token_count ==
+                      committed_rows + mla_continuation_rows,
+              "MLA batch state supports ordinary scalar continuation");
+        const uint64_t output_hash =
+            fnv64(batch.data(), batch.size() * sizeof(float));
+        const uint64_t continuation_hash = fnv64(
+            batch_cont.data(), batch_cont.size() * sizeof(float));
+        char hash_error[256] = {};
+        CHECK(ds4_tp_hash_check(
+                  tp.tp, UINT64_C(0x474c4d354d424154), output_hash,
+                  hash_error, sizeof(hash_error)) == 1 &&
+              ds4_tp_hash_check(
+                  tp.tp, UINT64_C(0x474c4d354d434f4e), continuation_hash,
+                  hash_error, sizeof(hash_error)) == 1,
+              hash_error);
+        std::fprintf(stderr,
+            "PASS GLM5 MLA+routed batch role=%s prefix=%u rows=%u "
+            "nrmse=%.9g cosine=%.12g max_abs=%.9g output=%016llx "
+            "continue_nrmse=%.9g continue_cosine=%.12g "
+            "continue_max_abs=%.9g continue_rows=%u continuation=%016llx "
+            "sequential_ms=%.3f batch_ms=%.3f speedup=%.3fx "
+            "tp_seq=%llu packed_q4_bytes=%llu rdma=1\n",
+            role, prefix_rows, rows, output_error.nrmse,
+            output_error.cosine,
+            output_error.max_abs, (unsigned long long)output_hash,
+            continuation_error.nrmse, continuation_error.cosine,
+            continuation_error.max_abs, mla_continuation_rows,
+            (unsigned long long)continuation_hash,
+            sequential_ms, batch_ms, sequential_ms / batch_ms,
+            (unsigned long long)sequence,
+            (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
+        return true;
     }
 
     if (kda_batch_test) {
