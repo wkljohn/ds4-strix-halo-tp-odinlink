@@ -99,6 +99,11 @@ typedef struct {
      * tail is separate so the validated pool kernel can consume tensor views
      * without retaining the full raw index history. */
     ds4_gpu_tensor *index_pool;
+    /* Persistent raw-token membership for completed pools.  Keeping this
+     * beside the pooled key cache lets the >2K selector expand device-side
+     * without reconstructing or reading back pool IDs. */
+    ds4_gpu_tensor *index_pool_ids;
+    ds4_gpu_tensor *index_pool_valid;
     ds4_gpu_tensor *index_tail;
     ds4_gpu_tensor *pool_gate_tail;
     uint32_t capacity_tokens;

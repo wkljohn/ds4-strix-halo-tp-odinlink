@@ -94,7 +94,14 @@ static void make_valid(ds4_glm5_next_model_offsets *model) {
         layer->attention = mla ? DS4_GLM5_NEXT_ATTN_MLA :
                                  DS4_GLM5_NEXT_ATTN_KDA;
         if (mla) fill_words(&layer->mla, sizeof(layer->mla), &next);
-        else fill_words(&layer->kda, sizeof(layer->kda), &next);
+        else {
+            fill_words(&layer->kda, sizeof(layer->kda), &next);
+            layer->kda.q_type = layer->kda.k_type = 30u;
+            layer->kda.v_type = layer->kda.output_type = 30u;
+            layer->kda.f_a_type = layer->kda.f_b_type = 30u;
+            layer->kda.g_a_type = layer->kda.g_b_type = 30u;
+            layer->kda.beta_type = 30u;
+        }
         if (il < DS4_GLM5_NEXT_LEADING_DENSE) {
             layer->ffn = DS4_GLM5_NEXT_FFN_DENSE;
             layer->ffn_weight.gate = next++;
@@ -117,13 +124,13 @@ static int test_bytes(void) {
     uint64_t bytes = 0u;
     CHECK(ds4_glm5_next_state_bytes(&model, 8u, &bytes),
           "8-token state size accepted");
-    CHECK(bytes == UINT64_C(152869888), "8-token compact state size exact");
+    CHECK(bytes == UINT64_C(152870328), "8-token compact state size exact");
     CHECK(ds4_glm5_next_state_bytes(&model, 9u, &bytes) &&
-          bytes == UINT64_C(152898048),
+          bytes == UINT64_C(152898708),
           "9-token state uses ceil pool capacity exactly");
     CHECK(ds4_glm5_next_state_bytes(&model, 262144u, &bytes),
           "256K state size accepted");
-    CHECK(bytes == UINT64_C(6427357184), "256K compact state size exact");
+    CHECK(bytes == UINT64_C(6441775104), "256K compact state size exact");
     CHECK(!ds4_glm5_next_state_bytes(&model, 0u, &bytes),
           "zero context rejected");
     model.layer[3].attention = DS4_GLM5_NEXT_ATTN_KDA;
@@ -146,12 +153,12 @@ static int test_lifecycle(void) {
           "initialize complete mixed-attention state");
     fflush(accounting_stream);
     CHECK(accounting_seen_before_alloc, "accounting precedes allocation");
-    CHECK(strstr(text, "context=8 kda=34 mla=11 bytes=152869888") != NULL,
+    CHECK(strstr(text, "context=8 kda=34 mla=11 bytes=152870328") != NULL,
           "combined accounting exact");
     CHECK(state.valid && state.kda.valid && state.layer_count == 45u &&
           state.mla_count == 11u && state.context_capacity == 8u,
           "complete state starts valid");
-    CHECK(alloc_calls == 180 && fill_calls == 136,
+    CHECK(alloc_calls == 202 && fill_calls == 136,
           "34 KDA and 11 four-buffer compact MLA states allocated once");
     CHECK(state.mla[3].valid && state.mla[3].owner == &state &&
           state.mla[3].capacity_tokens == 8u &&
@@ -236,11 +243,11 @@ static int test_lifecycle(void) {
     CHECK(ds4_glm5_next_state_reset(&state),
           "restored compact MLA pool buffer resets");
     ds4_glm5_next_state_free(&state);
-    CHECK(free_calls == 180 && !state.valid && !state.kda.layer &&
+    CHECK(free_calls == 202 && !state.valid && !state.kda.layer &&
           !state.mla[3].compact_kv,
           "complete mixed state freed exactly once");
     ds4_glm5_next_state_free(&state);
-    CHECK(free_calls == 180 && !ds4_glm5_next_state_reset(&state),
+    CHECK(free_calls == 202 && !ds4_glm5_next_state_reset(&state),
           "double free is harmless and reset-after-free fails closed");
     fclose(accounting_stream);
     accounting_stream = NULL;
