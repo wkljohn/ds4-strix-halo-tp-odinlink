@@ -1273,7 +1273,6 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
     uint64_t elements = 0u;
     bool routed_mid_is_f16 = true;
     if (n_tokens == 0u ||
-        n_tokens > GLM5_EXPERTS ||
         (uint64_t)n_tokens > UINT32_MAX / GLM5_WIDTH ||
         (uint64_t)n_tokens > UINT32_MAX / GLM5_RANK_MID) return 0;
     elements = (uint64_t)n_tokens * GLM5_WIDTH;

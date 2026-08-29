@@ -56,7 +56,7 @@ static uint32_t routed_moe_q4k_sorted_min_tokens(void) {
     static int initialized;
     if (!initialized) {
         value = routed_moe_q4k_env_u32(
-                "DS4_ROCM_Q4K_SORTED_MIN_TOKENS", 32u, 2u, 32u);
+                "DS4_ROCM_Q4K_SORTED_MIN_TOKENS", 32u, 2u, 256u);
         initialized = 1;
     }
     return value;
@@ -200,7 +200,7 @@ extern "C" uint32_t ds4_gpu_q4k_wmma_runtime_features(
         const void *down_w) {
     const ds4_q4k_wmma_dispatch_config *cfg = routed_moe_q4k_wmma_config();
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
-    const int shape_ok = q4k_weights &&
+    const int full_shape = q4k_weights &&
         expert_in_dim == 4096u && expert_mid_dim == 2048u &&
         xq_blocks == 16u &&
         gate_row_bytes == (uint64_t)xq_blocks * sizeof(cuda_block_q4_K) &&
@@ -210,6 +210,21 @@ extern "C" uint32_t ds4_gpu_q4k_wmma_runtime_features(
         down_row_bytes == 8u * sizeof(cuda_block_q4_K) &&
         down_expert_bytes == (uint64_t)down_out_dim * down_row_bytes &&
         (((uintptr_t)gate_w | (uintptr_t)up_w | (uintptr_t)down_w) & 15u) == 0u;
+    /* GLM-5.3 TP=2 consumes one exact K half of its Q4_K routed experts.
+     * The launcher already has a shape-checked packed-half WMMA path; include
+     * the same layout in the hello capability oracle so both ranks may
+     * negotiate it instead of silently falling back to scalar expert tiles. */
+    const int packed_half_shape = q4k_weights &&
+        expert_in_dim == 4096u && expert_mid_dim == 1024u &&
+        xq_blocks == 16u &&
+        gate_row_bytes == 16u * sizeof(cuda_block_q4_K) &&
+        gate_expert_bytes == (uint64_t)expert_mid_dim * gate_row_bytes &&
+        q4k_down_weights && down_in_dim == 1024u && down_out_dim == 4096u &&
+        down_in_dim / CUDA_QK_K == 4u &&
+        down_row_bytes == 4u * sizeof(cuda_block_q4_K) &&
+        down_expert_bytes == (uint64_t)down_out_dim * down_row_bytes &&
+        (((uintptr_t)gate_w | (uintptr_t)up_w | (uintptr_t)down_w) & 15u) == 0u;
+    const int shape_ok = full_shape || packed_half_shape;
     if (!(cfg->gfx1151 && shape_ok && cfg->opt_in &&
           !cfg->disabled && !g_quality_mode)) return 0u;
     uint32_t features = DS4_TP_FEATURE_Q4K_WMMA;

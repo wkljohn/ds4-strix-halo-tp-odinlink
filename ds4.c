@@ -53313,6 +53313,24 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
                 down->dim[1] * down_row_bytes, down_row_bytes,
                 (const uint8_t *)e->model.map + down->abs_offset);
     }
+    const char *glm5_q4k_wmma = getenv("DS4_ROCM_GLM5_Q4K_WMMA");
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 && glm5_q4k_wmma &&
+        glm5_q4k_wmma[0] == '1' && glm5_q4k_wmma[1] == '\0') {
+        /* GLM-5.3 binds routed tensors through its offset contract instead of
+         * the legacy e->weights layer table. Probe the exact per-rank packed
+         * half consumed by ds4_glm5_next_exec; the launcher repeats these
+         * shape checks against the real window pointers before dispatch. */
+        const uint64_t q4_row_bytes =
+            16u * gguf_types[DS4_TENSOR_Q4_K].block_bytes;
+        const uint64_t down_row_bytes =
+            4u * gguf_types[DS4_TENSOR_Q4_K].block_bytes;
+        const uint8_t *aligned_probe = (const uint8_t *)e->model.map;
+        saw_q4k_layer = true;
+        q4k_features &= ds4_gpu_q4k_wmma_runtime_features(
+            1, 4096u, 1024u, 1024u * q4_row_bytes, q4_row_bytes,
+            aligned_probe, aligned_probe, 1, 1024u, 4096u,
+            4096u * down_row_bytes, down_row_bytes, aligned_probe);
+    }
     const bool mtp_or_dspark = e->mtp_ready ||
         (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
     const char *q4k_kshard_legacy =
@@ -62787,7 +62805,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          * loader's residency behavior is bounded on a full prompt. */
         uint32_t batch = batch_env && batch_env[0] ? (uint32_t)strtoul(batch_env, NULL, 10) : 1u;
         if (batch < 2u) batch = 1u;
-        if (batch > 256u) batch = 256u;
+        if (batch > 1024u) batch = 1024u;
         for (int i = start; i < prompt->len; ) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");

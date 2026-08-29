@@ -142,6 +142,9 @@ struct ds4_gpu_q4k_window_cache {
     uint64_t misses;
     uint64_t fills;
     uint64_t evictions;
+    uint64_t profile_upload_bytes;
+    uint64_t profile_control_bytes;
+    double profile_prepare_sec;
     uint32_t n_expert;
     uint32_t slots;
     std::vector<int32_t> expert_to_slot;
@@ -979,6 +982,18 @@ static void cuda_q4k_packed_slice_release_all(void) {
     }
     for (ds4_gpu_q4k_window_cache *cache : g_q4k_window_caches) {
         if (!cache) continue;
+        if (getenv("DS4_ROCM_GLM5_WINDOW_PROFILE") &&
+            cache->profile_prepare_sec > 0.0) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 window prepare seconds=%.6f uploads=%.2f MiB "
+                    "control=%.2f KiB effective=%.2f GiB/s fills=%llu\n",
+                    cache->profile_prepare_sec,
+                    (double)cache->profile_upload_bytes / 1048576.0,
+                    (double)cache->profile_control_bytes / 1024.0,
+                    (double)cache->profile_upload_bytes /
+                        cache->profile_prepare_sec / 1073741824.0,
+                    (unsigned long long)cache->fills);
+        }
         if (cache->slot_ids_device) (void)cudaFree(cache->slot_ids_device);
         if (cache->base) (void)cudaFree(cache->base);
         delete cache;
@@ -7009,6 +7024,18 @@ extern "C" void ds4_gpu_q4k_window_cache_destroy(
                                  g_q4k_window_caches.end(), cache);
     if (found == g_q4k_window_caches.end()) return;
     (void)cudaDeviceSynchronize();
+    if (getenv("DS4_ROCM_GLM5_WINDOW_PROFILE") &&
+        cache->profile_prepare_sec > 0.0) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM5 window prepare seconds=%.6f uploads=%.2f MiB "
+                "control=%.2f KiB effective=%.2f GiB/s fills=%llu\n",
+                cache->profile_prepare_sec,
+                (double)cache->profile_upload_bytes / 1048576.0,
+                (double)cache->profile_control_bytes / 1024.0,
+                (double)cache->profile_upload_bytes /
+                    cache->profile_prepare_sec / 1073741824.0,
+                (unsigned long long)cache->fills);
+    }
     if (cache->slot_ids_device) (void)cudaFree(cache->slot_ids_device);
     if (cache->base) (void)cudaFree(cache->base);
     g_q4k_window_caches.erase(found);
@@ -7186,6 +7213,9 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare_device(
         id_bytes > (uint64_t)SIZE_MAX || weight_bytes > (uint64_t)SIZE_MAX) {
         return 0;
     }
+    const int profile = getenv("DS4_ROCM_GLM5_WINDOW_PROFILE") != NULL;
+    const double profile_started = profile ? cuda_wall_sec() : 0.0;
+    const uint64_t fills_before = cache->fills;
     std::vector<int32_t> host_ids;
     std::vector<int32_t> host_slots;
     std::vector<float> host_weights;
@@ -7246,6 +7276,13 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare_device(
     slot_ids->owner = 0;
     slot_ids->device_id = expert_ids->device_id;
     slot_ids->host_ptr = NULL;
+    if (profile) {
+        const uint64_t filled = cache->fills - fills_before;
+        cache->profile_prepare_sec += cuda_wall_sec() - profile_started;
+        cache->profile_upload_bytes += filled *
+            (2u * cache->gate_expert_bytes + cache->down_expert_bytes);
+        cache->profile_control_bytes += 2u * id_bytes + weight_bytes;
+    }
     return 1;
 }
 
