@@ -354,6 +354,22 @@ struct LayerTiming {
     uint64_t mla_routed_calls = 0u;
 };
 
+static void trace_layer_row(const char *mode, uint32_t il,
+                            const ds4_gpu_tensor *tensor,
+                            uint32_t row, uint32_t width) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = std::getenv("DS4_GLM5_BATCH_LAYER_TRACE") ? 1 : 0;
+    if (!enabled || !tensor || width == 0u) return;
+    std::vector<float> values(width);
+    if (!ds4_gpu_tensor_read(tensor,
+            (uint64_t)row * width * sizeof(float), values.data(),
+            (uint64_t)width * sizeof(float))) return;
+    double sum = 0.0, norm2 = 0.0;
+    for (float v : values) { sum += v; norm2 += (double)v * v; }
+    std::fprintf(stderr, "GLM5 layer-trace mode=%s layer=%u row=%u sum=%.9g l2=%.9g\n",
+                 mode, il, row, sum, std::sqrt(norm2));
+}
+
 bool execute_full_token(ds4_glm5_next_exec_ctx &exec,
                         ds4_glm5_next_state &state,
                         ds4_glm5_next_workspace *workspace,
@@ -387,6 +403,7 @@ bool execute_full_token(ds4_glm5_next_exec_ctx &exec,
             }
         }
         std::swap(current, output);
+        trace_layer_row("scalar", il, current, 0u, kHcWidth);
     }
     return true;
 }
@@ -426,6 +443,7 @@ bool execute_full_batch(ds4_glm5_next_exec_ctx &exec,
             }
         }
         std::swap(current, output);
+        trace_layer_row("batch", il, current, n_tokens - 1u, kHcWidth);
     }
     return true;
 }
