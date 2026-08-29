@@ -85,6 +85,7 @@ MLA_ROUTED_CONTINUATION_ROWS=${DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS:-1}
 ROCPROF_RANK=${DS4_GLM5_ROCPROF_RANK:-}
 BF16_TOKTILE_DISABLE=${DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE:-}
 BF16_LOWRANK128_TOKTILE_DISABLE=${DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE:-}
+BF16_TAIL25_DISABLE=${DS4_ROCM_DISABLE_BF16_TAIL25_FUSION:-}
 BF16_TOKTILE_VERBOSE=${DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE:-}
 Q4K_WMMA_MIN_COUNT=${DS4_ROCM_Q4K_WMMA_MIN_COUNT:-}
 EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
@@ -238,6 +239,10 @@ done
 [[ -z $BF16_LOWRANK128_TOKTILE_DISABLE ||
    $BF16_LOWRANK128_TOKTILE_DISABLE == 1 ]] || {
   echo "error: DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE must be empty or 1" >&2
+  exit 2
+}
+[[ -z $BF16_TAIL25_DISABLE || $BF16_TAIL25_DISABLE == 1 ]] || {
+  echo "error: DS4_ROCM_DISABLE_BF16_TAIL25_FUSION must be empty or 1" >&2
   exit 2
 }
 [[ -z $BF16_TOKTILE_VERBOSE || $BF16_TOKTILE_VERBOSE == 1 ]] || {
@@ -500,6 +505,9 @@ printf 'bf16_toktile_disabled=%s\n' "$([[ -n $BF16_TOKTILE_DISABLE ]] && printf 
 printf 'bf16_lowrank128_toktile_disabled=%s\n' \
   "$([[ -n $BF16_LOWRANK128_TOKTILE_DISABLE ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
+printf 'bf16_tail25_disabled=%s\n' \
+  "$([[ -n $BF16_TAIL25_DISABLE ]] && printf 1 || printf 0)" \
+  >>"$OUT/run.env"
 printf 'bf16_toktile_verbose=%s\n' "$([[ -n $BF16_TOKTILE_VERBOSE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
 printf 'q4k_wmma_min_count=%s\n' "${Q4K_WMMA_MIN_COUNT:-default}" >>"$OUT/run.env"
 printf 'expected_generated_fnv=%s\n' "$EXPECTED_GENERATED_FNV" >>"$OUT/run.env"
@@ -547,6 +555,10 @@ fi
 if [[ -n $BF16_LOWRANK128_TOKTILE_DISABLE ]]; then
   local_candidate_env+=(DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE=1)
   remote_candidate_env+=' DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE=1'
+fi
+if [[ -n $BF16_TAIL25_DISABLE ]]; then
+  local_candidate_env+=(DS4_ROCM_DISABLE_BF16_TAIL25_FUSION=1)
+  remote_candidate_env+=' DS4_ROCM_DISABLE_BF16_TAIL25_FUSION=1'
 fi
 if [[ -n $BF16_TOKTILE_VERBOSE ]]; then
   local_candidate_env+=(DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE=1)

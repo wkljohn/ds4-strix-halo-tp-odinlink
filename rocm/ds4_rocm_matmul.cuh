@@ -1445,6 +1445,25 @@ static int matmul_bf16_f32_toktile_w32_launch(
                      "matmul_bf16 token-tile32 launch")) return 0;
         first = chunks32 * 32u;
     }
+    static const int tail25_disabled =
+        getenv("DS4_ROCM_DISABLE_BF16_TAIL25_FUSION") != NULL;
+    if (!tail25_disabled && n_tok - first == 25u) {
+        matmul_bf16_f32_toktile_w32_kernel<25u><<<
+                out_dim, kDs4Bf16ToktileThreads>>>(
+            out + (uint64_t)first * out_dim, weight,
+            x + (uint64_t)first * in_dim, in_dim, out_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "matmul_bf16 token-tail25 launch")) return 0;
+        static int tail25_reported = 0;
+        if (!tail25_reported &&
+            getenv("DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE") != NULL) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "BF16 F32 tail25 fusion engaged: tokens=%u "
+                    "in=%u out=%u\n", n_tok, in_dim, out_dim);
+            tail25_reported = 1;
+        }
+        return true;
+    }
 #define DS4_BF16_LAUNCH_TAIL(T) do {                                      \
         if (n_tok - first >= (T)) {                                       \
             matmul_bf16_f32_toktile_w32_kernel<(T)><<<                  \

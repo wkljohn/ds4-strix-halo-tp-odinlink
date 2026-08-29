@@ -119,6 +119,24 @@ void launch_segmented_tiled(float *out, const uint16_t *weight,
     if (first != tokens) fail("segmented tile decomposition");
 }
 
+void launch_tail25_tiled(float *out, const uint16_t *weight,
+                         const float *x, uint32_t in_dim,
+                         uint32_t out_dim, uint32_t tokens) {
+    const uint32_t chunks32 = tokens / 32u;
+    const uint32_t first = chunks32 * 32u;
+    if (chunks32 > 0u) {
+        matmul_bf16_f32_toktile_w32_kernel<32u><<<
+            dim3(out_dim, chunks32), kThreads>>>(
+            out, weight, x, in_dim, out_dim);
+        hip_ok(hipGetLastError(), "tail25 tile32 launch");
+    }
+    if (tokens - first != 25u) fail("tail25 requires a 25-token tail");
+    matmul_bf16_f32_toktile_w32_kernel<25u><<<out_dim, kThreads>>>(
+        out + (uint64_t)first * out_dim, weight,
+        x + (uint64_t)first * in_dim, in_dim, out_dim);
+    hip_ok(hipGetLastError(), "tail25 fused launch");
+}
+
 void launch_lowrank128_tiled(float *out, const uint16_t *weight,
                              const float *x, uint32_t out_dim,
                              uint32_t tokens) {
@@ -377,6 +395,55 @@ void run_lowrank128_tail_coverage(const uint16_t *weight, uint32_t tokens) {
     hip_ok(hipFree(d_x), "free low-rank tail input");
 }
 
+void run_tail25_candidate(const uint16_t *weight, uint32_t in_dim,
+                          uint32_t out_dim, uint32_t tokens) {
+    const uint64_t x_count = (uint64_t)tokens * in_dim;
+    const uint64_t out_count = (uint64_t)tokens * out_dim;
+    std::vector<float> x(x_count);
+    for (uint64_t i = 0u; i < x_count; ++i)
+        x[i] = 0.6f * std::cos((double)(i % 3251u) * 0.007) -
+               0.05f * std::sin((double)i * 0.002);
+    float *d_x = nullptr, *d_reference = nullptr, *d_tail25 = nullptr;
+    hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
+           "allocate tail25 input");
+    hip_ok(hipMalloc(&d_reference, out_count * sizeof(float)),
+           "allocate tail25 reference");
+    hip_ok(hipMalloc(&d_tail25, out_count * sizeof(float)),
+           "allocate tail25 candidate");
+    hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
+                     hipMemcpyHostToDevice), "copy tail25 input");
+    const auto reference = [&] {
+        launch_segmented_tiled(d_reference, weight, d_x, in_dim, out_dim,
+                               tokens);
+    };
+    const auto tail25 = [&] {
+        launch_tail25_tiled(d_tail25, weight, d_x, in_dim, out_dim, tokens);
+    };
+    const float reference_ms = time_ms(reference);
+    const float tail25_ms = time_ms(tail25);
+    reference();
+    tail25();
+    hip_ok(hipDeviceSynchronize(), "tail25 synchronize");
+    std::vector<float> host_reference(out_count), host_tail25(out_count);
+    hip_ok(hipMemcpy(host_reference.data(), d_reference,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read tail25 reference");
+    hip_ok(hipMemcpy(host_tail25.data(), d_tail25,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read tail25 candidate");
+    if (std::memcmp(host_reference.data(), host_tail25.data(),
+                    out_count * sizeof(float)) != 0)
+        fail("tail25 candidate must bit-match segmented token tile");
+    std::printf(
+        "BF16 fused-tail shape=%ux%ux%u segmented_ms=%.4f "
+        "tail25_ms=%.4f tail25_speedup=%.3fx bit_exact=1\n",
+        tokens, out_dim, in_dim, reference_ms, tail25_ms,
+        reference_ms / tail25_ms);
+    hip_ok(hipFree(d_tail25), "free tail25 candidate");
+    hip_ok(hipFree(d_reference), "free tail25 reference");
+    hip_ok(hipFree(d_x), "free tail25 input");
+}
+
 void run_tail_coverage(const uint16_t *weight, uint32_t tokens) {
     constexpr uint32_t in_dim = 1024u;
     constexpr uint32_t out_dim = 1024u;
@@ -453,6 +520,10 @@ int main() {
     run_shape(handle, device_weight, 4096u, 8192u);
     run_shape(handle, device_weight, 8192u, 4096u);
     run_lowrank128_tail_coverage(device_weight, 63u);
+    for (const uint32_t tokens : {25u, 57u, 121u, 153u}) {
+        run_tail25_candidate(device_weight, 4096u, 8192u, tokens);
+        run_tail25_candidate(device_weight, 8192u, 4096u, tokens);
+    }
     for (const uint32_t tokens : {16u, 17u, 31u, 47u, 64u})
         run_tail_coverage(device_weight, tokens);
 
