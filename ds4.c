@@ -7030,43 +7030,26 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
 /* GLM5.3 has a tensor-derived weight table rather than ds4_weights.  Build
  * the resident-map contract used by the ordinary executor.  Its TP split is
  * over the intermediate rows of gate/up and over the K columns of down for
- * every expert; it is not an expert-id split.  Keep down experts whole in the
- * map because a row-major quantized matrix has strided K slices. */
+ * every expert; it is not an expert-id split.  Routed Q4 tensors are omitted
+ * from this linear map: the executor owns their packed, tile-local residency
+ * and mapping them here would duplicate tens of GiB before first execution. */
 static bool glm5_next_model_map_sharded_spans(
         const ds4_model *m, int rank, ds4_model_map_span_vec *spans) {
     if (!m || !spans || (rank != 0 && rank != 1)) return false;
     memset(spans, 0, sizeof(*spans));
-    enum { glm5_width = 4096, glm5_routed_mid = 2048,
-           glm5_rank_mid = 1024 };
+    (void)rank;
+    enum { glm5_width = 4096, glm5_routed_mid = 2048 };
     for (uint64_t i = 0u; i < m->n_tensors; ++i) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->ndim == 3u && t->dim[2] == DS4_N_EXPERT) {
-            uint64_t in_dim = 0u, out_dim = 0u, row_bytes = 0u;
-            if (!tensor_expert_bytes(m, t, 0u, &in_dim, &out_dim,
-                                     &row_bytes) || row_bytes == 0u) {
+            if (t->type != DS4_TENSOR_Q4_K ||
+                !((t->dim[0] == glm5_width && t->dim[1] == glm5_routed_mid) ||
+                  (t->dim[0] == glm5_routed_mid && t->dim[1] == glm5_width))) {
                 return false;
             }
-            const uint64_t expert_bytes = out_dim * row_bytes;
-            const bool down = t->dim[0] == glm5_routed_mid &&
-                              t->dim[1] == glm5_width;
-            if (down) {
-                const uint64_t bytes = (uint64_t)t->dim[2] * expert_bytes;
-                model_map_span_vec_append(spans, t->abs_offset,
-                                          t->abs_offset + bytes, true);
-                if (bytes > spans->max_tensor_bytes) spans->max_tensor_bytes = bytes;
-            } else if (t->dim[0] == glm5_width &&
-                       t->dim[1] == glm5_routed_mid) {
-                const uint64_t row_base = (uint64_t)rank * glm5_rank_mid;
-                const uint64_t bytes = (uint64_t)glm5_rank_mid * row_bytes;
-                for (uint64_t expert = 0u; expert < t->dim[2]; ++expert) {
-                    const uint64_t lo = t->abs_offset + expert * expert_bytes +
-                                        row_base * row_bytes;
-                    model_map_span_vec_append(spans, lo, lo + bytes, true);
-                }
-                if (bytes > spans->max_tensor_bytes) spans->max_tensor_bytes = bytes;
-            } else {
-                return false;
-            }
+            /* Packed-slice declaration/load is the sole owner of these
+             * routed weights.  Do not add a linear map span. */
+            continue;
         } else {
             model_map_span_vec_include_one(spans, t);
         }
