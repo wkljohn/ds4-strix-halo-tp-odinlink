@@ -51,7 +51,23 @@ int ds4_glm5_next_build_tp_gate_mask(
 }
 
 static int kda_complete(const ds4_glm5_kda_weight_offsets *w) {
-    return w->attn_norm && w->q && w->k && w->v && w->output &&
+    const int q_type = w->q_type == 0u || w->q_type == 12u ||
+                       w->q_type == 30u;
+    const int k_type = w->k_type == 0u || w->k_type == 12u ||
+                       w->k_type == 30u;
+    const int v_type = w->v_type == 0u || w->v_type == 8u ||
+                       w->v_type == 30u;
+    const int output_type = w->output_type == 0u || w->output_type == 8u ||
+                            w->output_type == 30u;
+    const int low_types =
+        (w->f_a_type == 0u || w->f_a_type == 8u || w->f_a_type == 30u) &&
+        (w->f_b_type == 0u || w->f_b_type == 8u || w->f_b_type == 30u) &&
+        (w->g_a_type == 0u || w->g_a_type == 8u || w->g_a_type == 30u) &&
+        (w->g_b_type == 0u || w->g_b_type == 8u || w->g_b_type == 30u) &&
+        (w->beta_type == 0u || w->beta_type == 8u ||
+         w->beta_type == 30u);
+    return q_type && k_type && v_type && output_type && low_types &&
+           w->attn_norm && w->q && w->k && w->v && w->output &&
            w->q_conv && w->k_conv && w->v_conv && w->f_a && w->f_b &&
            w->g_a && w->g_b && w->beta && w->o_norm && w->dt_bias &&
            w->a_log;
@@ -61,7 +77,9 @@ static int kda_empty(const ds4_glm5_kda_weight_offsets *w) {
     return !w->attn_norm && !w->q && !w->k && !w->v && !w->output &&
            !w->q_conv && !w->k_conv && !w->v_conv && !w->f_a && !w->f_b &&
            !w->g_a && !w->g_b && !w->beta && !w->o_norm && !w->dt_bias &&
-           !w->a_log;
+           !w->a_log && !w->q_type && !w->k_type && !w->v_type &&
+           !w->output_type && !w->f_a_type && !w->f_b_type &&
+           !w->g_a_type && !w->g_b_type && !w->beta_type;
 }
 
 static int mla_complete(const ds4_glm5_next_mla_offsets *w) {
@@ -109,6 +127,12 @@ int ds4_glm5_next_model_offsets_validate(
         !model->output_norm || !model->output || !model->nextn_eh_proj ||
         !(model->rms_norm_eps > 0.0f) || model->rms_norm_eps > 1.0f ||
         !(model->hc_eps > 0.0f) || model->hc_eps > 1.0f) {
+        return 0;
+    }
+    if ((model->token_embd_type != 0u &&
+         model->token_embd_type != 8u && model->token_embd_type != 30u) ||
+        (model->output_type != 0u &&
+         model->output_type != 8u && model->output_type != 30u)) {
         return 0;
     }
     for (uint32_t il = 0u; il < model->layer_count; ++il) {

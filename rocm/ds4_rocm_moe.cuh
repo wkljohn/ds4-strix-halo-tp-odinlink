@@ -288,6 +288,43 @@ __device__ static float dev_dot_q4_K_q8_K_block(const cuda_block_q4_K *x, const 
     return y->d * xd * (float)isum - y->d * xmin * (float)summs;
 }
 
+/* Correctness-first dense Q4_K projection used by GLM-5.3 KDA. One wave32
+ * owns one output row and reads the compact GGUF blocks directly; no expanded
+ * weight cache or activation cache is created. */
+__global__ static void glm5_dense_q4k_f32_kernel(
+        float *out, const cuda_block_q4_K *weights, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tokens) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t token = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    if (row >= out_dim || token >= n_tokens || lane >= 32u) return;
+    const uint32_t blocks = in_dim / CUDA_QK_K;
+    const cuda_block_q4_K *wr = weights + (uint64_t)row * blocks;
+    const float *xr = x + (uint64_t)token * in_dim;
+    float sum = 0.0f;
+    for (uint32_t b = 0u; b < blocks; ++b) {
+        const cuda_block_q4_K &w = wr[b];
+        const float d = dev_f16_to_f32(w.d);
+        const float dmin = dev_f16_to_f32(w.dmin);
+        #pragma unroll
+        for (uint32_t group = 0u; group < 8u; ++group) {
+            uint8_t scale = 0u, min_scale = 0u;
+            dev_q4_K_get_scale_min(group, w.scales, &scale, &min_scale);
+            const uint32_t byte_off = (group >> 1u) * 32u + lane;
+            const uint32_t shift = (group & 1u) ? 4u : 0u;
+            const uint32_t q = (w.qs[byte_off] >> shift) & 0x0fu;
+            const float value = d * (float)scale * (float)q -
+                                dmin * (float)min_scale;
+            sum += value * xr[(uint64_t)b * CUDA_QK_K + group * 32u + lane];
+        }
+    }
+    const MASK_T mask = static_cast<MASK_T>(0xffffffffu);
+    for (uint32_t delta = 16u; delta != 0u; delta >>= 1u) {
+        sum += __shfl_down_sync(mask, sum, delta, 32);
+    }
+    if (lane == 0u) out[(uint64_t)token * out_dim + row] = sum;
+}
+
 __device__ static void dev_dot_q4_K_q8_K_block4(
         const cuda_block_q4_K *x,
         const cuda_block_q8_K *y0,

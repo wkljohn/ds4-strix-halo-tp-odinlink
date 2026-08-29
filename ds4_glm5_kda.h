@@ -49,6 +49,10 @@ typedef struct {
     uint64_t attn_norm, q, k, v, output;
     uint64_t q_conv, k_conv, v_conv;
     uint64_t f_a, f_b, g_a, g_b, beta, o_norm, dt_bias, a_log;
+    /* Production bindings carry exact GGUF types for every quantizable KDA
+     * matrix. Zero retains the original BF16 synthetic-test contract. */
+    uint32_t q_type, k_type, v_type, output_type;
+    uint32_t f_a_type, f_b_type, g_a_type, g_b_type, beta_type;
 } ds4_glm5_kda_weight_offsets;
 
 typedef struct {

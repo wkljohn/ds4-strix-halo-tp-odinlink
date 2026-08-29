@@ -138,7 +138,7 @@ test-rocm-glm53-expert-window: tests/test_rocm_glm53_expert_window
 tests/test_rocm_glm5_q4k_shard_compose.o: tests/test_rocm_glm5_q4k_shard_compose.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_rocm_glm5_q4k_shard_compose: tests/test_rocm_glm5_q4k_shard_compose.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+tests/test_rocm_glm5_q4k_shard_compose: tests/test_rocm_glm5_q4k_shard_compose.o ds4_glm5_next_runtime.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-glm5-q4k-shard-compose: tests/test_rocm_glm5_q4k_shard_compose
@@ -238,6 +238,16 @@ tests/test_rocm_glm5_bf16_embedding: tests/test_rocm_glm5_bf16_embedding.o tests
 
 test-rocm-glm5-bf16-embedding: tests/test_rocm_glm5_bf16_embedding
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_bf16_embedding
+
+.PHONY: test-rocm-glm5-kda-q4k-projection
+tests/test_rocm_glm5_kda_q4k_projection.o: tests/test_rocm_glm5_kda_q4k_projection.cu tests/glm5_gguf_test.hpp ds4_gpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_kda_q4k_projection: tests/test_rocm_glm5_kda_q4k_projection.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-kda-q4k-projection: tests/test_rocm_glm5_kda_q4k_projection
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_kda_q4k_projection
 
 .PHONY: test-rocm-glm5-dense-block0 test-glm5-dense-block0-external-reference
 tests/test_rocm_glm5_dense_block0.o: tests/test_rocm_glm5_dense_block0.cu tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp ds4_glm5_kda.h ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h

@@ -78,6 +78,11 @@ typedef struct {
     uint64_t output_norm;
     uint64_t output;
     uint64_t nextn_eh_proj;
+    /* Exact GGUF types for ordinary-inference root matrices. Production
+     * bindings populate these; zero preserves the original BF16 contract for
+     * synthetic offset fixtures created before the fields existed. */
+    uint32_t token_embd_type;
+    uint32_t output_type;
     uint32_t layer_count;
     uint32_t trunk_count;
     uint32_t nextn_count;

@@ -4502,6 +4502,8 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
     w->offsets.output_norm = w->output_norm->abs_offset;
     w->offsets.output = w->output->abs_offset;
     w->offsets.nextn_eh_proj = w->nextn_eh_proj->abs_offset;
+    w->offsets.token_embd_type = w->token_embd->type;
+    w->offsets.output_type = w->output->type;
     w->offsets.layer_count = layer_count;
     w->offsets.trunk_count = trunk_count;
     w->offsets.nextn_count = nextn_count;
@@ -4583,6 +4585,15 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
                 .o_norm = l->kda_o_norm->abs_offset,
                 .dt_bias = l->kda_dt_bias->abs_offset,
                 .a_log = l->kda_a_log->abs_offset,
+                .q_type = l->kda_q->type,
+                .k_type = l->kda_k->type,
+                .v_type = l->kda_v->type,
+                .output_type = l->kda_output->type,
+                .f_a_type = l->kda_f_a->type,
+                .f_b_type = l->kda_f_b->type,
+                .g_a_type = l->kda_g_a->type,
+                .g_b_type = l->kda_g_b->type,
+                .beta_type = l->kda_beta->type,
             };
         }
         if (il < DS4_GLM5_NEXT_LEADING_DENSE) {

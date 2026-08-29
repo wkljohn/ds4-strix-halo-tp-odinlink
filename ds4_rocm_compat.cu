@@ -228,6 +228,44 @@ static int rocm_glm5_workspace_fits(
 #define DS4_GLM5_KDA_INJECTED(stage) 0
 #endif
 
+static int rocm_glm5_kda_matmul_typed(
+        ds4_gpu_tensor *out, const ds4_glm5_kda_device_args *args,
+        uint64_t base_offset, uint32_t type, uint64_t in_dim,
+        uint64_t row_start, uint64_t out_dim,
+        const ds4_gpu_tensor *input) {
+    uint64_t row_bytes = 0u;
+    if (!out || !args || !input || in_dim == 0u || out_dim == 0u) return 0;
+    if (type == 0u || type == 30u) {
+        if (in_dim > UINT64_MAX / sizeof(uint16_t)) return 0;
+        row_bytes = in_dim * sizeof(uint16_t);
+    } else if (type == 8u) {
+        if ((in_dim % 32u) != 0u || in_dim / 32u > UINT64_MAX / 34u)
+            return 0;
+        row_bytes = (in_dim / 32u) * 34u;
+    } else if (type == 12u) {
+        if ((in_dim % 256u) != 0u || in_dim / 256u > UINT64_MAX / 144u)
+            return 0;
+        row_bytes = (in_dim / 256u) * 144u;
+    } else {
+        return 0;
+    }
+    if (row_start > (UINT64_MAX - base_offset) / row_bytes) return 0;
+    const uint64_t offset = base_offset + row_start * row_bytes;
+    if (type == 8u) {
+        return ds4_gpu_matmul_q8_0_tensor(
+            out, args->model_map, args->model_size, offset,
+            in_dim, out_dim, input, args->n_tokens);
+    }
+    if (type == 12u) {
+        return ds4_gpu_matmul_q4_k_tensor(
+            out, args->model_map, args->model_size, offset,
+            in_dim, out_dim, input, args->n_tokens);
+    }
+    return ds4_gpu_matmul_bf16_tensor(
+        out, args->model_map, args->model_size, offset,
+        in_dim, out_dim, input, args->n_tokens);
+}
+
 extern "C" int ds4_rocm_glm5_kda_layer_begin(
         const ds4_glm5_kda_device_args *args) {
 #if !defined(DS4_GFX1151_WAVE32) || !DS4_GFX1151_WAVE32
@@ -248,33 +286,24 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
         (uint64_t)tokens * channels;
     const uint64_t beta_values =
         (uint64_t)tokens * heads;
-    const uint64_t wide_row_offset =
-        (uint64_t)head_start * DS4_GLM5_KDA_HEAD_DIM * 4096u *
-        sizeof(uint16_t);
-    const uint64_t low_row_offset =
-        (uint64_t)head_start * DS4_GLM5_KDA_HEAD_DIM * 128u *
-        sizeof(uint16_t);
-    const uint64_t beta_row_offset =
-        (uint64_t)head_start * 4096u * sizeof(uint16_t);
+    const uint64_t channel_start =
+        (uint64_t)head_start * DS4_GLM5_KDA_HEAD_DIM;
 
     if (!ds4_gpu_rms_norm_weight_rows_tensor(
             w->norm, args->input, args->model_map, args->model_size,
             weights->attn_norm, 4096u, tokens, 1.0e-5f) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_INPUT_NORM)) return 0;
-    if (!ds4_gpu_matmul_bf16_tensor(
-            w->q, args->model_map, args->model_size,
-            weights->q + wide_row_offset,
-            4096u, channels, w->norm, tokens) ||
+    if (!rocm_glm5_kda_matmul_typed(
+            w->q, args, weights->q, weights->q_type,
+            4096u, channel_start, channels, w->norm) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_Q_PROJECTION)) return 0;
-    if (!ds4_gpu_matmul_bf16_tensor(
-            w->k, args->model_map, args->model_size,
-            weights->k + wide_row_offset,
-            4096u, channels, w->norm, tokens) ||
+    if (!rocm_glm5_kda_matmul_typed(
+            w->k, args, weights->k, weights->k_type,
+            4096u, channel_start, channels, w->norm) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_K_PROJECTION)) return 0;
-    if (!ds4_gpu_matmul_bf16_tensor(
-            w->v, args->model_map, args->model_size,
-            weights->v + wide_row_offset,
-            4096u, channels, w->norm, tokens) ||
+    if (!rocm_glm5_kda_matmul_typed(
+            w->v, args, weights->v, weights->v_type,
+            4096u, channel_start, channels, w->norm) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_V_PROJECTION)) return 0;
 
     const uint64_t conv_offset =
@@ -304,17 +333,15 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
     ds4_glm5_kda_qk_norm_kernel<<<tokens * heads, 128u>>>(
         (float *)w->q->ptr, (float *)w->k->ptr, tokens, heads);
     if (hipGetLastError() != hipSuccess ||
-        !ds4_gpu_matmul_bf16_tensor(
-            w->f_low, args->model_map, args->model_size, weights->f_a,
-            4096u, 128u, w->norm, tokens) ||
-        !ds4_gpu_matmul_bf16_tensor(
-            w->forget, args->model_map, args->model_size,
-            weights->f_b + low_row_offset,
-            128u, channels, w->f_low, tokens) ||
-        !ds4_gpu_matmul_bf16_tensor(
-            w->beta, args->model_map, args->model_size,
-            weights->beta + beta_row_offset,
-            4096u, heads, w->norm, tokens)) return 0;
+        !rocm_glm5_kda_matmul_typed(
+            w->f_low, args, weights->f_a, weights->f_a_type,
+            4096u, 0u, 128u, w->norm) ||
+        !rocm_glm5_kda_matmul_typed(
+            w->forget, args, weights->f_b, weights->f_b_type,
+            128u, channel_start, channels, w->f_low) ||
+        !rocm_glm5_kda_matmul_typed(
+            w->beta, args, weights->beta, weights->beta_type,
+            4096u, head_start, heads, w->norm)) return 0;
 
     ds4_gpu_tensor dt_bias = {}, a_log = {};
     if (!rocm_glm5_model_view_init(
@@ -346,13 +373,12 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
             tokens, heads, DS4_GLM5_KDA_HEAD_DIM) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_RECURRENCE)) return 0;
 
-    if (!ds4_gpu_matmul_bf16_tensor(
-            w->f_low, args->model_map, args->model_size, weights->g_a,
-            4096u, 128u, w->norm, tokens) ||
-        !ds4_gpu_matmul_bf16_tensor(
-            w->forget, args->model_map, args->model_size,
-            weights->g_b + low_row_offset,
-            128u, channels, w->f_low, tokens)) return 0;
+    if (!rocm_glm5_kda_matmul_typed(
+            w->f_low, args, weights->g_a, weights->g_a_type,
+            4096u, 0u, 128u, w->norm) ||
+        !rocm_glm5_kda_matmul_typed(
+            w->forget, args, weights->g_b, weights->g_b_type,
+            128u, channel_start, channels, w->f_low)) return 0;
 
     ds4_gpu_tensor o_norm = {};
     if (!rocm_glm5_model_view_init(
@@ -387,10 +413,10 @@ extern "C" int ds4_rocm_glm5_kda_layer_finish(
     const uint64_t output_bytes =
         (uint64_t)args->n_tokens * 4096u * sizeof(float);
     if (full_gated->bytes < full_bytes || args->output->bytes < output_bytes ||
-        !ds4_gpu_matmul_bf16_tensor(
-            args->output, args->model_map, args->model_size,
-            args->weights->output, DS4_GLM5_KDA_CHANNELS, 4096u,
-            full_gated, args->n_tokens) ||
+        !rocm_glm5_kda_matmul_typed(
+            args->output, args, args->weights->output,
+            args->weights->output_type, DS4_GLM5_KDA_CHANNELS,
+            0u, 4096u, full_gated) ||
         DS4_GLM5_KDA_INJECTED(
             DS4_GLM5_KDA_FAIL_OUTPUT_PROJECTION)) return 0;
     return hipStreamSynchronize(0) == hipSuccess;

@@ -1272,6 +1272,16 @@ static int routed_moe_launch(
                                gate_expert_bytes, down_expert_bytes, expert_in_dim,
                                expert_mid_dim, out_dim, selected, weights, n_total_expert, n_expert, x,
                                n_tokens, &plan)) {
+        if (getenv("DS4_GLM5_NEXT_MOE_DEBUG")) fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "routed plan reject layer=%u types=%u/%u totals=%u/%u dims=%u/%u/%u bytes=%llu/%llu/%llu rows=%llu/%llu map=%p size=%llu\n",
+            layer_index, gate_type, down_type, n_total_expert, n_expert,
+            expert_in_dim, expert_mid_dim, out_dim,
+            (unsigned long long)gate_expert_bytes,
+            (unsigned long long)down_expert_bytes,
+            (unsigned long long)model_size,
+            (unsigned long long)gate_row_bytes,
+            (unsigned long long)down_row_bytes, model_map,
+            (unsigned long long)model_size);
         return 0;
     }
     const int q4k_path = plan.q4k_path;
@@ -1284,6 +1294,9 @@ static int routed_moe_launch(
     uint64_t pair_count64 = 0;
     if (!cuda_u64_mul_checked(n_tokens, n_expert, &pair_count64) ||
         pair_count64 > UINT32_MAX) {
+        if (getenv("DS4_GLM5_NEXT_MOE_DEBUG")) fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "routed pair count reject layer=%u tokens=%u experts=%u\n",
+            layer_index, n_tokens, n_expert);
         return 0;
     }
     const uint32_t pair_count = (uint32_t)pair_count64;
@@ -1425,6 +1438,11 @@ static int routed_moe_launch(
                     n_tokens,
                     n_total_expert,
                     n_expert);
+            if (getenv("DS4_GLM5_NEXT_MOE_DEBUG")) fprintf(stderr,
+                DS4_GPU_LOG_PREFIX "routed no selected pointer layer=%u compact=%d batch=%d split=%d full=%d cached=%d\n",
+                layer_index, compact_selected, batch_stream_selected,
+                batch_stream_split_selected, stream_full_layer,
+                full_table_cached);
             return 0;
         }
         if (!stream_full_layer) {
@@ -1447,6 +1465,10 @@ static int routed_moe_launch(
         }
         if (!cuda_stream_batch_selected_wait_upload_ready()) return 0;
     } else if (!gate_w || !up_w || !down_w) {
+        if (getenv("DS4_GLM5_NEXT_MOE_DEBUG")) fprintf(stderr,
+            DS4_GPU_LOG_PREFIX "routed null weights layer=%u gate=%p up=%p down=%p compact=%d batch=%d split=%d\n",
+            layer_index, gate_w, up_w, down_w, compact_selected,
+            batch_stream_selected, batch_stream_split_selected);
         return 0;
     }
     if (compact_selected && !cuda_stream_selected_wait_upload_ready()) return 0;
@@ -4277,6 +4299,39 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
                 layer_index, n_tokens, row_base / row_count);
     }
     return rc;
+}
+
+extern "C" int ds4_gpu_matmul_q4_k_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tokens) {
+    uint64_t blocks = 0u, row_bytes = 0u, weight_bytes = 0u;
+    uint64_t x_values = 0u, out_values = 0u;
+    if (!out || !out->ptr || !model_map || !x || !x->ptr ||
+        in_dim == 0u || out_dim == 0u || n_tokens == 0u ||
+        (in_dim % CUDA_QK_K) != 0u || in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX || n_tokens > UINT32_MAX ||
+        !cuda_u64_mul_checked(in_dim / CUDA_QK_K,
+                              sizeof(cuda_block_q4_K), &row_bytes) ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_u64_mul_checked(n_tokens, in_dim, &x_values) ||
+        !cuda_u64_mul_checked(n_tokens, out_dim, &out_values) ||
+        !cuda_tensor_has_f32(x, x_values) ||
+        !cuda_tensor_has_f32(out, out_values)) {
+        return 0;
+    }
+    blocks = in_dim / CUDA_QK_K;
+    (void)blocks;
+    const char *weights = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "glm5_dense_q4k");
+    if (!weights) return 0;
+    glm5_dense_q4k_f32_kernel<<<
+        dim3((uint32_t)out_dim, (uint32_t)n_tokens), 32u>>>(
+        (float *)out->ptr, (const cuda_block_q4_K *)weights,
+        (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim,
+        (uint32_t)n_tokens);
+    return cuda_ok(cudaGetLastError(), "GLM5 dense Q4_K launch");
 }
 
 /* Research-only arithmetic control for the packed half-shape batch path.
