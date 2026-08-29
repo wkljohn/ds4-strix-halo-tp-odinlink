@@ -89,6 +89,63 @@ def row(blob, base, rows, cols, row_index, count):
     return [bf16_at(blob, start + 2 * j) for j in range(count)]
 
 
+def f16_at(blob, offset):
+    return struct.unpack_from("<e", blob, offset)[0]
+
+
+def q4_k_scale_min(group, scales):
+    if group < 4:
+        return scales[group] & 63, scales[group + 4] & 63
+    return ((scales[group + 4] & 15) |
+            ((scales[group - 4] >> 6) << 4),
+            (scales[group + 4] >> 4) |
+            ((scales[group] >> 6) << 4))
+
+
+def q4_k_block(blob, offset):
+    """Independent GGML Q4_K 256-value block decoder."""
+    d = f16_at(blob, offset)
+    dmin = f16_at(blob, offset + 2)
+    scales = memoryview(blob)[offset + 4:offset + 16]
+    quants = memoryview(blob)[offset + 16:offset + 144]
+    values = []
+    for group in range(8):
+        scale, minimum = q4_k_scale_min(group, scales)
+        byte_base = (group >> 1) * 32
+        shift = (group & 1) * 4
+        values.extend(d * scale * ((quants[byte_base + i] >> shift) & 15) -
+                      dmin * minimum for i in range(32))
+    return values
+
+
+def q8_0_block(blob, offset):
+    d = f16_at(blob, offset)
+    return [d * struct.unpack_from("<b", blob, offset + 2 + i)[0]
+            for i in range(32)]
+
+
+def quant_row(blob, base, rows, cols, row_index, count, typ):
+    if row_index >= rows or count > cols:
+        raise ValueError("sample row outside tensor")
+    if typ == 30:
+        return row(blob, base, rows, cols, row_index, count)
+    if typ == 12:
+        block_values, block_bytes = 256, 144
+        decode = q4_k_block
+    elif typ == 8:
+        block_values, block_bytes = 32, 34
+        decode = q8_0_block
+    else:
+        raise ValueError(f"unsupported KDA oracle tensor type {typ}")
+    if cols % block_values:
+        raise ValueError("quantized KDA row is not block aligned")
+    row_base = base + row_index * (cols // block_values) * block_bytes
+    values = []
+    for block in range((count + block_values - 1) // block_values):
+        values.extend(decode(blob, row_base + block * block_bytes))
+    return values[:count]
+
+
 def f32_vec(blob, base, count):
     return [struct.unpack_from("<f", blob, base + 4 * i)[0]
             for i in range(count)]
@@ -290,34 +347,35 @@ def main(argv):
         blob = mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_READ)
     def tensor(name, shape, typ):
         dims, got_type, rel = tensors[name]
-        if dims != shape or got_type != typ:
+        allowed = typ if isinstance(typ, tuple) else (typ,)
+        if dims != shape or got_type not in allowed:
             raise ValueError(f"{name}: expected {(shape, typ)}, got {(dims, got_type)}")
-        return data_start + rel
+        return data_start + rel, got_type
 
     # GGUF dimensions are [input, output]; sample output rows explicitly.
-    q = tensor("blk.0.kda_q.weight", (4096, 8192), 30)
-    k = tensor("blk.0.kda_k.weight", (4096, 8192), 30)
-    v = tensor("blk.0.kda_v.weight", (4096, 8192), 30)
-    fa = tensor("blk.0.kda_f_a.weight", (4096, 128), 30)
-    fb = tensor("blk.0.kda_f_b.weight", (128, 8192), 30)
-    beta_w = tensor("blk.0.kda_beta.weight", (4096, 64), 30)
-    dt = tensor("blk.0.kda_dt_bias.weight", (8192,), 0)
-    alog = tensor("blk.0.kda_a_log.weight", (64,), 0)
+    q, q_type = tensor("blk.0.kda_q.weight", (4096, 8192), (30, 12))
+    k, k_type = tensor("blk.0.kda_k.weight", (4096, 8192), (30, 12))
+    v, v_type = tensor("blk.0.kda_v.weight", (4096, 8192), (30, 8))
+    fa, fa_type = tensor("blk.0.kda_f_a.weight", (4096, 128), (30, 8))
+    fb, fb_type = tensor("blk.0.kda_f_b.weight", (128, 8192), (30, 8))
+    beta_w, beta_type = tensor("blk.0.kda_beta.weight", (4096, 64), (30, 8))
+    dt, _ = tensor("blk.0.kda_dt_bias.weight", (8192,), 0)
+    alog, _ = tensor("blk.0.kda_a_log.weight", (64,), 0)
     dtv = f32_vec(blob, dt, 8192)
     alogv = f32_vec(blob, alog, 64)
 
     x = [math.sin(0.017 * (i + 1)) * 0.5 for i in range(4096)]
     # Use eight channels/values.  The complete tensors are still bounds
     # checked, while this probe reads only a few rows and remains quick.
-    qv = [sum(a * b for a, b in zip(row(blob, q, 8192, 4096, i, 4096), x))
+    qv = [sum(a * b for a, b in zip(quant_row(blob, q, 8192, 4096, i, 4096, q_type), x))
           for i in range(8)]
-    kv = [sum(a * b for a, b in zip(row(blob, k, 8192, 4096, i, 4096), x))
+    kv = [sum(a * b for a, b in zip(quant_row(blob, k, 8192, 4096, i, 4096, k_type), x))
           for i in range(8)]
-    vv = [sum(a * b for a, b in zip(row(blob, v, 8192, 4096, i, 4096), x))
+    vv = [sum(a * b for a, b in zip(quant_row(blob, v, 8192, 4096, i, 4096, v_type), x))
           for i in range(8)]
-    low = [sum(a * b for a, b in zip(row(blob, fa, 128, 4096, i, 4096), x))
+    low = [sum(a * b for a, b in zip(quant_row(blob, fa, 128, 4096, i, 4096, fa_type), x))
            for i in range(128)]
-    gate_proj = [sum(a * b for a, b in zip(row(blob, fb, 8192, 128, i, 128), low))
+    gate_proj = [sum(a * b for a, b in zip(quant_row(blob, fb, 8192, 128, i, 128, fb_type), low))
                  for i in range(8)]
     # GLM-5 uses the configured lower-bounded KDA gate.  The softplus branch
     # is only the fallback when no lower bound is present; using it here
@@ -325,7 +383,8 @@ def main(argv):
     gate = [-5.0 * sigmoid(math.exp(alogv[i]) * (gate_proj[i] + dtv[i]))
             for i in range(8)]
     # beta is a scalar per value head in this model; use its first row sample.
-    beta_raw = sum(a * b for a, b in zip(row(blob, beta_w, 64, 4096, 0, 4096), x))
+    beta_raw = sum(a * b for a, b in zip(
+        quant_row(blob, beta_w, 64, 4096, 0, 4096, beta_type), x))
     beta = 1.0 / (1.0 + math.exp(-beta_raw))
     state = [[0.01 * (i + j + 1) for j in range(8)] for i in range(8)]
     for i in range(8):
@@ -344,7 +403,8 @@ def main(argv):
         for b in struct.pack("<f", z):
             h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     print("PASS GLM5-next KDA payload probe")
-    print(f"sample_channels=8 beta={beta:.8g} output_fnv64={h:016x}")
+    print(f"sample_channels=8 q_type={q_type} v_type={v_type} "
+          f"beta={beta:.8g} output_fnv64={h:016x}")
     if args.output is not None:
         document = write_full_layer_oracle(
             path, blob, data_start, tensors, rms_norm_eps,
