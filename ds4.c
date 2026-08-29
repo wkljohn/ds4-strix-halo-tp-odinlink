@@ -4645,6 +4645,9 @@ static void glm5_next_weights_bind(ds4_glm5_next_weights *w,
             offset->ffn_weight.gate_exps = l->ffn_gate_exps->abs_offset;
             offset->ffn_weight.up_exps = l->ffn_up_exps->abs_offset;
             offset->ffn_weight.down_exps = l->ffn_down_exps->abs_offset;
+            offset->ffn_weight.gate_exps_type = l->ffn_gate_exps->type;
+            offset->ffn_weight.up_exps_type = l->ffn_up_exps->type;
+            offset->ffn_weight.down_exps_type = l->ffn_down_exps->type;
             offset->ffn_weight.gate_inp = l->ffn_gate_inp->abs_offset;
             offset->ffn_weight.exp_probs_b = l->exp_probs_b->abs_offset;
             offset->ffn_weight.gate_shexp =

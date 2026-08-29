@@ -46,6 +46,10 @@ typedef struct {
 typedef struct {
     uint64_t gate, up, down;
     uint64_t gate_exps, up_exps, down_exps;
+    /* GGUF types for routed experts.  Zero means legacy Q4_K metadata in
+     * older synthetic/test offset records; production bindings populate all
+     * three fields from the tensor descriptors. */
+    uint32_t gate_exps_type, up_exps_type, down_exps_type;
     uint64_t gate_inp, exp_probs_b;
     uint64_t gate_shexp, up_shexp, down_shexp;
 } ds4_glm5_next_ffn_offsets;

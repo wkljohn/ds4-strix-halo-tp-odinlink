@@ -146,6 +146,9 @@ static bool glm5_next_bind_real_offsets(
                                         {4096u, 2048u}, 8u, f.up_shexp) ||
                 !glm5_next_layer_tensor(g, il, "ffn_down_shexp.weight",
                                         {2048u, 4096u}, 8u, f.down_shexp)) return false;
+            f.gate_exps_type = 12u;
+            f.up_exps_type = 12u;
+            f.down_exps_type = 12u;
         }
         if (layer.is_trunk) {
             if (!glm5_next_layer_tensor(g, il, "hc_attn_fn.weight",
