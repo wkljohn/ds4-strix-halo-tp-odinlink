@@ -259,6 +259,8 @@ int ds4_gpu_q4k_packed_slice_load(
         uint32_t    row_count,
         uint64_t    column_byte_base,
         uint64_t    column_byte_count);
+/* Release packed routed slices after consuming kernels are synchronized. */
+void ds4_gpu_q4k_packed_slice_release_all(void);
 /* Synchronously load one expert from a declared nonlinear slice into a
  * caller-owned, reusable device slot.  This correctness-first primitive
  * waits for prior device work before overwriting the slot and never

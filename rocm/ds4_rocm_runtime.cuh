@@ -994,6 +994,11 @@ static void cuda_q4k_packed_slice_release_all(void) {
     cuda_q4k_kshard_state_clear();
 }
 
+extern "C" void ds4_gpu_q4k_packed_slice_release_all(void) {
+    /* Callers use this only after a device synchronization. */
+    cuda_q4k_packed_slice_release_all();
+}
+
 static void cuda_model_image_release_all(void) {
     g_q4k_kshard_cleanup_in_progress = 1;
     cuda_q4k_packed_slice_release_all();

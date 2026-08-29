@@ -3809,6 +3809,7 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
         const void *, uint64_t, uint32_t, uint32_t, uint64_t, uint64_t) {
     return 0;
 }
+extern "C" void ds4_gpu_q4k_packed_slice_release_all(void) {}
 extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
         const void *, uint64_t, uint32_t, uint32_t, uint64_t, uint64_t,
         uint32_t, ds4_gpu_tensor *) {
