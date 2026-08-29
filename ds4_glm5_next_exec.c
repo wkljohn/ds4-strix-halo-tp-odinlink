@@ -320,6 +320,32 @@ static int trace_tensor(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
     return ok;
 }
 
+static int trace_tensor_row(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
+                            uint32_t token, const char *name,
+                            const ds4_gpu_tensor *tensor, uint32_t row,
+                            uint64_t row_bytes) {
+    if (!ctx->trace_prefix || layer != ctx->trace_layer ||
+        (ctx->trace_token != UINT32_MAX && token != ctx->trace_token)) return 1;
+    if (!tensor || row_bytes == 0u ||
+        ds4_gpu_tensor_bytes(tensor) < (uint64_t)(row + 1u) * row_bytes)
+        return 0;
+    void *host = malloc((size_t)row_bytes);
+    if (!host) return 0;
+    char path[768];
+    const int n = snprintf(path, sizeof(path), "%s.batch.t%u.%s",
+                           ctx->trace_prefix, token, name);
+    int ok = n > 0 && (size_t)n < sizeof(path) &&
+             ds4_gpu_tensor_read(tensor, (uint64_t)row * row_bytes,
+                                 host, row_bytes);
+    FILE *fp = ok ? fopen(path, "wb") : NULL;
+    if (fp) {
+        ok = fwrite(host, 1u, (size_t)row_bytes, fp) == (size_t)row_bytes &&
+             fclose(fp) == 0;
+    } else ok = 0;
+    free(host);
+    return ok;
+}
+
 static int trace_mla_attention(const ds4_glm5_next_exec_ctx *ctx,
                                uint32_t layer, uint32_t token,
                                const ds4_gpu_tensor *hc_in,
@@ -1657,8 +1683,49 @@ static int mla_routed_dense_selection_rows_forward(
     const int ok =
         mla_dense_selection_attention_rows(
             ctx, il, state, w, hc_in, n_tokens) &&
+        trace_tensor_row(ctx, il,
+                         ctx->trace_token == UINT32_MAX ? token_ordinal :
+                         ctx->trace_token, "after_attn.f32",
+                         w->after_attention, n_tokens - 1u,
+                         (uint64_t)GLM5_HC_WIDTH * sizeof(float)) &&
         routed_ffn_rows(
             ctx, il, token_ordinal, w, hc_out, n_tokens);
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "output_hc.f32",
+                                hc_out, n_tokens - 1u,
+                                (uint64_t)GLM5_HC_WIDTH * sizeof(float)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "routed_out.f32",
+                                w->routed_out, n_tokens - 1u,
+                                (uint64_t)GLM5_WIDTH * sizeof(float)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "shared_out.f32",
+                                w->shared_out, n_tokens - 1u,
+                                (uint64_t)GLM5_WIDTH * sizeof(float)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "ffn_hidden.f32",
+                                w->ffn_hidden, n_tokens - 1u,
+                                (uint64_t)GLM5_WIDTH * sizeof(float)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "router_ids.i32",
+                                w->router_selected, n_tokens - 1u,
+                                (uint64_t)GLM5_EXPERTS_USED * sizeof(int32_t)))
+        return 0;
+    if (ok && !trace_tensor_row(ctx, il,
+                                ctx->trace_token == UINT32_MAX ? token_ordinal :
+                                ctx->trace_token, "router_weights.f32",
+                                w->router_weights, n_tokens - 1u,
+                                (uint64_t)GLM5_EXPERTS_USED * sizeof(float)))
+        return 0;
     if (!ok) {
         ds4_glm5_next_state_invalidate(state);
         return 0;
@@ -1726,8 +1793,7 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
         ds4_gpu_tensor_bytes(hc_out) != (uint64_t)n_tokens * hc_row_bytes ||
         il >= ctx->model->trunk_count ||
         state->layer_count != ctx->model->trunk_count ||
-        state->kda.layer_count != ctx->model->trunk_count ||
-        (n_tokens > 1u && ctx->trace_prefix)) return 0;
+        state->kda.layer_count != ctx->model->trunk_count) return 0;
     if (n_tokens == 1u) {
         return ds4_glm5_next_layer_forward(
             ctx, il, state, w, hc_in, hc_out);

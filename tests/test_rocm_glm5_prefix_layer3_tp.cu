@@ -376,7 +376,8 @@ bool execute_full_token(ds4_glm5_next_exec_ctx &exec,
                         uint32_t token,
                         ds4_gpu_tensor *&current,
                         ds4_gpu_tensor *&output,
-                        LayerTiming *timing = nullptr) {
+                        LayerTiming *timing = nullptr,
+                        std::vector<std::vector<float>> *layer_rows = nullptr) {
     CHECK(ds4_glm5_next_embed_token(&exec, token, current),
           "embed text token");
     for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
@@ -404,6 +405,13 @@ bool execute_full_token(ds4_glm5_next_exec_ctx &exec,
         }
         std::swap(current, output);
         trace_layer_row("scalar", il, current, 0u, kHcWidth);
+        if (layer_rows) {
+            (*layer_rows)[il].resize(kHcWidth);
+            CHECK(ds4_gpu_tensor_read(
+                      current, 0u, (*layer_rows)[il].data(),
+                      (uint64_t)kHcWidth * sizeof(float)),
+                  "capture scalar per-layer reference row");
+        }
     }
     return true;
 }
@@ -415,7 +423,8 @@ bool execute_full_batch(ds4_glm5_next_exec_ctx &exec,
                         uint32_t n_tokens,
                         ds4_gpu_tensor *&current,
                         ds4_gpu_tensor *&output,
-                        LayerTiming *timing = nullptr) {
+                        LayerTiming *timing = nullptr,
+                        const std::vector<std::vector<float>> *layer_rows = nullptr) {
     CHECK(ds4_glm5_next_embed_tokens(
               &exec, tokens, n_tokens, current),
           "embed text prompt batch");
@@ -444,6 +453,19 @@ bool execute_full_batch(ds4_glm5_next_exec_ctx &exec,
         }
         std::swap(current, output);
         trace_layer_row("batch", il, current, n_tokens - 1u, kHcWidth);
+        if (layer_rows) {
+            std::vector<float> row(kHcWidth);
+            CHECK(ds4_gpu_tensor_read(
+                      current,
+                      (uint64_t)(n_tokens - 1u) * kHcWidth * sizeof(float),
+                      row.data(), (uint64_t)kHcWidth * sizeof(float)),
+                  "read batch per-layer comparison row");
+            const VectorError error = vector_error((*layer_rows)[il], row);
+            std::fprintf(stderr,
+                "GLM5 layer-error layer=%u nrmse=%.9g cosine=%.12g "
+                "max_abs=%.9g\n", il, error.nrmse, error.cosine,
+                error.max_abs);
+        }
     }
     return true;
 }
@@ -1817,6 +1839,10 @@ bool run() {
             prompt_current = prompt_current_guard.value;
             prompt_output = prompt_output_guard.value;
         }
+        std::vector<std::vector<float>> layer_reference(
+            DS4_GLM5_NEXT_TRUNK_COUNT);
+        const bool compare_layer_rows =
+            std::getenv("DS4_GLM5_BATCH_LAYER_TRACE") != nullptr;
         if (batch_prefill_compare) {
             CHECK(ds4_glm5_next_state_init(
                       &prompt_reference_state.value, &offsets,
@@ -1836,7 +1862,10 @@ bool run() {
                           exec, prompt_reference_state.value,
                           workspace.value,
                           (uint32_t)prompt_tokens.value.v[i],
-                          reference_current, reference_output),
+                          reference_current, reference_output, nullptr,
+                          compare_layer_rows &&
+                                  i + 1 == prompt_tokens.value.len
+                              ? &layer_reference : nullptr),
                       "execute scalar prompt reference");
             }
             reference_hidden.resize(kHcWidth);
@@ -1867,7 +1896,8 @@ bool run() {
                       prompt_ids.value,
                       (uint32_t)prompt_tokens.value.len,
                       prompt_current, prompt_output,
-                      layer_timing ? &prompt_layer_timing : nullptr) &&
+                      layer_timing ? &prompt_layer_timing : nullptr,
+                      compare_layer_rows ? &layer_reference : nullptr) &&
                   ds4_gpu_tensor_copy(
                       current.value, 0u, prompt_current,
                       (uint64_t)(prompt_tokens.value.len - 1) *
