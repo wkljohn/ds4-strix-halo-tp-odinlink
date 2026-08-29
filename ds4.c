@@ -7088,14 +7088,17 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
 /* GLM5.3 has a tensor-derived weight table rather than ds4_weights.  Build
  * the resident-map contract used by the ordinary executor.  Its TP split is
  * over the intermediate rows of gate/up and over the K columns of down for
- * every expert; it is not an expert-id split.  Routed quantized tensors are omitted
- * from this linear map: the executor owns their packed, tile-local residency
- * and mapping them here would duplicate tens of GiB before first execution. */
+ * every expert; it is not an expert-id split.  Routed quantized tensors are
+ * omitted by default because the staged executor can demand-load selected
+ * slices.  An explicit resident-expert opt-in maps only this rank's contiguous
+ * expert half as raw GGUF bytes (never a Q8->FP16 expansion), which is the
+ * required no-SSD TP path for production-sized memory. */
 static bool glm5_next_model_map_sharded_spans(
         const ds4_model *m, int rank, ds4_model_map_span_vec *spans) {
     if (!m || !spans || (rank != 0 && rank != 1)) return false;
     memset(spans, 0, sizeof(*spans));
-    (void)rank;
+    const bool resident_experts =
+        getenv("DS4_GLM5_NEXT_RESIDENT_EXPERTS") != NULL;
     enum { glm5_width = 4096, glm5_routed_mid = 2048 };
     for (uint64_t i = 0u; i < m->n_tensors; ++i) {
         const ds4_tensor *t = &m->tensors[i];
@@ -7114,9 +7117,25 @@ static bool glm5_next_model_map_sharded_spans(
                 (gate_or_up_shape ? !gate_or_up_type : !down_type)) {
                 return false;
             }
-            /* Routed weights remain lazy and are loaded by a type-aware
-             * executor.  Do not add a linear map span: mapping a complete
-             * expert table would defeat the cache-free TP residency budget. */
+            if (resident_experts) {
+                if (t->dim[2] != DS4_N_EXPERT ||
+                    t->bytes == 0u || t->bytes % t->dim[2] != 0u) {
+                    return false;
+                }
+                const uint32_t split = DS4_N_EXPERT / 2u;
+                const uint32_t first = rank == 0 ? 0u : split;
+                const uint32_t count = rank == 0 ? split : DS4_N_EXPERT - split;
+                const uint64_t expert_bytes = t->bytes / t->dim[2];
+                const uint64_t lo = t->abs_offset +
+                    (uint64_t)first * expert_bytes;
+                const uint64_t hi = lo + (uint64_t)count * expert_bytes;
+                if (hi < lo) return false;
+                if (expert_bytes > spans->max_tensor_bytes)
+                    spans->max_tensor_bytes = expert_bytes;
+                /* Keep each routed tensor isolated so span coalescing cannot
+                 * create a broad envelope over unowned experts. */
+                model_map_span_vec_append(spans, lo, hi, true);
+            }
             continue;
         } else {
             model_map_span_vec_include_one(spans, t);
