@@ -987,7 +987,14 @@ static int mla_publish_completed_pool(
         ctx->model_map, ctx->model_size, offsets->index_pool_ape,
         4u, GLM5_INDEX_DIM, 4u, 0u);
     ds4_gpu_tensor_free(output);
-    return ok;
+    if (!ok || !mla->index_pool_ids || !mla->index_pool_valid)
+        return 0;
+    /* A committed pool is always the four contiguous rows immediately before
+     * the current tail.  Record this only after the pooled key kernel has
+     * completed successfully, preserving a single publication boundary. */
+    return ds4_gpu_glm5_fill_pool_members_tensor(
+        mla->index_pool_ids, mla->index_pool_valid, pool, pool * 4u,
+        mla->capacity_tokens);
 }
 
 /* The official selector uses the full visible range through top-k. Pooled

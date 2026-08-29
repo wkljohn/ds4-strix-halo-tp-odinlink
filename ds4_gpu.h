@@ -1751,6 +1751,15 @@ int ds4_gpu_glm5_kpool_tensor(
         uint32_t              pool_size,
         uint32_t              first_valid);
 
+/* Record the deterministic four-token membership of a completed pool.  The
+ * metadata is device-resident and is written only after kpool succeeds. */
+int ds4_gpu_glm5_fill_pool_members_tensor(
+        ds4_gpu_tensor       *pool_indices,
+        ds4_gpu_tensor       *pool_valid,
+        uint32_t              pool,
+        uint32_t              first_token,
+        uint32_t              n_rows);
+
 /* Single-sequence GLM-5.3 decode selection helpers. The mask preserves the
  * upstream finite minimum sentinel. Expansion converts selected pool IDs back
  * to raw token IDs and appends the incomplete visible tail (at most 3 rows).

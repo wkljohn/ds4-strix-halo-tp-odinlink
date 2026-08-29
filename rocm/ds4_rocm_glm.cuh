@@ -1979,6 +1979,34 @@ extern "C" int ds4_gpu_glm5_kpool_tensor(
     return cuda_ok(cudaGetLastError(), "glm5 kpool4 launch");
 }
 
+__global__ static void glm5_fill_pool_members_kernel(
+        int32_t *pool_indices, uint32_t *pool_valid,
+        uint32_t pool, uint32_t first_token, uint32_t n_rows) {
+    const uint32_t lane = threadIdx.x;
+    if (lane < 4u) {
+        const uint32_t token = first_token + lane;
+        pool_indices[(uint64_t)pool * 4u + lane] =
+            token < n_rows ? (int32_t)token : -1;
+    }
+    if (lane == 0u)
+        pool_valid[pool] = first_token <= n_rows &&
+                           n_rows - first_token >= 4u ? 1u : 0u;
+}
+
+extern "C" int ds4_gpu_glm5_fill_pool_members_tensor(
+        ds4_gpu_tensor *pool_indices, ds4_gpu_tensor *pool_valid,
+        uint32_t pool, uint32_t first_token, uint32_t n_rows) {
+    if (!pool_indices || !pool_valid || !pool_indices->ptr ||
+        !pool_valid->ptr || n_rows == 0u || first_token > n_rows ||
+        pool_indices->bytes < ((uint64_t)pool + 1u) * 4u * sizeof(int32_t) ||
+        pool_valid->bytes < ((uint64_t)pool + 1u) * sizeof(uint32_t))
+        return 0;
+    glm5_fill_pool_members_kernel<<<1, 64>>>(
+        (int32_t *)pool_indices->ptr, (uint32_t *)pool_valid->ptr,
+        pool, first_token, n_rows);
+    return cuda_ok(cudaGetLastError(), "glm5 pool membership launch");
+}
+
 __global__ static void glm5_mask_pool_scores_kernel(
         float *scores, const uint32_t *pool_valid, uint32_t n_pools) {
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
