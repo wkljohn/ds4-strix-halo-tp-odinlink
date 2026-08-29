@@ -1325,10 +1325,30 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             n_tokens) &&
         route_batch_agrees(ctx, il, token_ordinal,
                            w->router_selected, w->router_weights,
-                           n_tokens) &&
-        declare_local_q4k_half_only(ctx, layer);
+                           n_tokens);
+    const bool mixed_q2 = f->gate_exps_type == 16u &&
+                          f->up_exps_type == 16u &&
+                          f->down_exps_type == 10u;
     ds4_gpu_q4k_window_cache *cache = NULL;
-    if (ok) {
+    if (ok && mixed_q2) {
+        routed_mid_is_f16 = false;
+        ok = ds4_gpu_routed_moe_batch_tensor(
+            w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
+            w->routed_experts, ctx->model_map, ctx->model_size,
+            f->gate_exps, f->up_exps, f->down_exps,
+            f->gate_exps_type, f->down_exps_type,
+            (uint64_t)GLM5_ROUTED_MID * (GLM5_WIDTH / 256u) * 66u,
+            (GLM5_WIDTH / 256u) * 66u,
+            (uint64_t)GLM5_WIDTH * (GLM5_ROUTED_MID / 256u) * 84u,
+            (GLM5_ROUTED_MID / 256u) * 84u,
+            GLM5_WIDTH, GLM5_ROUTED_MID, GLM5_WIDTH,
+            w->router_selected, w->router_weights,
+            GLM5_EXPERTS, GLM5_EXPERTS_USED, 0.0f,
+            w->ffn_hidden, il, n_tokens, &routed_mid_is_f16, false);
+    } else if (ok) {
+        ok = declare_local_q4k_half_only(ctx, layer);
+    }
+    if (ok && !mixed_q2) {
         const ds4_gpu_q4k_window_cache_config config = {
             .model_map = ctx->model_map,
             .gate_offset = f->gate_exps,
