@@ -66,6 +66,7 @@
 /tests/test_rocm_prefill_wavefront_projections
 /tests/test_rocm_q4k_skip_unowned
 /tests/test_rocm_q8_pair_pack4
+/tests/test_rocm_q8_kslice_rows
 /tests/test_rocm_shared_gu_swiglu_fused
 /tests/test_rocm_tp_split_gate
 /tests/rocm_long_context_smoke

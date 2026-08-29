@@ -715,6 +715,21 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         uint64_t              k_cnt,
         const ds4_gpu_tensor *x,
         uint64_t              n_rows);
+/* Backend-optional physical-stride F32 row batching for a contiguous Q8_0 K
+ * slice. A weak backend-independent implementation returns -1 (not handled);
+ * an engaged backend returns 1 on success or 0 on failure. */
+int ds4_rocm_q8_kslice_f32_rows_strided(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              full_in_dim,
+        uint64_t              out_dim,
+        uint64_t              in_start,
+        uint64_t              in_count,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tokens,
+        uint64_t              x_token_stride);
 int ds4_gpu_matmul_quant_kslice_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

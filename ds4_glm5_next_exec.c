@@ -30,6 +30,32 @@ enum {
     GLM5_Q8_QK = 32,
 };
 
+/* ROCm may provide the existing strided F32xQ8 token-tile kernel for this
+ * layout. Other backends return -1 and retain the scalar exact fallback. A
+ * selected ROCm implementation returns 0 on failure so it cannot silently
+ * fall back after engaging. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+int ds4_rocm_q8_kslice_f32_rows_strided(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t out_dim,
+        uint64_t in_start, uint64_t in_count, const ds4_gpu_tensor *x,
+        uint64_t n_tokens, uint64_t x_token_stride) {
+    (void)out;
+    (void)model_map;
+    (void)model_size;
+    (void)weight_offset;
+    (void)full_in_dim;
+    (void)out_dim;
+    (void)in_start;
+    (void)in_count;
+    (void)x;
+    (void)n_tokens;
+    (void)x_token_stride;
+    return -1;
+}
+
 /* The MLA batch path temporarily aliases routed_experts as its
  * [token][head][kv_lora] attention output.  Keep that reuse fail-closed if
  * either model geometry changes. */
@@ -851,7 +877,7 @@ static int mla_value_project_rows_batch(
         GLM5_KV_LORA, GLM5_HEAD_DIM);
 }
 
-static int mla_output_project_rows_decode_exact(
+static int mla_output_project_rows_batch(
         const ds4_glm5_next_exec_ctx *ctx,
         const ds4_glm5_next_mla_offsets *offsets,
         ds4_glm5_next_workspace *w,
@@ -859,6 +885,28 @@ static int mla_output_project_rows_decode_exact(
     const uint64_t full_heads =
         (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
     const uint64_t half_heads = full_heads / 2u;
+    const uint64_t in_start = (uint64_t)ctx->tp_rank * half_heads;
+    /* A single row keeps the established decode implementation. Besides
+     * avoiding a 64 KiB token-tile launch for one row, this makes the hook's
+     * 0 return unambiguously mean that an engaged batch path failed. */
+    if (n_tokens == 1u) {
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(
+            ctx->tp_big_out, 0u,
+            (uint64_t)GLM5_WIDTH * sizeof(float));
+        const int ok = out && ds4_gpu_matmul_q8_0_kslice_tensor(
+            out, ctx->model_map, ctx->model_size, offsets->output,
+            full_heads, in_start, half_heads, GLM5_WIDTH, w->mla_heads,
+            in_start);
+        ds4_gpu_tensor_free(out);
+        return ok;
+    }
+    const int batch = ds4_rocm_q8_kslice_f32_rows_strided(
+        ctx->tp_big_out, ctx->model_map, ctx->model_size, offsets->output,
+        full_heads, GLM5_WIDTH, in_start, half_heads, w->mla_heads,
+        n_tokens, full_heads);
+    if (batch >= 0) return batch;
+    /* Preserve the exact one-row implementation on backends without the
+     * strided token-tile entry point. */
     for (uint32_t t = 0u; t < n_tokens; ++t) {
         ds4_gpu_tensor *out = ds4_gpu_tensor_view(
             ctx->tp_big_out,
@@ -866,10 +914,8 @@ static int mla_output_project_rows_decode_exact(
             (uint64_t)GLM5_WIDTH * sizeof(float));
         const int ok = out && ds4_gpu_matmul_q8_0_kslice_tensor(
             out, ctx->model_map, ctx->model_size, offsets->output,
-            full_heads, (uint64_t)ctx->tp_rank * half_heads, half_heads,
-            GLM5_WIDTH, w->mla_heads,
-            (uint64_t)t * full_heads +
-                (uint64_t)ctx->tp_rank * half_heads);
+            full_heads, in_start, half_heads, GLM5_WIDTH, w->mla_heads,
+            (uint64_t)t * full_heads + in_start);
         ds4_gpu_tensor_free(out);
         if (!ok) return 0;
     }
@@ -958,7 +1004,7 @@ static int mla_dense_selection_attention_rows(
             GLM5_HEAD_DIM, 0u, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
         mla_value_project_rows_batch(ctx, m, w, n_tokens) &&
-        mla_output_project_rows_decode_exact(ctx, m, w, n_tokens);
+        mla_output_project_rows_batch(ctx, m, w, n_tokens);
     return ok &&
         tp_exchange_rows(ctx, il, n_tokens) &&
         ds4_gpu_add_tensor(w->attention, ctx->tp_big_out, ctx->tp_big_in,

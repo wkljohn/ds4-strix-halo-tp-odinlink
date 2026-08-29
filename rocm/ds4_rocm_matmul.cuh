@@ -1892,6 +1892,52 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 kslice rows launch");
 }
 
+/* GLM-5.3 MLA produces full-width head rows but each TP rank owns one
+ * contiguous half. Reuse the existing strided F32xQ8 token-tile kernel so
+ * prompt rows share weight loads without introducing Q8 activation rounding. */
+extern "C" int ds4_rocm_q8_kslice_f32_rows_strided(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t out_dim,
+        uint64_t in_start, uint64_t in_count, const ds4_gpu_tensor *x,
+        uint64_t n_tokens, uint64_t x_token_stride) {
+    if (!out || !x || !model_map || n_tokens <= 1u ||
+        full_in_dim == 0u || out_dim == 0u || in_count == 0u ||
+        (in_start & 31u) != 0u || (in_count & 31u) != 0u ||
+        in_start > full_in_dim || in_count > full_in_dim - in_start ||
+        x_token_stride < in_start + in_count || n_tokens > UINT32_MAX ||
+        out_dim > UINT32_MAX || in_count > UINT32_MAX ||
+        x_token_stride > UINT32_MAX) return 0;
+    const uint64_t full_blocks = (full_in_dim + 31u) / 32u;
+    const uint64_t block_start = in_start / 32u;
+    const uint64_t slice_blocks = in_count / 32u;
+    const uint64_t row_bytes = full_blocks * 34u;
+    uint64_t weight_bytes = 0u, out_elements = 0u, last_x = 0u;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        weight_bytes > model_size - weight_offset ||
+        !cuda_u64_mul_checked(n_tokens, out_dim, &out_elements) ||
+        out_elements > UINT64_MAX / sizeof(float) ||
+        out->bytes < out_elements * sizeof(float) ||
+        !cuda_u64_mul_checked(n_tokens - 1u, x_token_stride, &last_x) ||
+        last_x > UINT64_MAX - in_start - in_count ||
+        x->bytes < (last_x + in_start + in_count) * sizeof(float)) return 0;
+    const char *wptr = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "q8_0_kslice_strided");
+    if (!wptr) return 0;
+    const unsigned char *slice_w =
+        reinterpret_cast<const unsigned char *>(wptr) + block_start * 34u;
+    const float *slice_x = (const float *)x->ptr + in_start;
+    /* BT=16 and tile_m=32 consume exactly 64 KiB of dynamic LDS. Keep these
+     * launch constants paired; increasing either requires a new LDS audit. */
+    cuda_launch_grouped_q8_a_sharedx_strided(
+        (float *)out->ptr, slice_w, slice_x, (uint32_t)n_tokens, 1u,
+        (uint32_t)slice_blocks, (uint32_t)out_dim,
+        (uint32_t)x_token_stride, 0u, row_bytes,
+        32u, 32u, 16u);
+    return cuda_ok(cudaGetLastError(),
+                   "q8_0 kslice strided F32 rows launch");
+}
+
 /* Thin wrapper: slices x by x_elem_off, then defers. Mirrors
  * ds4_cuda.cu:27483-27505. */
 extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(

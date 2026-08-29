@@ -182,12 +182,79 @@ int main() {
               full_in, out_dim, slice_begin + 1u, slice_dim, x3, rows3),
           "misaligned Q8 K slice fails closed");
 
+    std::vector<float> input_strided((uint64_t)rows3 * full_in, -7.0f);
+    for (uint32_t row = 0u; row < rows3; ++row) {
+        std::memcpy(input_strided.data() + (uint64_t)row * full_in +
+                        slice_begin,
+                    input9.data() + (uint64_t)row * slice_dim,
+                    (uint64_t)slice_dim * sizeof(float));
+    }
+    ds4_gpu_tensor *x_strided = ds4_gpu_tensor_alloc(
+        input_strided.size() * sizeof(float));
+    ds4_gpu_tensor *strided_reference = ds4_gpu_tensor_alloc(
+        (uint64_t)rows3 * out_dim * sizeof(float));
+    ds4_gpu_tensor *strided_candidate = ds4_gpu_tensor_alloc(
+        (uint64_t)rows3 * out_dim * sizeof(float));
+    CHECK(x_strided && strided_reference && strided_candidate &&
+              ds4_gpu_tensor_write(x_strided, 0u, input_strided.data(),
+                                    input_strided.size() * sizeof(float)),
+          "allocate physical-stride K-slice fixture");
+    for (uint32_t row = 0u; row < rows3; ++row) {
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            strided_reference, (uint64_t)row * out_dim * sizeof(float),
+            (uint64_t)out_dim * sizeof(float));
+        const int ok = out_row && ds4_gpu_matmul_q8_0_kslice_tensor(
+            out_row, model.data(), model.size(), 0u,
+            full_in, slice_begin, slice_dim, out_dim, x_strided,
+            (uint64_t)row * full_in + slice_begin);
+        ds4_gpu_tensor_free(out_row);
+        CHECK(ok, "run scalar F32 reference for physical-stride row");
+    }
+    CHECK(ds4_rocm_q8_kslice_f32_rows_strided(
+              strided_candidate, model.data(), model.size(), 0u,
+              full_in, out_dim, slice_begin, slice_dim, x_strided,
+              rows3, full_in) == 1 &&
+              !ds4_rocm_q8_kslice_f32_rows_strided(
+                  strided_candidate, model.data(), model.size(), 0u,
+                  full_in, out_dim, slice_begin, slice_dim, x_strided,
+                  rows3, slice_begin + slice_dim - 1u),
+          "run strided F32 token tile and reject an undersized row stride");
+    std::vector<float> host_strided_reference((uint64_t)rows3 * out_dim);
+    std::vector<float> host_strided_candidate((uint64_t)rows3 * out_dim);
+    CHECK(ds4_gpu_tensor_read(
+              strided_reference, 0u, host_strided_reference.data(),
+              host_strided_reference.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  strided_candidate, 0u, host_strided_candidate.data(),
+                  host_strided_candidate.size() * sizeof(float)),
+          "read physical-stride F32 token-tile comparison");
+    double strided_diff2 = 0.0, strided_ref2 = 0.0;
+    double strided_max_abs = 0.0;
+    for (uint64_t i = 0u; i < host_strided_reference.size(); ++i) {
+        const double reference = host_strided_reference[i];
+        const double delta = host_strided_candidate[i] - reference;
+        strided_diff2 += delta * delta;
+        strided_ref2 += reference * reference;
+        strided_max_abs = std::max(strided_max_abs, std::fabs(delta));
+    }
+    const double strided_nrmse = std::sqrt(strided_diff2 / strided_ref2);
+    CHECK(std::isfinite(strided_nrmse) &&
+              std::memcmp(host_strided_candidate.data(),
+                          host_strided_reference.data(),
+                          host_strided_reference.size() * sizeof(float)) == 0,
+          "strided F32 token tile bit-matches one-row F32 K-slice arithmetic");
+
     std::fprintf(stderr,
                  "PASS ROCm Q8 K-slice rows: repacked_exact=1 "
                  "chunk_8_plus_1_exact=1 rows=3,9 "
                  "decode_batch_seam_nrmse=%.9g "
-                 "decode_batch_seam_max_abs=%.9g\n",
-                 seam_nrmse, seam_max_abs);
+                 "decode_batch_seam_max_abs=%.9g "
+                 "strided_f32_nrmse=%.9g strided_f32_max_abs=%.9g\n",
+                 seam_nrmse, seam_max_abs,
+                 strided_nrmse, strided_max_abs);
+    ds4_gpu_tensor_free(strided_candidate);
+    ds4_gpu_tensor_free(strided_reference);
+    ds4_gpu_tensor_free(x_strided);
     ds4_gpu_tensor_free(out2);
     ds4_gpu_tensor_free(x2);
     ds4_gpu_tensor_free(out8);
