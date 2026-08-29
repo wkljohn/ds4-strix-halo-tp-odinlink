@@ -82,7 +82,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap test-rocm-glm5-q2-expert-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
 	python3 tests/test_frontier_logits_gate.py
@@ -1035,6 +1035,19 @@ tests/test_rocm_q4k_one_token_oracle: tests/test_rocm_q4k_one_token_oracle.o ds4
 
 test-rocm-q4k-one-token-oracle: tests/test_rocm_q4k_one_token_oracle
 	./tests/test_rocm_q4k_one_token_oracle
+
+# Independent same-GGUF GLM-5.3 Q2_K one-expert gate.  The model and the
+# pinned llama.cpp ggml-base oracle are supplied at run time; no cache or TP
+# inference is started by this target.
+tests/test_rocm_glm5_q2_expert_oracle.o: tests/test_rocm_glm5_q2_expert_oracle.cu ds4_gpu.h tests/glm5_gguf_test.hpp
+	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_q2_expert_oracle: tests/test_rocm_glm5_q2_expert_oracle.o ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS) -ldl
+
+test-rocm-glm5-q2-expert-oracle: tests/test_rocm_glm5_q2_expert_oracle
+	@test -n "$(DS4_GLM5_MODEL)" -a -n "$(DS4_LLAMA_GGML_BASE)" || { echo "error: set DS4_GLM5_MODEL and DS4_LLAMA_GGML_BASE" >&2; exit 2; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" DS4_LLAMA_GGML_BASE="$(DS4_LLAMA_GGML_BASE)" ./tests/test_rocm_glm5_q2_expert_oracle
 
 tests/test_rocm_q4k_staged_midq_oracle.o: tests/test_rocm_q4k_staged_midq_oracle.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
