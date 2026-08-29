@@ -23,11 +23,29 @@ def parser_for(repo: Path):
 EXPERT = re.compile(r"^blk\.\d+\.ffn_(?:gate|up|down)_exps\.weight$")
 
 
+def routed_family(tensors):
+    """Return the validated routed expert family, or fail closed."""
+    routed = {t.name: t.ggml_type for t in tensors if EXPERT.match(t.name)}
+    if not routed:
+        raise ValueError("model has no routed expert tensors")
+    gate = {v for k, v in routed.items() if ".ffn_gate_exps." in k}
+    up = {v for k, v in routed.items() if ".ffn_up_exps." in k}
+    down = {v for k, v in routed.items() if ".ffn_down_exps." in k}
+    # GLM-5.3 Flash Q2 control: IQ2_XXS gate/up (GGML type 16),
+    # Q2_K down (GGML type 10).  Do not describe a different layout as Q2.
+    if gate != {16} or up != {16} or down != {10}:
+        raise ValueError(
+            f"unsupported routed expert types gate={sorted(gate)} "
+            f"up={sorted(up)} down={sorted(down)}")
+    return "IQ2_XXS+Q2_K"
+
+
 def main(argv):
     if len(argv) != 3:
         print(f"usage: {argv[0]} REPO MODEL.gguf", file=sys.stderr)
         return 2
     info = parser_for(Path(argv[1])).parse_gguf(Path(argv[2]))
+    family = routed_family(info.tensors)
     total = sum(t.n_bytes for t in info.tensors)
     expert = sum(t.n_bytes for t in info.tensors if EXPERT.match(t.name))
     replicated = total - expert
@@ -45,6 +63,7 @@ def main(argv):
     if expert % 2:
         raise ValueError("expert bytes are not divisible by TP=2")
     print("PASS GLM5-next residency plan")
+    print(f"routed_family={family}")
     print(f"gguf_weight_bytes={total} ({total/1024**3:.3f} GiB)")
     print(f"replicated_bytes={replicated} ({replicated/1024**3:.3f} GiB)")
     print(f"expert_bytes={expert} ({expert/1024**3:.3f} GiB)")
@@ -55,6 +74,8 @@ def main(argv):
     print(f"target_gtt_bytes={gtt_target} ({gtt_target/1024**3:.3f} GiB)")
     headroom = gtt_target - per_rank - scratch
     print(f"headroom_after_scratch_bytes={headroom} ({headroom/1024**3:.3f} GiB)")
+    print("page_prefault_persistent_bytes=0")
+    print("expanded_weight_cache_bytes=0")
     if headroom <= 0:
         raise ValueError("target GTT cannot fit planned cache-free resident layout")
     print("persistent_weight_cache=disabled")
