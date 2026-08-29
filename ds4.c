@@ -62787,7 +62787,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          * loader's residency behavior is bounded on a full prompt. */
         uint32_t batch = batch_env && batch_env[0] ? (uint32_t)strtoul(batch_env, NULL, 10) : 1u;
         if (batch < 2u) batch = 1u;
-        if (batch > 32u) batch = 32u;
+        if (batch > 256u) batch = 256u;
         for (int i = start; i < prompt->len; ) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");

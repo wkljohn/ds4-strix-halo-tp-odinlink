@@ -6800,11 +6800,11 @@ extern "C" int ds4_gpu_q4k_packed_slice_load(
     return 1;
 }
 
-extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
+static int cuda_q4k_packed_slice_load_expert_impl(
         const void *model_map, uint64_t tensor_offset,
         uint32_t row_base, uint32_t row_count,
         uint64_t column_byte_base, uint64_t column_byte_count,
-        uint32_t expert, ds4_gpu_tensor *dst) {
+        uint32_t expert, ds4_gpu_tensor *dst, int synchronize_before) {
     cuda_q4k_packed_slice *p = cuda_q4k_packed_slice_find(
         model_map, tensor_offset, row_base, row_count,
         column_byte_base, column_byte_count);
@@ -6830,7 +6830,8 @@ extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
     const char *source = (const char *)model_map + source_offset;
     const int contiguous = p->column_byte_base == 0u &&
                            p->column_byte_count == p->source_row_bytes;
-    cudaError_t err = cudaDeviceSynchronize();
+    cudaError_t err = cudaSuccess;
+    if (synchronize_before) err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "packed Q4_K selected expert reuse wait failed expert=%u: "
@@ -6842,21 +6843,14 @@ extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
         err = cudaMemcpy(dst->ptr, source, (size_t)p->packed_expert_bytes,
                          cudaMemcpyHostToDevice);
     } else {
-        std::vector<char> packed;
-        try {
-            packed.resize((size_t)p->packed_expert_bytes);
-        } catch (...) {
-            return 0;
-        }
-        for (uint32_t row = 0; row < p->row_count; ++row) {
-            memcpy(packed.data() + (uint64_t)row * p->column_byte_count,
-                   source + (uint64_t)row * p->source_row_bytes +
-                       p->column_byte_base,
-                   (size_t)p->column_byte_count);
-        }
-        err = cudaMemcpy(dst->ptr, packed.data(),
-                         (size_t)p->packed_expert_bytes,
-                         cudaMemcpyHostToDevice);
+        /* Preserve the strided Q4_K source layout in the transfer engine.
+         * This avoids allocating and filling a multi-MiB CPU temporary for
+         * every selected down expert. */
+        err = hipMemcpy2D(dst->ptr, (size_t)p->column_byte_count,
+                          source + p->column_byte_base,
+                          (size_t)p->source_row_bytes,
+                          (size_t)p->column_byte_count, p->row_count,
+                          hipMemcpyHostToDevice);
     }
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -6872,9 +6866,22 @@ extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
     return 1;
 }
 
+extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
+        const void *model_map, uint64_t tensor_offset,
+        uint32_t row_base, uint32_t row_count,
+        uint64_t column_byte_base, uint64_t column_byte_count,
+        uint32_t expert, ds4_gpu_tensor *dst) {
+    return cuda_q4k_packed_slice_load_expert_impl(
+        model_map, tensor_offset, row_base, row_count,
+        column_byte_base, column_byte_count, expert, dst, 1);
+}
+
 extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
         const ds4_gpu_q4k_window_cache_config *config) {
-    const uint32_t max_slots = 4u * DS4_ROCM_N_EXPERT_USED;
+    /* The cache is layer-local and callers may size it to the complete expert
+     * union of one prompt tile.  n_expert remains the absolute allocation
+     * bound; no cache survives release_all(). */
+    const uint32_t max_slots = config ? config->n_expert : 0u;
     if (!config || !config->model_map || config->n_expert == 0u ||
         config->slots < DS4_ROCM_N_EXPERT_USED ||
         config->slots > max_slots ||
@@ -7050,6 +7057,21 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
     if (unique.size() > cache->slots) return 0;
     cache->prepares++;
 
+    bool needs_fill = false;
+    for (int32_t expert : unique) {
+        if (cache->expert_to_slot[(uint32_t)expert] < 0) {
+            needs_fill = true;
+            break;
+        }
+    }
+    /* All three tables share the null stream. One epoch-level wait is enough
+     * before overwriting cache slots; individual blocking copies remain
+     * ordered and published only after gate/up/down all succeed. */
+    if (needs_fill && cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+
     for (int32_t expert : unique) {
         int32_t slot = cache->expert_to_slot[(uint32_t)expert];
         if (slot >= 0) {
@@ -7103,24 +7125,24 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
             (uint64_t)victim * cache->down_expert_bytes;
         down_dst.bytes = cache->down_expert_bytes;
         down_dst.device_id = 0;
-        if (!ds4_gpu_q4k_packed_slice_load_expert(
+        if (!cuda_q4k_packed_slice_load_expert_impl(
                 cache->model_map, gate_slice.tensor_offset,
                 gate_slice.row_base, gate_slice.row_count,
                 gate_slice.column_byte_base,
                 gate_slice.column_byte_count,
-                (uint32_t)expert, &gate_dst) ||
-            !ds4_gpu_q4k_packed_slice_load_expert(
+                (uint32_t)expert, &gate_dst, 0) ||
+            !cuda_q4k_packed_slice_load_expert_impl(
                 cache->model_map, up_slice.tensor_offset,
                 up_slice.row_base, up_slice.row_count,
                 up_slice.column_byte_base,
                 up_slice.column_byte_count,
-                (uint32_t)expert, &up_dst) ||
-            !ds4_gpu_q4k_packed_slice_load_expert(
+                (uint32_t)expert, &up_dst, 0) ||
+            !cuda_q4k_packed_slice_load_expert_impl(
                 cache->model_map, down_slice.tensor_offset,
                 down_slice.row_base, down_slice.row_count,
                 down_slice.column_byte_base,
                 down_slice.column_byte_count,
-                (uint32_t)expert, &down_dst)) {
+                (uint32_t)expert, &down_dst, 0)) {
             entry.expert = -1;
             entry.valid = 0;
             return 0;

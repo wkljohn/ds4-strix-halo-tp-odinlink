@@ -336,9 +336,10 @@ int main() {
     CHECK(ds4_gpu_q4k_window_cache_create(&bad_coupling) == nullptr,
           "cache refuses mismatched gate/down rank halves");
     ds4_gpu_q4k_window_cache_config excessive_slots =
-        cache_config(gguf, gate_offset, up_offset, down_offset, 0u, 33u);
+        cache_config(gguf, gate_offset, up_offset, down_offset, 0u,
+                     kExperts + 1u);
     CHECK(ds4_gpu_q4k_window_cache_create(&excessive_slots) == nullptr,
-          "cache enforces the fixed 32-slot policy ceiling");
+          "cache enforces the configured expert-count ceiling");
 
     const uint64_t expected_cache_bytes =
         8u * (2u * kHalfGateBytes + kHalfDownBytes);
@@ -681,6 +682,117 @@ int main() {
     CHECK(moe_nonzero != 0u && moe_outputs_changed &&
           moe_output_fnv == UINT64_C(0x9b64bad7c433cb8f),
           "MoE epochs are nontrivial, distinct, and deterministic");
+
+    /* Two-row batch gate: both rows use the same eight global experts in a
+     * different order.  The bounded loader must compact the 16 assignments
+     * to eight slots and match an independently packed direct-table run. */
+    {
+        constexpr uint32_t kBatchTokens = 2u;
+        const int32_t global_ids[16] = {
+            12, 13, 14, 15, 100, 101, 102, 103,
+            103, 102, 101, 100, 15, 14, 13, 12};
+        float batch_route_weights[16];
+        std::copy_n(moe_weight_host, 8u, batch_route_weights);
+        std::copy_n(moe_weight_host, 8u, batch_route_weights + 8u);
+        std::vector<float> two_inputs((uint64_t)kBatchTokens * kEmbed);
+        std::copy(moe_input_host.begin(), moe_input_host.end(),
+                  two_inputs.begin());
+        std::copy(moe_input_host.rbegin(), moe_input_host.rend(),
+                  two_inputs.begin() + kEmbed);
+        ds4_gpu_tensor *bsel = ds4_gpu_tensor_alloc(sizeof(global_ids));
+        ds4_gpu_tensor *bw = ds4_gpu_tensor_alloc(sizeof(batch_route_weights));
+        ds4_gpu_tensor *bx = ds4_gpu_tensor_alloc(
+            two_inputs.size() * sizeof(float));
+        ds4_gpu_tensor *bg = ds4_gpu_tensor_alloc(kBatchTokens * kMidBytes);
+        ds4_gpu_tensor *bu = ds4_gpu_tensor_alloc(kBatchTokens * kMidBytes);
+        ds4_gpu_tensor *bm = ds4_gpu_tensor_alloc(kBatchTokens * kMidBytes);
+        ds4_gpu_tensor *bd = ds4_gpu_tensor_alloc(kBatchTokens * kDownBytes);
+        ds4_gpu_tensor *bout = ds4_gpu_tensor_alloc(kBatchTokens * kOutBytes);
+        ds4_gpu_tensor *bref = ds4_gpu_tensor_alloc(kBatchTokens * kOutBytes);
+        CHECK(bsel && bw && bx && bg && bu && bm && bd && bout && bref,
+              "allocate batched compact-window oracle tensors");
+        for (uint32_t slot = 0; slot < 8u; ++slot) {
+            expected_row_half(direct_one, gguf, gate_offset,
+                              (uint32_t)global_ids[slot], 0u);
+            std::memcpy(direct_gate_host.data() +
+                            (uint64_t)slot * kHalfGateBytes,
+                        direct_one.data(), (size_t)kHalfGateBytes);
+            expected_row_half(direct_one, gguf, up_offset,
+                              (uint32_t)global_ids[slot], 0u);
+            std::memcpy(direct_up_host.data() +
+                            (uint64_t)slot * kHalfGateBytes,
+                        direct_one.data(), (size_t)kHalfGateBytes);
+            expected_down_half(direct_one, gguf, down_offset,
+                               (uint32_t)global_ids[slot], 0u);
+            std::memcpy(direct_down_host.data() +
+                            (uint64_t)slot * kHalfDownBytes,
+                        direct_one.data(), (size_t)kHalfDownBytes);
+        }
+        bool mid_is_f16 = true;
+        std::vector<float> batch_got(kBatchTokens * kEmbed);
+        std::vector<float> batch_ref(kBatchTokens * kEmbed);
+        CHECK(hipMemcpy(direct_gate, direct_gate_host.data(),
+                        direct_table_bytes, hipMemcpyHostToDevice) == hipSuccess &&
+              hipMemcpy(direct_up, direct_up_host.data(),
+                        direct_table_bytes, hipMemcpyHostToDevice) == hipSuccess &&
+              hipMemcpy(direct_down, direct_down_host.data(),
+                        direct_table_bytes, hipMemcpyHostToDevice) == hipSuccess &&
+              ds4_gpu_tensor_write(bsel, 0u, global_ids, sizeof(global_ids)) &&
+              ds4_gpu_tensor_write(bw, 0u, batch_route_weights,
+                                   sizeof(batch_route_weights)) &&
+              ds4_gpu_tensor_write(bx, 0u, two_inputs.data(),
+                                   two_inputs.size() * sizeof(float)) &&
+              ds4_gpu_routed_moe_batch_packed_q4k_window_tensor(
+                  bout, bg, bu, bm, bd, cache0, bsel, bw, 8u, 10.0f,
+                  bx, 3u, kBatchTokens, &mid_is_f16) && !mid_is_f16 &&
+              ds4_gpu_synchronize() &&
+              ds4_gpu_tensor_read(bout, 0u, batch_got.data(),
+                                  batch_got.size() * sizeof(float)),
+              "execute batched compact-window routed MoE");
+        for (uint32_t row = 0u; row < kBatchTokens; ++row) {
+            ds4_gpu_tensor *rsel = ds4_gpu_tensor_view(
+                bsel, (uint64_t)row * 8u * sizeof(int32_t),
+                8u * sizeof(int32_t));
+            ds4_gpu_tensor *rw = ds4_gpu_tensor_view(
+                bw, (uint64_t)row * 8u * sizeof(float), 8u * sizeof(float));
+            ds4_gpu_tensor *rx = ds4_gpu_tensor_view(
+                bx, (uint64_t)row * kEmbed * sizeof(float),
+                kEmbed * sizeof(float));
+            ds4_gpu_tensor *ro = ds4_gpu_tensor_view(
+                bref, (uint64_t)row * kOutBytes, kOutBytes);
+            CHECK(rsel && rw && rx && ro &&
+                  ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
+                      ro, bg, bu, bm, bd, cache0, rsel, rw, 8u, 10.0f,
+                      rx, nullptr, 3u),
+                  "execute scalar compact-window row oracle");
+            ds4_gpu_tensor_free(ro); ds4_gpu_tensor_free(rx);
+            ds4_gpu_tensor_free(rw); ds4_gpu_tensor_free(rsel);
+        }
+        CHECK(ds4_gpu_synchronize() &&
+              ds4_gpu_tensor_read(bref, 0u, batch_ref.data(),
+                                  batch_ref.size() * sizeof(float)),
+              "read scalar row oracle output");
+        float batch_max_abs = 0.0f;
+        uint64_t batch_changed = 0u;
+        for (uint64_t i = 0u; i < batch_ref.size(); ++i) {
+            CHECK(std::isfinite(batch_got[i]) && std::isfinite(batch_ref[i]),
+                  "batched and scalar outputs remain finite");
+            const float d = std::fabs(batch_got[i] - batch_ref[i]);
+            batch_max_abs = std::max(batch_max_abs, d);
+            batch_changed += d != 0.0f;
+        }
+        std::fprintf(stderr,
+                     "glm53_expert_window batch-vs-scalar max_abs=%g "
+                     "changed=%" PRIu64 "/%zu\n",
+                     batch_max_abs, batch_changed, batch_ref.size());
+        CHECK(batch_max_abs <= 1.0e-4f,
+              "batched compact-window output stays within row-oracle tolerance");
+        ds4_gpu_tensor_free(bref); ds4_gpu_tensor_free(bout);
+        ds4_gpu_tensor_free(bd); ds4_gpu_tensor_free(bm);
+        ds4_gpu_tensor_free(bu); ds4_gpu_tensor_free(bg);
+        ds4_gpu_tensor_free(bx); ds4_gpu_tensor_free(bw);
+        ds4_gpu_tensor_free(bsel);
+    }
     int32_t padded_route[8];
     float padded_weights[8];
     std::memcpy(padded_route, route_c, sizeof(padded_route));

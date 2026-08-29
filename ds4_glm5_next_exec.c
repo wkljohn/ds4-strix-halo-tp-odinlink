@@ -813,8 +813,9 @@ static int route_batch_agrees(const ds4_glm5_next_exec_ctx *ctx,
     return 1;
 }
 
-static int declare_local_q4k_half(const ds4_glm5_next_exec_ctx *ctx,
-                                  const ds4_glm5_next_layer_offsets *layer) {
+static int declare_local_q4k_half_only(
+        const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_layer_offsets *layer) {
     const uint64_t gate_row_bytes =
         (GLM5_WIDTH / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
     const uint64_t down_row_bytes =
@@ -837,7 +838,18 @@ static int declare_local_q4k_half(const ds4_glm5_next_exec_ctx *ctx,
                ctx->model_map, ctx->model_size, layer->ffn_weight.down_exps,
                GLM5_EXPERTS, GLM5_WIDTH, down_row_bytes,
                0u, GLM5_WIDTH, column_base, down_half_bytes,
-               DS4_GPU_Q4K_PACKED_K_RANGE) &&
+               DS4_GPU_Q4K_PACKED_K_RANGE);
+}
+
+static int declare_local_q4k_half(const ds4_glm5_next_exec_ctx *ctx,
+                                  const ds4_glm5_next_layer_offsets *layer) {
+    const uint64_t gate_row_bytes =
+        (GLM5_WIDTH / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint64_t down_half_bytes =
+        (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint32_t row_base = ctx->tp_rank * GLM5_RANK_MID;
+    const uint64_t column_base = (uint64_t)ctx->tp_rank * down_half_bytes;
+    return declare_local_q4k_half_only(ctx, layer) &&
            ds4_gpu_q4k_packed_slice_load(
                ctx->model_map, layer->ffn_weight.gate_exps,
                row_base, GLM5_RANK_MID, 0u, gate_row_bytes) &&
@@ -1254,8 +1266,6 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
         (GLM5_WIDTH / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
     const uint64_t q4_gate_row_bytes =
         (GLM5_WIDTH / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
-    const uint64_t q4_down_row_bytes =
-        (GLM5_ROUTED_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
     const uint64_t q4_down_half_bytes =
         (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
     const uint64_t q4_down_base =
@@ -1263,10 +1273,11 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
     uint64_t elements = 0u;
     bool routed_mid_is_f16 = true;
     if (n_tokens == 0u ||
+        n_tokens > GLM5_EXPERTS ||
         (uint64_t)n_tokens > UINT32_MAX / GLM5_WIDTH ||
         (uint64_t)n_tokens > UINT32_MAX / GLM5_RANK_MID) return 0;
     elements = (uint64_t)n_tokens * GLM5_WIDTH;
-    const int ok =
+    int ok =
         ds4_gpu_rms_norm_plain_rows_tensor(
             w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, n_tokens,
             ctx->model->rms_norm_eps) &&
@@ -1291,16 +1302,34 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
         route_batch_agrees(ctx, il, token_ordinal,
                            w->router_selected, w->router_weights,
                            n_tokens) &&
-        declare_local_q4k_half(ctx, layer) &&
-        ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+        declare_local_q4k_half_only(ctx, layer);
+    ds4_gpu_q4k_window_cache *cache = NULL;
+    if (ok) {
+        const ds4_gpu_q4k_window_cache_config config = {
+            .model_map = ctx->model_map,
+            .gate_offset = f->gate_exps,
+            .up_offset = f->up_exps,
+            .down_offset = f->down_exps,
+            .n_expert = GLM5_EXPERTS,
+            .gate_row_base = rank_mid_base,
+            .gate_row_count = GLM5_RANK_MID,
+            .gate_column_byte_base = 0u,
+            .gate_column_byte_count = q4_gate_row_bytes,
+            .down_row_base = 0u,
+            .down_row_count = GLM5_WIDTH,
+            .down_column_byte_base = q4_down_base,
+            .down_column_byte_count = q4_down_half_bytes,
+            .slots = n_tokens > GLM5_EXPERTS / GLM5_EXPERTS_USED ?
+                GLM5_EXPERTS : n_tokens * GLM5_EXPERTS_USED,
+        };
+        cache = ds4_gpu_q4k_window_cache_create(&config);
+        ok = cache && ds4_gpu_routed_moe_batch_packed_q4k_window_tensor(
             w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
-            w->routed_experts, ctx->model_map, ctx->model_size,
-            f->gate_exps, f->up_exps, f->down_exps, GLM5_EXPERTS,
-            q4_gate_row_bytes, q4_down_row_bytes,
-            rank_mid_base, GLM5_RANK_MID, q4_down_base,
-            q4_down_half_bytes, w->router_selected, w->router_weights,
-            GLM5_EXPERTS_USED, 10.0f, w->ffn_hidden, il, n_tokens,
-            &routed_mid_is_f16) &&
+            w->routed_experts, cache, w->router_selected,
+            w->router_weights, GLM5_EXPERTS_USED, 10.0f,
+            w->ffn_hidden, il, n_tokens, &routed_mid_is_f16);
+    }
+    ok = ok &&
         !routed_mid_is_f16 &&
         ds4_gpu_matmul_q8_0_pair_tensor(
             w->shared_gate, w->shared_up,
@@ -1325,6 +1354,10 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             hc_out, w->down, w->after_attention, w->ffn_split,
             GLM5_WIDTH, GLM5_HC) &&
         ds4_gpu_synchronize();
+    if (!ok) ds4_gpu_synchronize();
+    /* release_all owns both the temporary cache and its three layer-local
+     * descriptors. It is called only after all consumers have synchronized. */
+    ds4_gpu_q4k_packed_slice_release_all();
     return ok;
 }
 

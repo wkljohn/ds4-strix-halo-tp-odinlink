@@ -39788,6 +39788,20 @@ int ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
     return 0;
 }
 
+int ds4_gpu_routed_moe_batch_packed_q4k_window_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,
+        ds4_gpu_q4k_window_cache *cache,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
+        uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
+    (void)out; (void)gate; (void)up; (void)mid; (void)experts;
+    (void)cache; (void)selected; (void)weights; (void)n_expert;
+    (void)clamp; (void)x; (void)layer_index; (void)n_tokens;
+    (void)mid_is_f16;
+    return 0;
+}
+
 int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, ds4_gpu_tensor *experts,

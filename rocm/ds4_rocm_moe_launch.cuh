@@ -4131,6 +4131,52 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
     return rc;
 }
 
+extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_window_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        ds4_gpu_q4k_window_cache *cache,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_expert, float clamp, const ds4_gpu_tensor *x,
+        uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
+    if (mid_is_f16) *mid_is_f16 = false;
+    if (!cuda_q4k_kshard_enabled() || !out || !gate || !up || !mid ||
+        !down || !cache || !selected || !weights || !x || n_tokens < 2u ||
+        n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
+        n_tokens > UINT32_MAX / n_expert) return 0;
+    ds4_gpu_q4k_window_cache_view view = {};
+    const uint32_t pair_count = n_tokens * n_expert;
+    if (!ds4_gpu_q4k_window_cache_get_view(cache, &view) ||
+        !view.model_map || view.model_size == 0u || !view.gate || !view.up ||
+        !view.down || view.slot_count < n_expert ||
+        view.gate_row_bytes != 16u * sizeof(cuda_block_q4_K) ||
+        view.down_row_bytes != 4u * sizeof(cuda_block_q4_K) ||
+        view.row_count != 1024u ||
+        (view.row_base != 0u && view.row_base != 1024u) ||
+        view.gate_expert_bytes !=
+            (uint64_t)view.row_count * view.gate_row_bytes ||
+        view.down_expert_bytes != 4096u * view.down_row_bytes) return 0;
+    ds4_gpu_tensor compact_selected = {};
+    if (!ds4_gpu_q4k_window_cache_prepare_device(
+            cache, selected, weights, pair_count, &compact_selected)) return 0;
+    const int rc = routed_moe_launch(
+        out, gate, up, mid, down, view.model_map, view.model_size,
+        view.gate_offset, view.up_offset, view.down_offset,
+        12u, 12u, view.gate_expert_bytes, view.gate_row_bytes,
+        view.down_expert_bytes, view.down_row_bytes,
+        4096u, view.row_count, 4096u,
+        &compact_selected, weights, view.slot_count, n_expert, clamp,
+        x, NULL, NULL, layer_index, n_tokens, false,
+        (const char *)view.gate, (const char *)view.up,
+        (const char *)view.down, true, false, false);
+    if (!rc) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "packed Q4_K batch window launch failed: layer=%u "
+                "tokens=%u slots=%u used=%u\n",
+                layer_index, n_tokens, view.slot_count, n_expert);
+    }
+    return rc;
+}
+
 extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up,
         ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
