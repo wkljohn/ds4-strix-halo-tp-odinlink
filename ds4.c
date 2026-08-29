@@ -60926,6 +60926,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #else
     if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
 
+    /* GLM5.3 has its own KDA/MLA executor and resident state.  The legacy
+     * glm_graph below cannot consume the staged offset table; fail clearly
+     * instead of attempting a partial allocation when an explicit research
+     * opt-in reaches session creation before staged wiring is complete. */
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
+        fprintf(stderr,
+                "ds4: GLM5.3 ordinary session execution is not wired; "
+                "use the staged TP harness until promotion\n");
+        return 1;
+    }
+
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
