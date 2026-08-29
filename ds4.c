@@ -6363,8 +6363,15 @@ static void config_validate_glm5_next_model(const ds4_model *m,
     /* The staged executor currently calls Q4_K packed-slice entry points.
      * Never reinterpret 66/84-byte blocks as Q4_K merely because structural
      * metadata passed. Type-aware strides/sharding must land first. */
-    if (require_executable_engine && mixed_q2) {
+    const bool mixed_q2_opt_in =
+        getenv("DS4_GLM5_NEXT_ENABLE_MIXED_Q2") != NULL;
+    if (require_executable_engine && mixed_q2 && !mixed_q2_opt_in) {
         ds4_die("glm5-next mixed IQ2_XXS/Q2_K runtime dispatch is not yet wired; refusing inference");
+    }
+    if (require_executable_engine && mixed_q2 && mixed_q2_opt_in) {
+        fprintf(stderr,
+                "warning: GLM5.3 mixed IQ2_XXS/Q2_K dispatch is experimental; "
+                "use only for staged validation\n");
     }
     /* GLM5.3 ordinary-engine wiring is still being validated against the
      * staged TP executor. Keep the production default fail-closed; an
