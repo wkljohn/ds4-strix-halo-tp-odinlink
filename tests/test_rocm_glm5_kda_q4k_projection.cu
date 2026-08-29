@@ -79,14 +79,24 @@ static float q4k_dot(const uint8_t *row, const float *x, uint32_t width) {
 }
 
 static bool run_test(void) {
-    constexpr uint32_t width = 4096u, full_rows = 8192u, rows = 64u;
+    constexpr uint32_t width = 4096u, rows = 64u;
     const char *model = std::getenv("DS4_GLM5_MODEL");
     CHECK(model && model[0], "model environment");
     Glm5TestGGUF gguf;
     CHECK(gguf.open_file(model), "open GLM5 GGUF");
     uint64_t base = 0u;
-    CHECK(gguf.tensor("blk.0.kda_q.weight", {width, full_rows}, 12u, base),
-          "bind layer-0 Q4_K KDA query");
+    uint32_t full_rows = 0u;
+    if (gguf.tensor("blk.0.kda_q.weight", {width, 8192u}, 12u, base)) {
+        full_rows = 8192u;
+    } else {
+        /* Q4 control files keep KDA in BF16; exercise the same compact Q4_K
+         * loader against the first routed expert instead.  The first expert
+         * is a contiguous 4096x2048 row slice of the 3-D GGUF tensor. */
+        CHECK(gguf.tensor("blk.3.ffn_gate_exps.weight",
+                          {width, 2048u, 288u}, 12u, base),
+              "bind Q4_K routed expert control");
+        full_rows = 2048u;
+    }
     ds4_gpu_config config = {};
     config.n_gpus = 1u;
     config.device_indices[0] = 0u;
