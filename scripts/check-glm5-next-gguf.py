@@ -131,11 +131,15 @@ def main(argv):
     )
     require(meta, "glm5-next.layer_types", expected_layer_types)
 
+    # Q4_K is uniform; the compact Q2 reference is mixed IQ2_XXS gate/up
+    # plus Q2_K down.  Keep the type alternatives explicit and shape-bound.
     required = {
-        "blk.3.ffn_gate_exps.weight": ((4096, 2048, 288), 12),
-        "blk.3.ffn_up_exps.weight": ((4096, 2048, 288), 12),
-        "blk.3.ffn_down_exps.weight": ((2048, 4096, 288), 12),
-        "blk.0.kda_q.weight": ((4096, 8192), 30),  # BF16
+        "blk.3.ffn_gate_exps.weight": ((4096, 2048, 288), (12, 16)),
+        "blk.3.ffn_up_exps.weight": ((4096, 2048, 288), (12, 16)),
+        "blk.3.ffn_down_exps.weight": ((2048, 4096, 288), (12, 10)),
+        # BF16 is used by the Q4 reference; the compact Q2 conversion uses
+        # Q4_K for KDA q/k.  Both are validated layouts.
+        "blk.0.kda_q.weight": ((4096, 8192), (30, 12)),
         "blk.3.attn_q_a.weight": ((4096, 1536), 8),
         "blk.3.attn_q_a_norm.weight": ((1536,), 0),
         "blk.3.attn_kv_a_norm.weight": ((512,), 0),
@@ -143,7 +147,8 @@ def main(argv):
     }
     for name, (shape, typ) in required.items():
         got = tensors.get(name)
-        if got is None or got[:2] != (shape, typ):
+        allowed_types = typ if isinstance(typ, tuple) else (typ,)
+        if got is None or got[0] != shape or got[1] not in allowed_types:
             raise ValueError(f"tensor {name}: expected shape/type {(shape, typ)!r}, got {got!r}")
 
     def count_suffix(suffix):
@@ -190,10 +195,10 @@ def main(argv):
     # Validate every descriptor in each family.  A count-only check would let
     # one malformed layer or an axis-swapped conversion pass unnoticed.
     family_shapes = {
-        ".kda_q.weight": ((4096, 8192), 30),
-        ".kda_k.weight": ((4096, 8192), 30),
-        ".kda_v.weight": ((4096, 8192), 30),
-        ".kda_output.weight": ((8192, 4096), 30),
+        ".kda_q.weight": ((4096, 8192), (30, 12)),
+        ".kda_k.weight": ((4096, 8192), (30, 12)),
+        ".kda_v.weight": ((4096, 8192), (30, 8)),
+        ".kda_output.weight": ((8192, 4096), (30, 8)),
         ".indexer.attn_q_b.weight": ((1536, 4096), 30),
         ".indexer.attn_k.weight": ((4096, 128), 30),
         ".indexer.proj.weight": ((4096, 32), 30),
@@ -209,9 +214,9 @@ def main(argv):
         ".attn_k_b.weight": ((256, 512, 64), 8),
         ".attn_v_b.weight": ((512, 256, 64), 8),
         ".attn_output.weight": ((16384, 4096), 8),
-        ".ffn_gate_exps.weight": ((4096, 2048, 288), 12),
-        ".ffn_up_exps.weight": ((4096, 2048, 288), 12),
-        ".ffn_down_exps.weight": ((2048, 4096, 288), 12),
+        ".ffn_gate_exps.weight": ((4096, 2048, 288), (12, 16)),
+        ".ffn_up_exps.weight": ((4096, 2048, 288), (12, 16)),
+        ".ffn_down_exps.weight": ((2048, 4096, 288), (12, 10)),
         ".hc_attn_fn.weight": ((16384, 24), 30),
         ".hc_ffn_fn.weight": ((16384, 24), 30),
     }
@@ -219,16 +224,24 @@ def main(argv):
         for tensor_name, (got_shape, got_type, _offset) in tensors.items():
             if (tensor_name.startswith("blk.") and tensor_name.endswith(name)
                     and not (name.startswith(".attn_") and ".indexer." in tensor_name)):
-                if (got_shape, got_type) != (shape, typ):
+                allowed_types = typ if isinstance(typ, tuple) else (typ,)
+                if got_shape != shape or got_type not in allowed_types:
                     raise ValueError(f"tensor {tensor_name}: expected {(shape, typ)!r}, got {(got_shape, got_type)!r}")
 
     layers = Counter()
     for name in tensors:
         if name.startswith("blk.") and "." in name[4:]:
             layers[name.split(".", 2)[1]] += 1
+    routed_types = tuple(sorted({t[1] for name, t in tensors.items()
+                                 if name.endswith((".ffn_gate_exps.weight",
+                                                   ".ffn_up_exps.weight",
+                                                   ".ffn_down_exps.weight"))}))
+    if routed_types not in ((10, 12), (12,), (10, 16), (12, 16)):
+        raise ValueError(f"unsupported routed expert type family: {routed_types}")
     print("PASS glm5-next metadata/tensor contract")
     print(f"tensors={len(tensors)} routed_expert_layers="
-          f"{sum(1 for n in tensors if n.endswith('ffn_gate_exps.weight'))}")
+          f"{sum(1 for n in tensors if n.endswith('ffn_gate_exps.weight'))} "
+          f"routed_types={routed_types}")
     print("type_counts=" + ",".join(f"{k}:{v}" for k, v in sorted(Counter(t[1] for t in tensors.values()).items())))
     return 0
 

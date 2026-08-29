@@ -36,27 +36,63 @@ def main(argv):
     info = parser.parse_gguf(model)
     kda = info.tensor_by_name["blk.0.kda_q.weight"]
     expert = info.tensor_by_name["blk.3.ffn_gate_exps.weight"]
-    if kda.ggml_type != 30 or kda.dims != (4096, 8192):
+    expert_up = info.tensor_by_name["blk.3.ffn_up_exps.weight"]
+    expert_down = info.tensor_by_name["blk.3.ffn_down_exps.weight"]
+    if kda.dims != (4096, 8192):
         raise ValueError(f"unexpected KDA descriptor: {kda}")
-    if expert.ggml_type != 12 or expert.dims != (4096, 2048, 288):
+    if expert.dims != (4096, 2048, 288) or expert_up.dims != expert.dims:
         raise ValueError(f"unexpected expert descriptor: {expert}")
+    if expert.ggml_type == 12:
+        if expert_up.ggml_type != 12 or expert_down.ggml_type != 12:
+            raise ValueError("uniform Q4_K expert family is incomplete")
+        gate_block_bytes = 144
+        down_block_bytes = 144
+        family = "Q4_K"
+    elif expert.ggml_type == 16:
+        if expert_up.ggml_type != 16 or expert_down.ggml_type != 10:
+            raise ValueError("mixed Q2 expert family must be IQ2_XXS/IQ2_XXS/Q2_K")
+        gate_block_bytes = 66
+        down_block_bytes = 84
+        family = "IQ2_XXS+Q2_K"
+    else:
+        raise ValueError(f"unsupported expert family type: {expert.ggml_type}")
+    if kda.ggml_type == 30:
+        kda_sample_bytes = 8192
+        kda_family = "BF16"
+    elif kda.ggml_type == 12:
+        kda_sample_bytes = 144
+        kda_family = "Q4_K"
+    elif kda.ggml_type == 8:
+        kda_sample_bytes = 34
+        kda_family = "Q8_0"
+    else:
+        raise ValueError(f"unsupported KDA q tensor type: {kda.ggml_type}")
     with model.open("rb") as fp:
         fp.seek(kda.data_offset)
-        raw = fp.read(8192)  # one 4096-element BF16 row
+        raw = fp.read(kda_sample_bytes)
         fp.seek(expert.data_offset)
-        q4_block = fp.read(144)  # one Q4_K block
-    row = bf16_to_float(raw)
-    if len(row) != 4096 or not all(math.isfinite(x) for x in row):
-        raise ValueError("KDA BF16 row contains invalid values")
-    activation = [((i % 17) - 8) * 0.0078125 for i in range(4096)]
-    dot_a = sum(a * b for a, b in zip(row, activation))
-    dot_b = sum(a * b for a, b in zip(row, activation))
-    if not math.isfinite(dot_a) or dot_a != dot_b:
-        raise ValueError("non-deterministic BF16 scalar oracle")
-    if len(q4_block) != 144:
-        raise ValueError("Q4_K block geometry mismatch")
+        gate_block = fp.read(gate_block_bytes)
+        fp.seek(expert_down.data_offset)
+        down_block = fp.read(down_block_bytes)
+    if len(raw) != kda_sample_bytes:
+        raise ValueError("KDA sample block is truncated")
+    if kda.ggml_type == 30:
+        row = bf16_to_float(raw)
+        if len(row) != 4096 or not all(math.isfinite(x) for x in row):
+            raise ValueError("KDA BF16 row contains invalid values")
+        activation = [((i % 17) - 8) * 0.0078125 for i in range(4096)]
+        dot_a = sum(a * b for a, b in zip(row, activation))
+        dot_b = sum(a * b for a, b in zip(row, activation))
+        if not math.isfinite(dot_a) or dot_a != dot_b:
+            raise ValueError("non-deterministic BF16 scalar oracle")
+    else:
+        dot_a = 0.0
+    if len(gate_block) != gate_block_bytes or len(down_block) != down_block_bytes:
+        raise ValueError("expert block geometry mismatch")
     print("PASS GLM5-next weight probe")
-    print(f"kda_bf16_row=4096 q4k_block_bytes={len(q4_block)} "
+    print(f"kda_family={kda_family} kda_sample_bytes={kda_sample_bytes} "
+          f"expert_family={family} "
+          f"gate_block_bytes={len(gate_block)} down_block_bytes={len(down_block)} "
           f"kda_scalar_dot={dot_a:.9g}")
     return 0
 
