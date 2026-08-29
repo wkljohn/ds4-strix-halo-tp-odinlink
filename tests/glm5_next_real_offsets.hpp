@@ -21,6 +21,24 @@ static bool glm5_next_layer_tensor(
            g.tensor(name, dims, type, offset);
 }
 
+static bool glm5_next_layer_tensor_any(
+        const Glm5TestGGUF &g, uint32_t layer, const char *suffix,
+        std::initializer_list<uint64_t> dims, uint32_t type_a, uint32_t type_b,
+        uint64_t &offset, uint32_t *actual_type = nullptr) {
+    char name[112];
+    const int n = std::snprintf(name, sizeof(name), "blk.%u.%s", layer, suffix);
+    if (n <= 0 || (size_t)n >= sizeof(name)) return false;
+    if (g.tensor(name, dims, type_a, offset)) {
+        if (actual_type) *actual_type = type_a;
+        return true;
+    }
+    if (type_b != type_a && g.tensor(name, dims, type_b, offset)) {
+        if (actual_type) *actual_type = type_b;
+        return true;
+    }
+    return false;
+}
+
 static bool glm5_next_bind_real_offsets(
         const Glm5TestGGUF &g, ds4_glm5_next_model_offsets &model) {
     model = {};
@@ -32,13 +50,18 @@ static bool glm5_next_bind_real_offsets(
         model.rms_norm_eps != 1.0e-5f ||
         !g.metadata("glm5-next.hyper_connection.epsilon", model.hc_eps) ||
         model.hc_eps != 1.0e-6f ||
+        !g.tensor("token_embd.weight", {4096u, 154880u}, 8u,
+                  model.token_embd) &&
         !g.tensor("token_embd.weight", {4096u, 154880u}, 30u,
                   model.token_embd) ||
         !g.tensor("output_norm.weight", {4096u}, 0u, model.output_norm) ||
+        !g.tensor("output.weight", {4096u, 154880u}, 8u, model.output) &&
         !g.tensor("output.weight", {4096u, 154880u}, 30u, model.output) ||
         !glm5_next_layer_tensor(g, 45u, "nextn.eh_proj.weight",
                                {8192u, 4096u}, 30u,
                                model.nextn_eh_proj)) return false;
+    model.token_embd_type = g.tensors.at("token_embd.weight").type;
+    model.output_type = g.tensors.at("output.weight").type;
 
     for (uint32_t il = 0u; il < model.layer_count; ++il) {
         ds4_glm5_next_layer_offsets &layer = model.layer[il];
@@ -54,30 +77,39 @@ static bool glm5_next_bind_real_offsets(
                                     0u, layer.ffn_norm)) return false;
         if (layer.attention == DS4_GLM5_NEXT_ATTN_KDA) {
             layer.kda.attn_norm = layer.attn_norm;
-            if (!glm5_next_layer_tensor(g, il, "kda_q.weight",
-                                        {4096u, 8192u}, 30u, layer.kda.q) ||
-                !glm5_next_layer_tensor(g, il, "kda_k.weight",
-                                        {4096u, 8192u}, 30u, layer.kda.k) ||
-                !glm5_next_layer_tensor(g, il, "kda_v.weight",
-                                        {4096u, 8192u}, 30u, layer.kda.v) ||
-                !glm5_next_layer_tensor(g, il, "kda_output.weight",
-                                        {8192u, 4096u}, 30u, layer.kda.output) ||
+            if (!glm5_next_layer_tensor_any(g, il, "kda_q.weight",
+                                        {4096u, 8192u}, 30u, 12u, layer.kda.q,
+                                        &layer.kda.q_type) ||
+                !glm5_next_layer_tensor_any(g, il, "kda_k.weight",
+                                        {4096u, 8192u}, 30u, 12u, layer.kda.k,
+                                        &layer.kda.k_type) ||
+                !glm5_next_layer_tensor_any(g, il, "kda_v.weight",
+                                        {4096u, 8192u}, 30u, 8u, layer.kda.v,
+                                        &layer.kda.v_type) ||
+                !glm5_next_layer_tensor_any(g, il, "kda_output.weight",
+                                        {8192u, 4096u}, 30u, 8u, layer.kda.output,
+                                        &layer.kda.output_type) ||
                 !glm5_next_layer_tensor(g, il, "kda_q_conv.weight",
                                         {4u, 1u, 8192u}, 0u, layer.kda.q_conv) ||
                 !glm5_next_layer_tensor(g, il, "kda_k_conv.weight",
                                         {4u, 1u, 8192u}, 0u, layer.kda.k_conv) ||
                 !glm5_next_layer_tensor(g, il, "kda_v_conv.weight",
                                         {4u, 1u, 8192u}, 0u, layer.kda.v_conv) ||
-                !glm5_next_layer_tensor(g, il, "kda_f_a.weight",
-                                        {4096u, 128u}, 30u, layer.kda.f_a) ||
-                !glm5_next_layer_tensor(g, il, "kda_f_b.weight",
-                                        {128u, 8192u}, 30u, layer.kda.f_b) ||
-                !glm5_next_layer_tensor(g, il, "kda_g_a.weight",
-                                        {4096u, 128u}, 30u, layer.kda.g_a) ||
-                !glm5_next_layer_tensor(g, il, "kda_g_b.weight",
-                                        {128u, 8192u}, 30u, layer.kda.g_b) ||
-                !glm5_next_layer_tensor(g, il, "kda_beta.weight",
-                                        {4096u, 64u}, 30u, layer.kda.beta) ||
+                !glm5_next_layer_tensor_any(g, il, "kda_f_a.weight",
+                                        {4096u, 128u}, 30u, 8u, layer.kda.f_a,
+                                        &layer.kda.f_a_type) ||
+                !glm5_next_layer_tensor_any(g, il, "kda_f_b.weight",
+                                        {128u, 8192u}, 30u, 8u, layer.kda.f_b,
+                                        &layer.kda.f_b_type) ||
+                !glm5_next_layer_tensor_any(g, il, "kda_g_a.weight",
+                                        {4096u, 128u}, 30u, 8u, layer.kda.g_a,
+                                        &layer.kda.g_a_type) ||
+                !glm5_next_layer_tensor_any(g, il, "kda_g_b.weight",
+                                        {128u, 8192u}, 30u, 8u, layer.kda.g_b,
+                                        &layer.kda.g_b_type) ||
+                !glm5_next_layer_tensor_any(g, il, "kda_beta.weight",
+                                        {4096u, 64u}, 30u, 8u, layer.kda.beta,
+                                        &layer.kda.beta_type) ||
                 !glm5_next_layer_tensor(g, il, "kda_o_norm.weight",
                                         {128u}, 0u, layer.kda.o_norm) ||
                 !glm5_next_layer_tensor(g, il, "kda_dt_bias.weight",
@@ -127,15 +159,15 @@ static bool glm5_next_bind_real_offsets(
                 !glm5_next_layer_tensor(g, il, "ffn_down.weight",
                                         {12288u, 4096u}, 8u, f.down)) return false;
         } else {
-            if (!glm5_next_layer_tensor(g, il, "ffn_gate_exps.weight",
-                                        {4096u, 2048u, 288u}, 12u,
-                                        f.gate_exps) ||
-                !glm5_next_layer_tensor(g, il, "ffn_up_exps.weight",
-                                        {4096u, 2048u, 288u}, 12u,
-                                        f.up_exps) ||
-                !glm5_next_layer_tensor(g, il, "ffn_down_exps.weight",
-                                        {2048u, 4096u, 288u}, 12u,
-                                        f.down_exps) ||
+            if (!glm5_next_layer_tensor_any(g, il, "ffn_gate_exps.weight",
+                                        {4096u, 2048u, 288u}, 12u, 16u,
+                                        f.gate_exps, &f.gate_exps_type) ||
+                !glm5_next_layer_tensor_any(g, il, "ffn_up_exps.weight",
+                                        {4096u, 2048u, 288u}, 12u, 16u,
+                                        f.up_exps, &f.up_exps_type) ||
+                !glm5_next_layer_tensor_any(g, il, "ffn_down_exps.weight",
+                                        {2048u, 4096u, 288u}, 12u, 10u,
+                                        f.down_exps, &f.down_exps_type) ||
                 !glm5_next_layer_tensor(g, il, "ffn_gate_inp.weight",
                                         {4096u, 288u}, 0u, f.gate_inp) ||
                 !glm5_next_layer_tensor(g, il, "exp_probs_b.bias",
@@ -146,9 +178,6 @@ static bool glm5_next_bind_real_offsets(
                                         {4096u, 2048u}, 8u, f.up_shexp) ||
                 !glm5_next_layer_tensor(g, il, "ffn_down_shexp.weight",
                                         {2048u, 4096u}, 8u, f.down_shexp)) return false;
-            f.gate_exps_type = 12u;
-            f.up_exps_type = 12u;
-            f.down_exps_type = 12u;
         }
         if (layer.is_trunk) {
             if (!glm5_next_layer_tensor(g, il, "hc_attn_fn.weight",
