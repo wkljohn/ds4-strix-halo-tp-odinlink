@@ -578,6 +578,10 @@ bool run() {
     ds4_glm5_next_model_offsets offsets = {};
     CHECK(glm5_next_bind_real_offsets(gguf, offsets),
           "bind complete real GLM5 offsets");
+    const bool mixed_q2_model =
+        offsets.layer[DS4_GLM5_NEXT_LEADING_DENSE].ffn_weight.gate_exps_type == 16u &&
+        offsets.layer[DS4_GLM5_NEXT_LEADING_DENSE].ffn_weight.up_exps_type == 16u &&
+        offsets.layer[DS4_GLM5_NEXT_LEADING_DENSE].ffn_weight.down_exps_type == 10u;
     const char *full_trunk_env = std::getenv("DS4_GLM5_FULL_TRUNK");
     const bool full_trunk = full_trunk_env &&
                             std::strcmp(full_trunk_env, "1") == 0;
@@ -772,7 +776,8 @@ bool run() {
         mla_batch_test ? mla_prefix_rows + mla_batch_rows +
                          mla_continuation_rows : 2u;
     Glm5NextKShardPlan kshard;
-    CHECK(!full_trunk || glm5_next_build_kshard_plan(gguf, offsets, kshard),
+    CHECK(!full_trunk || mixed_q2_model ||
+              glm5_next_build_kshard_plan(gguf, offsets, kshard),
           "build exact full-trunk compact residency plan");
     ds4_gpu_config config = {};
     config.n_gpus = 1u;
@@ -894,25 +899,31 @@ bool run() {
         CHECK(hipMemGetInfo(&free_before_install, &total_before_install) ==
                   hipSuccess,
               "query bounded residency budget before install");
-        const uint64_t packed_required = kshard.packed_total_bytes;
-        const uint64_t residency_required =
+        const uint64_t packed_required = mixed_q2_model ? 0u :
+            kshard.packed_total_bytes;
+        const uint64_t residency_required = mixed_q2_model ? 0u :
             kshard.dense_total_bytes + packed_required;
         std::fprintf(stderr,
             "GLM5 full-trunk plan rank=%u dense_spans=%zu "
             "dense_bytes=%llu packed_bytes=%llu required_bytes=%llu "
             "headroom_bytes=%llu hip_free=%llu hip_total=%llu\n",
-            exec.tp_rank, kshard.dense_offsets.size(),
-            (unsigned long long)kshard.dense_total_bytes,
+            exec.tp_rank, mixed_q2_model ? 0u : kshard.dense_offsets.size(),
+            (unsigned long long)(mixed_q2_model ? 0u : kshard.dense_total_bytes),
             (unsigned long long)packed_required,
             (unsigned long long)residency_required,
             (unsigned long long)install_headroom,
             (unsigned long long)free_before_install,
             (unsigned long long)total_before_install);
+        if (mixed_q2_model) {
+            std::fprintf(stderr,
+                "GLM5 mixed-Q2 typed residency oracle: no Q4 packed install; "
+                "executor consumes original IQ2_XXS/Q2_K ranges\n");
+        }
         CHECK(residency_required <= free_before_install &&
                   install_headroom <= free_before_install - residency_required,
               "full-trunk residency exceeds HIP-free GTT; reduce BIOS UMA "
               "carveout and retain at least 2 GiB install headroom");
-        CHECK(ds4_gpu_q4k_kshard_install(
+        CHECK(mixed_q2_model || ds4_gpu_q4k_kshard_install(
                   gguf.map, gguf.size, gguf.fd, exec.tp_rank,
                   kshard.dense_offsets.data(), kshard.dense_sizes.data(),
                   (uint32_t)kshard.dense_offsets.size(),
@@ -920,7 +931,7 @@ bool run() {
                   (uint32_t)kshard.layers.size()),
               "install bounded all-layer Q4 K-shard before model access");
         ds4_gpu_q4k_kshard_windows windows = {};
-        CHECK(ds4_gpu_q4k_kshard_windows_get(&windows) &&
+        CHECK(mixed_q2_model || (ds4_gpu_q4k_kshard_windows_get(&windows) &&
                   windows.rank == exec.tp_rank && windows.n_layers == 42u &&
                   windows.n_expert == 288u &&
                   windows.expert_in_dim == 4096u &&
@@ -930,14 +941,14 @@ bool run() {
                   windows.row_count == 1024u &&
                   windows.down_column_byte_base ==
                       (uint64_t)exec.tp_rank * 4u * 144u &&
-                  windows.down_column_byte_count == 4u * 144u,
+                  windows.down_column_byte_count == 4u * 144u),
               "installed Q4 shard geometry matches the negotiated rank");
         const uint64_t packed_from_windows =
             (uint64_t)windows.n_layers * windows.n_expert *
             (2u * windows.packed_gate_expert_bytes +
              windows.packed_down_expert_bytes);
-        CHECK(packed_from_windows == packed_required &&
-                  ds4_gpu_q4k_packed_slice_bytes() == packed_from_windows,
+        CHECK(mixed_q2_model || (packed_from_windows == packed_required &&
+                  ds4_gpu_q4k_packed_slice_bytes() == packed_from_windows),
               "installed Q4 bytes derive exactly from published windows");
         size_t free_after_install = 0u, total_after_install = 0u;
         CHECK(hipMemGetInfo(&free_after_install, &total_after_install) ==
@@ -947,8 +958,8 @@ bool run() {
         std::fprintf(stderr,
             "GLM5 full-trunk residency rank=%u dense_spans=%zu "
             "dense_bytes=%llu packed_q4_bytes=%llu\n",
-            exec.tp_rank, kshard.dense_offsets.size(),
-            (unsigned long long)kshard.dense_total_bytes,
+            exec.tp_rank, mixed_q2_model ? 0u : kshard.dense_offsets.size(),
+            (unsigned long long)(mixed_q2_model ? 0u : kshard.dense_total_bytes),
             (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
         std::fprintf(stderr,
             "GLM5 full-trunk post-install rank=%u hip_free=%llu "
