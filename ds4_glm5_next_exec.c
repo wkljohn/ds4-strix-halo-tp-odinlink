@@ -1235,9 +1235,6 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
     if (!ok) ds4_gpu_synchronize();
     ds4_gpu_q4k_packed_slice_release_all();
     (void)q8_down_row_bytes;
-    /* Do not retain every layer's 648 MiB packed slice group on UMA. */
-    if (!ok) ds4_gpu_synchronize();
-    ds4_gpu_q4k_packed_slice_release_all();
     return ok;
 }
 
