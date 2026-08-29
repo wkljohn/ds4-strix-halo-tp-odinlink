@@ -840,32 +840,15 @@ static int mla_stage_index_rows(const ds4_glm5_next_exec_ctx *ctx,
     return 1;
 }
 
-static int mla_value_project_rows_decode_exact(
+static int mla_value_project_rows_batch(
         const ds4_glm5_next_exec_ctx *ctx,
         const ds4_glm5_next_mla_offsets *offsets,
         ds4_glm5_next_workspace *w,
         uint32_t n_tokens) {
-    const uint64_t lora_row =
-        (uint64_t)GLM5_HEADS * GLM5_KV_LORA;
-    const uint64_t heads_row =
-        (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
-    for (uint32_t t = 0u; t < n_tokens; ++t) {
-        ds4_gpu_tensor *lora = ds4_gpu_tensor_view(
-            w->routed_experts, (uint64_t)t * lora_row * sizeof(float),
-            lora_row * sizeof(float));
-        ds4_gpu_tensor *heads = ds4_gpu_tensor_view(
-            w->mla_heads, (uint64_t)t * heads_row * sizeof(float),
-            heads_row * sizeof(float));
-        const int ok = lora && heads &&
-            ds4_gpu_glm_value_project_typed_batch_heads_tensor(
-                heads, lora, ctx->model_map, ctx->model_size,
-                offsets->v_b, 8u, 1u, GLM5_HEADS,
-                GLM5_KV_LORA, GLM5_HEAD_DIM);
-        ds4_gpu_tensor_free(heads);
-        ds4_gpu_tensor_free(lora);
-        if (!ok) return 0;
-    }
-    return 1;
+    return ds4_gpu_glm_value_project_typed_batch_heads_tensor(
+        w->mla_heads, w->routed_experts, ctx->model_map, ctx->model_size,
+        offsets->v_b, 8u, n_tokens, GLM5_HEADS,
+        GLM5_KV_LORA, GLM5_HEAD_DIM);
 }
 
 static int mla_output_project_rows_decode_exact(
@@ -974,7 +957,7 @@ static int mla_dense_selection_attention_rows(
             mla->capacity_tokens, false, GLM5_HEADS, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
-        mla_value_project_rows_decode_exact(ctx, m, w, n_tokens) &&
+        mla_value_project_rows_batch(ctx, m, w, n_tokens) &&
         mla_output_project_rows_decode_exact(ctx, m, w, n_tokens);
     return ok &&
         tp_exchange_rows(ctx, il, n_tokens) &&
