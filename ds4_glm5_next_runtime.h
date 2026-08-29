@@ -104,6 +104,7 @@ typedef struct {
      * without reconstructing or reading back pool IDs. */
     ds4_gpu_tensor *index_pool_ids;
     ds4_gpu_tensor *index_pool_valid;
+    ds4_gpu_tensor *index_valid_keys;
     ds4_gpu_tensor *index_tail;
     ds4_gpu_tensor *pool_gate_tail;
     uint32_t capacity_tokens;

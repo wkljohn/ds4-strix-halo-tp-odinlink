@@ -17,9 +17,9 @@ static int mul_u64(uint64_t a, uint64_t b, uint64_t *out) {
 
 static int mla_layer_bytes(uint32_t context_capacity, uint64_t *bytes) {
     uint64_t compact_values = 0u, pool_values = 0u, tail_values = 0u;
-    uint64_t pool_id_values = 0u, pool_valid_values = 0u;
+    uint64_t pool_id_values = 0u, pool_valid_values = 0u, valid_key_values = 0u;
     uint64_t compact_bytes = 0u, pool_bytes = 0u, tail_bytes = 0u;
-    uint64_t pool_id_bytes = 0u, pool_valid_bytes = 0u;
+    uint64_t pool_id_bytes = 0u, pool_valid_bytes = 0u, valid_key_bytes = 0u;
     const uint64_t pool_capacity = context_capacity / 4u +
         (context_capacity % 4u != 0u);
     return context_capacity != 0u &&
@@ -29,15 +29,18 @@ static int mla_layer_bytes(uint32_t context_capacity, uint64_t *bytes) {
            mul_u64(8u, DS4_GLM5_NEXT_INDEX_WIDTH, &tail_values) &&
            mul_u64(pool_capacity, 4u, &pool_id_values) &&
            mul_u64(pool_capacity, 1u, &pool_valid_values) &&
+           mul_u64(context_capacity, 1u, &valid_key_values) &&
            mul_u64(compact_values, sizeof(float), &compact_bytes) &&
            mul_u64(pool_values, sizeof(float), &pool_bytes) &&
            mul_u64(tail_values, sizeof(float), &tail_bytes) &&
            mul_u64(pool_id_values, sizeof(int32_t), &pool_id_bytes) &&
            mul_u64(pool_valid_values, sizeof(uint32_t), &pool_valid_bytes) &&
+           mul_u64(valid_key_values, sizeof(uint32_t), &valid_key_bytes) &&
            add_u64(compact_bytes, pool_bytes, bytes) &&
            add_u64(*bytes, tail_bytes, bytes) &&
            add_u64(*bytes, pool_id_bytes, bytes) &&
-           add_u64(*bytes, pool_valid_bytes, bytes);
+           add_u64(*bytes, pool_valid_bytes, bytes) &&
+           add_u64(*bytes, valid_key_bytes, bytes);
 }
 
 int ds4_glm5_next_state_bytes(const ds4_glm5_next_model_offsets *model,
@@ -80,6 +83,7 @@ void ds4_glm5_next_state_free(ds4_glm5_next_state *state) {
         ds4_gpu_tensor_free(state->mla[il].index_tail);
         ds4_gpu_tensor_free(state->mla[il].index_pool_valid);
         ds4_gpu_tensor_free(state->mla[il].index_pool_ids);
+        ds4_gpu_tensor_free(state->mla[il].index_valid_keys);
         ds4_gpu_tensor_free(state->mla[il].index_pool);
         ds4_gpu_tensor_free(state->mla[il].compact_kv);
     }
@@ -100,14 +104,16 @@ int ds4_glm5_next_state_reset(ds4_glm5_next_state *state) {
                             state->kda.layer[il].recurrent != NULL;
         if (is_kda) {
             if (mla->compact_kv || mla->index_pool || mla->index_pool_ids ||
-                mla->index_pool_valid || mla->index_tail || mla->pool_gate_tail)
+                mla->index_pool_valid || mla->index_valid_keys ||
+                mla->index_tail || mla->pool_gate_tail)
                 goto invalid;
             continue;
         }
         const uint32_t expected_pools = state->context_capacity / 4u +
             (state->context_capacity % 4u != 0u);
         if (!mla->index_pool || !mla->index_pool_ids ||
-            !mla->index_pool_valid || !mla->index_tail || !mla->pool_gate_tail ||
+            !mla->index_pool_valid || !mla->index_valid_keys ||
+            !mla->index_tail || !mla->pool_gate_tail ||
             !mla->compact_kv || mla->capacity_pools != expected_pools ||
             mla->capacity_tokens != state->context_capacity ||
             mla->owner != state) goto invalid;
@@ -123,6 +129,7 @@ int ds4_glm5_next_state_reset(ds4_glm5_next_state *state) {
         state->mla[DS4_GLM5_NEXT_TRUNK_COUNT].index_pool ||
         state->mla[DS4_GLM5_NEXT_TRUNK_COUNT].index_pool_ids ||
         state->mla[DS4_GLM5_NEXT_TRUNK_COUNT].index_pool_valid ||
+        state->mla[DS4_GLM5_NEXT_TRUNK_COUNT].index_valid_keys ||
         state->mla[DS4_GLM5_NEXT_TRUNK_COUNT].index_tail ||
         state->mla[DS4_GLM5_NEXT_TRUNK_COUNT].pool_gate_tail) goto invalid;
     state->valid = true;
@@ -139,6 +146,7 @@ int ds4_glm5_next_mla_append_plan(
     if (!mla || !tail_slot || !pool_index || !publish_pool || !mla->valid ||
         !mla->owner || !mla->compact_kv || !mla->index_pool ||
         !mla->index_pool_ids || !mla->index_pool_valid ||
+        !mla->index_valid_keys ||
         !mla->index_tail || !mla->pool_gate_tail ||
         mla->capacity_tokens == 0u || mla->capacity_pools == 0u ||
         mla->token_count >= mla->capacity_tokens || mla->first_valid != 0u ||
@@ -175,6 +183,7 @@ static int state_is_empty(const ds4_glm5_next_state *state) {
     for (uint32_t il = 0u; il < DS4_GLM5_NEXT_LAYER_COUNT; ++il) {
         if (state->mla[il].compact_kv || state->mla[il].index_pool ||
             state->mla[il].index_pool_ids || state->mla[il].index_pool_valid ||
+            state->mla[il].index_valid_keys ||
             state->mla[il].index_tail || state->mla[il].pool_gate_tail)
             return 0;
     }
@@ -239,6 +248,9 @@ int ds4_glm5_next_state_init(ds4_glm5_next_state *state,
         mla->index_pool_valid = ds4_gpu_tensor_alloc(
             (uint64_t)pool_capacity * sizeof(uint32_t));
         if (!mla->index_pool_valid) goto fail;
+        mla->index_valid_keys = ds4_gpu_tensor_alloc(
+            (uint64_t)context_capacity * sizeof(uint32_t));
+        if (!mla->index_valid_keys) goto fail;
         mla->index_tail = ds4_gpu_tensor_alloc(tail_bytes);
         if (!mla->index_tail) goto fail;
         mla->pool_gate_tail = ds4_gpu_tensor_alloc(tail_bytes);
