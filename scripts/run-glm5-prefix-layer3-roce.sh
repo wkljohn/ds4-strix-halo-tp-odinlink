@@ -84,6 +84,7 @@ MLA_ROUTED_PREFIX_ROWS=${DS4_GLM5_MLA_ROUTED_PREFIX_ROWS:-0}
 MLA_ROUTED_CONTINUATION_ROWS=${DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS:-1}
 ROCPROF_RANK=${DS4_GLM5_ROCPROF_RANK:-}
 BF16_TOKTILE_DISABLE=${DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE:-}
+BF16_LOWRANK128_TOKTILE_DISABLE=${DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE:-}
 BF16_TOKTILE_VERBOSE=${DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE:-}
 Q4K_WMMA_MIN_COUNT=${DS4_ROCM_Q4K_WMMA_MIN_COUNT:-}
 EXPECTED_GENERATED_FNV=${DS4_GLM5_EXPECT_GENERATED_FNV:-}
@@ -232,6 +233,11 @@ done
 }
 [[ -z $BF16_TOKTILE_DISABLE || $BF16_TOKTILE_DISABLE == 1 ]] || {
   echo "error: DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE must be empty or 1" >&2
+  exit 2
+}
+[[ -z $BF16_LOWRANK128_TOKTILE_DISABLE ||
+   $BF16_LOWRANK128_TOKTILE_DISABLE == 1 ]] || {
+  echo "error: DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE must be empty or 1" >&2
   exit 2
 }
 [[ -z $BF16_TOKTILE_VERBOSE || $BF16_TOKTILE_VERBOSE == 1 ]] || {
@@ -491,6 +497,9 @@ printf 'mla_routed_prefix_rows=%s\n' "$MLA_ROUTED_PREFIX_ROWS" >>"$OUT/run.env"
 printf 'mla_routed_continuation_rows=%s\n' "$MLA_ROUTED_CONTINUATION_ROWS" >>"$OUT/run.env"
 printf 'rocprof_rank=%s\n' "$ROCPROF_RANK" >>"$OUT/run.env"
 printf 'bf16_toktile_disabled=%s\n' "$([[ -n $BF16_TOKTILE_DISABLE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
+printf 'bf16_lowrank128_toktile_disabled=%s\n' \
+  "$([[ -n $BF16_LOWRANK128_TOKTILE_DISABLE ]] && printf 1 || printf 0)" \
+  >>"$OUT/run.env"
 printf 'bf16_toktile_verbose=%s\n' "$([[ -n $BF16_TOKTILE_VERBOSE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
 printf 'q4k_wmma_min_count=%s\n' "${Q4K_WMMA_MIN_COUNT:-default}" >>"$OUT/run.env"
 printf 'expected_generated_fnv=%s\n' "$EXPECTED_GENERATED_FNV" >>"$OUT/run.env"
@@ -534,6 +543,10 @@ fi
 if [[ -n $BF16_TOKTILE_DISABLE ]]; then
   local_candidate_env+=(DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE=1)
   remote_candidate_env+=' DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE=1'
+fi
+if [[ -n $BF16_LOWRANK128_TOKTILE_DISABLE ]]; then
+  local_candidate_env+=(DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE=1)
+  remote_candidate_env+=' DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE=1'
 fi
 if [[ -n $BF16_TOKTILE_VERBOSE ]]; then
   local_candidate_env+=(DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE=1)

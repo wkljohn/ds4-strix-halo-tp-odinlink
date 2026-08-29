@@ -8,6 +8,20 @@ static constexpr uint32_t kDs4Bf16ToktileWaves =
 static_assert(kDs4Bf16ToktileThreads % 32u == 0u,
               "BF16 token tile requires complete wave32 groups");
 
+static __device__ __forceinline__ float ds4_bf16_ordered_mul(float a,
+                                                              float b) {
+    float out;
+    asm("v_mul_f32 %0, %1, %2" : "=v"(out) : "v"(a), "v"(b));
+    return out;
+}
+
+static __device__ __forceinline__ float ds4_bf16_ordered_add(float a,
+                                                              float b) {
+    float out;
+    asm("v_add_f32 %0, %1, %2" : "=v"(out) : "v"(a), "v"(b));
+    return out;
+}
+
 template <uint32_t TokenTile>
 __global__ static void matmul_bf16_f32_toktile_w32_kernel(
         float *out,
@@ -47,5 +61,54 @@ __global__ static void matmul_bf16_f32_toktile_w32_kernel(
         for (uint32_t wv = 0u; wv < kDs4Bf16ToktileWaves; ++wv)
             value += wave_sums[threadIdx.x][wv];
         out[(uint64_t)(token_base + threadIdx.x) * out_dim + row] = value;
+    }
+}
+
+/* Exact-order GLM-5 KDA low-rank expansion. The scalar 256-thread kernel has
+ * only 128 active lanes for this shape. Its first effective reduction steps
+ * are (x[lane] + x[lane+64]) + (x[lane+32] + x[lane+96]), followed by the
+ * ordinary 32-lane tree. Preserve that order while sharing four BF16 weights
+ * across a tile of prompt rows. */
+template <uint32_t TokenTile>
+__global__ static void matmul_bf16_f32_lowrank128_toktile_w32_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t out_dim) {
+    static_assert(TokenTile >= 1u && TokenTile <= 32u,
+                  "low-rank BF16 token tile must fit one wave");
+    const uint32_t row = blockIdx.x;
+    const uint32_t token_base = blockIdx.y * TokenTile;
+    const uint32_t lane = threadIdx.x;
+    if (row >= out_dim || lane >= 32u) return;
+    const uint16_t *wr = w + (uint64_t)row * 128u;
+    const float w0 = __uint_as_float((uint32_t)wr[lane] << 16u);
+    const float w1 = __uint_as_float((uint32_t)wr[lane + 32u] << 16u);
+    const float w2 = __uint_as_float((uint32_t)wr[lane + 64u] << 16u);
+    const float w3 = __uint_as_float((uint32_t)wr[lane + 96u] << 16u);
+    float sums[TokenTile];
+#pragma unroll
+    for (uint32_t token = 0u; token < TokenTile; ++token) {
+        const float *xr = x + (uint64_t)(token_base + token) * 128u;
+        const float p0 = ds4_bf16_ordered_mul(w0, xr[lane]);
+        const float p1 = ds4_bf16_ordered_mul(w1, xr[lane + 32u]);
+        const float p2 = ds4_bf16_ordered_mul(w2, xr[lane + 64u]);
+        const float p3 = ds4_bf16_ordered_mul(w3, xr[lane + 96u]);
+        const float pair02 = ds4_bf16_ordered_add(p0, p2);
+        const float pair13 = ds4_bf16_ordered_add(p1, p3);
+        sums[token] = ds4_bf16_ordered_add(pair02, pair13);
+    }
+#pragma unroll
+    for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token)
+            sums[token] = ds4_bf16_ordered_add(
+                sums[token], __shfl_down(sums[token], offset, 32u));
+    }
+    if (lane == 0u) {
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token)
+            out[(uint64_t)(token_base + token) * out_dim + row] =
+                sums[token];
     }
 }

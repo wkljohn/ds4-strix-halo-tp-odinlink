@@ -119,6 +119,36 @@ void launch_segmented_tiled(float *out, const uint16_t *weight,
     if (first != tokens) fail("segmented tile decomposition");
 }
 
+void launch_lowrank128_tiled(float *out, const uint16_t *weight,
+                             const float *x, uint32_t out_dim,
+                             uint32_t tokens) {
+    uint32_t first = 0u;
+    const uint32_t chunks32 = tokens / 32u;
+    if (chunks32 > 0u) {
+        matmul_bf16_f32_lowrank128_toktile_w32_kernel<32u><<<
+            dim3(out_dim, chunks32), 32u>>>(out, weight, x, out_dim);
+        hip_ok(hipGetLastError(), "low-rank tile32 launch");
+        first = chunks32 * 32u;
+    }
+#define LAUNCH_LOWRANK_TAIL(T) do {                                      \
+        if ((tokens - first) >= (T)) {                                   \
+            matmul_bf16_f32_lowrank128_toktile_w32_kernel<(T)><<<        \
+                out_dim, 32u>>>(                                         \
+                out + (uint64_t)first * out_dim, weight,                 \
+                x + (uint64_t)first * 128u, out_dim);                    \
+            hip_ok(hipGetLastError(), "low-rank tail launch");          \
+            first += (T);                                                \
+        }                                                                \
+    } while (0)
+    LAUNCH_LOWRANK_TAIL(16u);
+    LAUNCH_LOWRANK_TAIL(8u);
+    LAUNCH_LOWRANK_TAIL(4u);
+    LAUNCH_LOWRANK_TAIL(2u);
+    LAUNCH_LOWRANK_TAIL(1u);
+#undef LAUNCH_LOWRANK_TAIL
+    if (first != tokens) fail("low-rank tile decomposition");
+}
+
 struct Error {
     double nrmse;
     double cosine;
@@ -178,7 +208,7 @@ void run_shape(hipblasHandle_t handle, const uint16_t *weight,
 
     float *d_x = nullptr, *d_reference = nullptr;
     float *d_blas = nullptr, *d_exact33 = nullptr;
-    float *d_segmented = nullptr;
+    float *d_segmented = nullptr, *d_lowrank = nullptr;
     uint16_t *d_x_bf16 = nullptr;
     hip_ok(hipMalloc(&d_x, x_count * sizeof(float)), "allocate F32 input");
     hip_ok(hipMalloc(&d_x_bf16, x_count * sizeof(uint16_t)),
@@ -191,6 +221,9 @@ void run_shape(hipblasHandle_t handle, const uint16_t *weight,
            "allocate exact33 output");
     hip_ok(hipMalloc(&d_segmented, out_count * sizeof(float)),
            "allocate segmented output");
+    if (in_dim == 128u)
+        hip_ok(hipMalloc(&d_lowrank, out_count * sizeof(float)),
+               "allocate low-rank output");
     hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
                      hipMemcpyHostToDevice), "copy input");
 
@@ -207,6 +240,9 @@ void run_shape(hipblasHandle_t handle, const uint16_t *weight,
     const auto segmented = [&] {
         launch_segmented_tiled(d_segmented, weight, d_x, in_dim,
                                out_dim, kTokens);
+    };
+    const auto lowrank = [&] {
+        launch_lowrank128_tiled(d_lowrank, weight, d_x, out_dim, kTokens);
     };
     const auto blas = [&] {
         f32_to_bf16_kernel<<<(x_count + 255u) / 256u, 256u>>>(
@@ -227,14 +263,17 @@ void run_shape(hipblasHandle_t handle, const uint16_t *weight,
     const float current_ms = time_ms(current);
     const float exact33_ms = time_ms(exact33);
     const float segmented_ms = time_ms(segmented);
+    const float lowrank_ms = in_dim == 128u ? time_ms(lowrank) : 0.0f;
     const float blas_ms = time_ms(blas);
     current();
     exact33();
     segmented();
+    if (in_dim == 128u) lowrank();
     blas();
     hip_ok(hipDeviceSynchronize(), "output synchronize");
     std::vector<float> reference(out_count), exact33_output(out_count);
     std::vector<float> segmented_output(out_count);
+    std::vector<float> lowrank_output;
     std::vector<float> blas_output(out_count);
     hip_ok(hipMemcpy(reference.data(), d_reference,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
@@ -245,11 +284,28 @@ void run_shape(hipblasHandle_t handle, const uint16_t *weight,
     hip_ok(hipMemcpy(segmented_output.data(), d_segmented,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
            "read segmented output");
+    if (in_dim == 128u) {
+        lowrank_output.resize(out_count);
+        hip_ok(hipMemcpy(lowrank_output.data(), d_lowrank,
+                         out_count * sizeof(float), hipMemcpyDeviceToHost),
+               "read low-rank output");
+    }
     hip_ok(hipMemcpy(blas_output.data(), d_blas,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
            "read hipBLAS output");
     const Error exact33_error = compare(reference, exact33_output);
     const Error segmented_error = compare(reference, segmented_output);
+    if (in_dim == 128u) {
+        const Error lowrank_error = compare(reference, lowrank_output);
+        if (std::memcmp(reference.data(), lowrank_output.data(),
+                        out_count * sizeof(float)) != 0)
+            fail("low-rank token tile must bit-match scalar reduction");
+        std::printf(
+            "  lowrank128_ms=%.4f speedup=%.3fx nrmse=%.9g "
+            "cosine=%.12g max_abs=%.9g bit_exact=1\n",
+            lowrank_ms, current_ms / lowrank_ms, lowrank_error.nrmse,
+            lowrank_error.cosine, lowrank_error.max_abs);
+    }
     const Error blas_error = compare(reference, blas_output);
     std::printf(
         "BF16 batch GEMM shape=%ux%ux%u residency=host-registered "
@@ -271,12 +327,54 @@ void run_shape(hipblasHandle_t handle, const uint16_t *weight,
         "  bf16_blas nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
         blas_error.nrmse, blas_error.cosine, blas_error.max_abs);
 
+    if (d_lowrank) hip_ok(hipFree(d_lowrank), "free low-rank output");
     hip_ok(hipFree(d_segmented), "free segmented output");
     hip_ok(hipFree(d_exact33), "free exact33 output");
     hip_ok(hipFree(d_blas), "free hipBLAS output");
     hip_ok(hipFree(d_reference), "free reference output");
     hip_ok(hipFree(d_x_bf16), "free BF16 input");
     hip_ok(hipFree(d_x), "free F32 input");
+}
+
+void run_lowrank128_tail_coverage(const uint16_t *weight, uint32_t tokens) {
+    constexpr uint32_t in_dim = 128u;
+    constexpr uint32_t out_dim = 8192u;
+    const uint64_t x_count = (uint64_t)tokens * in_dim;
+    const uint64_t out_count = (uint64_t)tokens * out_dim;
+    std::vector<float> x(x_count);
+    for (uint64_t i = 0u; i < x_count; ++i)
+        x[i] = 0.3f * std::cos((double)(i % 1877u) * 0.019) +
+               0.04f * std::sin((double)i * 0.005);
+    float *d_x = nullptr, *d_reference = nullptr, *d_candidate = nullptr;
+    hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
+           "allocate low-rank tail input");
+    hip_ok(hipMalloc(&d_reference, out_count * sizeof(float)),
+           "allocate low-rank tail reference");
+    hip_ok(hipMalloc(&d_candidate, out_count * sizeof(float)),
+           "allocate low-rank tail candidate");
+    hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
+                     hipMemcpyHostToDevice), "copy low-rank tail input");
+    current_bf16_f32_kernel<<<dim3(out_dim, tokens), kThreads>>>(
+        d_reference, weight, d_x, in_dim, out_dim, tokens);
+    hip_ok(hipGetLastError(), "low-rank tail reference launch");
+    launch_lowrank128_tiled(d_candidate, weight, d_x, out_dim, tokens);
+    hip_ok(hipDeviceSynchronize(), "low-rank tail synchronize");
+    std::vector<float> reference(out_count), candidate(out_count);
+    hip_ok(hipMemcpy(reference.data(), d_reference,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read low-rank tail reference");
+    hip_ok(hipMemcpy(candidate.data(), d_candidate,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read low-rank tail candidate");
+    if (std::memcmp(reference.data(), candidate.data(),
+                    out_count * sizeof(float)) != 0)
+        fail("low-rank binary-tail bit identity");
+    std::printf(
+        "BF16 low-rank token-tile tail tokens=%u decomposition=32+16+8+4+2+1 "
+        "bit_exact=1\n", tokens);
+    hip_ok(hipFree(d_candidate), "free low-rank tail candidate");
+    hip_ok(hipFree(d_reference), "free low-rank tail reference");
+    hip_ok(hipFree(d_x), "free low-rank tail input");
 }
 
 void run_tail_coverage(const uint16_t *weight, uint32_t tokens) {
@@ -347,8 +445,14 @@ int main() {
     hipblasHandle_t handle = nullptr;
     blas_ok(hipblasCreate(&handle), "create hipBLAS handle");
 
+    /* GLM-5.3 KDA f_b/g_b expand a 128-wide low-rank state into all 8192
+     * channels. This shape was intentionally below the original production
+     * token-tile gate, so keep it in the three-arm diagnostic before changing
+     * dispatch. */
+    run_shape(handle, device_weight, 128u, 8192u);
     run_shape(handle, device_weight, 4096u, 8192u);
     run_shape(handle, device_weight, 8192u, 4096u);
+    run_lowrank128_tail_coverage(device_weight, 63u);
     for (const uint32_t tokens : {16u, 17u, 31u, 47u, 64u})
         run_tail_coverage(device_weight, tokens);
 
