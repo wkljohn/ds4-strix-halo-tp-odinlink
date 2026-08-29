@@ -7028,15 +7028,16 @@ static DS4_MAYBE_UNUSED bool weights_model_map_sharded_spans(
 }
 
 /* GLM5.3 has a tensor-derived weight table rather than ds4_weights.  Build
- * the same resident-map contract for it: every replicated tensor is mapped,
- * while the three routed expert blobs are restricted to this rank's
- * contiguous expert range.  Do not use name or filename guesses for other
- * tensors; the GGUF dimensional contract identifies expert blobs. */
+ * the resident-map contract used by the ordinary executor.  Its TP split is
+ * over the intermediate rows of gate/up and over the K columns of down for
+ * every expert; it is not an expert-id split.  Keep down experts whole in the
+ * map because a row-major quantized matrix has strided K slices. */
 static bool glm5_next_model_map_sharded_spans(
         const ds4_model *m, int rank, ds4_model_map_span_vec *spans) {
     if (!m || !spans || (rank != 0 && rank != 1)) return false;
     memset(spans, 0, sizeof(*spans));
-    const uint64_t split = ds4_tp_expert_split_boundary();
+    enum { glm5_width = 4096, glm5_routed_mid = 2048,
+           glm5_rank_mid = 1024 };
     for (uint64_t i = 0u; i < m->n_tensors; ++i) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->ndim == 3u && t->dim[2] == DS4_N_EXPERT) {
@@ -7046,12 +7047,26 @@ static bool glm5_next_model_map_sharded_spans(
                 return false;
             }
             const uint64_t expert_bytes = out_dim * row_bytes;
-            const uint64_t first = rank == 1 ? split : 0u;
-            const uint64_t count = rank == 1 ? DS4_N_EXPERT - split : split;
-            const uint64_t lo = t->abs_offset + first * expert_bytes;
-            const uint64_t bytes = count * expert_bytes;
-            model_map_span_vec_append(spans, lo, lo + bytes, true);
-            if (bytes > spans->max_tensor_bytes) spans->max_tensor_bytes = bytes;
+            const bool down = t->dim[0] == glm5_routed_mid &&
+                              t->dim[1] == glm5_width;
+            if (down) {
+                const uint64_t bytes = (uint64_t)t->dim[2] * expert_bytes;
+                model_map_span_vec_append(spans, t->abs_offset,
+                                          t->abs_offset + bytes, true);
+                if (bytes > spans->max_tensor_bytes) spans->max_tensor_bytes = bytes;
+            } else if (t->dim[0] == glm5_width &&
+                       t->dim[1] == glm5_routed_mid) {
+                const uint64_t row_base = (uint64_t)rank * glm5_rank_mid;
+                const uint64_t bytes = (uint64_t)glm5_rank_mid * row_bytes;
+                for (uint64_t expert = 0u; expert < t->dim[2]; ++expert) {
+                    const uint64_t lo = t->abs_offset + expert * expert_bytes +
+                                        row_base * row_bytes;
+                    model_map_span_vec_append(spans, lo, lo + bytes, true);
+                }
+                if (bytes > spans->max_tensor_bytes) spans->max_tensor_bytes = bytes;
+            } else {
+                return false;
+            }
         } else {
             model_map_span_vec_include_one(spans, t);
         }
@@ -59608,7 +59623,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
         !e->ssd_streaming;
     const int tp_shard_rank = opt->tp.role == DS4_TP_WORKER ? 1 : 0;
     const uint32_t tp_expert_split = ds4_tp_expert_split_boundary();
-    if (tp_shard) ds4_gpu_tp_set_expert_split(tp_expert_split);
+    /* GLM5 ordinary TP shards intermediate rows/K-columns for every expert;
+     * it must not inherit the routed expert-id split used by DS4. */
+    if (tp_shard && DS4_MODEL_VARIANT != DS4_VARIANT_GLM53) {
+        ds4_gpu_tp_set_expert_split(tp_expert_split);
+    }
     g_tp_shard_model_bytes = 0;
     if (tp_shard && DS4_MODEL_VARIANT != DS4_VARIANT_GLM53) {
         ds4_model_map_span_vec shard_spans;
@@ -60730,7 +60749,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     /* Install the negotiated all-expert K-half before the first request.  This
      * keeps representation setup out of prefill timing and makes every prompt,
      * including a replacement prompt, use the same resident layout. */
-    if ((ds4_tp_runtime_features(tp) &
+    if (DS4_MODEL_VARIANT != DS4_VARIANT_GLM53 &&
+        (ds4_tp_runtime_features(tp) &
          DS4_TP_FEATURE_Q4K_KSHARD) != 0u &&
         !ds4_engine_activate_q4k_kshard(e, err, errlen)) {
         return 0;
