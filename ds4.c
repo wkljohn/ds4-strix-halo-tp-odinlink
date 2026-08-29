@@ -6486,6 +6486,10 @@ static void weights_bind(
         bool             optional_output) {
     memset(w, 0, sizeof(*w));
 
+    /* GLM5.3 uses ds4_glm5_next_weights, whose schedule distinguishes KDA
+     * and MLA layers. Never partially populate the legacy table. */
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) return;
+
     uint32_t executable_layers = DS4_N_LAYER;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
         DS4_N_LAYER > DS4_N_NEXTN_PREDICT) {
@@ -38744,6 +38748,9 @@ struct ds4_engine {
     ds4_model mtp_model;
     ds4_vocab vocab;
     ds4_weights weights;
+    /* GLM5.3 uses a KDA/MLA-aware table; legacy ds4_weights cannot represent
+     * its KDA layer 0. Unused by all other model variants. */
+    ds4_glm5_next_weights *glm5_next;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
     ds4_backend backend;
@@ -59335,6 +59342,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
+        e->glm5_next = xcalloc(1, sizeof(*e->glm5_next));
+        glm5_next_weights_bind(e->glm5_next, &e->model,
+                               DS4_GLM5_NEXT_LAYER_COUNT,
+                               DS4_GLM5_NEXT_TRUNK_COUNT,
+                               1u);
+    }
     if (load_slice && load_layer_end == UINT32_MAX) {
         const uint32_t normal_layers = ds4_model_normal_layer_count();
         if (normal_layers == 0) {
@@ -60678,6 +60692,8 @@ void ds4_engine_close(ds4_engine *e) {
 #endif
     ds4_expert_profile_close();
     weights_free(&e->weights);
+    free(e->glm5_next);
+    e->glm5_next = NULL;
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
     if (e->mtp_model.map) model_close(&e->mtp_model);
