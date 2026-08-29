@@ -4404,6 +4404,28 @@ static void tensor_expect_layout(
     }
 }
 
+/* Shape checks for quantized conversions with an explicitly bounded set of
+ * supported GGML types.  This stays separate from tensor_expect_layout so a
+ * new quantization cannot pass by accident. */
+static void tensor_expect_layout_types(
+        const ds4_tensor *t,
+        uint32_t          type_a,
+        uint32_t          type_b,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (t->type != type_a && t->type != type_b) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type %s, expected %s or %s\n",
+                (int)t->name.len, t->name.ptr, tensor_type_name(t->type),
+                tensor_type_name(type_a), tensor_type_name(type_b));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
+}
+
 /* GLM-5.3 has a different graph and therefore cannot use ds4_layer_weights,
  * whose fields encode the older GLM/DeepSeek attention schedule.  This small
  * reference-only table reuses the normal GGUF name lookup and mmap-backed
@@ -6253,12 +6275,14 @@ static void config_validate_glm5_next_model(const ds4_model *m,
      * different KDA/MLA schedule and must never see this model. */
     ds4_glm5_next_weights bound = {0};
     glm5_next_weights_bind(&bound, m, layers, trunk_layers, nextn);
-    tensor_expect_layout(bound.token_embd,
-                         DS4_TENSOR_BF16, 2, 4096, 154880, 0);
+    tensor_expect_layout_types(bound.token_embd,
+                               DS4_TENSOR_BF16, DS4_TENSOR_Q8_0,
+                               2, 4096, 154880, 0);
     tensor_expect_layout(bound.output_norm,
                          DS4_TENSOR_F32, 1, 4096, 0, 0);
-    tensor_expect_layout(bound.output,
-                         DS4_TENSOR_BF16, 2, 4096, 154880, 0);
+    tensor_expect_layout_types(bound.output,
+                               DS4_TENSOR_BF16, DS4_TENSOR_Q8_0,
+                               2, 4096, 154880, 0);
     tensor_expect_layout(bound.nextn_eh_proj,
                          DS4_TENSOR_BF16, 2, 8192, 4096, 0);
     for (uint32_t il = 0; il < layers; ++il) {
@@ -6283,18 +6307,18 @@ static void config_validate_glm5_next_model(const ds4_model *m,
             tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.k_norm.weight", il), DS4_TENSOR_F32, 1, 128, 0, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.indexer.k_norm.bias", il), DS4_TENSOR_F32, 1, 128, 0, 0);
         } else {
-            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_q.weight", il), DS4_TENSOR_BF16, 2, 4096, 8192, 0);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_k.weight", il), DS4_TENSOR_BF16, 2, 4096, 8192, 0);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_v.weight", il), DS4_TENSOR_BF16, 2, 4096, 8192, 0);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_output.weight", il), DS4_TENSOR_BF16, 2, 8192, 4096, 0);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_q.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q4_K, 2, 4096, 8192, 0);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_k.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q4_K, 2, 4096, 8192, 0);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_v.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q8_0, 2, 4096, 8192, 0);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_output.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q8_0, 2, 8192, 4096, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.kda_q_conv.weight", il), DS4_TENSOR_F32, 3, 4, 1, 8192);
             tensor_expect_layout(required_tensorf(m, "blk.%u.kda_k_conv.weight", il), DS4_TENSOR_F32, 3, 4, 1, 8192);
             tensor_expect_layout(required_tensorf(m, "blk.%u.kda_v_conv.weight", il), DS4_TENSOR_F32, 3, 4, 1, 8192);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_f_a.weight", il), DS4_TENSOR_BF16, 2, 4096, 128, 0);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_f_b.weight", il), DS4_TENSOR_BF16, 2, 128, 8192, 0);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_g_a.weight", il), DS4_TENSOR_BF16, 2, 4096, 128, 0);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_g_b.weight", il), DS4_TENSOR_BF16, 2, 128, 8192, 0);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.kda_beta.weight", il), DS4_TENSOR_BF16, 2, 4096, 64, 0);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_f_a.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q8_0, 2, 4096, 128, 0);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_f_b.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q8_0, 2, 128, 8192, 0);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_g_a.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q8_0, 2, 4096, 128, 0);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_g_b.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q8_0, 2, 128, 8192, 0);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.kda_beta.weight", il), DS4_TENSOR_BF16, DS4_TENSOR_Q8_0, 2, 4096, 64, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.kda_o_norm.weight", il), DS4_TENSOR_F32, 1, 128, 0, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.kda_dt_bias.weight", il), DS4_TENSOR_F32, 1, 8192, 0, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.kda_a_log.weight", il), DS4_TENSOR_F32, 1, 64, 0, 0);
@@ -6304,9 +6328,9 @@ static void config_validate_glm5_next_model(const ds4_model *m,
             tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_up.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 12288, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_down.weight", il), DS4_TENSOR_Q8_0, 2, 12288, 4096, 0);
         } else {
-            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il), DS4_TENSOR_Q4_K, 3, 4096, 2048, 288);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_up_exps.weight", il), DS4_TENSOR_Q4_K, 3, 4096, 2048, 288);
-            tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_down_exps.weight", il), DS4_TENSOR_Q4_K, 3, 2048, 4096, 288);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il), DS4_TENSOR_Q4_K, DS4_TENSOR_IQ2_XXS, 3, 4096, 2048, 288);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.ffn_up_exps.weight", il), DS4_TENSOR_Q4_K, DS4_TENSOR_IQ2_XXS, 3, 4096, 2048, 288);
+            tensor_expect_layout_types(required_tensorf(m, "blk.%u.ffn_down_exps.weight", il), DS4_TENSOR_Q4_K, DS4_TENSOR_Q2_K, 3, 2048, 4096, 288);
             tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il), DS4_TENSOR_F32, 2, 4096, 288, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.exp_probs_b.bias", il), DS4_TENSOR_F32, 1, 288, 0, 0);
             tensor_expect_layout(required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il), DS4_TENSOR_Q8_0, 2, 4096, 2048, 0);
@@ -6325,6 +6349,19 @@ static void config_validate_glm5_next_model(const ds4_model *m,
     if (!bound.schedule_valid || bound.layer_count != layers ||
         bound.kda_count == 0u) {
         ds4_die("glm5-next tensor-derived attention schedule was not validated");
+    }
+    const ds4_tensor *routed_gate =
+        bound.layer[DS4_GLM5_NEXT_LEADING_DENSE].ffn_gate_exps;
+    const ds4_tensor *routed_down =
+        bound.layer[DS4_GLM5_NEXT_LEADING_DENSE].ffn_down_exps;
+    const bool mixed_q2 = routed_gate && routed_down &&
+        routed_gate->type == DS4_TENSOR_IQ2_XXS &&
+        routed_down->type == DS4_TENSOR_Q2_K;
+    /* The staged executor currently calls Q4_K packed-slice entry points.
+     * Never reinterpret 66/84-byte blocks as Q4_K merely because structural
+     * metadata passed. Type-aware strides/sharding must land first. */
+    if (require_executable_engine && mixed_q2) {
+        ds4_die("glm5-next mixed IQ2_XXS/Q2_K runtime dispatch is not yet wired; refusing inference");
     }
     /* GLM5.3 ordinary-engine wiring is still being validated against the
      * staged TP executor. Keep the production default fail-closed; an
