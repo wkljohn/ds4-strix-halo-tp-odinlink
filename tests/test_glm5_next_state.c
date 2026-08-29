@@ -158,7 +158,7 @@ static int test_lifecycle(void) {
     CHECK(state.valid && state.kda.valid && state.layer_count == 45u &&
           state.mla_count == 11u && state.context_capacity == 8u,
           "complete state starts valid");
-    CHECK(alloc_calls == 213 && fill_calls == 136,
+    CHECK(alloc_calls == 213 && fill_calls == 147,
           "34 KDA and 11 four-buffer compact MLA states allocated once");
     CHECK(state.mla[3].valid && state.mla[3].owner == &state &&
           state.mla[3].capacity_tokens == 8u &&
@@ -223,7 +223,7 @@ static int test_lifecycle(void) {
           state.mla[3].token_count == 0u &&
           state.mla[3].complete_pools == 0u &&
           state.mla[3].tail_count == 0u &&
-          state.mla[3].first_valid == 0u && fill_calls == 408,
+          state.mla[3].first_valid == 0u && fill_calls == 419,
           "mixed state resets atomically");
     state.mla[3].owner = NULL;
     CHECK(!ds4_glm5_next_state_reset(&state) && !state.valid,

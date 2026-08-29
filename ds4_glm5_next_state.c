@@ -251,6 +251,11 @@ int ds4_glm5_next_state_init(ds4_glm5_next_state *state,
         mla->index_valid_keys = ds4_gpu_tensor_alloc(
             (uint64_t)context_capacity * sizeof(uint32_t));
         if (!mla->index_valid_keys) goto fail;
+        /* The selector treats valid_keys as a u32 nonzero mask.  The generic
+         * tensor fill writes the same nonzero bit pattern for every row and
+         * avoids a host readback or a second persistent allocation. */
+        if (!ds4_gpu_tensor_fill_f32(
+                mla->index_valid_keys, 1.0f, context_capacity)) goto fail;
         mla->index_tail = ds4_gpu_tensor_alloc(tail_bytes);
         if (!mla->index_tail) goto fail;
         mla->pool_gate_tail = ds4_gpu_tensor_alloc(tail_bytes);
