@@ -59570,7 +59570,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     const uint32_t tp_expert_split = ds4_tp_expert_split_boundary();
     if (tp_shard) ds4_gpu_tp_set_expert_split(tp_expert_split);
     g_tp_shard_model_bytes = 0;
-    if (tp_shard) {
+    if (tp_shard && DS4_MODEL_VARIANT != DS4_VARIANT_GLM53) {
         ds4_model_map_span_vec shard_spans;
         if (weights_model_map_sharded_spans(&e->weights, &e->model,
                                             tp_shard_rank, &shard_spans)) {
@@ -59626,10 +59626,15 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
         bool glm_backend_supported = ds4_backend_uses_graph(e->backend);
 #ifdef DS4_ROCM_BUILD
+        /* GLM5.3 TP keeps compact resident Q4_K weights split across the two
+         * nodes.  The older GLM5.2 single-node graph needs SSD streaming, but
+         * applying that guard to GLM5.3 made TP impossible: its routed TP
+         * executor rejects streaming by design. */
         const bool rocm_full_model_requires_streaming =
             e->backend == DS4_BACKEND_CUDA &&
             !e->ssd_streaming &&
-            !load_slice;
+            !load_slice &&
+            DS4_MODEL_VARIANT != DS4_VARIANT_GLM53;
         if (rocm_full_model_requires_streaming) {
             glm_backend_supported = false;
         }
@@ -59660,7 +59665,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (opt->context_size > 0) {
             uint32_t guard_ctx = 0;
             if (!glm_graph_context_request(opt->context_size, &guard_ctx) ||
-                !(load_slice ?
+                (!((DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) &&
+                   opt->tp.role != DS4_TP_NONE && !e->ssd_streaming) &&
+                 (load_slice ?
                     glm_graph_memory_guard_slice(&e->model,
                                                  &e->weights,
                                                  e->ssd_streaming,
@@ -59675,7 +59682,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     glm_graph_memory_guard(&e->model,
                                            &e->weights,
                                            e->ssd_streaming,
-                                           guard_ctx))) {
+                                           guard_ctx)))) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -60153,6 +60160,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         load_span_count,
                                                         spans.max_tensor_bytes);
             free(spans.v);
+        } else if (tp_shard && DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
+            /* GLM5.3 has its own tensor-derived binding table; the legacy
+             * ds4_weights shard-span builder cannot describe KDA layer 0 or
+             * the mixed expert tensor names.  Keep the mmap complete and let
+             * the staged executor touch only rank-owned expert ranges.  This
+             * is virtual/lazy mapping, not a second resident weight copy. */
+            e->startup_model_span_bytes = e->model.size / 2u;
+            model_map_ok = ds4_gpu_set_model_map(e->model.map, e->model.size);
         } else if (tp_shard) {
             ds4_model_map_span_vec spans;
             if (!weights_model_map_sharded_spans(&e->weights, &e->model,
@@ -60210,9 +60225,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (tp_shard) {
+        if (tp_shard && DS4_MODEL_VARIANT != DS4_VARIANT_GLM53) {
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
+        } else if (tp_shard && DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
+            fprintf(stderr,
+                    "ds4: GLM5.3 TP leaves the mapped GGUF lazy; "
+                    "full weight warming is disabled\n");
         }
         const bool support_model_runtime_ready =
             e->mtp_ready ||
