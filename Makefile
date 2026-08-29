@@ -475,6 +475,15 @@ test-glm5-kda-tp-digest: tests/test_glm5_kda_tp_digest
 	./tests/test_glm5_kda_tp_digest
 
 .PHONY: test-glm5-next-runtime-refusal test-glm5-resident-kda
+tests/test_glm5_next_real_offset_hash: tests/test_glm5_next_real_offset_hash.cpp tests/glm5_next_real_offsets.hpp tests/glm5_gguf_test.hpp ds4_glm5_next_runtime.h ds4_glm5_kda.h
+	$(CXX) $(CXXFLAGS) -I. -o $@ $< ds4_glm5_next_runtime.c
+
+test-glm5-next-real-offset-hash: tests/test_glm5_next_real_offset_hash
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 2; }
+	@expected=7cea648ebfd0d89c; actual=$$(./tests/test_glm5_next_real_offset_hash "$(DS4_GLM5_MODEL)"); \
+	 test "$$actual" = "$$expected" || { echo "FAIL GLM5 offset parity expected=$$expected actual=$$actual" >&2; exit 1; }; \
+	 echo "PASS GLM5 independent offset parity $$actual"
+
 test-glm5-next-runtime-refusal:
 	@test -x ./ds4 || { echo "error: build the intended backend before this gate" >&2; exit 2; }
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
