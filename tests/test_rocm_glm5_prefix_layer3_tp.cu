@@ -92,6 +92,48 @@ struct VectorError {
     double max_abs = 0.0;
 };
 
+static bool install_mixed_q2_owned_spans(const Glm5TestGGUF &gguf,
+                                         uint32_t rank) {
+    struct Span { uint64_t off, bytes; };
+    std::vector<std::pair<uint64_t, std::string>> order;
+    order.reserve(gguf.tensors.size());
+    for (const auto &item : gguf.tensors)
+        order.emplace_back(gguf.data_start + item.second.relative_offset,
+                           item.first);
+    std::sort(order.begin(), order.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    std::vector<Span> spans;
+    spans.reserve(order.size() + 3u * 46u);
+    uint64_t max_tensor = 0u;
+    for (size_t i = 0; i < order.size(); ++i) {
+        const uint64_t off = order[i].first;
+        const uint64_t end = i + 1u < order.size() ? order[i + 1u].first : gguf.size;
+        if (end <= off || end > gguf.size) return false;
+        const auto &info = gguf.tensors.at(order[i].second);
+        const bool expert = info.dims.size() == 3u && info.dims[2] == 288u &&
+            (order[i].second.find(".ffn_gate_exps.weight") != std::string::npos ||
+             order[i].second.find(".ffn_up_exps.weight") != std::string::npos ||
+             order[i].second.find(".ffn_down_exps.weight") != std::string::npos);
+        uint64_t span_off = off, span_bytes = end - off;
+        if (expert) {
+            if (span_bytes % 288u != 0u) return false;
+            const uint64_t one = span_bytes / 288u;
+            span_off += (uint64_t)(rank ? 144u : 0u) * one;
+            span_bytes = 144u * one;
+        }
+        spans.push_back({span_off, span_bytes});
+        max_tensor = std::max(max_tensor, span_bytes);
+    }
+    std::vector<uint64_t> offsets, sizes;
+    offsets.reserve(spans.size()); sizes.reserve(spans.size());
+    for (const Span &span : spans) {
+        offsets.push_back(span.off); sizes.push_back(span.bytes);
+    }
+    return ds4_gpu_set_model_map_spans(gguf.map, gguf.size, offsets.data(),
+                                       sizes.data(), (uint32_t)offsets.size(),
+                                       max_tensor) != 0;
+}
+
 VectorError vector_error_data(const float *reference, const float *candidate,
                               size_t count) {
     VectorError result;
@@ -164,12 +206,18 @@ struct TpGuard {
     ds4_gpu_tensor *big_out = nullptr;
     ds4_gpu_tensor *big_in = nullptr;
     ~TpGuard() {
+        ds4_gpu_tp_shutdown();
         ds4_gpu_tensor_free(big_in);
         ds4_gpu_tensor_free(big_out);
         if (tp) ds4_tp_free(tp);
         ds4_gpu_tensor_free(slab);
     }
 };
+
+static int test_gpu_tp_exchange(void *ud, uint32_t layer, uint32_t gate,
+                                uint64_t seq) {
+    return ds4_tp_gate_exchange(static_cast<ds4_tp *>(ud), layer, gate, seq);
+}
 
 bool create_tp(const Glm5TestGGUF &gguf, bool leader,
                const char *host, const char *device, int port,
@@ -259,6 +307,18 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
               guard.tp, ds4_gpu_tensor_contents(guard.big_out),
               ds4_gpu_tensor_contents(guard.big_in), direct_bytes),
           "GLM5 layer3 uses direct registered big-gate rows");
+
+    /* The staged harness uses the same ROCm TP globals as production.  Keep
+     * expert ownership enabled when the resident experiment requests it;
+     * otherwise both ranks compute every routed expert and the rank-equal
+     * token check cannot detect duplicated routed FFN work. */
+    if (std::getenv("DS4_GLM5_NEXT_RESIDENT_EXPERTS")) {
+        ds4_gpu_tp_set_expert_split(144u);
+    }
+    CHECK(ds4_gpu_tp_init(leader ? 0u : 1u, guard.slab,
+                          ds4_tp_slab_gpu_flags_offset(guard.tp),
+                          test_gpu_tp_exchange, guard.tp),
+          "initialize ROCm TP runtime for mixed-Q2 ownership");
 
     exec.tp = guard.tp;
     exec.tp_rank = leader ? 0u : 1u;
@@ -784,7 +844,11 @@ bool run() {
     config.device_indices[0] = 0u;
     CHECK(ds4_gpu_init_multi(&config) &&
           ds4_gpu_set_model_fd_for_map(gguf.fd, gguf.map) &&
-          (full_trunk || ds4_gpu_set_model_map(gguf.map, gguf.size)),
+          ((!full_trunk && ds4_gpu_set_model_map(gguf.map, gguf.size)) ||
+           (full_trunk && mixed_q2_model &&
+            std::getenv("DS4_GLM5_NEXT_RESIDENT_EXPERTS") &&
+            install_mixed_q2_owned_spans(gguf, leader ? 0u : 1u)) ||
+           (full_trunk && !mixed_q2_model)),
           "initialize gfx1151 without broad full-trunk mmap registration");
 
     StateGuard state;
@@ -832,6 +896,10 @@ bool run() {
                     context_capacity,
                     tp, exec, sequence),
           "create persistent GLM5 layer3 RoCE transport");
+    if (mixed_q2_model && std::getenv("DS4_GLM5_NEXT_RESIDENT_EXPERTS")) {
+        CHECK(ds4_gpu_tp_expert_shard_active(),
+              "mixed-Q2 resident mode enables expert sharding");
+    }
     const bool kda_tp_enabled =
         (ds4_tp_runtime_features(tp.tp) &
          DS4_TP_FEATURE_GLM5_KDA_TP) != 0u;
@@ -963,7 +1031,7 @@ bool run() {
             (unsigned long long)ds4_gpu_q4k_packed_slice_bytes());
         std::fprintf(stderr,
             "GLM5 full-trunk post-install rank=%u hip_free=%llu "
-            "hip_total=%llu installed_delta=%llu\n",
+            "hip_total=%llu post_budget_sample_delta=%llu\n",
             exec.tp_rank, (unsigned long long)free_after_install,
             (unsigned long long)total_after_install,
             (unsigned long long)(free_before_install - free_after_install));
