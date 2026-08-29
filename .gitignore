@@ -80,6 +80,10 @@
 /tests/roce_v2_mr_probe
 *.o
 tests/test_glm5_next_real_offset_hash
+tests/test_glm5_kda_binding
+tests/test_glm5_kda_tp_digest
+tests/test_glm5_next_state
+tests/test_glm5_next_text_codec
 *.dSYM/
 /build/
 /build-*/
