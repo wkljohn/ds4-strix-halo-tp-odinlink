@@ -18,14 +18,28 @@ done
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 MODEL_SIZE=$(stat -c %s "$LOCAL_MODEL")
 if ! PEER_INFO=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$PEER" \
-    "test -f '$PEER_MODEL' && sha256sum '$PEER_MODEL' && stat -c '%s' '$PEER_MODEL' && df -Pk --output=avail '$PEER_MODEL' | tail -1"); then
+    "test -f '$PEER_MODEL' && stat -c '%s' '$PEER_MODEL' && df -Pk '$PEER_MODEL' | awk 'NR==2 {print \$4}'"); then
     echo "error: peer model is missing or cannot be inspected" >&2
     exit 1
 fi
-PEER_SHA=$(printf '%s\n' "$PEER_INFO" | sed -n '1p' | awk '{print $1}')
-PEER_SIZE=$(printf '%s\n' "$PEER_INFO" | sed -n '2p')
-PEER_FREE_KIB=$(printf '%s\n' "$PEER_INFO" | sed -n '3p' | tr -d ' ')
-MODEL_SHA=$(sha256sum "$LOCAL_MODEL" | awk '{print $1}')
+PEER_SIZE=$(printf '%s\n' "$PEER_INFO" | sed -n '1p')
+PEER_FREE_KIB=$(printf '%s\n' "$PEER_INFO" | sed -n '2p' | tr -d ' ')
+[[ $MODEL_SIZE == "$PEER_SIZE" ]] || {
+    echo "error: model size mismatch between ranks" >&2
+    exit 1
+}
+# Hash both independent filesystems concurrently; sequential hashing adds
+# several unnecessary minutes on 90-GiB artifacts.
+HASH_DIR=$(mktemp -d)
+trap 'rm -f "$HASH_DIR/local" "$HASH_DIR/peer"; rmdir "$HASH_DIR"' EXIT
+sha256sum "$LOCAL_MODEL" >"$HASH_DIR/local" &
+LOCAL_HASH_PID=$!
+ssh -o BatchMode=yes "$PEER" "sha256sum '$PEER_MODEL'" >"$HASH_DIR/peer" &
+PEER_HASH_PID=$!
+wait "$LOCAL_HASH_PID"
+wait "$PEER_HASH_PID"
+MODEL_SHA=$(awk '{print $1}' "$HASH_DIR/local")
+PEER_SHA=$(awk '{print $1}' "$HASH_DIR/peer")
 [[ $MODEL_SIZE == "$PEER_SIZE" && $MODEL_SHA == "$PEER_SHA" ]] || {
     echo "error: model size/hash mismatch between ranks" >&2
     printf 'local size=%s sha=%s\npeer  size=%s sha=%s\n' \
@@ -51,7 +65,7 @@ ssh -o BatchMode=yes "$PEER" \
     echo "error: peer $PEER_DEV GID $GID_INDEX is not RoCE v2" >&2; exit 1;
 }
 
-LOCAL_FREE_KIB=$(df -Pk --output=avail "$LOCAL_MODEL" | tail -1 | tr -d ' ')
+LOCAL_FREE_KIB=$(df -Pk "$LOCAL_MODEL" | awk 'NR==2 {print $4}')
 [[ $LOCAL_FREE_KIB =~ ^[0-9]+$ && $PEER_FREE_KIB =~ ^[0-9]+$ ]] || {
     echo "error: could not read free-space figures" >&2; exit 1;
 }
