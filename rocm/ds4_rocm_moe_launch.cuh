@@ -721,6 +721,21 @@ static int routed_moe_decode_profile_collect(
  * re-quantizing mid to Q8_K and taking the older qwarp down path.  This keeps
  * the CyberNeurova all-Q2 path untouched while giving the standard IQ2 mix the
  * same fast Q2 down projection used by q2k_path. */
+#ifdef DS4_TP_TEST_HOOKS
+static thread_local ds4_gpu_test_glm5_q2_dispatch g_test_glm5_q2_dispatch;
+
+extern "C" void ds4_gpu_test_reset_glm5_q2_dispatch(void) {
+    memset(&g_test_glm5_q2_dispatch, 0, sizeof(g_test_glm5_q2_dispatch));
+}
+
+extern "C" int ds4_gpu_test_get_glm5_q2_dispatch(
+        ds4_gpu_test_glm5_q2_dispatch *dispatch) {
+    if (!dispatch) return 0;
+    *dispatch = g_test_glm5_q2_dispatch;
+    return 1;
+}
+#endif
+
 static int routed_moe_q2_float_down_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *down,
@@ -761,7 +776,12 @@ static int routed_moe_q2_float_down_launch(
     const uint32_t down_rpb = 16u;
     const uint32_t down_threads = down_rpb * 32u;
     const size_t down_shmem = (size_t)down_tile * 256u * sizeof(float);
-    const int use_f16_down = (out_dim & 1u) == 0u;
+    int use_f16_down = (out_dim & 1u) == 0u;
+#ifdef DS4_TP_TEST_HOOKS
+    /* Oracle-only discriminator for WMMA accumulation versus the final F16
+     * store. Production objects do not compile this environment switch. */
+    if (getenv("DS4_ROCM_TEST_Q2_DOWN_F32") != NULL) use_f16_down = 0;
+#endif
     half *down_h = use_f16_down ? (half *)down->ptr : NULL;
 
     uint32_t hot_count = 0u;
@@ -785,6 +805,13 @@ static int routed_moe_q2_float_down_launch(
             }
         }
     }
+
+#ifdef DS4_TP_TEST_HOOKS
+    g_test_glm5_q2_dispatch.use_f16_down = use_f16_down ? 1u : 0u;
+    g_test_glm5_q2_dispatch.use_wmma_hot =
+        use_wmma_hot && hot_count != 0u ? 1u : 0u;
+    g_test_glm5_q2_dispatch.hot_count = hot_count;
+#endif
 
     const uint32_t scalar_max = hot_count != 0u ? hot_threshold : 0u;
     const dim3 down_grid((out_dim + down_rpb - 1u) / down_rpb, n_total_expert, 1u);
@@ -2565,6 +2592,17 @@ static int routed_moe_launch(
             n_expert <= DS4_ROCM_N_EXPERT_USED &&
             !force_iq2_q2_q8_mid_down &&
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts;
+#ifdef DS4_TP_TEST_HOOKS
+        if (iq2_path) {
+            g_test_glm5_q2_dispatch.n_tokens = n_tokens;
+            g_test_glm5_q2_dispatch.n_expert = n_expert;
+            g_test_glm5_q2_dispatch.use_sorted_pairs = use_sorted_pairs;
+            g_test_glm5_q2_dispatch.requested_q8_mid =
+                force_iq2_q2_q8_mid_down;
+            g_test_glm5_q2_dispatch.use_float_down =
+                use_iq2_q2_float_down;
+        }
+#endif
         if (ok && !use_iq2_q2_float_down) {
             dim3 midq_grid(midq_blocks, pair_count, 1);
             q8_K_quantize_kernel<<<midq_grid, 256>>>(

@@ -61,6 +61,7 @@
 /tests/test_rocm_glm5_prefix_layer3_tp
 /tests/test_rocm_glm5_kda_layer
 /tests/test_rocm_glm5_kda_bf16_rowslice
+/tests/test_rocm_glm5_q2_expert_oracle
 /tests/test_rocm_bf16_decode_mlp
 /tests/test_glm5_next_runtime_offsets
 /tests/test_rocm_bf16_batch_gemm

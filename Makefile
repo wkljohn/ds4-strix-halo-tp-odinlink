@@ -1046,13 +1046,15 @@ tests/test_rocm_q4k_one_token_oracle: tests/test_rocm_q4k_one_token_oracle.o ds4
 test-rocm-q4k-one-token-oracle: tests/test_rocm_q4k_one_token_oracle
 	./tests/test_rocm_q4k_one_token_oracle
 
-# Independent same-GGUF GLM-5.3 Q2_K one-expert gate.  The model and the
-# pinned llama.cpp ggml-base oracle are supplied at run time; no cache or TP
-# inference is started by this target.
+# Independent same-GGUF GLM-5.3 mixed-Q2 component gate. The model and pinned
+# llama.cpp ggml-base oracle are supplied at run time; no TP inference starts.
 tests/test_rocm_glm5_q2_expert_oracle.o: tests/test_rocm_glm5_q2_expert_oracle.cu ds4_gpu.h tests/glm5_gguf_test.hpp
-	$(HIPCC) $(ROCM_CFLAGS) -I. -c -o $@ $<
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_rocm_glm5_q2_expert_oracle: tests/test_rocm_glm5_q2_expert_oracle.o ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o
+tests/ds4_rocm_glm5_q2_oracle.o: ds4_rocm.cu ds4_gpu.h $(ROCM_SRCS)
+	$(HIPCC) $(ROCM_CFLAGS) -DDS4_TP_TEST_HOOKS -c -o $@ $<
+
+tests/test_rocm_glm5_q2_expert_oracle: tests/test_rocm_glm5_q2_expert_oracle.o tests/ds4_rocm_glm5_q2_oracle.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS) -ldl
 
 test-rocm-glm5-q2-expert-oracle: tests/test_rocm_glm5_q2_expert_oracle

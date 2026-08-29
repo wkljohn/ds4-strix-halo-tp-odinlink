@@ -3089,6 +3089,24 @@ int ds4_gpu_routed_moe_batch_tensor(
         bool                   *mid_is_f16,
         bool                    force_resident);
 
+#ifdef DS4_TP_TEST_HOOKS
+typedef struct {
+    uint32_t n_tokens;
+    uint32_t n_expert;
+    uint32_t use_sorted_pairs;
+    uint32_t requested_q8_mid;
+    uint32_t use_float_down;
+    uint32_t use_f16_down;
+    uint32_t use_wmma_hot;
+    uint32_t hot_count;
+} ds4_gpu_test_glm5_q2_dispatch;
+
+/* Test-only observation of mixed IQ2_XXS/Q2_K routed-MoE dispatch. */
+void ds4_gpu_test_reset_glm5_q2_dispatch(void);
+int ds4_gpu_test_get_glm5_q2_dispatch(
+        ds4_gpu_test_glm5_q2_dispatch *dispatch);
+#endif
+
 /* =========================================================================
  * Hyper-Connection Kernels.
  * =========================================================================
