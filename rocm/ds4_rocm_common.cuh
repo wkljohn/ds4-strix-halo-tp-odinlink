@@ -263,6 +263,48 @@ __global__ static void matmul_bf16_f32_sharedx_warp_rows_w32_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+/* Exact-order gfx1151 decode matvec.  Each lane retains the original
+ * lane,lane+32,... accumulation sequence, but batches 64 independent weight
+ * and LDS loads before consuming them.  This raises memory-level parallelism
+ * without adding another accumulator or changing the wave reduction tree. */
+__global__ static void matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t in_dim,
+        uint64_t out_dim) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const uint16_t *wr = w + row * (uint64_t)in_dim;
+    float acc = 0.0f;
+    uint32_t i = lane;
+    for (; i + 63u * 32u < in_dim; i += 64u * 32u) {
+        uint16_t packed_w[64];
+        float packed_x[64];
+#pragma unroll
+        for (uint32_t u = 0u; u < 64u; ++u) {
+            const uint32_t index = i + u * 32u;
+            packed_w[u] = wr[index];
+            packed_x[u] = shx[index];
+        }
+#pragma unroll
+        for (uint32_t u = 0u; u < 64u; ++u)
+            acc += __uint_as_float((uint32_t)packed_w[u] << 16) * packed_x[u];
+    }
+    for (; i < in_dim; i += 32u)
+        acc += __uint_as_float((uint32_t)wr[i] << 16) * shx[i];
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
 __global__ static void matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel(
         float *out0,
         float *out1,

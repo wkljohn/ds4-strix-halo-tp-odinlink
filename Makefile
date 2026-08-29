@@ -1171,6 +1171,13 @@ tests/test_rocm_glm5_kda_bf16_rowslice: tests/test_rocm_glm5_kda_bf16_rowslice.o
 test-rocm-glm5-kda-bf16-rowslice: tests/test_rocm_glm5_kda_bf16_rowslice
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_kda_bf16_rowslice
 
+.PHONY: test-rocm-bf16-decode-mlp
+tests/test_rocm_bf16_decode_mlp: tests/test_rocm_bf16_decode_mlp.cu tests/glm5_gguf_test.hpp
+	$(HIPCC) $(ROCM_CFLAGS) -I. -o $@ $<
+
+test-rocm-bf16-decode-mlp: tests/test_rocm_bf16_decode_mlp
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_bf16_decode_mlp
+
 tests/test_rocm_attention_q_b_fused.o: tests/test_rocm_attention_q_b_fused.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 

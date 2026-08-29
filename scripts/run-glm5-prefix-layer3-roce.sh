@@ -86,6 +86,7 @@ ROCPROF_RANK=${DS4_GLM5_ROCPROF_RANK:-}
 BF16_TOKTILE_DISABLE=${DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE:-}
 BF16_LOWRANK128_TOKTILE_DISABLE=${DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE:-}
 BF16_TAIL25_DISABLE=${DS4_ROCM_DISABLE_BF16_TAIL25_FUSION:-}
+BF16_DECODE_MLP64_DISABLE=${DS4_ROCM_DISABLE_BF16_DECODE_MLP64:-}
 BF16_TOKTILE_VERBOSE=${DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE:-}
 Q4K_WMMA_MIN_COUNT=${DS4_ROCM_Q4K_WMMA_MIN_COUNT:-}
 BIGGATE_PROFILE=${DS4_TP_BIGGATE_PROFILE:-}
@@ -527,6 +528,9 @@ printf 'bf16_lowrank128_toktile_disabled=%s\n' \
 printf 'bf16_tail25_disabled=%s\n' \
   "$([[ -n $BF16_TAIL25_DISABLE ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
+printf 'bf16_decode_mlp64_disabled=%s\n' \
+  "$([[ -n $BF16_DECODE_MLP64_DISABLE ]] && printf 1 || printf 0)" \
+  >>"$OUT/run.env"
 printf 'bf16_toktile_verbose=%s\n' "$([[ -n $BF16_TOKTILE_VERBOSE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
 printf 'q4k_wmma_min_count=%s\n' "${Q4K_WMMA_MIN_COUNT:-default}" >>"$OUT/run.env"
 printf 'biggate_profile=%s\n' "$([[ -n $BIGGATE_PROFILE ]] && printf 1 || printf 0)" >>"$OUT/run.env"
@@ -584,6 +588,10 @@ fi
 if [[ -n $BF16_TAIL25_DISABLE ]]; then
   local_candidate_env+=(DS4_ROCM_DISABLE_BF16_TAIL25_FUSION=1)
   remote_candidate_env+=' DS4_ROCM_DISABLE_BF16_TAIL25_FUSION=1'
+fi
+if [[ -n $BF16_DECODE_MLP64_DISABLE ]]; then
+  local_candidate_env+=(DS4_ROCM_DISABLE_BF16_DECODE_MLP64=1)
+  remote_candidate_env+=' DS4_ROCM_DISABLE_BF16_DECODE_MLP64=1'
 fi
 if [[ -n $BF16_TOKTILE_VERBOSE ]]; then
   local_candidate_env+=(DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE=1)

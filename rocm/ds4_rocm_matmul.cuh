@@ -1537,15 +1537,29 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         in_dim * sizeof(float) <= 65536u &&
         getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") == NULL) {
         const uint32_t rows_per_block = 32u;
-        matmul_bf16_f32_sharedx_warp_rows_w32_kernel<<<
-                ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
-                rows_per_block * 32u,
-                (size_t)in_dim * sizeof(float)>>>(
-                (float *)out->ptr,
-                (const uint16_t *)wptr,
-                (const float *)x->ptr,
-                (uint32_t)in_dim,
-                out_dim);
+        static const int decode_mlp64_disabled =
+            getenv("DS4_ROCM_DISABLE_BF16_DECODE_MLP64") != NULL;
+        const dim3 grid(
+            ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block);
+        const dim3 block(rows_per_block * 32u);
+        const size_t shared_bytes = (size_t)in_dim * sizeof(float);
+        if (!decode_mlp64_disabled && in_dim >= 4096u) {
+            matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel<<<
+                    grid, block, shared_bytes>>>(
+                    (float *)out->ptr,
+                    (const uint16_t *)wptr,
+                    (const float *)x->ptr,
+                    (uint32_t)in_dim,
+                    out_dim);
+        } else {
+            matmul_bf16_f32_sharedx_warp_rows_w32_kernel<<<
+                    grid, block, shared_bytes>>>(
+                    (float *)out->ptr,
+                    (const uint16_t *)wptr,
+                    (const float *)x->ptr,
+                    (uint32_t)in_dim,
+                    out_dim);
+        }
         return cuda_ok(cudaGetLastError(), "matmul_bf16 sharedx launch");
     }
     /* Launcher/test contract: rollback variables are set before process start,
