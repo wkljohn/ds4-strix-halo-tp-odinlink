@@ -71,6 +71,7 @@ TEXT_PROMPT=${DS4_GLM5_TEXT_PROMPT:-}
 TEXT_GENERATE=${DS4_GLM5_TEXT_GENERATE:-4}
 TEXT_TEACHER_IDS=${DS4_GLM5_TEXT_TEACHER_IDS:-}
 PERF_MODE=${DS4_GLM5_PERF_MODE:-0}
+LOGIT_DUMP_STEP=${DS4_GLM5_TEXT_LOGIT_DUMP_STEP:-}
 LAYER_TIMING=${DS4_GLM5_LAYER_TIMING:-0}
 BATCH_PREFILL_TEST=${DS4_GLM5_BATCH_PREFILL_TEST:-0}
 BATCH_PREFILL_COMPARE=${DS4_GLM5_BATCH_PREFILL_COMPARE:-0}
@@ -164,6 +165,13 @@ done
 }
 [[ $PERF_MODE == 0 || $PERF_MODE == 1 ]] || {
   echo "error: DS4_GLM5_PERF_MODE must be 0 or 1" >&2
+  exit 2
+}
+[[ -z $LOGIT_DUMP_STEP ||
+   ($LOGIT_DUMP_STEP =~ ^[0-9]+$ &&
+    $LOGIT_DUMP_STEP -lt $TEXT_GENERATE &&
+    $PERF_MODE == 0 && -n $TEXT_TEACHER_IDS) ]] || {
+  echo "error: DS4_GLM5_TEXT_LOGIT_DUMP_STEP requires a bounded full-logit teacher step" >&2
   exit 2
 }
 [[ $LAYER_TIMING == 0 || $LAYER_TIMING == 1 ]] || {
@@ -538,6 +546,7 @@ printf 'text_mode=%s\n' "$([[ -n $TEXT_PROMPT ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
 printf 'text_generate=%s\n' "$TEXT_GENERATE" >>"$OUT/run.env"
 printf 'perf_mode=%s\n' "$PERF_MODE" >>"$OUT/run.env"
+printf 'text_logit_dump_step=%s\n' "$LOGIT_DUMP_STEP" >>"$OUT/run.env"
 printf 'layer_timing=%s\n' "$LAYER_TIMING" >>"$OUT/run.env"
 printf 'batch_prefill_test=%s\n' "$BATCH_PREFILL_TEST" >>"$OUT/run.env"
 printf 'batch_prefill_compare=%s\n' "$BATCH_PREFILL_COMPARE" >>"$OUT/run.env"
@@ -728,6 +737,14 @@ if [[ -n $TEXT_PROMPT ]]; then
     text_env+=(DS4_GLM5_TEXT_TEACHER_IDS="$TEXT_TEACHER_IDS")
     remote_text_env+=" DS4_GLM5_TEXT_TEACHER_IDS='$TEXT_TEACHER_IDS'"
   fi
+  if [[ -n $LOGIT_DUMP_STEP ]]; then
+    printf -v logit_dump_name 'decode_%06d.logits.f32' "$LOGIT_DUMP_STEP"
+    local_logit_dump="$OUT/$logit_dump_name"
+    peer_logit_dump="$PEER_RESEARCH_ROOT/glm5-next-tp2/$TAG/$logit_dump_name"
+    text_env+=(DS4_GLM5_TEXT_LOGIT_DUMP_STEP="$LOGIT_DUMP_STEP")
+    text_env+=(DS4_GLM5_TEXT_LOGIT_DUMP_PATH="$local_logit_dump")
+    remote_text_env+=" DS4_GLM5_TEXT_LOGIT_DUMP_STEP='$LOGIT_DUMP_STEP' DS4_GLM5_TEXT_LOGIT_DUMP_PATH='$peer_logit_dump'"
+  fi
 fi
 local_command=("$BINARY")
 if [[ $ROCPROF_RANK == leader ]]; then
@@ -836,6 +853,26 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
     grep -q 'window_cache_bytes=0 rdma=1' "$log"
   fi
 done
+if [[ -n $LOGIT_DUMP_STEP ]]; then
+  expected_logit_bytes=$((154880 * 4))
+  [[ $(stat -c %s "$local_logit_dump") == "$expected_logit_bytes" ]] || {
+    echo "error: local bounded logit dump has the wrong size" >&2
+    exit 1
+  }
+  peer_logit_size=$(ssh -o BatchMode=yes "$PEER" "stat -c %s '$peer_logit_dump'")
+  [[ $peer_logit_size == "$expected_logit_bytes" ]] || {
+    echo "error: peer bounded logit dump has the wrong size" >&2
+    exit 1
+  }
+  local_logit_sha=$(sha256sum "$local_logit_dump" | awk '{print $1}')
+  peer_logit_sha=$(ssh -o BatchMode=yes "$PEER" \
+    "sha256sum '$peer_logit_dump'" | awk '{print $1}')
+  [[ $local_logit_sha == "$peer_logit_sha" ]] || {
+    echo "error: all-rank bounded logit dumps differ" >&2
+    exit 1
+  }
+  printf 'text_logit_dump_sha256=%s\n' "$local_logit_sha" >>"$OUT/run.env"
+fi
 if [[ $KDA_ATTENTION_ONLY_TEST == 1 ]]; then
   LEADER_OUTPUT=$(sed -n '/PASS GLM5 KDA-attention batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
   WORKER_OUTPUT=$(sed -n '/PASS GLM5 KDA-attention batch role=/s/.* output=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)

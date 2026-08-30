@@ -869,6 +869,21 @@ bool run() {
         CHECK(text_mode && teacher_ids.size() == text_generate,
               "teacher token count must equal generated-token bound");
     }
+    const char *logit_dump_path =
+        std::getenv("DS4_GLM5_TEXT_LOGIT_DUMP_PATH");
+    const char *logit_dump_step_env =
+        std::getenv("DS4_GLM5_TEXT_LOGIT_DUMP_STEP");
+    char *logit_dump_step_end = nullptr;
+    const unsigned long logit_dump_step_long = logit_dump_step_env ?
+        std::strtoul(logit_dump_step_env, &logit_dump_step_end, 10) : 0ul;
+    CHECK((!logit_dump_path && !logit_dump_step_env) ||
+              (logit_dump_path && logit_dump_path[0] &&
+               logit_dump_step_env && logit_dump_step_end &&
+               *logit_dump_step_end == '\0' &&
+               logit_dump_step_long < text_generate &&
+               !teacher_ids.empty() && !perf_mode),
+          "bounded logit dump requires teacher-forced full-logit mode");
+    const uint32_t logit_dump_step = (uint32_t)logit_dump_step_long;
     CHECK(!perf_mode || (text_mode && teacher_ids.empty()),
           "performance mode requires greedy text generation");
     CHECK(!batch_prefill || text_mode,
@@ -2118,6 +2133,17 @@ bool run() {
                       logits_hash, logits_error,
                       sizeof(logits_error)) == 1,
                   logits_error);
+            if (logit_dump_path && step == logit_dump_step) {
+                FILE *dump = std::fopen(logit_dump_path, "wb");
+                CHECK(dump != nullptr,
+                      "open bounded teacher logit dump");
+                const size_t written = std::fwrite(
+                    host_logits.data(), sizeof(host_logits[0]),
+                    host_logits.size(), dump);
+                const int close_rc = std::fclose(dump);
+                CHECK(written == host_logits.size() && close_rc == 0,
+                      "write bounded teacher logit dump");
+            }
             const uint32_t token = teacher_ids.empty() ?
                 top1 : teacher_ids[step];
             double teacher_nll = 0.0;
