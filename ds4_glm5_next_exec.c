@@ -986,6 +986,42 @@ static int declare_local_q4k_half_only(
                DS4_GPU_Q4K_PACKED_K_RANGE);
 }
 
+/* Return 1 only when the exact gate/up/down triple is already materialized,
+ * 0 when none is resident, and -1 for a partial/inconsistent triple.  The
+ * distinction is load-bearing: a layer-local streaming cache owns and releases
+ * its descriptors, while full-trunk residency must survive every layer/token. */
+static int local_q4k_half_residency(
+        const ds4_glm5_next_exec_ctx *ctx,
+        const ds4_glm5_next_layer_offsets *layer) {
+    const uint64_t gate_row_bytes =
+        (GLM5_WIDTH / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint64_t down_row_bytes =
+        (GLM5_ROUTED_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint64_t down_half_bytes =
+        (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint32_t row_base = ctx->tp_rank * GLM5_RANK_MID;
+    const uint64_t column_base = (uint64_t)ctx->tp_rank * down_half_bytes;
+    const void *device = NULL;
+    uint64_t packed = 0u, expert = 0u, row = 0u;
+    const int gate = ds4_gpu_q4k_packed_slice_resolve(
+        ctx->model_map, layer->ffn_weight.gate_exps, GLM5_EXPERTS,
+        GLM5_ROUTED_MID, gate_row_bytes, row_base, GLM5_RANK_MID,
+        0u, gate_row_bytes, DS4_GPU_Q4K_PACKED_ROW_RANGE,
+        &device, &packed, &expert, &row);
+    const int up = ds4_gpu_q4k_packed_slice_resolve(
+        ctx->model_map, layer->ffn_weight.up_exps, GLM5_EXPERTS,
+        GLM5_ROUTED_MID, gate_row_bytes, row_base, GLM5_RANK_MID,
+        0u, gate_row_bytes, DS4_GPU_Q4K_PACKED_ROW_RANGE,
+        &device, &packed, &expert, &row);
+    const int down = ds4_gpu_q4k_packed_slice_resolve(
+        ctx->model_map, layer->ffn_weight.down_exps, GLM5_EXPERTS,
+        GLM5_WIDTH, down_row_bytes, 0u, GLM5_WIDTH,
+        column_base, down_half_bytes, DS4_GPU_Q4K_PACKED_K_RANGE,
+        &device, &packed, &expert, &row);
+    const int loaded = gate + up + down;
+    return loaded == 0 ? 0 : loaded == 3 ? 1 : -1;
+}
+
 static int declare_local_q4k_half(const ds4_glm5_next_exec_ctx *ctx,
                                   const ds4_glm5_next_layer_offsets *layer) {
     const uint64_t gate_row_bytes =
@@ -1338,6 +1374,11 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
         (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
     const uint64_t q4_down_base =
         (uint64_t)ctx->tp_rank * q4_down_half_bytes;
+    const bool mixed_q2 = f->gate_exps_type == 16u &&
+                          f->up_exps_type == 16u &&
+                          f->down_exps_type == 10u;
+    const int q4_residency = mixed_q2 ? 0 :
+        local_q4k_half_residency(ctx, layer);
     int ok = ds4_gpu_rms_norm_plain_rows_tensor(
             w->ffn_flat, w->after_attention, GLM5_HC_WIDTH, 1u,
             ctx->model->rms_norm_eps);
@@ -1375,9 +1416,12 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                 il, ctx->tp_rank);
         goto routed_one_done;
     }
-    const bool mixed_q2 = f->gate_exps_type == 16u &&
-                          f->up_exps_type == 16u &&
-                          f->down_exps_type == 10u;
+    if (q4_residency < 0) {
+        fprintf(stderr,
+                "ds4: GLM5 routed layer %u has partial Q4_K residency rank=%u\n",
+                il, ctx->tp_rank);
+        ok = 0;
+    }
     if (ok && mixed_q2) {
         /* The mixed GLM Q2 layout is handled by the existing type-aware
          * routed launcher. It consumes the original GGUF tables and uses
@@ -1398,7 +1442,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
             GLM5_EXPERTS, GLM5_EXPERTS_USED, 10.0f,
             w->ffn_hidden, NULL, il, false);
     } else if (ok) {
-        ok = declare_local_q4k_half(ctx, layer) &&
+        ok = (q4_residency == 1 || declare_local_q4k_half(ctx, layer)) &&
         ds4_gpu_routed_moe_one_packed_q4k_tensor(
             w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
             w->routed_experts, ctx->model_map, ctx->model_size,
@@ -1450,7 +1494,8 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
      * it safe to release them before the next layer is declared. */
 routed_one_done:
     if (!ok) ds4_gpu_synchronize();
-    ds4_gpu_q4k_packed_slice_release_all();
+    if (!mixed_q2 && q4_residency == 0)
+        ds4_gpu_q4k_packed_slice_release_all();
     (void)q8_down_row_bytes;
     return ok;
 }
@@ -1505,6 +1550,8 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
         (GLM5_WIDTH / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
     const uint64_t q4_gate_row_bytes =
         (GLM5_WIDTH / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
+    const uint64_t q4_down_row_bytes =
+        (GLM5_ROUTED_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
     const uint64_t q4_down_half_bytes =
         (GLM5_RANK_MID / GLM5_Q4K_QK) * GLM5_Q4K_BLOCK_BYTES;
     const uint64_t q4_down_base =
@@ -1543,6 +1590,14 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
     const bool mixed_q2 = f->gate_exps_type == 16u &&
                           f->up_exps_type == 16u &&
                           f->down_exps_type == 10u;
+    const int q4_residency = mixed_q2 ? 0 :
+        local_q4k_half_residency(ctx, layer);
+    if (q4_residency < 0) {
+        fprintf(stderr,
+                "ds4: GLM5 batch layer %u has partial Q4_K residency rank=%u\n",
+                il, ctx->tp_rank);
+        ok = 0;
+    }
     ds4_gpu_q4k_window_cache *cache = NULL;
     if (ok && mixed_q2) {
         routed_mid_is_f16 = false;
@@ -1604,10 +1659,20 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             w->router_selected, w->router_weights,
             GLM5_EXPERTS, GLM5_EXPERTS_USED, 10.0f,
             w->ffn_hidden, il, n_tokens, &routed_mid_is_f16, false);
-    } else if (ok) {
+    } else if (ok && q4_residency == 0) {
         ok = declare_local_q4k_half_only(ctx, layer);
     }
-    if (ok && !mixed_q2) {
+    if (ok && !mixed_q2 && q4_residency == 1) {
+        ok = ds4_gpu_routed_moe_batch_packed_q4k_tensor(
+            w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
+            w->routed_experts, ctx->model_map, ctx->model_size,
+            f->gate_exps, f->up_exps, f->down_exps, GLM5_EXPERTS,
+            q4_gate_row_bytes, q4_down_row_bytes,
+            rank_mid_base, GLM5_RANK_MID, q4_down_base,
+            q4_down_half_bytes, w->router_selected, w->router_weights,
+            GLM5_EXPERTS_USED, 10.0f, w->ffn_hidden, il, n_tokens,
+            &routed_mid_is_f16);
+    } else if (ok && !mixed_q2) {
         const ds4_gpu_q4k_window_cache_config config = {
             .model_map = ctx->model_map,
             .gate_offset = f->gate_exps,
@@ -1737,9 +1802,10 @@ static int routed_ffn_rows(const ds4_glm5_next_exec_ctx *ctx,
             GLM5_WIDTH, GLM5_HC) &&
         ds4_gpu_synchronize();
     if (!ok) ds4_gpu_synchronize();
-    /* release_all owns both the temporary cache and its three layer-local
-     * descriptors. It is called only after all consumers have synchronized. */
-    ds4_gpu_q4k_packed_slice_release_all();
+    /* Only the streaming branch owns these layer-local descriptors/cache.
+     * Full-trunk packed residency is process-scoped and must survive. */
+    if (!mixed_q2 && q4_residency == 0)
+        ds4_gpu_q4k_packed_slice_release_all();
     return ok;
 }
 

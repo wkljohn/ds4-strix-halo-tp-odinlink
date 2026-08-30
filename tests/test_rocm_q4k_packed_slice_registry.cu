@@ -90,7 +90,8 @@ int main(void) {
         (uint64_t)N_EXPERT * SOURCE_ROWS * down_row_bytes;
     const uint64_t gate_offset = 4096u;
     const uint64_t down_offset = align_up(gate_offset + gate_bytes, 4096u);
-    const uint64_t model_bytes = align_up(down_offset + down_bytes, 4096u);
+    const uint64_t up_offset = align_up(down_offset + down_bytes, 4096u);
+    const uint64_t model_bytes = align_up(up_offset + gate_bytes, 4096u);
     unsigned char *model = (unsigned char *)malloc((size_t)model_bytes);
     CHECK(model != NULL, "model allocation");
     for (uint64_t i = 0; i < model_bytes; i++) {
@@ -134,6 +135,11 @@ int main(void) {
               down_row_bytes, 0u, SOURCE_ROWS, down_column_base,
               down_row_bytes / 2u, DS4_GPU_Q4K_PACKED_K_RANGE),
           "declare K slice");
+    CHECK(ds4_gpu_q4k_packed_slice_declare(
+              model, model_bytes, up_offset, N_EXPERT, SOURCE_ROWS,
+              gate_row_bytes, gate_row_base, ROW_HALF, 0u, gate_row_bytes,
+              DS4_GPU_Q4K_PACKED_ROW_RANGE),
+          "declare unloaded peer row slice");
     CHECK(ds4_gpu_q4k_packed_slice_declare(
               model, model_bytes, down_offset, N_EXPERT, SOURCE_ROWS,
               down_row_bytes, 0u, SOURCE_ROWS, down_column_base,
@@ -190,6 +196,48 @@ int main(void) {
               model, down_offset, 0u, SOURCE_ROWS,
               down_column_base, down_row_bytes / 2u),
           "load K slice");
+
+    /* Model the executor's fail-closed partial-residency state without
+     * perturbing a live full-trunk allocation: gate and down are loaded while
+     * up remains declared-only.  The streaming cache must refuse to couple
+     * this mixed-ownership triple. */
+    const void *gate_resolved = NULL;
+    const void *up_resolved = NULL;
+    const void *down_resolved = NULL;
+    uint64_t ignored_bytes = 0u, ignored_expert = 0u, ignored_row = 0u;
+    CHECK(ds4_gpu_q4k_packed_slice_resolve(
+              model, gate_offset, N_EXPERT, SOURCE_ROWS, gate_row_bytes,
+              gate_row_base, ROW_HALF, 0u, gate_row_bytes,
+              DS4_GPU_Q4K_PACKED_ROW_RANGE, &gate_resolved, &ignored_bytes,
+              &ignored_expert, &ignored_row) && gate_resolved,
+          "partial triple resolves loaded gate");
+    CHECK(!ds4_gpu_q4k_packed_slice_resolve(
+              model, up_offset, N_EXPERT, SOURCE_ROWS, gate_row_bytes,
+              gate_row_base, ROW_HALF, 0u, gate_row_bytes,
+              DS4_GPU_Q4K_PACKED_ROW_RANGE, &up_resolved, &ignored_bytes,
+              &ignored_expert, &ignored_row) && !up_resolved,
+          "partial triple refuses unloaded up");
+    CHECK(ds4_gpu_q4k_packed_slice_resolve(
+              model, down_offset, N_EXPERT, SOURCE_ROWS, down_row_bytes,
+              0u, SOURCE_ROWS, down_column_base, down_row_bytes / 2u,
+              DS4_GPU_Q4K_PACKED_K_RANGE, &down_resolved, &ignored_bytes,
+              &ignored_expert, &ignored_row) && down_resolved,
+          "partial triple resolves loaded down");
+    ds4_gpu_q4k_window_cache_config partial = {};
+    partial.model_map = model;
+    partial.gate_offset = gate_offset;
+    partial.up_offset = up_offset;
+    partial.down_offset = down_offset;
+    partial.n_expert = N_EXPERT;
+    partial.gate_row_base = gate_row_base;
+    partial.gate_row_count = ROW_HALF;
+    partial.gate_column_byte_count = gate_row_bytes;
+    partial.down_row_count = SOURCE_ROWS;
+    partial.down_column_byte_base = down_column_base;
+    partial.down_column_byte_count = down_row_bytes / 2u;
+    partial.slots = N_EXPERT;
+    CHECK(ds4_gpu_q4k_window_cache_create(&partial) == NULL,
+          "partial loaded triple refuses streaming-cache ownership");
 
     const uint64_t gate_packed_bytes =
         (uint64_t)N_EXPERT * ROW_HALF * gate_row_bytes;

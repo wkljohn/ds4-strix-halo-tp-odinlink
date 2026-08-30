@@ -1901,6 +1901,8 @@ bool run() {
 
     if (text_mode) {
         using Clock = std::chrono::steady_clock;
+        const uint64_t expected_text_packed_bytes = mixed_q2_model ? 0u :
+            (full_trunk ? kshard.packed_total_bytes : 0u);
         WorkspaceGuard prompt_workspace;
         TensorGuard prompt_ids, prompt_current_guard, prompt_output_guard;
         StateGuard prompt_reference_state;
@@ -2088,6 +2090,9 @@ bool run() {
             }
         }
         const auto prompt_end = Clock::now();
+        CHECK(ds4_gpu_q4k_packed_slice_bytes() ==
+                  expected_text_packed_bytes,
+              "text prefill preserves process-owned Q4 residency");
         if (layer_timing) {
             const double classified = prompt_layer_timing.kda_dense_ms +
                 prompt_layer_timing.kda_routed_ms +
@@ -2206,6 +2211,9 @@ bool run() {
         CHECK(!generated.empty(), "real-text generation produced a token");
         CHECK(teacher_ids.empty() || generated.size() == teacher_ids.size(),
               "teacher-forced run consumed every prescribed token");
+        CHECK(ds4_gpu_q4k_packed_slice_bytes() ==
+                  expected_text_packed_bytes,
+              "text decode preserves process-owned Q4 residency");
         const uint64_t generated_hash = fnv64(
             generated.data(), generated.size() * sizeof(generated[0]));
         char generated_error[256] = {};
