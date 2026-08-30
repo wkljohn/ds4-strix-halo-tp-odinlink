@@ -124,6 +124,10 @@ struct cuda_q4k_window_cache_entry {
 
 struct ds4_gpu_q4k_window_cache {
     const void *model_map;
+    uint64_t model_size;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
     size_t gate_slice_index;
     size_t up_slice_index;
     size_t down_slice_index;
@@ -2284,7 +2288,9 @@ static int cuda_q4k_linear_residency_intersection(
     for (const cuda_model_image &img : g_model_images) {
         if (img.host_base == model_map &&
             cuda_u64_ranges_overlap(offset, bytes,
-                                    img.device_offset, img.size)) return 1;
+                                    img.device_offset, img.size)) {
+            return 1;
+        }
     }
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_base == model_map &&
@@ -6854,18 +6860,28 @@ static int cuda_q4k_packed_slice_load_expert_impl(
         (void)cudaGetLastError();
         return 0;
     }
+    const char *async_window = getenv("DS4_ROCM_GLM5_WINDOW_ASYNC");
+    const int use_async = async_window && strcmp(async_window, "1") == 0;
     if (contiguous) {
-        err = cudaMemcpy(dst->ptr, source, (size_t)p->packed_expert_bytes,
-                         cudaMemcpyHostToDevice);
+        err = use_async ? cudaMemcpyAsync(
+            dst->ptr, source, (size_t)p->packed_expert_bytes,
+            cudaMemcpyHostToDevice, (cudaStream_t)0) :
+            cudaMemcpy(dst->ptr, source, (size_t)p->packed_expert_bytes,
+                       cudaMemcpyHostToDevice);
     } else {
         /* Preserve the strided Q4_K source layout in the transfer engine.
          * This avoids allocating and filling a multi-MiB CPU temporary for
          * every selected down expert. */
-        err = hipMemcpy2D(dst->ptr, (size_t)p->column_byte_count,
-                          source + p->column_byte_base,
-                          (size_t)p->source_row_bytes,
-                          (size_t)p->column_byte_count, p->row_count,
-                          hipMemcpyHostToDevice);
+        err = use_async ? hipMemcpy2DAsync(
+            dst->ptr, (size_t)p->column_byte_count,
+            source + p->column_byte_base, (size_t)p->source_row_bytes,
+            (size_t)p->column_byte_count, p->row_count,
+            hipMemcpyHostToDevice, (hipStream_t)0) :
+            hipMemcpy2D(dst->ptr, (size_t)p->column_byte_count,
+                        source + p->column_byte_base,
+                        (size_t)p->source_row_bytes,
+                        (size_t)p->column_byte_count, p->row_count,
+                        hipMemcpyHostToDevice);
     }
     if (err != cudaSuccess) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -6876,8 +6892,22 @@ static int cuda_q4k_packed_slice_load_expert_impl(
         (void)cudaGetLastError();
         return 0;
     }
-    cuda_model_discard_source_full_pages(
-        model_map, p->model_size, source_offset, source_window_bytes);
+    /* The default keeps the previous bounded-page eviction policy.  For the
+     * GLM selected-window diagnosis, allowing the host pages to remain cached
+     * separates source fault-in cost from copy/kernel cost without allocating
+     * any additional device memory.  Require an explicit value of 1 so a
+     * merely-present environment variable cannot silently alter production. */
+    const char *keep_source_pages =
+        getenv("DS4_ROCM_Q4K_KEEP_SOURCE_PAGES");
+    /* An async transfer may still reference the mmap source after this
+     * function returns, so eviction is unsafe until the caller's epoch wait.
+     * Treat async mode as implicitly keep-pages for correctness; it remains
+     * opt-in and does not alter the default path. */
+    if ((!keep_source_pages || strcmp(keep_source_pages, "1") != 0) &&
+        !use_async) {
+        cuda_model_discard_source_full_pages(
+            model_map, p->model_size, source_offset, source_window_bytes);
+    }
     return 1;
 }
 
@@ -6977,6 +7007,10 @@ extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
         return NULL;
     }
     cache->model_map = config->model_map;
+    cache->model_size = gate->model_size;
+    cache->gate_offset = config->gate_offset;
+    cache->up_offset = config->up_offset;
+    cache->down_offset = config->down_offset;
     cache->gate_slice_index = (size_t)(gate - g_q4k_packed_slices.data());
     cache->up_slice_index = (size_t)(up - g_q4k_packed_slices.data());
     cache->down_slice_index = (size_t)(down - g_q4k_packed_slices.data());
@@ -7017,6 +7051,100 @@ extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
     return cache;
 }
 
+extern "C" int ds4_gpu_q4k_window_cache_rebind(
+        ds4_gpu_q4k_window_cache *cache,
+        const ds4_gpu_q4k_window_cache_config *config) {
+    if (!cache || !config ||
+        std::find(g_q4k_window_caches.begin(), g_q4k_window_caches.end(),
+                  cache) == g_q4k_window_caches.end() ||
+        config->model_map != cache->model_map ||
+        config->n_expert != cache->n_expert ||
+        config->slots != cache->slots) return 0;
+    cuda_q4k_packed_slice *gate = cuda_q4k_packed_slice_find(
+        config->model_map, config->gate_offset,
+        config->gate_row_base, config->gate_row_count,
+        config->gate_column_byte_base, config->gate_column_byte_count);
+    cuda_q4k_packed_slice *up = cuda_q4k_packed_slice_find(
+        config->model_map, config->up_offset,
+        config->gate_row_base, config->gate_row_count,
+        config->gate_column_byte_base, config->gate_column_byte_count);
+    cuda_q4k_packed_slice *down = cuda_q4k_packed_slice_find(
+        config->model_map, config->down_offset,
+        config->down_row_base, config->down_row_count,
+        config->down_column_byte_base, config->down_column_byte_count);
+    if (!gate || !up || !down || gate == up || gate == down || up == down ||
+        gate->kind != DS4_GPU_Q4K_PACKED_ROW_RANGE ||
+        up->kind != DS4_GPU_Q4K_PACKED_ROW_RANGE ||
+        down->kind != DS4_GPU_Q4K_PACKED_K_RANGE ||
+        gate->loaded || up->loaded || down->loaded ||
+        gate->n_expert != config->n_expert ||
+        up->n_expert != config->n_expert ||
+        down->n_expert != config->n_expert ||
+        gate->model_size != up->model_size ||
+        gate->model_size != down->model_size ||
+        gate->source_rows != up->source_rows ||
+        gate->source_row_bytes != up->source_row_bytes ||
+        gate->row_base != up->row_base || gate->row_count != up->row_count ||
+        gate->column_byte_base != 0u || up->column_byte_base != 0u ||
+        gate->column_byte_count != gate->source_row_bytes ||
+        up->column_byte_count != up->source_row_bytes ||
+        gate->packed_expert_bytes != up->packed_expert_bytes ||
+        gate->packed_expert_bytes != cache->gate_expert_bytes ||
+        down->packed_expert_bytes != cache->down_expert_bytes ||
+        gate->row_count * 2u != gate->source_rows ||
+        (gate->row_base != 0u && gate->row_base != gate->row_count) ||
+        (gate->row_base % CUDA_QK_K) != 0u ||
+        (gate->row_count % CUDA_QK_K) != 0u || down->row_base != 0u ||
+        down->row_count != down->source_rows ||
+        down->column_byte_count * 2u != down->source_row_bytes ||
+        (down->column_byte_base != 0u &&
+         down->column_byte_base != down->column_byte_count) ||
+        gate->tensor_offset != config->gate_offset ||
+        up->tensor_offset != config->up_offset ||
+        down->tensor_offset != config->down_offset) return 0;
+    const uint64_t block_bytes = sizeof(cuda_block_q4_K);
+    uint64_t expected_down_base = 0u, expected_down_count = 0u;
+    if (!cuda_u64_mul_checked(gate->row_base / CUDA_QK_K, block_bytes,
+                              &expected_down_base) ||
+        !cuda_u64_mul_checked(gate->row_count / CUDA_QK_K, block_bytes,
+                              &expected_down_count) ||
+        down->column_byte_base != expected_down_base ||
+        down->column_byte_count != expected_down_count) return 0;
+    /* The scalar scratch consumer performs a terminal synchronize at the end
+     * of every routed layer before rebinding this same slab.  In that
+     * explicitly opt-in async mode the prior-layer fence is the required
+     * lifetime proof, so avoid paying a duplicate device-wide wait here.
+     * Retain the conservative wait for every other caller. */
+    const char *scratch_async = getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
+    const char *window_async = getenv("DS4_ROCM_GLM5_WINDOW_ASYNC");
+    const bool prior_layer_fenced = scratch_async &&
+        strcmp(scratch_async, "1") == 0 && window_async &&
+        strcmp(window_async, "1") == 0;
+    if (!prior_layer_fenced && cudaDeviceSynchronize() != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    cache->model_size = gate->model_size;
+    cache->gate_offset = config->gate_offset;
+    cache->up_offset = config->up_offset;
+    cache->down_offset = config->down_offset;
+    cache->gate_slice_index = (size_t)(gate - g_q4k_packed_slices.data());
+    cache->up_slice_index = (size_t)(up - g_q4k_packed_slices.data());
+    cache->down_slice_index = (size_t)(down - g_q4k_packed_slices.data());
+    std::fill(cache->expert_to_slot.begin(), cache->expert_to_slot.end(), -1);
+    for (cuda_q4k_window_cache_entry &entry : cache->entries) {
+        entry.expert = -1;
+        entry.last_used = 0u;
+        entry.valid = 0;
+    }
+    cache->clock = 0u;
+    cache->prepares = cache->hits = cache->misses = 0u;
+    cache->fills = cache->evictions = 0u;
+    cache->profile_upload_bytes = cache->profile_control_bytes = 0u;
+    cache->profile_prepare_sec = 0.0;
+    return 1;
+}
+
 extern "C" void ds4_gpu_q4k_window_cache_destroy(
         ds4_gpu_q4k_window_cache *cache) {
     if (!cache) return;
@@ -7035,6 +7163,14 @@ extern "C" void ds4_gpu_q4k_window_cache_destroy(
                 (double)cache->profile_upload_bytes /
                     cache->profile_prepare_sec / 1073741824.0,
                 (unsigned long long)cache->fills);
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM5 window cache stats prepares=%llu hits=%llu misses=%llu "
+                "evictions=%llu slots=%u capacity=%.2f MiB\n",
+                (unsigned long long)cache->prepares,
+                (unsigned long long)cache->hits,
+                (unsigned long long)cache->misses,
+                (unsigned long long)cache->evictions,
+                cache->slots, (double)cache->capacity_bytes / 1048576.0);
     }
     if (cache->slot_ids_device) (void)cudaFree(cache->slot_ids_device);
     if (cache->base) (void)cudaFree(cache->base);
@@ -7179,6 +7315,14 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
         cache->fills++;
         entry.valid = 1;
         cache->expert_to_slot[(uint32_t)expert] = (int32_t)victim;
+    }
+    if (cache->fills != 0u) {
+        const char *async_window = getenv("DS4_ROCM_GLM5_WINDOW_ASYNC");
+        if (async_window && strcmp(async_window, "1") == 0 &&
+            cudaDeviceSynchronize() != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
     }
     for (uint32_t i = 0; i < count; ++i) {
         if (expert_ids[i] == -1) {
@@ -8023,7 +8167,12 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_rdma_host(uint64_t bytes) {
     if (!t) return NULL;
     void *host = NULL;
     void *device = NULL;
-    cudaError_t err = hipHostMalloc(&host, (size_t)bytes, hipHostMallocMapped);
+    unsigned int host_flags = hipHostMallocMapped;
+    const char *coherent_env = getenv("DS4_ROCM_RDMA_HOST_COHERENT");
+    const int force_coherent = coherent_env && coherent_env[0] &&
+                               strcmp(coherent_env, "0") != 0;
+    if (force_coherent) host_flags |= hipHostMallocCoherent;
+    cudaError_t err = hipHostMalloc(&host, (size_t)bytes, host_flags);
     if (err == hipSuccess)
         err = hipHostGetDevicePointer(&device, host, 0);
     if (err != hipSuccess || !host || !device) {
@@ -8040,8 +8189,9 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_rdma_host(uint64_t bytes) {
     t->owner = 2;
     t->device_id = 0;
     fprintf(stderr, DS4_GPU_LOG_PREFIX
-            "using mapped host-pinned TP slab for generic RDMA (%.2f MiB)\n",
-            (double)bytes / 1048576.0);
+            "using mapped host-pinned TP slab for generic RDMA (%.2f MiB, "
+            "coherent=%d)\n",
+            (double)bytes / 1048576.0, force_coherent);
     return t;
 }
 
@@ -8145,6 +8295,33 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
+}
+
+__global__ static void rdma_system_release_kernel(void) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN__)
+    if (blockIdx.x == 0u && threadIdx.x == 0u) {
+        __threadfence_system();
+    }
+#endif
+}
+
+__global__ static void rdma_system_acquire_kernel(void) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN__)
+    if (blockIdx.x == 0u && threadIdx.x == 0u) {
+        asm volatile("buffer_gl1_inv\n\tbuffer_gl0_inv" ::: "memory");
+    }
+#endif
+}
+
+extern "C" int ds4_rocm_rdma_cache_release(void) {
+    rdma_system_release_kernel<<<1, 64>>>();
+    return cuda_ok(cudaGetLastError(), "RDMA system release launch") &&
+           cuda_ok(cudaDeviceSynchronize(), "RDMA system release sync");
+}
+
+extern "C" int ds4_rocm_rdma_cache_acquire(void) {
+    rdma_system_acquire_kernel<<<1, 64>>>();
+    return cuda_ok(cudaGetLastError(), "RDMA system acquire launch");
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -9216,7 +9393,14 @@ extern "C" int ds4_gpu_set_model_map_spans(
      * slices once, but split sparse coordinator layer+head selections into
      * separate device images instead of allocating their huge file envelope. */
     const uint64_t bbox = max_end - min_offset;
-    if (bbox <= span_bytes + span_bytes / 10u) {
+    /* GLM5 TP intentionally omits large routed-expert tensors from the
+     * resident span set.  Its remaining tensors can still have a compact
+     * bounding box numerically, but copying that box would bridge the
+     * omission and make packed Q4_K declaration fail later. */
+    const bool glm5_span_policy =
+        getenv("DS4_GLM5_NEXT_ENABLE_ORDINARY") != NULL;
+    if (!glm5_span_policy &&
+        bbox <= span_bytes + span_bytes / 10u) {
         return cuda_model_copy_chunked(model_map, model_size,
                                        min_offset, bbox);
     }

@@ -22,6 +22,37 @@ int ds4_glm5_next_mla_dense_selection_visible(
         token_count, capacity_tokens, DS4_GLM5_NEXT_INDEX_TOP_K, visible);
 }
 
+int ds4_glm5_next_mla_sparse_selection_plan(
+        uint64_t token_count, uint32_t capacity_tokens, uint32_t top_k,
+        uint32_t pool_size, uint32_t *visible, uint32_t *n_pools,
+        uint32_t *selected_pools, uint32_t *selected_tokens) {
+    if (!visible || !n_pools || !selected_pools || !selected_tokens ||
+        capacity_tokens == 0u || top_k == 0u || pool_size == 0u ||
+        top_k % pool_size != 0u || token_count >= capacity_tokens ||
+        token_count < top_k || token_count >= UINT32_MAX) return 0;
+    const uint32_t rows = (uint32_t)token_count + 1u;
+    const uint32_t pools = rows / pool_size;
+    const uint32_t pool_budget = top_k / pool_size;
+    const uint32_t selected = pools < pool_budget ? pools : pool_budget;
+    if (selected > (UINT32_MAX - rows % pool_size) / pool_size) return 0;
+    *visible = rows;
+    *n_pools = pools;
+    *selected_pools = selected;
+    *selected_tokens = selected * pool_size + rows % pool_size;
+    return 1;
+}
+
+uint32_t ds4_glm5_next_prefill_chunk(
+        uint32_t position, uint32_t remaining, uint32_t requested_batch) {
+    if (remaining == 0u) return 0u;
+    if (requested_batch < 2u ||
+        position >= DS4_GLM5_NEXT_INDEX_TOP_K) return 1u;
+    uint32_t chunk = remaining < requested_batch ? remaining : requested_batch;
+    const uint32_t dense_remaining = DS4_GLM5_NEXT_INDEX_TOP_K - position;
+    if (chunk > dense_remaining) chunk = dense_remaining;
+    return chunk ? chunk : 1u;
+}
+
 int ds4_glm5_next_build_tp_gate_mask(
         uint64_t mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS],
         uint32_t *gate_count,

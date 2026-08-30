@@ -108,6 +108,7 @@ __global__ static void embed_tokens_hc_bf16_kernel(
 }
 
 __device__ static float warp_sum_f32(float v);
+__device__ static float warp_sum_f32_compensated(float v);
 
 __global__ static void matmul_f16_kernel(
         float *out,
@@ -162,6 +163,41 @@ __global__ static void matmul_bf16_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) out[tok * out_dim + row] = partial[0];
+}
+
+/* BF16 K-slice over a row-major [out_dim, full_in_dim] matrix.  The input is
+ * compact [n_tok, k_cnt], but weight rows retain their full physical stride.
+ * This is intentionally distinct from output-row slicing: treating the
+ * 8192-wide KDA output weight as a packed 4096-wide matrix would make row 1
+ * consume row 0's second half. */
+__global__ static void matmul_bf16_kslice_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t full_in_dim,
+        uint32_t k_off,
+        uint32_t k_cnt,
+        uint32_t out_dim,
+        uint32_t n_tok) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tok = blockIdx.y;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    float sum = 0.0f;
+    const uint16_t *wr = w + (uint64_t)row * full_in_dim + k_off;
+    const float *xr = x + (uint64_t)tok * k_cnt;
+    for (uint32_t i = threadIdx.x; i < k_cnt; i += blockDim.x)
+        sum += __uint_as_float((uint32_t)wr[i] << 16u) * xr[i];
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride)
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u)
+        out[(uint64_t)tok * out_dim + row] = partial[0];
 }
 
 #include "ds4_rocm_bf16_toktile.cuh"
@@ -272,7 +308,8 @@ __global__ static void matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel(
         const uint16_t *w,
         const float *x,
         uint32_t in_dim,
-        uint64_t out_dim) {
+        uint64_t out_dim,
+        int split_order) {
     extern __shared__ float shx[];
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -285,6 +322,7 @@ __global__ static void matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel(
     if (row >= out_dim) return;
     const uint16_t *wr = w + row * (uint64_t)in_dim;
     float acc = 0.0f;
+    float acc_hi = 0.0f;
     uint32_t i = lane;
     for (; i + 63u * 32u < in_dim; i += 64u * 32u) {
         uint16_t packed_w[64];
@@ -296,12 +334,92 @@ __global__ static void matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel(
             packed_x[u] = shx[index];
         }
 #pragma unroll
-        for (uint32_t u = 0u; u < 64u; ++u)
-            acc += __uint_as_float((uint32_t)packed_w[u] << 16) * packed_x[u];
+        for (uint32_t u = 0u; u < 64u; ++u) {
+            const float product =
+                __uint_as_float((uint32_t)packed_w[u] << 16) * packed_x[u];
+            if (split_order && i + u * 32u >= 4096u) acc_hi += product;
+            else acc += product;
+        }
     }
-    for (; i < in_dim; i += 32u)
-        acc += __uint_as_float((uint32_t)wr[i] << 16) * shx[i];
-    acc = warp_sum_f32(acc);
+    for (; i < in_dim; i += 32u) {
+        const float product =
+            __uint_as_float((uint32_t)wr[i] << 16) * shx[i];
+        if (split_order && i >= 4096u) acc_hi += product;
+        else acc += product;
+    }
+    acc = split_order ? warp_sum_f32(acc) + warp_sum_f32(acc_hi)
+                      : warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
+/* Decode form of the strided BF16 K-slice above.  Each rank stages only its
+ * compact activation half in LDS and reads the matching half of every full
+ * matrix row.  Reduction order is deterministic within a slice, but summing
+ * two slice outputs is Lane-B-equivalent rather than bit-identical to one
+ * 8192-element reduction. */
+__global__ static void
+matmul_bf16_f32_sharedx_mlp64_kslice_warp_rows_w32_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t full_in_dim,
+        uint32_t k_off,
+        uint32_t k_cnt,
+        uint32_t out_dim,
+        int compensated_reduce,
+        int pair_accum,
+        int kahan_accum) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    for (uint32_t i = tid; i < k_cnt; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint32_t row = blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const uint16_t *wr = w + (uint64_t)row * full_in_dim + k_off;
+    float acc = 0.0f;
+    float acc_pair = 0.0f;
+    float acc_c = 0.0f;
+    uint32_t i = lane;
+    for (; i + 63u * 32u < k_cnt; i += 64u * 32u) {
+        uint16_t packed_w[64];
+        float packed_x[64];
+#pragma unroll
+        for (uint32_t u = 0u; u < 64u; ++u) {
+            const uint32_t index = i + u * 32u;
+            packed_w[u] = wr[index];
+            packed_x[u] = shx[index];
+        }
+#pragma unroll
+        for (uint32_t u = 0u; u < 64u; ++u) {
+            const float product =
+                __uint_as_float((uint32_t)packed_w[u] << 16u) * packed_x[u];
+            if (pair_accum && (u & 1u)) acc_pair += product;
+            else if (kahan_accum) {
+                const float y = product - acc_c;
+                const float t = acc + y;
+                acc_c = (t - acc) - y;
+                acc = t;
+            } else acc += product;
+        }
+    }
+    for (; i < k_cnt; i += 32u) {
+        const float product =
+            __uint_as_float((uint32_t)wr[i] << 16u) * shx[i];
+        if (pair_accum && ((i >> 5u) & 1u)) acc_pair += product;
+        else if (kahan_accum) {
+            const float y = product - acc_c;
+            const float t = acc + y;
+            acc_c = (t - acc) - y;
+            acc = t;
+        } else acc += product;
+    }
+    acc += acc_pair + acc_c;
+    acc = compensated_reduce ? warp_sum_f32_compensated(acc)
+                             : warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
 }
 
@@ -818,6 +936,27 @@ __device__ static float warp_sum_f32(float v) {
 #endif
     }
     return v;
+}
+
+/* Error-compensated wave reduction for split-K experiments.  The production
+ * path intentionally keeps warp_sum_f32's established arithmetic.  This
+ * helper preserves a low component through the fixed shuffle tree, allowing
+ * us to measure whether finalization error (rather than the per-lane dot
+ * accumulation) is responsible for K-slice drift. */
+__device__ static float warp_sum_f32_compensated(float v) {
+    float c = 0.0f;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        const float other = __shfl_down(v, offset, 32);
+#else
+        const float other = __shfl_down_sync(FULL_WARP_MASK, v, offset, 32);
+#endif
+        const float t = v + other;
+        if (fabsf(v) >= fabsf(other)) c += (v - t) + other;
+        else c += (other - t) + v;
+        v = t;
+    }
+    return v + c;
 }
 
 __device__ static float warp_max_f32(float v) {

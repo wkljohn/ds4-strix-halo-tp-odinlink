@@ -5,6 +5,8 @@ extern "C" {
 }
 #include "tests/glm5_gguf_test.hpp"
 
+#include <hip/hip_runtime.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -42,6 +44,48 @@ struct Tensors {
         return value;
     }
 };
+
+struct ErrorStats {
+    double max_abs = 0.0;
+    long double error_sq = 0.0;
+    long double reference_sq = 0.0;
+    long double dot = 0.0;
+    long double candidate_sq = 0.0;
+    bool finite = true;
+};
+
+ErrorStats compare_f32(const std::vector<float> &reference,
+                       const std::vector<float> &candidate) {
+    ErrorStats stats;
+    if (reference.size() != candidate.size()) {
+        stats.finite = false;
+        return stats;
+    }
+    for (size_t i = 0; i < reference.size(); ++i) {
+        const double r = reference[i];
+        const double c = candidate[i];
+        if (!std::isfinite(r) || !std::isfinite(c)) stats.finite = false;
+        const double error = c - r;
+        stats.max_abs = std::max(stats.max_abs, std::fabs(error));
+        stats.error_sq += (long double)error * error;
+        stats.reference_sq += (long double)r * r;
+        stats.candidate_sq += (long double)c * c;
+        stats.dot += (long double)r * c;
+    }
+    return stats;
+}
+
+double nmse(const ErrorStats &stats) {
+    return (double)(stats.error_sq /
+        std::max(stats.reference_sq, (long double)1.0e-30));
+}
+
+double cosine(const ErrorStats &stats) {
+    const long double denom = std::sqrt(
+        std::max(stats.reference_sq * stats.candidate_sq,
+                 (long double)1.0e-60));
+    return (double)(stats.dot / denom);
+}
 
 uint64_t fnv1a64(const void *data, uint64_t bytes) {
     const auto *p = static_cast<const uint8_t *>(data);
@@ -134,19 +178,284 @@ bool run_shape(const Glm5TestGGUF &gguf, const char *name,
     return true;
 }
 
+bool run_output_kslice(const Glm5TestGGUF &gguf, uint64_t weight_offset,
+                       uint32_t tokens, bool benchmark) {
+    constexpr uint32_t kFull = 8192u;
+    constexpr uint32_t kHalf = 4096u;
+    constexpr uint32_t kOut = 4096u;
+    const uint64_t full_input_count = (uint64_t)tokens * kFull;
+    const uint64_t half_input_count = (uint64_t)tokens * kHalf;
+    const uint64_t output_count = (uint64_t)tokens * kOut;
+    std::vector<float> full_input((size_t)full_input_count);
+    std::vector<float> half_input[2] = {
+        std::vector<float>((size_t)half_input_count),
+        std::vector<float>((size_t)half_input_count),
+    };
+    for (uint32_t token = 0u; token < tokens; ++token) {
+        for (uint32_t k = 0u; k < kFull; ++k) {
+            const uint64_t linear = (uint64_t)token * kFull + k;
+            const int32_t centered =
+                (int32_t)((linear * UINT64_C(89) + tokens * 31u) % 1021u) -
+                510;
+            const float value = (float)centered * (1.0f / 4096.0f) +
+                0.015625f * std::sin((double)(linear % 16381u) * 0.013);
+            full_input[(size_t)linear] = value;
+            half_input[k / kHalf][(uint64_t)token * kHalf + k % kHalf] =
+                value;
+        }
+    }
+
+    Tensors tensors;
+    ds4_gpu_tensor *full_x = tensors.f32(full_input_count);
+    ds4_gpu_tensor *half_x[2] = {
+        tensors.f32(half_input_count), tensors.f32(half_input_count),
+    };
+    ds4_gpu_tensor *full_y = tensors.f32(output_count);
+    ds4_gpu_tensor *partial[2] = {
+        tensors.f32(output_count), tensors.f32(output_count),
+    };
+    ds4_gpu_tensor *sum = tensors.f32(output_count);
+    CHECK(full_x && half_x[0] && half_x[1] && full_y && partial[0] &&
+          partial[1] && sum, "allocate BF16 K-slice tensors");
+    CHECK(ds4_gpu_tensor_write(full_x, 0u, full_input.data(),
+                               full_input_count * sizeof(float)) &&
+          ds4_gpu_tensor_write(half_x[0], 0u, half_input[0].data(),
+                               half_input_count * sizeof(float)) &&
+          ds4_gpu_tensor_write(half_x[1], 0u, half_input[1].data(),
+                               half_input_count * sizeof(float)),
+          "upload deterministic BF16 K-slice inputs");
+
+    CHECK(ds4_gpu_matmul_bf16_tensor(
+              full_y, gguf.map, gguf.size, weight_offset,
+              kFull, kOut, full_x, tokens) &&
+          ds4_gpu_matmul_bf16_kslice_rows_tensor(
+              partial[0], gguf.map, gguf.size, weight_offset,
+              kFull, kOut, 0u, kHalf, half_x[0], tokens) &&
+          ds4_gpu_matmul_bf16_kslice_rows_tensor(
+              partial[1], gguf.map, gguf.size, weight_offset,
+              kFull, kOut, kHalf, kHalf, half_x[1], tokens) &&
+          ds4_gpu_add_tensor(sum, partial[0], partial[1],
+                             (uint32_t)output_count) &&
+          ds4_gpu_synchronize(),
+          "execute full and two-half BF16 KDA output projections");
+
+    std::vector<float> full_host((size_t)output_count);
+    std::vector<float> partial_host[2] = {
+        std::vector<float>((size_t)output_count),
+        std::vector<float>((size_t)output_count),
+    };
+    std::vector<float> sum_host((size_t)output_count);
+    CHECK(ds4_gpu_tensor_read(full_y, 0u, full_host.data(),
+                              output_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(partial[0], 0u, partial_host[0].data(),
+                              output_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(partial[1], 0u, partial_host[1].data(),
+                              output_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(sum, 0u, sum_host.data(),
+                              output_count * sizeof(float)),
+          "read BF16 K-slice outputs");
+
+    /* A batch-vs-tokenwise comparison is stricter than full-vs-two-halves at
+     * one batch shape: it exposes row-count-dependent accumulation or tile
+     * ordering before a two-node recurrence test can conflate that drift with
+     * RDMA gate sequencing. */
+    if (tokens <= 2049u) {
+        ds4_gpu_tensor *tokenwise_partial[2] = {
+            tensors.f32(output_count), tensors.f32(output_count),
+        };
+        CHECK(tokenwise_partial[0] && tokenwise_partial[1],
+              "allocate tokenwise BF16 K-slice outputs");
+        for (uint32_t token = 0u; token < tokens; ++token) {
+            for (uint32_t rank = 0u; rank < 2u; ++rank) {
+            ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+                half_x[rank], (uint64_t)token * kHalf * sizeof(float),
+                (uint64_t)kHalf * sizeof(float));
+            ds4_gpu_tensor *output_row = ds4_gpu_tensor_view(
+                tokenwise_partial[rank],
+                (uint64_t)token * kOut * sizeof(float),
+                (uint64_t)kOut * sizeof(float));
+            CHECK(input_row && output_row,
+                  "create tokenwise BF16 K-slice views");
+            const int row_ok = ds4_gpu_matmul_bf16_kslice_rows_tensor(
+                output_row, gguf.map, gguf.size, weight_offset,
+                kFull, kOut, rank * kHalf, kHalf, input_row, 1u);
+            ds4_gpu_tensor_free(output_row);
+            ds4_gpu_tensor_free(input_row);
+            CHECK(row_ok, "execute tokenwise BF16 K-slice projection");
+            }
+        }
+        CHECK(ds4_gpu_synchronize(),
+              "synchronize tokenwise BF16 K-slice projections");
+        std::vector<float> tokenwise_host[2] = {
+            std::vector<float>((size_t)output_count),
+            std::vector<float>((size_t)output_count),
+        };
+        CHECK(ds4_gpu_tensor_read(tokenwise_partial[0], 0u,
+                                  tokenwise_host[0].data(),
+                                  output_count * sizeof(float)) &&
+              ds4_gpu_tensor_read(tokenwise_partial[1], 0u,
+                                  tokenwise_host[1].data(),
+                                  output_count * sizeof(float)),
+              "read tokenwise BF16 K-slice outputs");
+        for (uint32_t rank = 0u; rank < 2u; ++rank) {
+            const ErrorStats row_error =
+                compare_f32(partial_host[rank], tokenwise_host[rank]);
+            uint64_t bit_mismatches = 0u;
+            for (uint64_t i = 0u; i < output_count; ++i) {
+                if (std::memcmp(&partial_host[rank][(size_t)i],
+                                &tokenwise_host[rank][(size_t)i],
+                                sizeof(float)) != 0) ++bit_mismatches;
+            }
+            std::fprintf(stderr,
+                "MEASURE GLM5 KDA BF16 K-slice route tokens=%u rank=%u "
+                "max_abs=%.9g nmse=%.9g nrmse=%.9g mismatches=%llu/%llu "
+                "batch_fnv=%016llx tokenwise_fnv=%016llx\n",
+                tokens, rank, row_error.max_abs, nmse(row_error),
+                std::sqrt(nmse(row_error)),
+                (unsigned long long)bit_mismatches,
+                (unsigned long long)output_count,
+                (unsigned long long)fnv1a64(
+                    partial_host[rank].data(), output_count * sizeof(float)),
+                (unsigned long long)fnv1a64(
+                    tokenwise_host[rank].data(), output_count * sizeof(float)));
+            const bool route_ok = row_error.finite &&
+                row_error.max_abs <= 1.0e-7 &&
+                std::sqrt(nmse(row_error)) <= 1.0e-7;
+            std::fprintf(stderr,
+                "DECISION GLM5 KDA BF16 K-slice route tokens=%u rank=%u "
+                "result=%s threshold_nrmse=1e-7 threshold_max_abs=1e-7\n",
+                tokens, rank, route_ok ? "PASS" : "REPAIR");
+            if (std::getenv("DS4_GLM5_KDA_REQUIRE_ROUTE_MATCH") != nullptr) {
+                CHECK(route_ok,
+                      "BF16 K-slice batch preserves tokenwise route envelope");
+            }
+        }
+    }
+    const ErrorStats split_error = compare_f32(full_host, sum_host);
+    CHECK(split_error.finite && split_error.max_abs <= 5.0e-4 &&
+          nmse(split_error) <= 1.0e-7 && cosine(split_error) >= 0.9999999,
+          "BF16 K-slice Lane-B numerical envelope");
+
+    /* Independent address/layout check against a long-double dot for sampled
+     * rows and the first/last token. This catches the packed-row footgun even
+     * though the GPU full-vs-split comparison uses related kernels. */
+    const uint16_t *weights = reinterpret_cast<const uint16_t *>(
+        gguf.map + weight_offset);
+    const uint32_t sample_rows[] = {0u, 1u, 127u, 2048u, 4095u};
+    double cpu_max_abs = 0.0;
+    for (uint32_t sample_token : {0u, tokens - 1u}) {
+        for (uint32_t row : sample_rows) {
+            long double ref = 0.0;
+            const uint16_t *wr = weights + (uint64_t)row * kFull;
+            for (uint32_t k = 0u; k < kFull; ++k) {
+                const uint32_t bits = (uint32_t)wr[k] << 16u;
+                float wf = 0.0f;
+                std::memcpy(&wf, &bits, sizeof(wf));
+                ref += (long double)wf *
+                    full_input[(uint64_t)sample_token * kFull + k];
+            }
+            cpu_max_abs = std::max(cpu_max_abs,
+                std::fabs((double)ref -
+                          (double)sum_host[(uint64_t)sample_token * kOut + row]));
+        }
+    }
+    CHECK(cpu_max_abs <= 2.0e-4,
+          "BF16 K-slice sampled independent GGUF dot envelope");
+
+    ds4_gpu_tensor *scratch = tensors.f32(output_count);
+    CHECK(scratch &&
+          !ds4_gpu_matmul_bf16_kslice_rows_tensor(
+              scratch, gguf.map, gguf.size, weight_offset,
+              kFull, kOut, 0u, kHalf - 1u, half_x[0], tokens) &&
+          !ds4_gpu_matmul_bf16_kslice_rows_tensor(
+              scratch, gguf.map, gguf.size, weight_offset,
+              kFull, kOut, kHalf, kHalf + 32u, half_x[1], tokens),
+          "BF16 K-slice malformed ranges fail closed");
+
+    std::fprintf(stderr,
+        "PASS GLM5 KDA BF16 K-slice tokens=%u max_abs=%.9g nmse=%.9g "
+        "cosine=%.12g cpu_sample_max_abs=%.9g full_fnv=%016llx "
+        "sum_fnv=%016llx\n",
+        tokens, split_error.max_abs, nmse(split_error), cosine(split_error),
+        cpu_max_abs,
+        (unsigned long long)fnv1a64(full_host.data(),
+                                    output_count * sizeof(float)),
+        (unsigned long long)fnv1a64(sum_host.data(),
+                                    output_count * sizeof(float)));
+
+    if (benchmark) {
+        const uint32_t warmup = tokens >= 512u ? 2u : 8u;
+        const uint32_t repeats = tokens >= 512u ? 6u : 64u;
+        const auto launch = [&](uint32_t operation) {
+            if (operation == 0u)
+                return ds4_gpu_matmul_bf16_tensor(
+                    full_y, gguf.map, gguf.size, weight_offset,
+                    kFull, kOut, full_x, tokens) != 0;
+            if (operation <= 2u) {
+                const uint32_t rank = operation - 1u;
+                return ds4_gpu_matmul_bf16_kslice_rows_tensor(
+                    partial[rank], gguf.map, gguf.size, weight_offset,
+                    kFull, kOut, rank * kHalf, kHalf, half_x[rank], tokens) != 0;
+            }
+            return ds4_gpu_add_tensor(
+                       sum, partial[0], partial[1],
+                       (uint32_t)output_count) != 0;
+        };
+        const auto time_operation = [&](uint32_t operation) -> double {
+            for (uint32_t i = 0u; i < warmup; ++i)
+                CHECK(launch(operation), "warm BF16 K-slice timing operation");
+            hipEvent_t begin = nullptr, end = nullptr;
+            CHECK(hipEventCreate(&begin) == hipSuccess &&
+                  hipEventCreate(&end) == hipSuccess &&
+                  hipEventRecord(begin) == hipSuccess,
+                  "create BF16 K-slice timing events");
+            for (uint32_t i = 0u; i < repeats; ++i)
+                CHECK(launch(operation), "launch BF16 K-slice timing operation");
+            CHECK(hipEventRecord(end) == hipSuccess &&
+                  hipEventSynchronize(end) == hipSuccess,
+                  "complete BF16 K-slice timing events");
+            float total_ms = 0.0f;
+            CHECK(hipEventElapsedTime(&total_ms, begin, end) == hipSuccess,
+                  "read BF16 K-slice timing events");
+            CHECK(hipEventDestroy(end) == hipSuccess &&
+                  hipEventDestroy(begin) == hipSuccess,
+                  "destroy BF16 K-slice timing events");
+            return (double)total_ms / repeats;
+        };
+        const double full_ms = time_operation(0u);
+        const double rank0_ms = time_operation(1u);
+        const double rank1_ms = time_operation(2u);
+        const double add_ms = time_operation(3u);
+        CHECK(full_ms > 0.0 && rank0_ms > 0.0 && rank1_ms > 0.0 &&
+              add_ms > 0.0, "valid BF16 K-slice timing results");
+        const double critical_ms = std::max(rank0_ms, rank1_ms) + add_ms;
+        const double speedup = full_ms / critical_ms;
+        std::fprintf(stderr,
+            "MEASURE GLM5 KDA BF16 K-slice tokens=%u full_ms=%.6f "
+            "rank0_ms=%.6f "
+            "rank1_ms=%.6f add_ms=%.6f critical_ms=%.6f speedup=%.4fx "
+            "decision=%s\n",
+            tokens, full_ms, rank0_ms, rank1_ms, add_ms, critical_ms, speedup,
+            speedup >= 1.4 ? "GO" : "STOP");
+    }
+    return true;
+}
+
 bool run_test() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     CHECK(model && model[0], "DS4_GLM5_MODEL environment");
     Glm5TestGGUF gguf;
     CHECK(gguf.open_file(model), "open GLM5 GGUF");
 
-    uint64_t q = 0u, k = 0u, v = 0u;
+    uint64_t q = 0u, k = 0u, v = 0u, output = 0u;
     uint64_t f_b = 0u, g_b = 0u, beta = 0u;
     uint64_t q_conv = 0u, k_conv = 0u, v_conv = 0u;
     uint64_t dt_bias = 0u, a_log = 0u;
     CHECK(gguf.tensor("blk.0.kda_q.weight", {4096u, 8192u}, 30u, q) &&
           gguf.tensor("blk.0.kda_k.weight", {4096u, 8192u}, 30u, k) &&
           gguf.tensor("blk.0.kda_v.weight", {4096u, 8192u}, 30u, v) &&
+          gguf.tensor("blk.0.kda_output.weight", {8192u, 4096u}, 30u,
+                      output) &&
           gguf.tensor("blk.0.kda_f_b.weight", {128u, 8192u}, 30u, f_b) &&
           gguf.tensor("blk.0.kda_g_b.weight", {128u, 8192u}, 30u, g_b) &&
           gguf.tensor("blk.0.kda_beta.weight", {4096u, 64u}, 30u, beta) &&
@@ -201,7 +510,7 @@ bool run_test() {
           "initialize gfx1151 and register GLM5 model map");
     runtime.active = true;
 
-    for (uint32_t tokens : {1u, 4u, 33u}) {
+    for (uint32_t tokens : {1u, 3u, 4u, 33u}) {
         CHECK(run_shape(gguf, "kda_q", q, 4096u, 8192u, tokens),
               "KDA q projection row-slice identity");
         CHECK(run_shape(gguf, "kda_k", k, 4096u, 8192u, tokens),
@@ -214,7 +523,21 @@ bool run_test() {
               "KDA g_b projection row-slice identity");
         CHECK(run_shape(gguf, "kda_beta", beta, 4096u, 64u, tokens),
               "KDA beta projection row-slice identity");
+        CHECK(run_output_kslice(
+                  gguf, output, tokens, tokens == 1u || tokens == 33u),
+              "KDA output K-slice real-GGUF oracle");
     }
+    /* The production token-tile dispatcher consumes complete 32-row chunks
+     * followed by 16/8/4/2/1 tails.  Exercise both sides of the first two
+     * boundaries and the production prefill boundary against repeated
+     * one-row execution, rather than assuming the 33-row case covers every
+     * tail composition. */
+    for (uint32_t tokens : {31u, 32u, 63u, 64u, 65u, 2049u}) {
+        CHECK(run_output_kslice(gguf, output, tokens, false),
+              "KDA output K-slice token-tile boundary oracle");
+    }
+    CHECK(run_output_kslice(gguf, output, 2048u, true),
+          "KDA output K-slice 2048-row correctness and timing oracle");
     std::fprintf(stderr,
                  "PASS complete real-GGUF GLM5 KDA BF16 row-slice gate\n");
     return true;

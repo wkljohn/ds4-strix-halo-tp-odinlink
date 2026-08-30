@@ -28,6 +28,14 @@ typedef struct {
     const char *trace_prefix;
     uint32_t trace_layer;
     uint32_t trace_token;
+#ifdef DS4_TP_TEST_HOOKS
+    /* Optional GPU-only MLA stage capture. The executor enqueues copies into
+     * this independent buffer and the harness performs one terminal read, so
+     * diagnosis does not insert a synchronization between MLA and its FFN. */
+    ds4_gpu_tensor *device_mla_stage_capture;
+    uint64_t device_mla_stage_capture_bytes;
+    uint32_t device_mla_stage_capture_layer;
+#endif
     /* Transport-global, monotonically increasing big-gate sequence.  It is
      * deliberately not reset with a model sequence while the TP link lives. */
     uint64_t *tp_sequence;
@@ -40,7 +48,51 @@ typedef struct {
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void);
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity(
         uint32_t capacity_tokens);
+/* Decode sparse-MLA scratch is sized from the session context independently
+ * of the token-tile capacity. */
+ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity_context(
+        uint32_t capacity_tokens, uint32_t context_capacity);
 void ds4_glm5_next_workspace_destroy(ds4_glm5_next_workspace *workspace);
+/* Cache ownership follows the caller's execution phase. Prefill never uses
+ * the bounded decode scratch, including scalar prompt tails. */
+void ds4_glm5_next_workspace_begin_prefill(
+        ds4_glm5_next_workspace *workspace);
+void ds4_glm5_next_workspace_begin_decode(
+        ds4_glm5_next_workspace *workspace);
+
+#ifdef DS4_TP_TEST_HOOKS
+uint64_t ds4_glm5_next_mla_stage_capture_bytes(uint32_t n_tokens);
+int ds4_glm5_next_mla_stage_capture_dump(
+        const ds4_gpu_tensor *capture, uint32_t n_tokens, FILE *stream);
+/* Returns the exact compact activation slice and byte requirement used by
+ * the production KDA TP output projection. This exists so a 4096/8192
+ * dimension substitution cannot escape the production-shaped test gate. */
+int ds4_glm5_next_kda_output_kslice_contract_test(
+        uint32_t rank, uint32_t n_tokens, uint64_t *k_off,
+        uint64_t *k_cnt, uint64_t *local_bytes);
+/* Execute the production sparse selector at a smaller test-only top-k so the
+ * pool crossover can be proven without a 2,048-token setup. */
+int ds4_glm5_next_mla_sparse_attention_forward_test(
+        const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t layer,
+        ds4_glm5_next_state *state,
+        ds4_glm5_next_workspace *workspace,
+        const ds4_gpu_tensor *hc_in,
+        ds4_gpu_tensor *hc_out,
+        uint32_t top_k);
+int ds4_glm5_next_mla_sparse_selection_read_test(
+        const ds4_glm5_next_workspace *workspace,
+        int32_t *selected,
+        uint32_t count);
+int ds4_glm5_next_mla_sparse_indexer_read_test(
+        const ds4_glm5_next_workspace *workspace,
+        uint32_t n_pools,
+        uint32_t selected_count,
+        float *query,
+        float *weights,
+        float *scores,
+        uint32_t *selected_pools);
+#endif
 
 int ds4_glm5_next_embed_token(const ds4_glm5_next_exec_ctx *ctx,
                               uint32_t token,

@@ -141,6 +141,11 @@ int ds4_glm5_kda_layer_finish(ds4_glm5_kda_layer_state *state,
                               const ds4_gpu_tensor *full_gated,
                               ds4_gpu_tensor *output,
                               uint32_t n_tokens);
+/* Commit a successful externally composed output suffix.  This is used by
+ * the TP K-slice path only after both rank partials have been exchanged and
+ * added; failure retains the same fail-closed state semantics as finish(). */
+int ds4_glm5_kda_layer_commit(ds4_glm5_kda_layer_state *state,
+                             uint32_t n_tokens);
 void ds4_glm5_kda_layer_abort(ds4_glm5_kda_layer_state *state);
 int ds4_glm5_kda_compose_head_halves(ds4_gpu_tensor *full,
                                      const ds4_gpu_tensor *rank0,

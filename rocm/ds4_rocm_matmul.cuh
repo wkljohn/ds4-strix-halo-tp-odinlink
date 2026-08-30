@@ -1484,6 +1484,42 @@ static int matmul_bf16_f32_toktile_w32_launch(
     return first == n_tok;
 }
 
+static int matmul_bf16_f32_kslice_toktile_w32_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t full_in_dim, uint32_t k_off, uint32_t k_cnt,
+        uint32_t out_dim, uint32_t n_tok) {
+    uint32_t first = 0u;
+    const uint32_t chunks32 = n_tok / 32u;
+    if (chunks32 > 0u) {
+        matmul_bf16_f32_kslice_toktile_w32_kernel<32u><<<
+                dim3(out_dim, chunks32), kDs4Bf16ToktileThreads>>>(
+            out, weight, x, full_in_dim, k_off, k_cnt, out_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "matmul_bf16 kslice token-tile32 launch")) return 0;
+        first = chunks32 * 32u;
+    }
+#define DS4_BF16_KSLICE_LAUNCH_TAIL(T) do {                              \
+        if (n_tok - first >= (T)) {                                      \
+            matmul_bf16_f32_kslice_toktile_w32_kernel<(T)><<<            \
+                out_dim, kDs4Bf16ToktileThreads>>>(                       \
+                out + (uint64_t)first * out_dim, weight,                 \
+                x + (uint64_t)first * k_cnt, full_in_dim, k_off, k_cnt,  \
+                out_dim);                                                \
+            if (!cuda_ok(cudaGetLastError(),                              \
+                         "matmul_bf16 kslice token-tail launch"))        \
+                return 0;                                                \
+            first += (T);                                                \
+        }                                                                \
+    } while (0)
+    DS4_BF16_KSLICE_LAUNCH_TAIL(16u);
+    DS4_BF16_KSLICE_LAUNCH_TAIL(8u);
+    DS4_BF16_KSLICE_LAUNCH_TAIL(4u);
+    DS4_BF16_KSLICE_LAUNCH_TAIL(2u);
+    DS4_BF16_KSLICE_LAUNCH_TAIL(1u);
+#undef DS4_BF16_KSLICE_LAUNCH_TAIL
+    return first == n_tok;
+}
+
 static int matmul_bf16_f32_lowrank128_toktile_w32_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t out_dim, uint32_t n_tok) {
@@ -1544,13 +1580,17 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         const dim3 block(rows_per_block * 32u);
         const size_t shared_bytes = (size_t)in_dim * sizeof(float);
         if (!decode_mlp64_disabled && in_dim >= 4096u) {
+        static const int split_order =
+                (getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER") != NULL &&
+                 strcmp(getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER"), "1") == 0);
             matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel<<<
                     grid, block, shared_bytes>>>(
                     (float *)out->ptr,
                     (const uint16_t *)wptr,
                     (const float *)x->ptr,
                     (uint32_t)in_dim,
-                    out_dim);
+                    out_dim,
+                    split_order && in_dim == 8192u);
         } else {
             matmul_bf16_f32_sharedx_warp_rows_w32_kernel<<<
                     grid, block, shared_bytes>>>(
@@ -1614,6 +1654,95 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
                                       (const float *)x->ptr,
                                       in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_kslice_rows_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t out_dim,
+        uint64_t k_off, uint64_t k_cnt, const ds4_gpu_tensor *x,
+        uint64_t n_rows) {
+    if (!out || !x || !model_map || full_in_dim == 0u || out_dim == 0u ||
+        k_cnt == 0u || n_rows == 0u || full_in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX || k_off > UINT32_MAX || k_cnt > UINT32_MAX ||
+        n_rows > UINT32_MAX || (k_off & 31u) != 0u ||
+        (k_cnt & 31u) != 0u || k_off > full_in_dim ||
+        k_cnt > full_in_dim - k_off) return 0;
+    uint64_t weight_elems = 0u, x_elems = 0u, out_elems = 0u;
+    if (weight_offset > model_size ||
+        !cuda_u64_mul_checked(out_dim, full_in_dim, &weight_elems) ||
+        weight_elems > UINT64_MAX / sizeof(uint16_t) ||
+        weight_elems * sizeof(uint16_t) > model_size - weight_offset ||
+        !cuda_u64_mul_checked(n_rows, k_cnt, &x_elems) ||
+        x_elems > UINT64_MAX / sizeof(float) ||
+        x->bytes < x_elems * sizeof(float) ||
+        !cuda_u64_mul_checked(n_rows, out_dim, &out_elems) ||
+        out_elems > UINT64_MAX / sizeof(float) ||
+        out->bytes < out_elems * sizeof(float) ||
+        cuda_u64_ranges_overlap(
+            (uint64_t)(uintptr_t)out->ptr, out_elems * sizeof(float),
+            (uint64_t)(uintptr_t)x->ptr, x_elems * sizeof(float))) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    const char *wptr = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "bf16_kslice");
+    if (!wptr) return 0;
+    const uint32_t full = (uint32_t)full_in_dim;
+    const uint32_t off = (uint32_t)k_off;
+    const uint32_t count = (uint32_t)k_cnt;
+    const uint32_t rows = (uint32_t)out_dim;
+    const uint32_t tokens = (uint32_t)n_rows;
+    /* Diagnostic/promotion lane: use one reduction tree for decode and
+     * batched rows so route comparisons isolate KDA recurrence rather than
+     * comparing the shared-x decode tree with the token-tile tree. */
+    static const char *route_toktile_value =
+        getenv("DS4_ROCM_KSLICE_ROUTE_TOKTILE");
+    static const int route_toktile = route_toktile_value != NULL &&
+        strcmp(route_toktile_value, "1") == 0;
+    if (tokens == 1u && count <= 8192u &&
+        count * sizeof(float) <= 65536u && !route_toktile) {
+        const uint32_t rows_per_block = 32u;
+        static const int compensated_reduce =
+            getenv("DS4_ROCM_KSLICE_COMPENSATED_REDUCE") != NULL;
+        static const int pair_accum =
+            getenv("DS4_ROCM_KSLICE_PAIR_ACCUM") != NULL;
+        static const int kahan_accum =
+            getenv("DS4_ROCM_KSLICE_KAHAN_ACCUM") != NULL;
+        matmul_bf16_f32_sharedx_mlp64_kslice_warp_rows_w32_kernel<<<
+                (rows + rows_per_block - 1u) / rows_per_block,
+                rows_per_block * 32u,
+                (size_t)count * sizeof(float)>>>(
+            (float *)out->ptr, (const uint16_t *)wptr,
+            (const float *)x->ptr, full, off, count, rows,
+            compensated_reduce, pair_accum, kahan_accum);
+        return cuda_ok(cudaGetLastError(),
+                       "matmul_bf16 kslice sharedx launch");
+    }
+    if ((tokens >= 16u || route_toktile) &&
+        count >= 1024u && rows >= 1024u &&
+        !g_quality_mode && !cuda_runtime_config()->graph_dump) {
+        return matmul_bf16_f32_kslice_toktile_w32_launch(
+            (float *)out->ptr, (const uint16_t *)wptr,
+            (const float *)x->ptr, full, off, count, rows, tokens);
+    }
+    matmul_bf16_kslice_kernel<<<dim3(rows, tokens), 256u>>>(
+        (float *)out->ptr, (const uint16_t *)wptr,
+        (const float *)x->ptr, full, off, count, rows, tokens);
+    return cuda_ok(cudaGetLastError(), "matmul_bf16 kslice launch");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_kslice_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
+        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint64_t x_elem_off) {
+    if (!x || x_elem_off > x->bytes / sizeof(float) ||
+        k_cnt > x->bytes / sizeof(float) - x_elem_off) return 0;
+    ds4_gpu_tensor compact = *x;
+    compact.ptr = (char *)x->ptr + x_elem_off * sizeof(float);
+    compact.bytes = k_cnt * sizeof(float);
+    compact.owner = 0;
+    return ds4_gpu_matmul_bf16_kslice_rows_tensor(
+        out, model_map, model_size, weight_offset, full_in_dim, out_dim,
+        k_off, k_cnt, &compact, 1u);
 }
 
 extern "C" int ds4_gpu_matmul_f16_pair_temporal_tensor(
@@ -1989,6 +2118,8 @@ extern "C" int ds4_rocm_q8_kslice_f32_rows_strided(
         uint64_t in_start, uint64_t in_count, const ds4_gpu_tensor *x,
         uint64_t x_elem_start, uint64_t n_tokens,
         uint64_t x_token_stride) {
+    if (getenv("DS4_ROCM_GLM5_DISABLE_STRIDED_F32_ROWS") != nullptr)
+        return -1;
     if (!out || !x || !model_map ||
         full_in_dim == 0u || out_dim == 0u || in_count == 0u ||
         (in_start & 31u) != 0u || (in_count & 31u) != 0u ||

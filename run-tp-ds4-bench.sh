@@ -315,10 +315,16 @@ if [[ -n $FROZEN_TOKEN_FILE || -n $FROZEN_LOGITS_DIR ]]; then
 fi
 
 [[ -r $MODEL && -r $PROMPT_FILE ]] || { echo "error: missing local model or prompt" >&2; exit 1; }
-CURRENT_OPT_ENV=(
-  DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
-)
+MODEL_ARCH=$(python3 "$REPO/scripts/gguf_tensor_types.py" --architecture "$MODEL") || {
+  echo "error: unable to inspect general.architecture in $MODEL" >&2
+  exit 1
+}
+CURRENT_OPT_ENV=()
 if [[ $DSPARK == 1 ]]; then
+  [[ $MODEL_ARCH != glm5-next ]] || {
+    echo "error: GLM5.3 ordinary TP benchmark does not support DSpark/MTP" >&2
+    exit 2
+  }
   # Paired one-token DP4A changes the committed target trajectory unless the
   # five-row verifier uses identical arithmetic. Keep the exact production
   # DSpark path; the runtime independently enforces this safety invariant.
@@ -336,7 +342,21 @@ else
       exit 1
       ;;
   esac
-  if [[ $ROUTED_FAMILY == HYBRID_Q2 ]]; then
+  if [[ $MODEL_ARCH == glm5-next ]]; then
+    # GLM5.3 owns its KDA/MLA and routed-expert dispatch. Do not leak the
+    # DeepSeek compressor, greedy-vocabulary split, or skip/fusion switches
+    # into this independently quality-gated arithmetic path.
+    CURRENT_OPT_ENV+=(
+      DS4_GLM5_NEXT_ENABLE_ORDINARY=1
+      DS4_TP_BIG_DIRECT=1
+      DS4_TP_GREEDY_TOP2=0
+      DS4_ROCM_TEMPORAL_COMPRESSOR=0
+    )
+    EXPECT_GREEDY_TOP2=0
+  elif [[ $MODEL_ARCH != deepseek4 ]]; then
+    echo "error: ds4-bench-tp has no validated TP profile for architecture $MODEL_ARCH" >&2
+    exit 1
+  elif [[ $ROUTED_FAMILY == HYBRID_Q2 ]]; then
     CURRENT_OPT_ENV+=(DS4_ROCM_TP_ZERO_WEIGHT_TILE_SKIP=1)
     if [[ $CANDIDATE == 1 ]]; then
       for env_kv in "${EXTRA_ENV[@]}"; do
@@ -348,21 +368,24 @@ else
       done
     fi
   fi
-  CURRENT_OPT_ENV+=(
-    DS4_TP_GREEDY_TOP2=1
-    DS4_TP_HOST_CALLBACK=1
-    DS4_TP_PREFILL_FFN_WAVEFRONT=1
-    DS4_ROCM_TEMPORAL_COMPRESSOR=1
-    DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
-    DS4_ROCM_Q8_BATCH_WMMA_M256_K128=1
-    DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1
-    DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP=1
-    DS4_ROCM_Q4K_WMMA_FUSE_MID=1
-    DS4_ROCM_TP_SKIP_UNOWNED=1
-    DS4_ROCM_TP_PREFILL_SKIP_UNOWNED="$TP_PREFILL_SKIP_UNOWNED"
-    DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1
-  )
-  EXPECT_GREEDY_TOP2=1
+  if [[ $MODEL_ARCH == deepseek4 ]]; then
+    CURRENT_OPT_ENV+=(
+      DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
+      DS4_TP_GREEDY_TOP2=1
+      DS4_TP_HOST_CALLBACK=1
+      DS4_TP_PREFILL_FFN_WAVEFRONT=1
+      DS4_ROCM_TEMPORAL_COMPRESSOR=1
+      DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
+      DS4_ROCM_Q8_BATCH_WMMA_M256_K128=1
+      DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1
+      DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP=1
+      DS4_ROCM_Q4K_WMMA_FUSE_MID=1
+      DS4_ROCM_TP_SKIP_UNOWNED=1
+      DS4_ROCM_TP_PREFILL_SKIP_UNOWNED="$TP_PREFILL_SKIP_UNOWNED"
+      DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1
+    )
+    EXPECT_GREEDY_TOP2=1
+  fi
 fi
 
 # Distributional quality diagnostics require complete vocabulary logits.
@@ -380,7 +403,7 @@ fi
 }
 
 if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
-  echo "validated_config rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE candidate_lane=$CANDIDATE_LANE baseline_id=${BASELINE_ID:-n/a} tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
+  echo "validated_config model_arch=$MODEL_ARCH rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK prefill_arg=$([[ $MODEL_ARCH == glm5-next ]] && echo omitted || echo passed) routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE candidate_lane=$CANDIDATE_LANE baseline_id=${BASELINE_ID:-n/a} tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ $MODEL_ARCH == deepseek4 && ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
   exit 0
 fi
 
@@ -408,6 +431,14 @@ else
 fi
 WORKER_ENV=("${COMMON_ENV[@]}")
 COORD_ENV=("${COMMON_ENV[@]}")
+
+# GLM-5.3 uses the GLM-DSA graph scheduler, which rejects the legacy
+# --prefill-chunk option. DeepSeek and all other validated paths retain the
+# explicit chunk argument and its provider-specific defaults.
+PREFILL_ARGS=(--prefill-chunk "$PREFILL_CHUNK")
+if [[ $MODEL_ARCH == glm5-next ]]; then
+  PREFILL_ARGS=()
+fi
 if [[ $CANDIDATE == 1 && $EXPECT_GREEDY_TOP2 == 1 ]]; then
   COORD_ENV+=(DS4_BENCH_EXPECT_GREEDY_TOP2=1)
 fi
@@ -622,6 +653,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'peer_ds4_sha256=%s\n' "$PEER_DS4_HASH"
   printf 'ds4_bench_tp_sha256=%s\n' "$LOCAL_BENCH_HASH"
   printf 'model=%s\n' "$MODEL"
+  printf 'model_arch=%s\n' "$MODEL_ARCH"
   printf 'model_size=%s\n' "$LOCAL_MODEL_SIZE"
   printf 'model_sample_sha256=%s\n' "$LOCAL_MODEL_FINGERPRINT"
   printf 'prompt=%s\n' "$PROMPT_FILE"
@@ -746,7 +778,7 @@ if [[ $DSPARK == 1 ]]; then echo "mtp_sample_sha256: $LOCAL_MTP_FINGERPRINT resi
 WORKER_APP=(./ds4
   --role worker --tensor-parallel --coordinator "$COORDINATOR_ADDR" 9000
   --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
-  --prefill-chunk "$PREFILL_CHUNK"
+  "${PREFILL_ARGS[@]}"
   "${WORKER_RDMA_ARGS[@]}"
   "${WORKER_ARGS[@]}")
 WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}" "${WORKER_APP[@]}")
@@ -791,7 +823,7 @@ fi
   --ctx-start "$FRONTIER" --ctx-max "$FRONTIER_MAX" \
   --step-incr "$STEP_INCR" --step-mul "$STEP_MUL" \
   --ctx-alloc "$CONTEXT" \
-  --prefill-chunk "$PREFILL_CHUNK" --gen-tokens "$TOKENS" --csv "$CSV" \
+  "${PREFILL_ARGS[@]}" --gen-tokens "$TOKENS" --csv "$CSV" \
   "${CANDIDATE_ARGS[@]}" \
   "${COORD_ARGS[@]}" \
   > "$COORD_LOG" 2>&1

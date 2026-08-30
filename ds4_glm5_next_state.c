@@ -1,6 +1,7 @@
 #include "ds4_glm5_next_runtime.h"
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int add_u64(uint64_t a, uint64_t b, uint64_t *out) {
@@ -260,6 +261,29 @@ int ds4_glm5_next_state_init(ds4_glm5_next_state *state,
         if (!mla->index_tail) goto fail;
         mla->pool_gate_tail = ds4_gpu_tensor_alloc(tail_bytes);
         if (!mla->pool_gate_tail) goto fail;
+        /* Diagnostic for a read-before-write in the persistent sparse-MLA
+         * state.  All sizes are four-byte aligned.  Keep this opt-in until a
+         * narrower buffer contract is proven; clearing the full KV capacity
+         * at startup is intentionally not a production default. */
+        if (getenv("DS4_GLM5_ZERO_PERSISTENT_MLA") != NULL &&
+            (!ds4_gpu_tensor_fill_f32(
+                 mla->compact_kv, 0.0f,
+                 (uint32_t)(compact_bytes / sizeof(float))) ||
+             !ds4_gpu_tensor_fill_f32(
+                 mla->index_pool, 0.0f,
+                 (uint32_t)(pool_bytes / sizeof(float))) ||
+             !ds4_gpu_tensor_fill_f32(
+                 mla->index_pool_ids, 0.0f,
+                 pool_capacity * 4u) ||
+             !ds4_gpu_tensor_fill_f32(
+                 mla->index_pool_valid, 0.0f,
+                 pool_capacity) ||
+             !ds4_gpu_tensor_fill_f32(
+                 mla->index_tail, 0.0f,
+                 (uint32_t)(tail_bytes / sizeof(float))) ||
+             !ds4_gpu_tensor_fill_f32(
+                 mla->pool_gate_tail, 0.0f,
+                 (uint32_t)(tail_bytes / sizeof(float))))) goto fail;
         ++allocated_mla;
     }
     if (allocated_mla != DS4_GLM5_NEXT_MLA_COUNT) goto fail;

@@ -330,6 +330,11 @@ __global__ static void glm_store_indexer_k_kernel(
         __syncthreads();
     }
     const float mean = partial[0] / (float)head_dim;
+    /* All waves must consume the reduced mean before wave 0 reuses partial[]
+     * for the variance reduction.  A 256-thread block spans eight gfx1151
+     * wave32s, so the preceding reduction barrier does not order these later
+     * reads against an early variance write. */
+    __syncthreads();
     float ss = 0.0f;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
         const float d = src[i] - mean;
@@ -862,8 +867,9 @@ __global__ static void glm_attention_indexed_lora_kernel(
     const uint32_t qk_dim = qk_nope + qk_rope;
     const float scale = rsqrtf((float)qk_dim);
     extern __shared__ float sh[];
-    float *red = sh;
-    float *scores = sh + 256u;
+    float *max_red = sh;
+    float *sum_red = sh + 256u;
+    float *scores = sh + 512u;
     const float *qh = q + ((uint64_t)token * n_head + head) * qk_dim;
     const float *low = qk_low + ((uint64_t)token * n_head + head) * kv_lora_dim;
 
@@ -904,33 +910,36 @@ __global__ static void glm_attention_indexed_lora_kernel(
         scores[s] = score;
         local_max = fmaxf(local_max, score);
     }
-    red[threadIdx.x] = local_max;
+    max_red[threadIdx.x] = local_max;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + stride]);
+        if (threadIdx.x < stride) {
+            max_red[threadIdx.x] = fmaxf(
+                max_red[threadIdx.x], max_red[threadIdx.x + stride]);
+        }
         __syncthreads();
     }
-    const float max_score = red[0];
-    if (!isfinite(max_score)) {
-        float *out = lora_out + ((uint64_t)token * n_head + head) * kv_lora_dim;
-        for (uint32_t j = threadIdx.x; j < kv_lora_dim; j += blockDim.x) {
-            out[j] = 0.0f;
-        }
-        return;
-    }
+    /* Do not reuse max_red for the sum reduction.  Without an intervening
+     * barrier, wave 0 could overwrite max_red[0] while a later wave was still
+     * loading the softmax offset, producing intermittent row-local drift.
+     * Separate LDS regions remove that WAR hazard without adding a barrier. */
+    const float max_score = max_red[0];
+    const bool valid_max = isfinite(max_score);
     float local_sum = 0.0f;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        const float w = expf(scores[s] - max_score);
+        const float w = valid_max ? expf(scores[s] - max_score) : 0.0f;
         scores[s] = w;
         local_sum += w;
     }
-    red[threadIdx.x] = local_sum;
+    sum_red[threadIdx.x] = local_sum;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
+        if (threadIdx.x < stride) {
+            sum_red[threadIdx.x] += sum_red[threadIdx.x + stride];
+        }
         __syncthreads();
     }
-    const float denom = fmaxf(red[0], 1.0e-20f);
+    const float denom = fmaxf(sum_red[0], 1.0e-20f);
     float *out = lora_out + ((uint64_t)token * n_head + head) * kv_lora_dim;
     for (uint32_t j = threadIdx.x; j < kv_lora_dim; j += blockDim.x) {
         float acc = 0.0f;
@@ -946,7 +955,7 @@ __global__ static void glm_attention_indexed_lora_kernel(
                                                        cache_f16);
             }
         }
-        out[j] = acc / denom;
+        out[j] = valid_max ? acc / denom : 0.0f;
     }
 }
 
@@ -3565,7 +3574,7 @@ static int glm_attention_indexed_lora_launch(
         return 1;
     }
     dim3 grid(n_head, n_tokens, 1);
-    const size_t shmem = ((size_t)256u + n_selected) * sizeof(float);
+    const size_t shmem = ((size_t)512u + n_selected) * sizeof(float);
     glm_attention_indexed_lora_kernel<<<grid, 256, shmem>>>((float *)lora_out->ptr,
                                                             (const float *)q->ptr,
                                                             (const float *)qk_low->ptr,

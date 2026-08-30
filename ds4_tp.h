@@ -101,6 +101,11 @@ enum {
      * inserts an attention gate before the unchanged output projection.
      * The bit changes both state ownership and the 53->87 gate schedule. */
     DS4_TP_FEATURE_GLM5_KDA_TP = UINT32_C(1) << 22,
+    /* Replace the exchanged gated-head half with the rank-local BF16
+     * kda_output K-slice partial.  Payload size and gate count stay fixed,
+     * but payload meaning and FP32 reduction order change, so independently
+     * launched ranks must agree before entering the KDA graph. */
+    DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE = UINT32_C(1) << 23,
 };
 
 static inline uint32_t ds4_tp_glm5_kda_tp_feature(

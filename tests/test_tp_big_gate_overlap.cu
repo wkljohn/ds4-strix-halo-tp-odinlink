@@ -412,6 +412,12 @@ int main(int argc, char **argv) {
     const uint64_t chunk_bytes = kBytes / chunks;
     const uint64_t chunk_values = kValues / chunks;
     const uint32_t rank = leader ? 0u : 1u;
+    const char *raw_only_env = std::getenv("DS4_TP_BIG_GATE_RAW_ONLY");
+    const bool raw_only = raw_only_env && std::strcmp(raw_only_env, "1") == 0;
+    if (raw_only_env && !raw_only && std::strcmp(raw_only_env, "0") != 0) {
+        std::fprintf(stderr, "FAIL DS4_TP_BIG_GATE_RAW_ONLY must be 0 or 1\n");
+        return 2;
+    }
 
     /* First use includes QP/cache/clock warmup and is not evidence.  Consume
      * one identical untimed pass before the measured arms. */
@@ -419,6 +425,32 @@ int main(int argc, char **argv) {
     const double wire_ms = wire_only(tp, send_host, recv_host, chunks,
                                      chunk_bytes, 1000u);
     std::atomic_thread_fence(std::memory_order_acquire);
+    std::vector<float> raw_peer(kValues);
+    fail_hip(hipMemcpy(raw_peer.data(), recv_device, (size_t)kBytes,
+                       hipMemcpyDeviceToHost), "copy raw peer payload");
+    uint64_t raw_mismatches = 0u;
+    const uint32_t peer_rank = rank ^ 1u;
+    for (uint64_t i = 0u; i < kValues; ++i) {
+        const int32_t centered = (int32_t)(i % 1024u) - 512;
+        const float expected = (float)centered * (1.0f / 1024.0f) +
+            (float)peer_rank * 0.25f;
+        if (std::memcmp(&raw_peer[i], &expected, sizeof(expected)) != 0)
+            ++raw_mismatches;
+    }
+    std::printf("TP_BIG_GATE_RAW rank=%u provider=%s bytes=%llu chunks=%u "
+                "wire_ms=%.3f mismatches=%llu\n", rank, device,
+                (unsigned long long)kBytes, chunks, wire_ms,
+                (unsigned long long)raw_mismatches);
+    if (raw_only || raw_mismatches != 0u) {
+        (void)hipFree(production_out);
+        (void)hipFree(production_single_out);
+        (void)hipFree(pipeline_out);
+        (void)hipFree(serial_out);
+        ds4_tp_free(tp);
+        if (host_slab) (void)hipHostFree(slab_host);
+        else (void)hipFree(slab_host);
+        return raw_mismatches == 0u ? 0 : 1;
+    }
     const double compute_ms = compute_only(serial_out, send_device, recv_device,
                                            chunks, chunk_values, rank,
                                            work_iters);

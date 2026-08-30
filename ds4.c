@@ -3020,6 +3020,28 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
+        /* GLM5 TP's ordinary executor declares packed routed Q4_K slices
+         * lazily at the first routed layer.  Do not put those source spans
+         * into the generic linear model-image cache first: the packed-slice
+         * contract deliberately rejects overlapping linear residency, and
+         * doing so makes the standard benchmark fail before prefill.  Other
+         * GLM tensors remain eligible for normal span preparation. */
+        static const char routed_suffix[] = "_exps.weight";
+        bool is_glm_routed_q4 = false;
+        if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 &&
+            t->type == DS4_TENSOR_Q4_K && t->name.ptr &&
+            t->name.len >= sizeof(routed_suffix) - 1u) {
+            const size_t suffix_len = sizeof(routed_suffix) - 1u;
+            for (size_t pos = 0; pos + suffix_len <= t->name.len; ++pos) {
+                if (memcmp(t->name.ptr + pos, routed_suffix, suffix_len) == 0) {
+                    is_glm_routed_q4 = true;
+                    break;
+                }
+            }
+        }
+        if (is_glm_routed_q4) {
+            continue;
+        }
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
             return false;
@@ -7097,12 +7119,27 @@ static bool glm5_next_model_map_sharded_spans(
         const ds4_model *m, int rank, ds4_model_map_span_vec *spans) {
     if (!m || !spans || (rank != 0 && rank != 1)) return false;
     memset(spans, 0, sizeof(*spans));
-    const bool resident_experts =
-        getenv("DS4_GLM5_NEXT_RESIDENT_EXPERTS") != NULL;
-    enum { glm5_width = 4096, glm5_routed_mid = 2048 };
+    const char *resident_experts_env =
+        getenv("DS4_GLM5_NEXT_RESIDENT_EXPERTS");
+    const bool resident_experts = resident_experts_env &&
+        strcmp(resident_experts_env, "1") == 0;
+    enum { glm5_width = 4096, glm5_routed_mid = 2048,
+           glm5_experts = 288 };
     for (uint64_t i = 0u; i < m->n_tensors; ++i) {
         const ds4_tensor *t = &m->tensors[i];
-        if (t->ndim == 3u && t->dim[2] == DS4_N_EXPERT) {
+        const char routed_suffix[] = "_exps.weight";
+        bool routed_name = false;
+        if (t->name.ptr && t->name.len >= sizeof(routed_suffix) - 1u) {
+            const size_t suffix_len = sizeof(routed_suffix) - 1u;
+            for (size_t pos = 0; pos + suffix_len <= t->name.len; ++pos) {
+                if (memcmp(t->name.ptr + pos, routed_suffix, suffix_len) == 0) {
+                    routed_name = true;
+                    break;
+                }
+            }
+        }
+        if (routed_name) {
+            if (t->ndim != 3u || t->dim[2] != glm5_experts) return false;
             const bool gate_or_up_shape =
                 t->dim[0] == glm5_width && t->dim[1] == glm5_routed_mid;
             const bool down_shape =
@@ -7118,13 +7155,13 @@ static bool glm5_next_model_map_sharded_spans(
                 return false;
             }
             if (resident_experts) {
-                if (t->dim[2] != DS4_N_EXPERT ||
+                if (t->dim[2] != glm5_experts ||
                     t->bytes == 0u || t->bytes % t->dim[2] != 0u) {
                     return false;
                 }
-                const uint32_t split = DS4_N_EXPERT / 2u;
+                const uint32_t split = glm5_experts / 2u;
                 const uint32_t first = rank == 0 ? 0u : split;
-                const uint32_t count = rank == 0 ? split : DS4_N_EXPERT - split;
+                const uint32_t count = rank == 0 ? split : glm5_experts - split;
                 const uint64_t expert_bytes = t->bytes / t->dim[2];
                 const uint64_t lo = t->abs_offset +
                     (uint64_t)first * expert_bytes;
@@ -7138,7 +7175,15 @@ static bool glm5_next_model_map_sharded_spans(
             }
             continue;
         } else {
-            model_map_span_vec_include_one(spans, t);
+            /* Keep every non-routed tensor as an isolated view as well.  The
+             * omitted routed tensors are often physically adjacent to dense
+             * tensors in GGUF; ordinary span coalescing would otherwise
+             * bridge the omission and create linear residency over Q4_K
+             * expert bytes, preventing their packed declarations later. */
+            uint64_t lo = UINT64_MAX, hi = 0u;
+            model_map_span_include_tensor(t, &lo, &hi,
+                                          &spans->max_tensor_bytes);
+            model_map_span_vec_append(spans, lo, hi, true);
         }
     }
     return model_map_span_vec_finish(spans);
@@ -51386,7 +51431,7 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
                                       int ctx_size) {
     if (!s || !e || !e->glm5_next || !e->model.map || e->model.size == 0u ||
         !e->tp.active || !e->tp.ctx || e->tp.rank < 0 || e->tp.rank > 1 ||
-        !ds4_tp_is_rdma(e->tp.ctx) || !ds4_tp_requires_host_slab(e->tp.ctx)) {
+        !ds4_tp_is_rdma(e->tp.ctx)) {
         fprintf(stderr,
                 "ds4: GLM5 ordinary opt-in requires a two-rank RDMA TP session\n");
         return 0;
@@ -51394,18 +51439,6 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
     const uint32_t capacity = (uint32_t)ctx_size;
     const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint32_t big_capacity = ds4_tp_big_capacity_rows(e->tp.ctx);
-    /* The current metadata-validated NoPE indexer keeps a bounded 2048-row
-     * history.  Reject larger contexts before loading a session; accepting
-     * them would let prefill run until the first out-of-window tile and then
-     * fail after doing observable work.  A paged/segmented index history is a
-     * separate correctness-gated stage, not an implicit fallback. */
-    if (capacity > DS4_GLM5_NEXT_INDEX_TOP_K) {
-        fprintf(stderr,
-                "ds4: GLM5 ordinary executor currently supports context "
-                "<= %u (requested %u; indexed history is bounded)\n",
-                DS4_GLM5_NEXT_INDEX_TOP_K, capacity);
-        return 0;
-    }
     /* The mlx5 provider deliberately caps the registered direct slab at
      * 2048 rows.  That is a transport-buffer limit, not a model/KV context
      * limit: batch execution exchanges long prefills in bounded chunks. */
@@ -51416,7 +51449,8 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
                 capacity, big_capacity);
         return 0;
     }
-    s->glm5_next_ws = ds4_glm5_next_workspace_create_capacity(1u);
+    s->glm5_next_ws = ds4_glm5_next_workspace_create_capacity_context(
+        1u, capacity);
     if (!s->glm5_next_ws ||
         !ds4_glm5_next_state_init(&s->glm5_next_state,
                                   &e->glm5_next->offsets,
@@ -51549,6 +51583,7 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
         ds4_glm5_next_workspace_destroy(w);
         return 1;
     }
+    ds4_glm5_next_workspace_begin_prefill(w);
     uint32_t *id_host = calloc(n_tokens, sizeof(*id_host));
     int ok = id_host != NULL;
     for (uint32_t i = 0u; ok && i < n_tokens; ++i) {
@@ -62905,6 +62940,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     const char *backend_name = ds4_backend_name(e->backend);
     (void)backend_name; (void)e;
     if (s->glm5_next_ready) {
+        ds4_glm5_next_workspace_begin_prefill(s->glm5_next_ws);
         int start = 0;
         if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint)) {
@@ -62929,13 +62965,18 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             const uint32_t remaining = (uint32_t)(prompt->len - i);
-            const uint32_t chunk = remaining < batch ? remaining : batch;
+            const uint32_t chunk = ds4_glm5_next_prefill_chunk(
+                (uint32_t)i, remaining, batch);
             const int rc = chunk > 1u ?
                 ds4_session_glm5_next_forward_rows(
                     s, prompt->v + i, chunk, (uint32_t)i, err, errlen) :
                 ds4_session_glm5_next_forward_token(s, prompt->v[i], err, errlen);
-            if (rc)
+            if (rc) {
+                ds4_glm5_next_state_invalidate(&s->glm5_next_state);
+                s->checkpoint.len = 0;
+                s->checkpoint_valid = false;
                 return 1;
+            }
             i += (int)chunk;
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
@@ -64788,6 +64829,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_engine *e = s->engine;
     if (s->glm5_next_ready) {
         (void)probe_mtp;
+        ds4_glm5_next_workspace_begin_decode(s->glm5_next_ws);
         return ds4_session_glm5_next_forward_token(s, token, err, errlen);
     }
     if (ds4_session_is_glm(s)) {

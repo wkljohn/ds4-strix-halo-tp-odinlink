@@ -64,6 +64,49 @@ __global__ static void matmul_bf16_f32_toktile_w32_kernel(
     }
 }
 
+template <uint32_t TokenTile>
+__global__ static void matmul_bf16_f32_kslice_toktile_w32_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t full_in_dim,
+        uint32_t k_off,
+        uint32_t k_cnt,
+        uint32_t out_dim) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t token_base = blockIdx.y * TokenTile;
+    if (row >= out_dim) return;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint16_t *wr = w + (uint64_t)row * full_in_dim + k_off;
+    float sums[TokenTile] = {};
+    for (uint32_t i = threadIdx.x; i < k_cnt; i += blockDim.x) {
+        const float weight = __uint_as_float((uint32_t)wr[i] << 16u);
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token) {
+            sums[token] += weight *
+                x[(uint64_t)(token_base + token) * k_cnt + i];
+        }
+    }
+    __shared__ float wave_sums[TokenTile][kDs4Bf16ToktileWaves];
+#pragma unroll
+    for (uint32_t token = 0u; token < TokenTile; ++token) {
+        float value = sums[token];
+#pragma unroll
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u)
+            value += __shfl_down(value, offset, 32u);
+        if (lane == 0u) wave_sums[token][wave] = value;
+    }
+    __syncthreads();
+    if (threadIdx.x < TokenTile) {
+        float value = 0.0f;
+#pragma unroll
+        for (uint32_t wv = 0u; wv < kDs4Bf16ToktileWaves; ++wv)
+            value += wave_sums[threadIdx.x][wv];
+        out[(uint64_t)(token_base + threadIdx.x) * out_dim + row] = value;
+    }
+}
+
 /* Exact-order GLM-5 KDA low-rank expansion. The scalar 256-thread kernel has
  * only 128 active lanes for this shape. Its first effective reduction steps
  * are (x[lane] + x[lane+64]) + (x[lane+32] + x[lane+96]), followed by the

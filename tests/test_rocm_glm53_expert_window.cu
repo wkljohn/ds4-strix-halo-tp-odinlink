@@ -895,6 +895,22 @@ int main() {
           hipFree(direct_up) == hipSuccess &&
           hipFree(direct_gate) == hipSuccess,
           "free independent direct-control tables");
+
+    /* Rebinding is exercised after the normal accounting and consumer tests:
+     * it deliberately resets cache metadata, so it must not perturb the
+     * preceding hit/miss assertions. */
+    CHECK(ds4_gpu_q4k_window_cache_rebind(cache0, &config1),
+          "rebind compact cache to peer rank half");
+    int32_t slots_rebound[8] = {};
+    CHECK(ds4_gpu_q4k_window_cache_prepare(
+              cache0, route_a, 8u, slots_rebound) &&
+          verify_cache_routes(cache0, gguf, gate_offset, up_offset,
+                              down_offset, 1u, route_a, slots_rebound, 8u),
+          "rebound cache is byte-exact");
+    ds4_gpu_q4k_window_cache_stats rebound_stats = {};
+    CHECK(ds4_gpu_q4k_window_cache_get_stats(cache0, &rebound_stats) &&
+          rebound_stats.hits == 0u,
+          "rebind invalidates prior expert slots");
     ds4_gpu_tensor_free(moe_direct);
     ds4_gpu_tensor_free(moe_cached);
     ds4_gpu_tensor_free(moe_down);

@@ -4,8 +4,10 @@ GT={0:"F32",1:"F16",2:"Q4_0",3:"Q4_1",6:"Q5_0",7:"Q5_1",8:"Q8_0",9:"Q8_1",10:"Q2
     18:"IQ3_XXS",19:"IQ1_S",20:"IQ4_NL",21:"IQ3_S",22:"IQ2_S",23:"IQ4_XS",
     24:"I8",25:"I16",26:"I32",27:"I64",28:"F64",29:"IQ1_M",30:"BF16",
     39:"MXFP4",}
-routed_only = len(sys.argv) == 3 and sys.argv[1] == "--routed-family"
-path = sys.argv[2] if routed_only else sys.argv[1]
+mode = sys.argv[1] if len(sys.argv) == 3 and sys.argv[1].startswith("--") else "--summary"
+if mode not in ("--summary", "--routed-family", "--architecture"):
+    raise SystemExit("usage: gguf_tensor_types.py [--routed-family|--architecture] MODEL")
+path = sys.argv[2] if mode != "--summary" else sys.argv[1]
 f=open(path,'rb')
 assert f.read(4)==b'GGUF'
 ver,=struct.unpack('<I',f.read(4))
@@ -14,14 +16,24 @@ nkv,=struct.unpack('<Q',f.read(8))
 def rs():
     n,=struct.unpack('<Q',f.read(8)); return f.read(n)
 SZ={0:1,1:1,2:2,3:2,4:4,5:4,6:4,7:1,10:8,11:8,12:8}
-def skipval(t):
-    if t==8: rs()
+def readval(t):
+    if t==8: return rs().decode()
     elif t==9:
         et,=struct.unpack('<I',f.read(4)); n,=struct.unpack('<Q',f.read(8))
-        for _ in range(n): skipval(et)
-    else: f.read(SZ[t])
+        for _ in range(n): readval(et)
+        return None
+    else:
+        if t not in SZ: raise ValueError("unsupported GGUF metadata type %d" % t)
+        f.read(SZ[t]); return None
+metadata={}
 for _ in range(nkv):
-    rs(); t,=struct.unpack('<I',f.read(4)); skipval(t)
+    key=rs().decode(); t,=struct.unpack('<I',f.read(4)); value=readval(t)
+    if key == "general.architecture": metadata[key]=value
+if mode == "--architecture":
+    architecture=metadata.get("general.architecture")
+    if not architecture: raise SystemExit("missing general.architecture")
+    print(architecture)
+    sys.exit(0)
 hist=collections.Counter(); interesting={}; routed={}
 for _ in range(ntensor):
     name=rs().decode(); nd,=struct.unpack('<I',f.read(4))
@@ -32,7 +44,7 @@ for _ in range(ntensor):
         interesting.setdefault(tn,[]).append((name,dims))
     if 'ffn_gate_exps' in name or 'ffn_up_exps' in name or 'ffn_down_exps' in name:
         routed.setdefault(tn,[]).append(name)
-if routed_only:
+if mode == "--routed-family":
     types=set(routed)
     if types == {"Q4_K"}:
         print("Q4_K")

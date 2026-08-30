@@ -356,6 +356,12 @@ typedef struct ds4_gpu_q4k_window_cache_view {
  * three tensors upload. */
 ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
         const ds4_gpu_q4k_window_cache_config *config);
+/* Rebind an existing bounded cache to a new layer-local row/K slice.  The
+ * operation must invalidate all expert slots and fail closed on geometry or
+ * tensor-offset mismatch; callers must have synchronized the prior consumer. */
+int ds4_gpu_q4k_window_cache_rebind(
+        ds4_gpu_q4k_window_cache *cache,
+        const ds4_gpu_q4k_window_cache_config *config);
 void ds4_gpu_q4k_window_cache_destroy(ds4_gpu_q4k_window_cache *cache);
 int ds4_gpu_q4k_window_cache_prepare(
         ds4_gpu_q4k_window_cache *cache,
@@ -1236,6 +1242,32 @@ int ds4_gpu_matmul_bf16_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* BF16 K-slice over physical row stride full_in_dim.  Each input row is a
+ * compact k_cnt-element slice; partial outputs from ranks are summed in fixed
+ * rank order.  This is a different contract from output-row slicing. */
+int ds4_gpu_matmul_bf16_kslice_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              full_in_dim,
+        uint64_t              out_dim,
+        uint64_t              k_off,
+        uint64_t              k_cnt,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_rows);
+int ds4_gpu_matmul_bf16_kslice_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              full_in_dim,
+        uint64_t              k_off,
+        uint64_t              k_cnt,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              x_elem_off);
 
 /* Exact multi-row form of the DeepSeek 4096x256 F16 router projection. */
 int ds4_gpu_matmul_f16_router_rows_exact_tensor(

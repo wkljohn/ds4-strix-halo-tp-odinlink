@@ -401,6 +401,17 @@ int ds4_glm5_kda_layer_finish(ds4_glm5_kda_layer_state *state,
         ds4_glm5_kda_layer_abort(state);
         return 0;
     }
+    return ds4_glm5_kda_layer_commit(state, n_tokens);
+}
+
+int ds4_glm5_kda_layer_commit(ds4_glm5_kda_layer_state *state,
+                              uint32_t n_tokens) {
+    if (!state || !state->valid || n_tokens == 0u ||
+        state->pending_tokens != n_tokens ||
+        state->token_count > UINT64_MAX - n_tokens) {
+        ds4_glm5_kda_layer_abort(state);
+        return 0;
+    }
     state->pending_tokens = 0u;
     state->token_count += n_tokens;
     return 1;

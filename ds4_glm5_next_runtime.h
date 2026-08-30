@@ -139,6 +139,18 @@ int ds4_glm5_next_mla_dense_selection_visible(
 int ds4_glm5_next_mla_dense_selection_visible_for_topk(
         uint64_t token_count, uint32_t capacity_tokens, uint32_t top_k,
         uint32_t *visible);
+/* Plan the official pool-4 sparse selector for the token being appended.
+ * The fixed top-k budget applies to rows from completed pools; the current
+ * incomplete tail (zero to three rows) is appended separately. */
+int ds4_glm5_next_mla_sparse_selection_plan(
+        uint64_t token_count, uint32_t capacity_tokens, uint32_t top_k,
+        uint32_t pool_size, uint32_t *visible, uint32_t *n_pools,
+        uint32_t *selected_pools, uint32_t *selected_tokens);
+/* Batched MLA prefill is currently dense-only.  Stop a tile exactly at the
+ * sparse boundary and use scalar execution thereafter so no earlier layer can
+ * commit state for a tile that a later MLA layer must reject. */
+uint32_t ds4_glm5_next_prefill_chunk(
+        uint32_t position, uint32_t remaining, uint32_t requested_batch);
 int ds4_glm5_next_build_tp_gate_mask(
         uint64_t mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS],
         uint32_t *gate_count,

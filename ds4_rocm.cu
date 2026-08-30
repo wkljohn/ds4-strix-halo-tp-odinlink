@@ -1994,7 +1994,9 @@ static void ds4_tp_expert_range(uint32_t n_total, int32_t *lo, int32_t *hi) {
  *
  * Returns 1 when remapped (out_base/out_count set), 0 when TP is inactive or
  * the shard is suspended (Metal suspends around the DSpark support model,
- * ds4_metal.m:8646-8649), in which case the caller uses its inputs unchanged. */
+ * ds4_metal.m:8646-8649), in which case the caller uses its inputs unchanged,
+ * and -1 on a launch failure.  The error state must not be collapsed into the
+ * inactive result: doing so would silently run the unsharded expert set. */
 extern "C" int ds4_gpu_tp_expert_shard_remap(
         const int32_t *selected, const float *weights, void *scratch,
         uint32_t n_pairs, uint32_t n_total_expert,
@@ -2027,9 +2029,25 @@ extern "C" int ds4_gpu_tp_expert_shard_remap(
     }
     const uint32_t threads = 256u;
     const uint32_t blocks = (n_pairs + threads - 1u) / threads;
+    /* Clear a sticky error from an earlier asynchronous call before
+     * attributing an error to this launch. The stale value is diagnostic;
+     * only the post-launch value belongs to the remap operation. */
+    const hipError_t stale_err = hipGetLastError();
     hipLaunchKernelGGL(ds4_tp_shard_remap_kernel, dim3(blocks), dim3(threads), 0, 0,
                        sel_dst, w_dst, selected, weights, n_pairs, lo, hi,
                        prefill_skip_unowned);
+    const hipError_t launch_err = hipGetLastError();
+    if (stale_err != hipSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "tp expert shard remap observed prior sticky error: %s\n",
+                hipGetErrorString(stale_err));
+    }
+    if (launch_err != hipSuccess) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "tp expert shard remap launch failed: %s\n",
+                hipGetErrorString(launch_err));
+        return -1;
+    }
     if (out_selected) *out_selected = sel_dst;
     if (out_weights)  *out_weights  = w_dst;
     if (out_base)     *out_base     = (uint32_t)lo;

@@ -3961,10 +3961,14 @@ static int ds4_tp_shard_prepare(const ds4_gpu_tensor *selected,
     const int32_t *sel_p = NULL;
     const float *w_p = NULL;
     uint32_t base = 0, count = 0;
-    if (!ds4_gpu_tp_expert_shard_remap((const int32_t *)selected->ptr,
-                                       (const float *)weights->ptr,
-                                       scratch, n_pairs, n_total_expert,
-                                       &sel_p, &w_p, &base, &count)) {
+    const int remap_rc = ds4_gpu_tp_expert_shard_remap(
+        (const int32_t *)selected->ptr, (const float *)weights->ptr,
+        scratch, n_pairs, n_total_expert,
+        &sel_p, &w_p, &base, &count);
+    if (remap_rc < 0) {
+        return 0; /* selected TP remap failed: never use unsharded inputs */
+    }
+    if (remap_rc == 0) {
         return 1; /* TP inactive or shard suspended: use inputs unchanged */
     }
     v->sel = *selected; v->sel.ptr = (void *)sel_p; v->sel.owner = 0;

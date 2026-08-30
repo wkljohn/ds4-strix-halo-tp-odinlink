@@ -36,7 +36,18 @@ static void make_valid(ds4_glm5_next_model_offsets *model) {
         layer->attention = mla ? DS4_GLM5_NEXT_ATTN_MLA :
                                  DS4_GLM5_NEXT_ATTN_KDA;
         if (mla) fill_words(&layer->mla, sizeof(layer->mla), &next);
-        else fill_words(&layer->kda, sizeof(layer->kda), &next);
+        else {
+            fill_words(&layer->kda, sizeof(layer->kda), &next);
+            layer->kda.q_type = 0u;
+            layer->kda.k_type = 0u;
+            layer->kda.v_type = 0u;
+            layer->kda.output_type = 0u;
+            layer->kda.f_a_type = 0u;
+            layer->kda.f_b_type = 0u;
+            layer->kda.g_a_type = 0u;
+            layer->kda.g_b_type = 0u;
+            layer->kda.beta_type = 0u;
+        }
         if (il < DS4_GLM5_NEXT_LEADING_DENSE) {
             layer->ffn = DS4_GLM5_NEXT_FFN_DENSE;
             layer->ffn_weight.gate = next++;
@@ -70,6 +81,39 @@ static int test_contract(void) {
           "token 2049 fails closed until pooled selection is implemented");
     CHECK(!ds4_glm5_next_mla_dense_selection_visible(8u, 8u, &visible),
           "dense-selection policy enforces state capacity");
+    uint32_t pools = 0u, selected_pools = 0u, selected_tokens = 0u;
+    CHECK(!ds4_glm5_next_mla_sparse_selection_plan(
+              2047u, 4096u, 2048u, 4u, &visible, &pools,
+              &selected_pools, &selected_tokens),
+          "sparse-selection policy rejects the dense side of crossover");
+    CHECK(ds4_glm5_next_mla_sparse_selection_plan(
+              2048u, 4096u, 2048u, 4u, &visible, &pools,
+              &selected_pools, &selected_tokens) &&
+              visible == 2049u && pools == 512u &&
+              selected_pools == 512u && selected_tokens == 2049u,
+          "sparse-selection policy appends the first current tail row");
+    CHECK(ds4_glm5_next_mla_sparse_selection_plan(
+              2049u, 4096u, 2048u, 4u, &visible, &pools,
+              &selected_pools, &selected_tokens) &&
+              visible == 2050u && pools == 512u &&
+              selected_pools == 512u && selected_tokens == 2050u,
+          "sparse-selection policy appends the second current tail row");
+    CHECK(ds4_glm5_next_mla_sparse_selection_plan(
+              2051u, 4096u, 2048u, 4u, &visible, &pools,
+              &selected_pools, &selected_tokens) &&
+              visible == 2052u && pools == 513u &&
+              selected_pools == 512u && selected_tokens == 2048u,
+          "sparse-selection policy selects after publishing a new pool");
+    CHECK(ds4_glm5_next_mla_sparse_selection_plan(
+              2052u, 4096u, 2048u, 4u, &visible, &pools,
+              &selected_pools, &selected_tokens) &&
+              visible == 2053u && pools == 513u &&
+              selected_pools == 512u && selected_tokens == 2049u,
+          "sparse-selection policy appends tail after the new pool");
+    CHECK(!ds4_glm5_next_mla_sparse_selection_plan(
+              4096u, 4096u, 2048u, 4u, &visible, &pools,
+              &selected_pools, &selected_tokens),
+          "sparse-selection policy enforces state capacity");
     CHECK(ds4_glm5_next_mla_dense_selection_visible_for_topk(
               7u, 16u, 8u, &visible) && visible == 8u &&
           !ds4_glm5_next_mla_dense_selection_visible_for_topk(
@@ -78,6 +122,17 @@ static int test_contract(void) {
     CHECK(!ds4_glm5_next_mla_dense_selection_visible_for_topk(
               0u, 16u, 0u, &visible),
           "scaled policy rejects a zero top-k");
+    CHECK(ds4_glm5_next_prefill_chunk(0u, 4096u, 1024u) == 1024u &&
+          ds4_glm5_next_prefill_chunk(1024u, 3072u, 1024u) == 1024u,
+          "prefill planner retains dense 1024-row tiles");
+    CHECK(ds4_glm5_next_prefill_chunk(1536u, 1024u, 1024u) == 512u,
+          "prefill planner stops a straddling tile at sparse crossover");
+    CHECK(ds4_glm5_next_prefill_chunk(2048u, 512u, 1024u) == 1u &&
+          ds4_glm5_next_prefill_chunk(2347u, 1u, 1024u) == 1u,
+          "prefill planner uses scalar sparse execution after crossover");
+    CHECK(ds4_glm5_next_prefill_chunk(0u, 8u, 1u) == 1u &&
+          ds4_glm5_next_prefill_chunk(0u, 0u, 1024u) == 0u,
+          "prefill planner preserves scalar and empty contracts");
     uint64_t gate_mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS] = {0};
     uint32_t gate_count = 0;
     CHECK(ds4_glm5_next_build_tp_gate_mask(gate_mask, &gate_count, 0u) &&

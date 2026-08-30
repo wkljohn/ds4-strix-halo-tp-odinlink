@@ -7,6 +7,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -48,6 +49,169 @@ static double nmse(const ErrorStats &stats) {
     return stats.reference_sq == 0.0L
         ? (double)stats.error_sq
         : (double)(stats.error_sq / stats.reference_sq);
+}
+
+static uint64_t bit_mismatches(const std::vector<float> &a,
+                               const std::vector<float> &b) {
+    if (a.size() != b.size()) return UINT64_MAX;
+    uint64_t mismatches = 0u;
+    for (size_t i = 0; i < a.size(); ++i) {
+        uint32_t av = 0u, bv = 0u;
+        std::memcpy(&av, &a[i], sizeof(av));
+        std::memcpy(&bv, &b[i], sizeof(bv));
+        mismatches += av != bv;
+    }
+    return mismatches;
+}
+
+static bool compare_batch_stage(const char *name,
+                                const ds4_gpu_tensor *batch,
+                                const ds4_gpu_tensor *serial,
+                                uint64_t count,
+                                bool require_exact) {
+    std::vector<float> batch_host((size_t)count);
+    std::vector<float> serial_host((size_t)count);
+    CHECK(ds4_gpu_tensor_read(batch, 0u, batch_host.data(), count * 4u) &&
+          ds4_gpu_tensor_read(serial, 0u, serial_host.data(), count * 4u),
+          "read mHC batch differential stage");
+    const ErrorStats error = compare(serial_host, batch_host);
+    const uint64_t mismatches = bit_mismatches(serial_host, batch_host);
+    std::fprintf(stderr,
+                 "GLM5 mHC batch differential stage=%s mismatches=%llu/%llu "
+                 "max_abs=%.9g nmse=%.9g\n",
+                 name, (unsigned long long)mismatches,
+                 (unsigned long long)count, error.max_abs, nmse(error));
+    CHECK(error.finite, "finite mHC batch differential stage");
+    CHECK(!require_exact || mismatches == 0u,
+          "exact rowwise mHC batch differential stage");
+    return true;
+}
+
+static bool run_batch_differential(
+        const Glm5TestGGUF &gguf, uint64_t fn, uint64_t base,
+        uint64_t scale, uint64_t norm_weight) {
+    constexpr uint32_t tokens = 33u, width = 4096u, hc = 4u;
+    constexpr uint32_t hc_width = width * hc, mix_width = 24u;
+    const uint64_t input_count = (uint64_t)tokens * hc_width;
+    const uint64_t mix_count = (uint64_t)tokens * mix_width;
+    const uint64_t row_count = (uint64_t)tokens * width;
+    std::vector<float> input((size_t)input_count);
+    for (uint64_t i = 0u; i < input_count; ++i) {
+        input[(size_t)i] =
+            0.125f * std::sin((float)(i * 17u + 11u) * 0.00037f) +
+            0.03125f * std::cos((float)(i * 29u + 7u) * 0.00019f);
+    }
+
+    ds4_gpu_tensor *residual = ds4_gpu_tensor_alloc(input_count * 4u);
+    ds4_gpu_tensor *batch_flat = ds4_gpu_tensor_alloc(input_count * 4u);
+    ds4_gpu_tensor *serial_flat = ds4_gpu_tensor_alloc(input_count * 4u);
+    ds4_gpu_tensor *batch_mix = ds4_gpu_tensor_alloc(mix_count * 4u);
+    ds4_gpu_tensor *serial_mix = ds4_gpu_tensor_alloc(mix_count * 4u);
+    ds4_gpu_tensor *batch_split = ds4_gpu_tensor_alloc(mix_count * 4u);
+    ds4_gpu_tensor *serial_split = ds4_gpu_tensor_alloc(mix_count * 4u);
+    ds4_gpu_tensor *batch_collapsed = ds4_gpu_tensor_alloc(row_count * 4u);
+    ds4_gpu_tensor *serial_collapsed = ds4_gpu_tensor_alloc(row_count * 4u);
+    ds4_gpu_tensor *batch_norm = ds4_gpu_tensor_alloc(row_count * 4u);
+    ds4_gpu_tensor *serial_norm = ds4_gpu_tensor_alloc(row_count * 4u);
+    CHECK(residual && batch_flat && serial_flat && batch_mix && serial_mix &&
+          batch_split && serial_split && batch_collapsed && serial_collapsed &&
+          batch_norm && serial_norm &&
+          ds4_gpu_tensor_write(residual, 0u, input.data(), input_count * 4u),
+          "allocate mHC 33-row differential tensors");
+
+    CHECK(ds4_gpu_rms_norm_plain_rows_tensor(
+              batch_flat, residual, hc_width, tokens, 1.0e-5f) &&
+          ds4_gpu_matmul_bf16_tensor(
+              batch_mix, gguf.map, gguf.size, fn, hc_width, mix_width,
+              batch_flat, tokens),
+          "execute batched mHC producer");
+    for (uint32_t token = 0u; token < tokens; ++token) {
+        ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+            residual, (uint64_t)token * hc_width * 4u,
+            (uint64_t)hc_width * 4u);
+        ds4_gpu_tensor *flat_row = ds4_gpu_tensor_view(
+            serial_flat, (uint64_t)token * hc_width * 4u,
+            (uint64_t)hc_width * 4u);
+        ds4_gpu_tensor *mix_row = ds4_gpu_tensor_view(
+            serial_mix, (uint64_t)token * mix_width * 4u,
+            (uint64_t)mix_width * 4u);
+        const int ok = input_row && flat_row && mix_row &&
+            ds4_gpu_rms_norm_plain_rows_tensor(
+                flat_row, input_row, hc_width, 1u, 1.0e-5f) &&
+            ds4_gpu_matmul_bf16_tensor(
+                mix_row, gguf.map, gguf.size, fn, hc_width, mix_width,
+                flat_row, 1u);
+        ds4_gpu_tensor_free(mix_row);
+        ds4_gpu_tensor_free(flat_row);
+        ds4_gpu_tensor_free(input_row);
+        CHECK(ok, "execute one-row mHC producer");
+    }
+    CHECK(ds4_gpu_synchronize(), "synchronize mHC producer differential");
+    CHECK(compare_batch_stage("rmsnorm", batch_flat, serial_flat,
+                              input_count, true),
+          "compare mHC RMSNorm");
+    CHECK(compare_batch_stage("bf16_projection", batch_mix, serial_mix,
+                              mix_count, false),
+          "compare mHC BF16 projection");
+
+    /* Feed the same projected rows to both forms. This tests whether the
+     * rowwise split/Sinkhorn/collapse/RMSNorm fusion itself changes merely
+     * because the launch contains more than one row. */
+    CHECK(ds4_gpu_hc_split_weighted_sum_norm_tensor(
+              batch_collapsed, batch_norm, batch_split, batch_mix, residual,
+              gguf.map, gguf.size, scale, base, norm_weight,
+              width, hc, 20u, 1.0e-6f, 1.0e-5f),
+          "execute batched mHC split control");
+    for (uint32_t token = 0u; token < tokens; ++token) {
+        ds4_gpu_tensor *mix_row = ds4_gpu_tensor_view(
+            batch_mix, (uint64_t)token * mix_width * 4u,
+            (uint64_t)mix_width * 4u);
+        ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+            residual, (uint64_t)token * hc_width * 4u,
+            (uint64_t)hc_width * 4u);
+        ds4_gpu_tensor *split_row = ds4_gpu_tensor_view(
+            serial_split, (uint64_t)token * mix_width * 4u,
+            (uint64_t)mix_width * 4u);
+        ds4_gpu_tensor *collapsed_row = ds4_gpu_tensor_view(
+            serial_collapsed, (uint64_t)token * width * 4u,
+            (uint64_t)width * 4u);
+        ds4_gpu_tensor *norm_row = ds4_gpu_tensor_view(
+            serial_norm, (uint64_t)token * width * 4u,
+            (uint64_t)width * 4u);
+        const int ok = mix_row && input_row && split_row && collapsed_row &&
+            norm_row && ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                collapsed_row, norm_row, split_row, mix_row, input_row,
+                gguf.map, gguf.size, scale, base, norm_weight,
+                width, hc, 20u, 1.0e-6f, 1.0e-5f);
+        ds4_gpu_tensor_free(norm_row);
+        ds4_gpu_tensor_free(collapsed_row);
+        ds4_gpu_tensor_free(split_row);
+        ds4_gpu_tensor_free(input_row);
+        ds4_gpu_tensor_free(mix_row);
+        CHECK(ok, "execute one-row mHC split control");
+    }
+    CHECK(ds4_gpu_synchronize(), "synchronize mHC split differential");
+    CHECK(compare_batch_stage("hc_split", batch_split, serial_split,
+                              mix_count, true), "compare mHC split");
+    CHECK(compare_batch_stage("hc_collapsed", batch_collapsed,
+                              serial_collapsed, row_count, true),
+          "compare mHC collapsed");
+    CHECK(compare_batch_stage("hc_post_norm", batch_norm, serial_norm,
+                              row_count, true), "compare mHC post norm");
+
+    ds4_gpu_tensor_free(serial_norm);
+    ds4_gpu_tensor_free(batch_norm);
+    ds4_gpu_tensor_free(serial_collapsed);
+    ds4_gpu_tensor_free(batch_collapsed);
+    ds4_gpu_tensor_free(serial_split);
+    ds4_gpu_tensor_free(batch_split);
+    ds4_gpu_tensor_free(serial_mix);
+    ds4_gpu_tensor_free(batch_mix);
+    ds4_gpu_tensor_free(serial_flat);
+    ds4_gpu_tensor_free(batch_flat);
+    ds4_gpu_tensor_free(residual);
+    std::fprintf(stderr, "PASS real-GGUF GLM5 33-row mHC differential\n");
+    return true;
 }
 
 static bool read_f32(const std::string &path, uint64_t count,
@@ -156,6 +320,8 @@ static bool run_test(void) {
           "same-GGUF mHC numerical envelope");
     CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "mHC pre-stage invokes no TP exchange API");
+    CHECK(run_batch_differential(gguf, fn, base, scale, norm_weight),
+          "real-GGUF 33-row mHC differential");
 
     ds4_gpu_tensor_free(norm);
     ds4_gpu_tensor_free(collapsed);

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Score tracked official continuations through the real TP=2 OdinLink RDMA path.
+# Score tracked official continuations through a real TP=2 RDMA path.
 # Usage: ./run-tp-quality-score.sh TAG MODEL.gguf [NAME=VALUE ...]
 set -euo pipefail
 
@@ -19,7 +19,6 @@ PEER_REPO=${DS4_PEER_REPO:-$REPO}
 PEER_MGMT=${DS4_PEER_MGMT:-}
 PEER_HOST_KEY_ALIAS=${DS4_PEER_HOST_KEY_ALIAS:-${PEER_MGMT#*@}}
 COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
-ODINLINK_ROOT=${DS4_ODINLINK_ROOT:-}
 PORT=${DS4_QUALITY_PORT:-9002}
 CONTEXT=${DS4_QUALITY_CONTEXT:-4096}
 MAX_CASES=${DS4_QUALITY_MAX_CASES:-100}
@@ -37,10 +36,30 @@ PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes
   -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS" "$PEER_MGMT")
 PEER_SCP=(scp -o BatchMode=yes -o StrictHostKeyChecking=yes
   -o "HostKeyAlias=$PEER_HOST_KEY_ALIAS")
-VERBS_LIB=$ODINLINK_ROOT/build/verbs/libodl_tb5_verbs.so.0.1.0
-ODL_LD_PATH=$ODINLINK_ROOT/build/lib:$ODINLINK_ROOT/build/verbs
+RDMA_PROFILE=${DS4_QUALITY_RDMA_PROFILE:-${DS4_BENCH_RDMA_PROFILE:-odinlink}}
+case $RDMA_PROFILE in
+  odinlink)
+    LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-odl_tb5_0}
+    PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-odl_tb5_0}
+    ODINLINK_ROOT=${DS4_ODINLINK_ROOT:-}
+    [[ -n $ODINLINK_ROOT ]] || {
+      echo "error: OdinLink quality scoring requires DS4_ODINLINK_ROOT" >&2; exit 2;
+    }
+    VERBS_LIB=$ODINLINK_ROOT/build/verbs/libodl_tb5_verbs.so.0.1.0
+    ODL_LD_PATH=$ODINLINK_ROOT/build/lib:$ODINLINK_ROOT/build/verbs
+    ;;
+  roce-v2)
+    LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
+    PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
+    RDMA_GID_INDEX=${DS4_RDMA_GID_INDEX:-3}
+    ;;
+  *)
+    echo "error: DS4_QUALITY_RDMA_PROFILE must be odinlink or roce-v2" >&2
+    exit 2
+    ;;
+esac
 
-for required in PEER_MGMT COORDINATOR_ADDR ODINLINK_ROOT; do
+for required in PEER_MGMT COORDINATOR_ADDR; do
   [[ -n ${!required} ]] || { echo "error: set $required in bench.env.local or the environment" >&2; exit 2; }
 done
 
@@ -58,13 +77,27 @@ for kv in "${EXTRA_ENV[@]}"; do
       echo "error: the accuracy baseline requires the balanced 128/128 split" >&2; exit 2 ;;
   esac
 done
-[[ -r $MODEL && -r $MANIFEST && -x $SCORER && -x $REPO/ds4 && -r $VERBS_LIB ]] || {
-  echo "error: missing model, manifest, scorer, ds4 binary, or OdinLink provider" >&2; exit 1;
+[[ -r $MODEL && -r $MANIFEST && -x $SCORER && -x $REPO/ds4 ]] || {
+  echo "error: missing model, manifest, scorer, or ds4 binary" >&2; exit 1;
 }
-[[ -r /dev/odl_tb5_0 ]] || { echo "error: local OdinLink device unavailable" >&2; exit 1; }
-"${PEER_SSH[@]}" "test -r '$MODEL' -a -r /dev/odl_tb5_0 -a -x '$PEER_REPO/ds4'" || {
-  echo "error: peer model, binary, or OdinLink device unavailable" >&2; exit 1;
-}
+if [[ $RDMA_PROFILE == odinlink ]]; then
+  [[ -r /dev/odl_tb5_0 && -r $VERBS_LIB ]] || {
+    echo "error: local OdinLink device or provider unavailable" >&2; exit 1;
+  }
+  "${PEER_SSH[@]}" "test -r '$MODEL' -a -r /dev/odl_tb5_0 -a -r '$VERBS_LIB' -a -x '$PEER_REPO/ds4'" || {
+    echo "error: peer model, binary, OdinLink device, or provider unavailable" >&2; exit 1;
+  }
+else
+  [[ $RDMA_GID_INDEX =~ ^[0-9]+$ && $RDMA_GID_INDEX -le 255 ]] || {
+    echo "error: DS4_RDMA_GID_INDEX must be in 0..255" >&2; exit 2;
+  }
+  grep -qx 'RoCE v2' "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX" || {
+    echo "error: local RoCE v2 GID unavailable" >&2; exit 1;
+  }
+  "${PEER_SSH[@]}" "test -r '$MODEL' -a -x '$PEER_REPO/ds4' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX')\" = 'RoCE v2'" || {
+    echo "error: peer model, binary, or RoCE v2 GID unavailable" >&2; exit 1;
+  }
+fi
 
 LOCAL_SIZE=$(stat -c %s "$MODEL")
 PEER_SIZE=$("${PEER_SSH[@]}" "stat -c %s '$MODEL'")
@@ -112,10 +145,7 @@ printf -v PEER_OUT_Q '%q' "$PEER_OUT"
 COMMON_ENV=(
   env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8
   DS4_TP_TIMEOUT_SEC=60
-  DS4_TP_ODINLINK_BATCH_ASYNC=1
   DS4_TP_RDMA_LOGITS=1
-  DS4_TP_VERBS_LIB="$VERBS_LIB"
-  LD_LIBRARY_PATH="$ODL_LD_PATH"
   DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
   DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
   DS4_ROCM_Q4K_DECODE_SPLIT_GATE_UP=1
@@ -125,6 +155,31 @@ COMMON_ENV=(
   DS4_ROCM_SHARED_GU_SWIGLU_FUSE=1
   "${EXTRA_ENV[@]}"
 )
+LOCAL_RDMA_ARGS=(--rdma-device "$LOCAL_RDMA_DEVICE")
+PEER_RDMA_ARGS=(--rdma-device "$PEER_RDMA_DEVICE")
+if [[ $RDMA_PROFILE == odinlink ]]; then
+  COMMON_ENV+=(
+    DS4_TP_ODINLINK_BATCH_ASYNC=1
+    DS4_TP_VERBS_LIB="$VERBS_LIB"
+    LD_LIBRARY_PATH="$ODL_LD_PATH"
+  )
+else
+  LOCAL_RDMA_ARGS+=(--rdma-gid-index "$RDMA_GID_INDEX")
+  PEER_RDMA_ARGS+=(--rdma-gid-index "$RDMA_GID_INDEX")
+fi
+MODEL_ARCH=$(python3 "$REPO/scripts/gguf_tensor_types.py" --architecture "$MODEL") || {
+  echo "error: unable to inspect model architecture" >&2; exit 1;
+}
+PREFILL_ARGS=(--prefill-chunk 4096)
+if [[ $MODEL_ARCH == glm5-next ]]; then
+  PREFILL_ARGS=()
+  COMMON_ENV+=(
+    DS4_GLM5_NEXT_ENABLE_ORDINARY=1
+    DS4_TP_BIG_DIRECT=1
+    DS4_TP_GREEDY_TOP2=0
+    DS4_ROCM_TEMPORAL_COMPRESSOR=0
+  )
+fi
 
 echo "quality_tag=$TAG"
 echo "ds4_sha256=$LOCAL_HASH"
@@ -146,7 +201,8 @@ cleanup() {
 trap cleanup EXIT
 
 WORKER_APP=(./ds4 --role worker --tensor-parallel --coordinator "$COORDINATOR_ADDR" "$PORT"
-  --transport rdma --rocm -m "$MODEL" -c "$CONTEXT" --prefill-chunk 4096)
+  --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
+  "${PREFILL_ARGS[@]}" "${PEER_RDMA_ARGS[@]}")
 printf -v WORKER_CMD_Q '%q ' "${COMMON_ENV[@]}" "${WORKER_APP[@]}"
 printf -v PEER_REPO_Q '%q' "$PEER_REPO"
 printf -v WORKER_LOG_Q '%q' "$REMOTE_WORKER_LOG"
@@ -156,7 +212,8 @@ WORKER_STARTED=1
 
 "${COMMON_ENV[@]}" "$SCORER" "$MODEL" "$MANIFEST" "$SCORES" "$CONTEXT" \
   --max-cases "$MAX_CASES" --role coordinator --tensor-parallel \
-  --listen 0.0.0.0 "$PORT" --transport rdma --rocm >"$COORD_LOG" 2>&1
+  --listen 0.0.0.0 "$PORT" --transport rdma --rocm \
+  "${LOCAL_RDMA_ARGS[@]}" >"$COORD_LOG" 2>&1
 
 for _ in $(seq 1 180); do worker_running || break; sleep 1; done
 worker_running && { echo "error: worker did not exit after STOP" >&2; exit 1; }
@@ -188,7 +245,10 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'cases=%s\n' "$MAX_CASES"
   printf 'target_tokens=%s\n' "$TARGET_TOKENS"
   printf 'context=%s\n' "$CONTEXT"
-  printf 'rdma_profile=odinlink\n'
+  printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
+  printf 'local_rdma_device=%s\n' "$LOCAL_RDMA_DEVICE"
+  printf 'peer_rdma_device=%s\n' "$PEER_RDMA_DEVICE"
+  printf 'rdma_gid_index=%s\n' "${RDMA_GID_INDEX:-n/a}"
   printf 'dspark=0\n'
   printf 'extra_env=%s\n' "$EXTRA_ENV_Q"
 } > "$SCORES_MANIFEST"

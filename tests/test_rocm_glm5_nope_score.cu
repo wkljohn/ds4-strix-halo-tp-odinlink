@@ -195,9 +195,10 @@ bool run_test() {
     ds4_gpu_tensor *d_pool_valid = ds4_gpu_tensor_alloc(
         (uint64_t)kPools * sizeof(uint32_t));
     ds4_gpu_tensor *d_scores = alloc_f32(kPools);
+    ds4_gpu_tensor *d_key_repeat = alloc_f32((uint64_t)kRows * kHeadDim);
     CHECK(d_hidden && d_q_resid && d_q && d_kraw && d_key && d_gate &&
           d_weights_unscaled && d_weights && d_valid && d_pooled &&
-          d_pool_indices && d_pool_valid && d_scores,
+          d_pool_indices && d_pool_valid && d_scores && d_key_repeat,
           "allocate bounded NoPE component tensors");
     ds4_gpu_tensor *d_query_hidden = ds4_gpu_tensor_view(
         d_hidden, (uint64_t)(kRows - 1u) * kHidden * sizeof(float),
@@ -302,7 +303,35 @@ bool run_test() {
     CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "rank-local NoPE score invokes no TP exchange");
 
+    /* The indexer layernorm uses a 256-thread block (eight gfx1151 waves).
+     * Repeated exact outputs guard the mean-to-variance LDS handoff against
+     * future removal of its required workgroup ordering. */
+    std::vector<float> repeat_reference, repeat_output;
+    CHECK(ds4_gpu_glm_store_indexer_k_tensor(
+              d_key_repeat, d_kraw, gguf.map, gguf.size,
+              norm_weight_offset, norm_bias_offset, 0u, kRows, kRows,
+              kHeadDim, 0u, 1u, 1.0e-6f, 1.0f, 1.0f,
+              0.0f, 1.0f, 0.0f, 0.0f, false) &&
+          ds4_gpu_synchronize() &&
+          read_tensor(d_key_repeat, kRows * kHeadDim, repeat_reference),
+          "capture deterministic indexer layernorm reference");
+    for (uint32_t repeat = 1u; repeat < 50u; ++repeat) {
+        CHECK(ds4_gpu_glm_store_indexer_k_tensor(
+                  d_key_repeat, d_kraw, gguf.map, gguf.size,
+                  norm_weight_offset, norm_bias_offset, 0u, kRows, kRows,
+                  kHeadDim, 0u, 1u, 1.0e-6f, 1.0f, 1.0f,
+                  0.0f, 1.0f, 0.0f, 0.0f, false) &&
+              ds4_gpu_synchronize() &&
+              read_tensor(d_key_repeat, kRows * kHeadDim, repeat_output) &&
+              std::memcmp(repeat_reference.data(), repeat_output.data(),
+                          repeat_reference.size() * sizeof(float)) == 0,
+              "indexer layernorm is bit-identical across 50 launches");
+    }
+    std::fprintf(stderr,
+                 "GLM5 NoPE indexer layernorm repeatability launches=50 exact=1\n");
+
     ds4_gpu_tensor_free(d_query_hidden);
+    ds4_gpu_tensor_free(d_key_repeat);
     ds4_gpu_tensor_free(d_scores);
     ds4_gpu_tensor_free(d_pool_valid);
     ds4_gpu_tensor_free(d_pool_indices);

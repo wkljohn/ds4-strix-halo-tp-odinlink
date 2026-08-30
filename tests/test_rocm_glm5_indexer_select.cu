@@ -28,6 +28,7 @@ struct Case {
     uint32_t n_rows;
     uint32_t first_valid;
     uint32_t invalid_pool;
+    bool tied_scores = false;
 };
 
 float score_for_pool(uint32_t pool) {
@@ -61,7 +62,8 @@ bool run_case(const Case &test_case) {
                                             complete_count);
     std::vector<float> scores(n_pools);
     for (uint32_t pool = 0; pool < n_pools; ++pool)
-        scores[pool] = score_for_pool(pool);
+        scores[pool] = test_case.tied_scores ?
+            (float)(pool % 17u) : score_for_pool(pool);
     if (test_case.invalid_pool < n_pools)
         scores[test_case.invalid_pool] = 1000.0f;
 
@@ -181,6 +183,13 @@ bool run_test() {
     CHECK(run_case({9u, 1u, UINT32_MAX}) &&
           run_case({19u, 2u, UINT32_MAX}),
           "left-padded GLM5 pool and tail alignment");
+    CHECK(run_case({2049u, 0u, UINT32_MAX}) &&
+          run_case({2050u, 0u, UINT32_MAX}) &&
+          run_case({2051u, 0u, UINT32_MAX}) &&
+          run_case({2052u, 0u, UINT32_MAX}),
+          "GLM5 first sparse boundary through the 513-to-512 pool eviction");
+    CHECK(run_case({2052u, 0u, UINT32_MAX, true}),
+          "GLM5 first sparse eviction is deterministic with tied scores");
     CHECK(run_case({8195u, 0u, UINT32_MAX}),
           "long GLM5 selection with three-token tail");
     CHECK(run_case({8192u, 0u, 5u}),

@@ -234,6 +234,12 @@ int main(void) {
     ok &= check("hello mismatched-glm5-kda-tp",
                 DS4_TP_FEATURE_GLM5_KDA_TP, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00400000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-kda-output-kslice",
+                DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE,
+                DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE, 1, NULL);
+    ok &= check("hello mismatched-glm5-kda-output-kslice",
+                DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x00800000 peer=0x00000000)");
     ok &= check("hello q4k-wmma-kshard mismatch",
                 DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD,
                 DS4_TP_FEATURE_Q4K_WMMA, 0,
@@ -280,12 +286,15 @@ int main(void) {
         DS4_TP_FEATURE_INDEXER_TOPK_RADIX_TREE |
         DS4_TP_FEATURE_Q4K_KSHARD |
         DS4_TP_FEATURE_GLM5_RESIDENT_KDA |
-        DS4_TP_FEATURE_GLM5_SMALL_GATE;
-    if ((DS4_TP_FEATURE_GLM5_KDA_TP & prior_features) != 0u) {
-        fprintf(stderr, "FAIL GLM5 KDA-TP feature overlaps prior bits\n");
+        DS4_TP_FEATURE_GLM5_SMALL_GATE |
+        DS4_TP_FEATURE_GLM5_KDA_TP;
+    if ((DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE & prior_features) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 KDA output K-slice feature overlaps prior bits\n");
         ok = 0;
     } else {
-        fprintf(stderr, "PASS GLM5 KDA-TP feature is disjoint\n");
+        fprintf(stderr,
+                "PASS GLM5 KDA output K-slice feature is disjoint\n");
     }
     if (ds4_tp_glm5_resident_kda_feature(1, 1, 1, 1) !=
             DS4_TP_FEATURE_GLM5_RESIDENT_KDA ||
