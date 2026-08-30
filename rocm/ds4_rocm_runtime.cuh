@@ -7318,7 +7318,16 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
     }
     if (cache->fills != 0u) {
         const char *async_window = getenv("DS4_ROCM_GLM5_WINDOW_ASYNC");
-        if (async_window && strcmp(async_window, "1") == 0 &&
+        const char *scratch_window =
+            getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
+        const bool same_stream_fenced = async_window &&
+            strcmp(async_window, "1") == 0 && scratch_window &&
+            strcmp(scratch_window, "1") == 0;
+        /* Scratch decode queues the routed consumer on the same stream and
+         * the layer epilogue synchronizes before slab rebind.  Avoid a host
+         * wait here; retain the old conservative wait for every other arm. */
+        if (!same_stream_fenced && async_window &&
+            strcmp(async_window, "1") == 0 &&
             cudaDeviceSynchronize() != cudaSuccess) {
             (void)cudaGetLastError();
             return 0;
