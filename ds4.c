@@ -60222,10 +60222,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
 #endif
     }
-    /* With a raised wired limit the sharded span views (~97 GiB) fit the
-     * GPU budget, so let the residency set pin them — that is what makes
-     * the shard actually resident.  Without the sysctl, fall back to lazy
-     * faulting (slow but functional). */
+#ifdef __APPLE__
+    /* Metal uses the iogpu wired-memory budget to decide whether a model
+     * residency set can be pinned.  This sysctl does not exist on Linux;
+     * never emit the Apple hint or alter ROCm residency policy there. */
     if (graph_backend && tp_shard && glm_graph_wired_limit_bytes() == 0) {
         fprintf(stderr,
                 "ds4: iogpu.wired_limit_mb is 0 -- TP expert shard will page "
@@ -60233,6 +60233,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 "for full residency\n");
         ds4_gpu_model_residency_skip(1);
     }
+#endif
     if (graph_backend) {
         if (e->multi_tier) {
             /* Wave-2 multi-tier branch.
