@@ -330,6 +330,13 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
         identity.runtime_features |=
             DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE;
     }
+    const char *gpu_row_gate = std::getenv("DS4_GLM5_GPU_ROW_GATE");
+    if (gpu_row_gate && std::strcmp(gpu_row_gate, "1") == 0 &&
+        small_gate_enabled &&
+        !(std::getenv("DS4_TP_HOST_CALLBACK") &&
+          std::strcmp(std::getenv("DS4_TP_HOST_CALLBACK"), "1") == 0)) {
+        identity.runtime_features |= DS4_TP_FEATURE_GLM5_GPU_ROW_GATE;
+    }
     identity.gate_slot_start =
         (identity.runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u ?
             0u : 3u * DS4_TP_GATES_PER_LAYER;
@@ -2765,7 +2772,15 @@ bool run() {
                      (unsigned long long)kPrefixFNV,
                      (unsigned long long)prefix_hash);
     }
-    CHECK(prefix_hash == kPrefixFNV,
+    const char *allow_prefix_mismatch =
+        std::getenv("DS4_GLM5_ALLOW_PREFIX_MISMATCH");
+    const bool diagnostic_prefix = allow_prefix_mismatch &&
+        std::strcmp(allow_prefix_mismatch, "1") == 0;
+    if (diagnostic_prefix && prefix_hash != kPrefixFNV)
+        std::fprintf(stderr,
+                     "warning: accepting prefix mismatch for diagnostic "
+                     "timing only\n");
+    CHECK(prefix_hash == kPrefixFNV || diagnostic_prefix,
           "production prefix matches frozen real-GGUF fixture");
 
     if (full_trunk) {

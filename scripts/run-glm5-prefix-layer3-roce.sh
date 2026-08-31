@@ -824,6 +824,10 @@ if [[ -n $SMALL_GATE ]]; then
   local_candidate_env+=(DS4_GLM5_SMALL_GATE=1)
   remote_candidate_env+=' DS4_GLM5_SMALL_GATE=1'
 fi
+if [[ ${DS4_GLM5_ALLOW_PREFIX_MISMATCH:-} == 1 ]]; then
+  local_candidate_env+=(DS4_GLM5_ALLOW_PREFIX_MISMATCH=1)
+  remote_candidate_env+=' DS4_GLM5_ALLOW_PREFIX_MISMATCH=1'
+fi
 if [[ -n $RESIDENT_EXPERTS ]]; then
   local_candidate_env+=(DS4_GLM5_NEXT_RESIDENT_EXPERTS="$RESIDENT_EXPERTS")
   remote_candidate_env+=" DS4_GLM5_NEXT_RESIDENT_EXPERTS='$RESIDENT_EXPERTS'"
