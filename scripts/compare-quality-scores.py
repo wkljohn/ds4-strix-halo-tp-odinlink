@@ -68,14 +68,19 @@ def load_thresholds(path: Path) -> dict:
     for key in required - {"baseline_id", "min_cases", "min_target_tokens"}:
         if not isinstance(value[key], (int, float)) or not math.isfinite(value[key]):
             raise ValueError(f"{path}: {key} must be finite")
+    if "max_case_nll_delta" in value and (
+            not isinstance(value["max_case_nll_delta"], (int, float)) or
+            not math.isfinite(value["max_case_nll_delta"])):
+        raise ValueError(f"{path}: max_case_nll_delta must be finite")
     return value
 
 
-def ratio(rows: list[dict[str, str]], numerator: str, denominator: str) -> float:
+def ratio(rows: list[dict[str, str]], numerator: str,
+          denominator: str) -> float | None:
     top = sum(number(row, numerator, True) for row in rows)
     bottom = sum(number(row, denominator, True) for row in rows)
     if bottom <= 0:
-        raise ValueError(f"score table has no {denominator}")
+        return None
     return top / bottom
 
 
@@ -117,10 +122,20 @@ def main() -> int:
         mean_delta = statistics.fmean(deltas)
         ci_half = 1.96 * statistics.stdev(deltas) / math.sqrt(len(deltas))
         weighted_delta = (cand_nll - ref_nll) / target_tokens
+        max_case_delta = max(deltas)
         ref_top1 = ratio(reference, "api_top1_match", "api_top1_count")
         cand_top1 = ratio(candidate, "api_top1_match", "api_top1_count")
         ref_pair = ratio(reference, "api_pair_agree", "api_pair_total")
         cand_pair = ratio(candidate, "api_pair_agree", "api_pair_total")
+        api_metrics_available = all(
+            value is not None
+            for value in (ref_top1, cand_top1, ref_pair, cand_pair))
+        api_top1_delta = (
+            cand_top1 - ref_top1 if cand_top1 is not None and
+            ref_top1 is not None else None)
+        api_pair_delta = (
+            cand_pair - ref_pair if cand_pair is not None and
+            ref_pair is not None else None)
         metrics = {
             "cases": len(deltas),
             "target_tokens": target_tokens,
@@ -130,17 +145,28 @@ def main() -> int:
             "paired_mean_avg_nll_delta": mean_delta,
             "paired_ci95_low": mean_delta - ci_half,
             "paired_ci95_high": mean_delta + ci_half,
-            "api_top1_rate_delta": cand_top1 - ref_top1,
-            "api_pair_rate_delta": cand_pair - ref_pair,
+            "max_case_avg_nll_delta": max_case_delta,
+            "api_metrics_available": api_metrics_available,
+            "api_top1_rate_delta": api_top1_delta,
+            "api_pair_rate_delta": api_pair_delta,
         }
-        passed = bool(
+        nll_screen_passed = bool(
             metrics["cases"] >= thresholds["min_cases"] and
             metrics["target_tokens"] >= thresholds["min_target_tokens"] and
             metrics["weighted_nll_delta"] <= thresholds["max_mean_nll_delta"] and
             metrics["paired_ci95_high"] <= thresholds["max_ci95_high_nll_delta"] and
-            metrics["api_top1_rate_delta"] >= thresholds["min_api_top1_rate_delta"] and
-            metrics["api_pair_rate_delta"] >= thresholds["min_api_pair_rate_delta"]
+            ("max_case_nll_delta" not in thresholds or
+             max_case_delta <= thresholds["max_case_nll_delta"])
         )
+        api_screen_passed = bool(
+            api_metrics_available and
+            api_top1_delta is not None and api_pair_delta is not None and
+            api_top1_delta >= thresholds["min_api_top1_rate_delta"] and
+            api_pair_delta >= thresholds["min_api_pair_rate_delta"])
+        passed = nll_screen_passed and api_screen_passed
+        blockers = []
+        if not api_metrics_available:
+            blockers.append("hosted API top-1/pair logprob metrics unavailable")
         result = {
             "schema_version": 1,
             "baseline_id": thresholds["baseline_id"],
@@ -156,6 +182,10 @@ def main() -> int:
             },
             "thresholds_sha256": sha256(args.thresholds),
             "metrics": metrics,
+            "nll_screen_passed": nll_screen_passed,
+            "api_screen_passed": (
+                api_screen_passed if api_metrics_available else None),
+            "blockers": blockers,
             "passed": passed,
         }
     except (OSError, ValueError, json.JSONDecodeError) as error:
@@ -166,7 +196,11 @@ def main() -> int:
         args.output.write_text(encoded, encoding="utf-8")
     sys.stdout.write(encoded)
     if not passed:
-        print("quality-scores: FAIL paired non-inferiority gate", file=sys.stderr)
+        if not metrics["api_metrics_available"]:
+            print("quality-scores: FAIL hosted API metrics unavailable; "
+                  "paired NLL screen was still reported", file=sys.stderr)
+        else:
+            print("quality-scores: FAIL paired non-inferiority gate", file=sys.stderr)
         return 1
     return 0
 
