@@ -214,7 +214,7 @@ def main() -> int:
     parser.add_argument(
         "--score-arm-mode", choices=(
             "kda-tp", "kda-kslice", "repeat", "full-split-order-null",
-            "null-vs-kslice"),
+            "null-vs-kslice", "fallback-vs-kslice"),
         help="required arm relationship for score_official GLM5 diagnostics")
     args = parser.parse_args()
     try:
@@ -267,6 +267,7 @@ def main() -> int:
                 "repeat": ("kda-kslice", "kda-kslice"),
                 "full-split-order-null": ("kda-tp", "kda-tp"),
                 "null-vs-kslice": ("kda-tp", "kda-kslice"),
+                "fallback-vs-kslice": ("kda-tp", "kda-kslice"),
             }[args.score_arm_mode]
             actual_arms = (reference_manifest.get("teacher_arm"),
                            candidate_manifest.get("teacher_arm"))
@@ -300,6 +301,13 @@ def main() -> int:
                         "null-vs-kslice requires the legal reorder only in "
                         "the reference arm")
                 selectors.add(null_key)
+            elif args.score_arm_mode == "fallback-vs-kslice":
+                fallback_key = "DS4_ROCM_DISABLE_BF16_DECODE_MLP64"
+                if ref_env.get(fallback_key) != "1" or fallback_key in cand_env:
+                    raise ValueError(
+                        "fallback-vs-kslice requires the independent BF16 "
+                        "fallback only in the reference arm")
+                selectors.add(fallback_key)
             if ({k: v for k, v in ref_env.items() if k not in selectors} !=
                     {k: v for k, v in cand_env.items() if k not in selectors}):
                 raise ValueError("score arms differ outside the KDA selectors")

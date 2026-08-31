@@ -44,7 +44,8 @@ def dump(path: Path, logits: list[float], quality: bool = False,
 
 def score_manifest(path: Path, *, arm: str,
                    model_hash: str = "model-hash",
-                   full_split_order: bool = False) -> None:
+                   full_split_order: bool = False,
+                   fallback_mlp64: bool = False) -> None:
     selectors = {
         "kda-off": ("0", "0"),
         "kda-tp": ("1", "0"),
@@ -70,7 +71,9 @@ def score_manifest(path: Path, *, arm: str,
                       f"DS4_GLM5_KDA_OUTPUT_KSLICE={kslice} "
                       "DS4_GLM5_NEXT_PREFILL_BATCH=512 " +
                       ("DS4_ROCM_BF16_FULL_SPLIT_ORDER=1 "
-                       if full_split_order else "")),
+                       if full_split_order else "") +
+                      ("DS4_ROCM_DISABLE_BF16_DECODE_MLP64=1 "
+                       if fallback_mlp64 else "")),
         "coordinator_features": (f"GLM5 TP features: kda_tp={kda_tp} "
                                  f"kda_output_kslice={kslice}"),
         "worker_features": (f"GLM5 TP features: kda_tp={kda_tp} "
@@ -227,6 +230,23 @@ def main() -> int:
         assert invalid_null_vs_kslice.returncode == 1
         assert "legal reorder only in the reference" in \
             invalid_null_vs_kslice.stderr
+
+        score_manifest(reference / "manifest", arm="kda-tp",
+                       fallback_mlp64=True)
+        score_manifest(candidate / "manifest", arm="kda-kslice")
+        fallback_vs_kslice = run(
+            str(reference), str(candidate),
+            "--score-arm-mode", "fallback-vs-kslice")
+        assert fallback_vs_kslice.returncode == 0, \
+            fallback_vs_kslice.stderr
+        score_manifest(candidate / "manifest", arm="kda-kslice",
+                       fallback_mlp64=True)
+        invalid_fallback_vs_kslice = run(
+            str(reference), str(candidate),
+            "--score-arm-mode", "fallback-vs-kslice")
+        assert invalid_fallback_vs_kslice.returncode == 1
+        assert "independent BF16 fallback only in the reference" in \
+            invalid_fallback_vs_kslice.stderr
     print("test_compare_teacher_logits: PASS")
     return 0
 
