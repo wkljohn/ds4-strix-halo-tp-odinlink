@@ -1441,7 +1441,8 @@ static int tp_rdma_drain_cq_observe(ds4_tp *tp, uint64_t target_seq,
         if (wc[i].opcode & IBV_WC_RECV) {
             if (target_recv && wc[i].wr_id == target_seq) *target_recv = 1;
             if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
-        } else if (r->send_outstanding > 0) {
+        } else if (!(wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) &&
+                   r->send_outstanding > 0) {
             if (target_send && wc[i].wr_id == target_seq) *target_send = 1;
             r->send_outstanding--;
         }
@@ -1924,6 +1925,12 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
 #else
     g_bg_trace = 0;
 #endif
+    static int signal_each_cached = -1;
+    if (signal_each_cached < 0) {
+        const char *env = getenv("DS4_TP_BIGGATE_SIG_ALL");
+        signal_each_cached = !env || !env[0] || strcmp(env, "0") != 0;
+    }
+    const bool signal_each = signal_each_cached != 0;
     const double bg_t0 = g_bg_trace ? tp_now_sec() : 0.0;
     double bg_copy = 0.0;
 
@@ -2015,7 +2022,10 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
              * applies and the sends can be linked/posted as one batch like
              * the receives above - this was serializing up to 64
              * completion round-trips per bulk gate for no reason anymore. */
-            send_wr[i].send_flags = IBV_SEND_SIGNALED;
+            /* Keep all sends signaled by default; the opt-in experiment
+             * signals only the final linked WR to reduce send CQ traffic. */
+            send_wr[i].send_flags =
+                (signal_each || i + 1u == chunks) ? IBV_SEND_SIGNALED : 0;
             send_wr[i].next = i + 1u < chunks ? &send_wr[i + 1u] : NULL;
         }
         struct ibv_send_wr *bad_send = NULL;
@@ -2034,7 +2044,8 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         uint32_t peer_poll = 0;
         bool bg_seen_first = false;
         uint64_t bg_empty_this_round = 0;
-        while (recv_done < chunks || send_done < chunks) {
+        while (recv_done < chunks ||
+               (signal_each ? send_done < chunks : send_done == 0u)) {
             struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
             int n = ibv_poll_cq(r->cq,
                                (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
@@ -2069,8 +2080,11 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     if (g_bg_trace && recv_done == chunks)
                         g_bg_towait_lastrecv_s += tp_now_sec() - ps1;
                 } else {
-                    send_done++;
-                    if (g_bg_trace && send_done == chunks)
+                    /* The final signaled WR is a local completion fence for
+                     * all earlier linked sends on this QP. */
+                    send_done = signal_each ? send_done + 1u : chunks;
+                    if (g_bg_trace &&
+                        send_done == (signal_each ? chunks : 1u))
                         g_bg_towait_lastsend_s += tp_now_sec() - ps1;
                 }
             }
@@ -2083,7 +2097,8 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 fprintf(stderr,
                         "ds4-tp: timeout waiting for bulk RDMA round "
                         "(%u/%u recvs, %u/%u sends)\n",
-                        recv_done, chunks, send_done, chunks);
+                        recv_done, chunks, send_done,
+                        signal_each ? chunks : 1u);
                 return 0;
             }
         }
