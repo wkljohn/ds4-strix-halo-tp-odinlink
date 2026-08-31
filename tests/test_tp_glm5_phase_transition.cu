@@ -101,6 +101,13 @@ int main(int argc, char **argv) {
 
     (void)setenv("DS4_TP_BIG_DIRECT", "1", 1);
     (void)setenv("DS4_TP_BIG_DIRECT_MAX_ROWS", "1", 1);
+    const char *small_env = std::getenv("DS4_TEST_GLM5_SMALL_GATE");
+    const bool small_gate = !small_env || std::strcmp(small_env, "1") == 0;
+    if (small_env && std::strcmp(small_env, "0") != 0 &&
+        std::strcmp(small_env, "1") != 0) {
+        std::fprintf(stderr, "FAIL DS4_TEST_GLM5_SMALL_GATE must be 0 or 1\n");
+        return 1;
+    }
 
     ds4_tp_options options = {};
     options.role = leader ? DS4_TP_LEADER : DS4_TP_WORKER;
@@ -125,7 +132,8 @@ int main(int argc, char **argv) {
     identity.n_vocab = 1u;
     identity.quant_bits = 4u;
     identity.ctx_size = 16u;
-    identity.runtime_features = DS4_TP_FEATURE_GLM5_SMALL_GATE;
+    identity.runtime_features = small_gate
+        ? DS4_TP_FEATURE_GLM5_SMALL_GATE : 0u;
     const char *kda_tp_env = std::getenv("DS4_GLM5_KDA_TP");
     const bool kda_tp = kda_tp_env && std::strcmp(kda_tp_env, "1") == 0;
     if (kda_tp_env && !kda_tp && std::strcmp(kda_tp_env, "0") != 0) {
@@ -251,16 +259,24 @@ int main(int argc, char **argv) {
                 const uint64_t seq = ++sequence;
                 fill_payload<<<1, 256>>>(stage, rank, seq);
                 hip_check(hipGetLastError(), "decode fill launch");
-                const uint64_t out_off =
-                    ds4_tp_slab_out_offset(tp, g.layer, g.gate);
-                const uint64_t in_off =
-                    ds4_tp_slab_in_offset(tp, g.layer, g.gate);
+                const uint64_t out_off = small_gate
+                    ? ds4_tp_slab_out_offset(tp, g.layer, g.gate)
+                    : ds4_tp_slab_big_out_offset(tp);
+                const uint64_t in_off = small_gate
+                    ? ds4_tp_slab_in_offset(tp, g.layer, g.gate)
+                    : ds4_tp_slab_big_in_offset(tp);
                 hip_check(hipMemcpyAsync((char *)slab_device + out_off, stage,
                                          (size_t)kBytes,
                                          hipMemcpyDeviceToDevice, 0),
                           "decode mapped output copy");
                 hip_check(hipDeviceSynchronize(), "decode producer sync");
-                if (!ds4_tp_gate_exchange(tp, g.layer, g.gate, seq)) {
+                const bool exchanged = small_gate
+                    ? ds4_tp_gate_exchange(tp, g.layer, g.gate, seq)
+                    : ds4_tp_big_gate_exchange(
+                          tp, g.layer, seq,
+                          (char *)slab_host + out_off,
+                          (char *)slab_host + in_off, kBytes);
+                if (!exchanged) {
                     std::fprintf(stderr,
                                  "FAIL decode exchange cycle=%u token=%u "
                                  "seq=%llu\n", cycle, token,
@@ -286,10 +302,11 @@ int main(int argc, char **argv) {
             std::chrono::steady_clock::now() - decode_start).count();
     }
 
-    std::printf("provider_device=%s rank=%u allocator=%s cycles=%u "
+    std::printf("provider_device=%s rank=%u allocator=%s small_gate=%u cycles=%u "
                 "prompt_gates=%zu decode_tokens=%u checked=%llu "
                 "final_seq=%llu prompt_ms=%.3f decode_ms=%.3f verdict=%s\n",
                 device, rank, mapped_host ? "hipHostMallocMapped" : "hipMalloc",
+                small_gate ? 1u : 0u,
                 kCycles, schedule.size(), kDecodeTokens,
                 (unsigned long long)checked,
                 (unsigned long long)sequence, prompt_ms, decode_ms,
