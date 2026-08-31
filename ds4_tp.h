@@ -106,6 +106,11 @@ enum {
      * but payload meaning and FP32 reduction order change, so independently
      * launched ranks must agree before entering the KDA graph. */
     DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE = UINT32_C(1) << 23,
+    /* GLM-5.3 one-token reductions are ordered through the common GPU row
+     * gate encoder instead of a device-wide synchronize followed by a direct
+     * graph-thread exchange.  The wire verb and slab layout stay unchanged,
+     * but both ranks must choose the same gate sequence source. */
+    DS4_TP_FEATURE_GLM5_GPU_ROW_GATE = UINT32_C(1) << 24,
 };
 
 static inline uint32_t ds4_tp_glm5_kda_tp_feature(
@@ -137,6 +142,16 @@ static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(
            (runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u &&
            all_kda_outputs_bf16
         ? DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_gpu_row_gate_feature(
+        const char *env,
+        uint32_t runtime_features,
+        const char *callback_env) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           !(callback_env && callback_env[0] == '1' && callback_env[1] == '\0') &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u
+        ? DS4_TP_FEATURE_GLM5_GPU_ROW_GATE : 0u;
 }
 
 static inline uint32_t ds4_tp_glm5_resident_kda_feature(

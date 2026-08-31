@@ -1059,11 +1059,50 @@ static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
             ds4_tp_slab_out_offset(ctx->tp, layer, gate);
         const uint64_t in_off =
             ds4_tp_slab_in_offset(ctx->tp, layer, gate);
+        const int gpu_row_gate =
+            (ds4_tp_runtime_features(ctx->tp) &
+             DS4_TP_FEATURE_GLM5_GPU_ROW_GATE) != 0u;
         if (ds4_gpu_tensor_bytes(ctx->tp_slab) < out_off + bytes ||
             ds4_gpu_tensor_bytes(ctx->tp_slab) < in_off + bytes ||
             !ds4_gpu_tensor_copy(ctx->tp_slab, out_off,
-                                 ctx->tp_big_out, 0u, bytes) ||
-            !ds4_gpu_synchronize()) {
+                                 ctx->tp_big_out, 0u, bytes)) {
+            ds4_tp_mark_failed(ctx->tp);
+            return 0;
+        }
+        if (gpu_row_gate) {
+            if (fence_release && !ds4_rocm_rdma_cache_release()) {
+                ds4_tp_mark_failed(ctx->tp);
+                return 0;
+            }
+            /* Keep the GLM control/hash sequence advancing exactly as the
+             * legacy path does.  The GPU row channel owns a separate RDMA
+             * sequence; conflating the two made a later prefill/decode
+             * transition depend on whichever gate arrived first. */
+            ++*ctx->tp_sequence;
+            if (!ds4_gpu_tp_gate_encode(layer, gate) ||
+                !ds4_gpu_tensor_copy(ctx->tp_big_in, 0u,
+                                     ctx->tp_slab, in_off, bytes)) {
+                ds4_tp_mark_failed(ctx->tp);
+                return 0;
+            }
+            /* This mode is intentionally tested with host-synchronous gates
+             * first.  In that mode encode returns only after RDMA completion,
+             * so acquire fencing is ordered before the consumer copy. */
+            if (fence_acquire && !ds4_rocm_rdma_cache_acquire()) {
+                ds4_tp_mark_failed(ctx->tp);
+                return 0;
+            }
+            static int gpu_reported;
+            if (!gpu_reported) {
+                fprintf(stderr,
+                        "ds4: GLM5 one-token TP reductions use the "
+                        "GPU-ordered preposted latency gate (%llu bytes)\n",
+                        (unsigned long long)bytes);
+                gpu_reported = 1;
+            }
+            return 1;
+        }
+        if (!ds4_gpu_synchronize()) {
             ds4_tp_mark_failed(ctx->tp);
             return 0;
         }

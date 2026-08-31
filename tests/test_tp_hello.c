@@ -287,7 +287,8 @@ int main(void) {
         DS4_TP_FEATURE_Q4K_KSHARD |
         DS4_TP_FEATURE_GLM5_RESIDENT_KDA |
         DS4_TP_FEATURE_GLM5_SMALL_GATE |
-        DS4_TP_FEATURE_GLM5_KDA_TP;
+        DS4_TP_FEATURE_GLM5_KDA_TP |
+        DS4_TP_FEATURE_GLM5_GPU_ROW_GATE;
     if ((DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE & prior_features) != 0u) {
         fprintf(stderr,
                 "FAIL GLM5 KDA output K-slice feature overlaps prior bits\n");
@@ -333,6 +334,21 @@ int main(void) {
         ok = 0;
     } else {
         fprintf(stderr, "PASS GLM5 small-gate advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_gpu_row_gate_feature(
+            "1", DS4_TP_FEATURE_GLM5_SMALL_GATE, NULL) !=
+            DS4_TP_FEATURE_GLM5_GPU_ROW_GATE ||
+        ds4_tp_glm5_gpu_row_gate_feature(NULL,
+                                         DS4_TP_FEATURE_GLM5_SMALL_GATE, NULL) != 0u ||
+        ds4_tp_glm5_gpu_row_gate_feature("0",
+                                         DS4_TP_FEATURE_GLM5_SMALL_GATE, NULL) != 0u ||
+        ds4_tp_glm5_gpu_row_gate_feature("1", 0u, NULL) != 0u ||
+        ds4_tp_glm5_gpu_row_gate_feature(
+            "1", DS4_TP_FEATURE_GLM5_SMALL_GATE, "1") != 0u) {
+        fprintf(stderr, "FAIL GLM5 GPU row-gate advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS GLM5 GPU row-gate advertisement predicate\n");
     }
     if (ds4_tp_glm5_kda_output_kslice_feature(
             "1", DS4_TP_FEATURE_GLM5_KDA_TP, 1) !=
