@@ -123,6 +123,7 @@ SMALL_GATE_DISABLE=${DS4_GLM5_DISABLE_SMALL_GATE:-}
 KDA_TP=${DS4_GLM5_KDA_TP:-}
 KDA_OUTPUT_KSLICE=${DS4_GLM5_KDA_OUTPUT_KSLICE:-}
 GPU_ROW_GATE=${DS4_GLM5_GPU_ROW_GATE:-}
+SMALL_GATE=${DS4_GLM5_SMALL_GATE:-}
 RESIDENT_EXPERTS=${DS4_GLM5_NEXT_RESIDENT_EXPERTS:-}
 WARM_RESIDENT=${DS4_GLM5_NEXT_WARM_RESIDENT:-}
 TP_SKIP_UNOWNED=${DS4_ROCM_TP_PREFILL_SKIP_UNOWNED:-}
@@ -394,6 +395,10 @@ done
 }
 [[ -z $GPU_ROW_GATE || $GPU_ROW_GATE == 1 ]] || {
   echo "error: DS4_GLM5_GPU_ROW_GATE must be empty or 1" >&2
+  exit 2
+}
+[[ -z $SMALL_GATE || $SMALL_GATE == 1 ]] || {
+  echo "error: DS4_GLM5_SMALL_GATE must be empty or 1" >&2
   exit 2
 }
 [[ -z $KDA_OUTPUT_KSLICE || -n $KDA_TP ]] || {
@@ -814,6 +819,10 @@ fi
 if [[ -n $GPU_ROW_GATE ]]; then
   local_candidate_env+=(DS4_GLM5_GPU_ROW_GATE=1)
   remote_candidate_env+=' DS4_GLM5_GPU_ROW_GATE=1'
+fi
+if [[ -n $SMALL_GATE ]]; then
+  local_candidate_env+=(DS4_GLM5_SMALL_GATE=1)
+  remote_candidate_env+=' DS4_GLM5_SMALL_GATE=1'
 fi
 if [[ -n $RESIDENT_EXPERTS ]]; then
   local_candidate_env+=(DS4_GLM5_NEXT_RESIDENT_EXPERTS="$RESIDENT_EXPERTS")
