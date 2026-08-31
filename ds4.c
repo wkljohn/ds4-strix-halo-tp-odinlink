@@ -51571,6 +51571,15 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
         if (errlen) snprintf(err, errlen, "GLM5 prompt tile is not ready");
         return 1;
     }
+    const bool phase_trace = getenv("DS4_GLM5_PHASE_TRACE") != NULL &&
+        strcmp(getenv("DS4_GLM5_PHASE_TRACE"), "1") == 0;
+    if (phase_trace) {
+        fprintf(stderr,
+                "ds4: GLM5 phase rank=%d time=%.9f phase=tile_alloc_enter pos=%u rows=%u\n",
+                s->engine && s->engine->tp.active ? s->engine->tp.rank : -1,
+                now_sec(), pos0, n_tokens);
+        fflush(stderr);
+    }
     const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     ds4_glm5_next_workspace *w =
         ds4_glm5_next_workspace_create_capacity(n_tokens);
@@ -51582,6 +51591,13 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(cur); ds4_gpu_tensor_free(ids);
         ds4_glm5_next_workspace_destroy(w);
         return 1;
+    }
+    if (phase_trace) {
+        fprintf(stderr,
+                "ds4: GLM5 phase rank=%d time=%.9f phase=tile_alloc_done pos=%u rows=%u\n",
+                s->engine && s->engine->tp.active ? s->engine->tp.rank : -1,
+                now_sec(), pos0, n_tokens);
+        fflush(stderr);
     }
     ds4_glm5_next_workspace_begin_prefill(w);
     uint32_t *id_host = calloc(n_tokens, sizeof(*id_host));
@@ -51597,6 +51613,13 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
     uint32_t failed_layer = UINT32_MAX;
     const bool layer_profile = getenv("DS4_GLM5_LAYER_PROFILE") != NULL;
     for (uint32_t il = 0u; ok && il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        if (phase_trace && il == 0u) {
+            fprintf(stderr,
+                    "ds4: GLM5 phase rank=%d time=%.9f phase=layer_enter layer=0 pos=%u rows=%u\n",
+                    s->engine && s->engine->tp.active ? s->engine->tp.rank : -1,
+                    now_sec(), pos0, n_tokens);
+            fflush(stderr);
+        }
         const double layer_t0 = layer_profile ? now_sec() : 0.0;
         ok = ds4_glm5_next_layer_forward_batch(
             &s->glm5_next_exec, il, &s->glm5_next_state, w,
@@ -51607,6 +51630,13 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
                     il, n_tokens, (now_sec() - layer_t0) * 1000.0, ok ? 1 : 0);
         }
         if (!ok) failed_layer = il;
+        if (phase_trace && il == 0u) {
+            fprintf(stderr,
+                    "ds4: GLM5 phase rank=%d time=%.9f phase=layer_exit layer=0 pos=%u rows=%u ok=%d\n",
+                    s->engine && s->engine->tp.active ? s->engine->tp.rank : -1,
+                    now_sec(), pos0, n_tokens, ok ? 1 : 0);
+            fflush(stderr);
+        }
         ds4_gpu_tensor *tmp = cur; cur = out; out = tmp;
     }
     if (ok) {

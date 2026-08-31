@@ -43,6 +43,20 @@ static double glm5_exec_now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+static void glm5_phase_trace(const ds4_glm5_next_exec_ctx *ctx,
+                             const char *phase, uint32_t layer,
+                             uint32_t n_tokens) {
+    const char *enabled = getenv("DS4_GLM5_PHASE_TRACE");
+    if (!enabled || strcmp(enabled, "1") != 0 || layer != 0u) return;
+    fprintf(stderr,
+            "ds4: GLM5 phase rank=%u time=%.9f phase=%s layer=%u rows=%u seq=%llu\n",
+            ctx ? ctx->tp_rank : UINT32_MAX, glm5_exec_now_sec(), phase,
+            layer, n_tokens,
+            (unsigned long long)(ctx && ctx->tp_sequence ?
+                                 *ctx->tp_sequence : 0u));
+    fflush(stderr);
+}
+
 static int kda_output_kslice_contract(uint32_t rank, uint32_t n_tokens,
                                       uint64_t *k_off, uint64_t *k_cnt,
                                       uint64_t *local_bytes) {
@@ -694,6 +708,7 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
                               uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
     ds4_glm5_kda_layer_state *kda = &state->kda.layer[il];
+    glm5_phase_trace(ctx, "kda_prefix_enter", il, n_tokens);
     const int prefix_ok =
         ds4_gpu_rms_norm_plain_rows_tensor(
             w->hc_flat, hc_in, GLM5_HC_WIDTH, n_tokens,
@@ -708,6 +723,7 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
             layer->hc.attn_scale, layer->hc.attn_base,
             GLM5_WIDTH, GLM5_HC, 20u, ctx->model->hc_eps);
     if (!prefix_ok) return 0;
+    glm5_phase_trace(ctx, "kda_prefix_done", il, n_tokens);
 #ifdef DS4_TP_TEST_HOOKS
     /* Differential-only boundary capture.  The batch-vs-tokenwise fixture
      * enables this to identify whether drift begins before the recurrent
@@ -774,12 +790,15 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
     }
     ds4_gpu_tensor *const local_gated =
         output_kslice ? w->kda.recurrent_out : ctx->tp_big_out;
+    glm5_phase_trace(ctx, "kda_begin_enter", il, n_tokens);
     const int local_ok = ds4_glm5_kda_layer_begin(
         &local, &w->kda, &layer->kda, ctx->model_map, ctx->model_size,
         w->collapsed, local_gated, n_tokens,
         ctx->model->rms_norm_eps,
         ctx->tp_rank * (DS4_GLM5_KDA_HEADS / 2u),
         DS4_GLM5_KDA_HEADS / 2u);
+    glm5_phase_trace(ctx, local_ok ? "kda_begin_done" : "kda_begin_failed",
+                     il, n_tokens);
 #ifdef DS4_TP_TEST_HOOKS
     if (local_ok && getenv("DS4_GLM5_KDA_STAGE_TRACE") != NULL &&
         ctx->trace_prefix) {
@@ -830,6 +849,7 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
             return 0;
         }
     }
+    glm5_phase_trace(ctx, "kda_gate_enter", il, n_tokens);
     if (!local_ok ||
         !tp_exchange_rows(ctx, il, DS4_TP_GATE_ATTN, n_tokens)) {
         ds4_glm5_kda_layer_abort(&local);
@@ -837,6 +857,7 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
         ds4_glm5_next_state_invalidate(state);
         return 0;
     }
+    glm5_phase_trace(ctx, "kda_gate_done", il, n_tokens);
     if (output_kslice) {
         const ds4_gpu_tensor *rank0_partial =
             ctx->tp_rank == 0u ? w->attention : ctx->tp_big_in;
@@ -1070,15 +1091,19 @@ static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
         return 1;
     }
 
+    glm5_phase_trace(ctx, "gate_gpu_sync_enter", layer, n_tokens);
     if (!ds4_gpu_synchronize()) return 0;
+    glm5_phase_trace(ctx, "gate_gpu_sync_done", layer, n_tokens);
     if (fence_release && !ds4_rocm_rdma_cache_release()) return 0;
     const uint64_t sequence = ++*ctx->tp_sequence;
+    glm5_phase_trace(ctx, "gate_rdma_enter", layer, n_tokens);
     if (!ds4_tp_big_gate_exchange(ctx->tp, layer, sequence,
                                   ctx->tp_big_out_host,
                                   ctx->tp_big_in_host, bytes)) {
         ds4_tp_mark_failed(ctx->tp);
         return 0;
     }
+    glm5_phase_trace(ctx, "gate_rdma_done", layer, n_tokens);
     if (fence_acquire && !ds4_rocm_rdma_cache_acquire()) {
         ds4_tp_mark_failed(ctx->tp);
         return 0;
