@@ -927,6 +927,17 @@ bool run() {
           "MLA attention-only selector is exactly 0 or 1");
     CHECK(!mla_attention_only || mla_batch_test,
           "MLA attention-only gate requires the MLA batch fixture");
+    const char *mla_attention_mode_env =
+        std::getenv("DS4_GLM5_MLA_ATTENTION_MODE");
+    const bool mla_attention_sequential =
+        !mla_attention_mode_env ||
+        std::strcmp(mla_attention_mode_env, "sequential") == 0;
+    const bool mla_attention_batch =
+        !mla_attention_mode_env ||
+        std::strcmp(mla_attention_mode_env, "batch") == 0;
+    CHECK(!mla_attention_mode_env || mla_attention_sequential ||
+              mla_attention_batch,
+          "MLA attention mode is sequential or batch");
     const char *mla_sparse_boundary_env =
         std::getenv("DS4_GLM5_MLA_SPARSE_BOUNDARY_TEST");
     const bool mla_sparse_boundary_test = mla_sparse_boundary_env &&
@@ -943,8 +954,9 @@ bool run() {
               (mla_batch_rows_end && *mla_batch_rows_end == '\0')) &&
               (mla_batch_rows_long == 3ul || mla_batch_rows_long == 5ul ||
                mla_batch_rows_long == 33ul ||
-               mla_batch_rows_long == 121ul),
-          "MLA routed batch rows are the bounded 3, 5, 33, or 121 fixture");
+               mla_batch_rows_long == 121ul ||
+               mla_batch_rows_long == 256ul),
+          "MLA routed batch rows are the bounded 3, 5, 33, 121, or 256 fixture");
     const uint32_t mla_batch_rows = (uint32_t)mla_batch_rows_long;
     const char *mla_prefix_rows_env =
         std::getenv("DS4_GLM5_MLA_ROUTED_PREFIX_ROWS");
@@ -1544,7 +1556,7 @@ bool run() {
          * cross-disciplinary prompt used by the end-to-end repeatability
          * gate.  The two trailing control tokens permit the existing bounded
          * prefix cases without inventing a different input fixture. */
-        const std::vector<uint32_t> ids = {
+        std::vector<uint32_t> ids = {
             154822u, 154824u, 154826u, 25062u, 287u, 29905u, 371u, 25u,
             7487u, 154827u, 50258u, 264u, 63141u, 5312u, 51325u, 43201u,
             24206u, 13u, 758u, 3162u, 14657u, 11u, 10334u, 3170u,
@@ -1562,6 +1574,10 @@ bool run() {
             18940u, 20484u, 16859u, 13057u, 504u, 18532u, 13u, 154828u,
             154841u, 17u, 287u,
         };
+        const size_t frozen_ids = ids.size();
+        while (ids.size() < committed_rows) {
+            ids.push_back(ids[(ids.size() - frozen_ids) % frozen_ids]);
+        }
         CHECK(committed_rows <= ids.size(),
               "select exact MLA routed token fixture");
         constexpr uint32_t continuation_ids[16] = {
@@ -1688,7 +1704,8 @@ bool run() {
                   "seed identical scalar MLA tail before batch");
         }
 
-        for (uint32_t row = 0u; row < rows; ++row) {
+        for (uint32_t row = 0u;
+             mla_attention_sequential && row < rows; ++row) {
             ds4_gpu_tensor *row_input = ds4_gpu_tensor_view(
                 batch_input.value,
                 (uint64_t)row * kHcWidth * sizeof(float),
@@ -1705,7 +1722,8 @@ bool run() {
             ds4_gpu_tensor_free(row_input);
             CHECK(row_ok, "execute sequential MLA attention oracle row");
         }
-        CHECK(ds4_glm5_next_mla_attention_forward_test(
+        CHECK(!mla_attention_batch ||
+              ds4_glm5_next_mla_attention_forward_test(
                   &exec, 3u, &attention_batch_state.value,
                   batch_workspace.value, batch_input.value,
                   attention_batch_output.value, rows),
@@ -1713,31 +1731,48 @@ bool run() {
         std::vector<float> attention_sequential(
             (uint64_t)rows * kHcWidth);
         std::vector<float> attention_batch((uint64_t)rows * kHcWidth);
-        CHECK(ds4_gpu_tensor_read(
+        CHECK(!mla_attention_sequential || ds4_gpu_tensor_read(
                   attention_sequential_output.value, 0u,
                   attention_sequential.data(),
-                  attention_sequential.size() * sizeof(float)) &&
-              ds4_gpu_tensor_read(
+                  attention_sequential.size() * sizeof(float)),
+              "read sequential MLA attention outputs");
+        CHECK(!mla_attention_batch || ds4_gpu_tensor_read(
                   attention_batch_output.value, 0u,
                   attention_batch.data(),
                   attention_batch.size() * sizeof(float)),
-              "read decomposed MLA attention outputs");
-        const VectorError attention_error =
-            vector_error(attention_sequential, attention_batch);
-        std::fprintf(stderr,
-            "GLM5 MLA attention batch measurement role=%s prefix=%u rows=%u "
-            "nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
-            role, prefix_rows, rows, attention_error.nrmse,
-            attention_error.cosine,
-            attention_error.max_abs);
-        CHECK(attention_error.nrmse <= 1.0e-6 &&
-                  attention_error.cosine >= 0.999999999 &&
-                  attention_error.max_abs <= 2.0e-6,
-              "MLA attention batch matches sequential same-GGUF execution");
+              "read batched MLA attention outputs");
+        if (mla_attention_sequential && mla_attention_batch) {
+            const VectorError attention_error =
+                vector_error(attention_sequential, attention_batch);
+            std::fprintf(stderr,
+                "GLM5 MLA attention batch measurement role=%s prefix=%u rows=%u "
+                "nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+                role, prefix_rows, rows, attention_error.nrmse,
+                attention_error.cosine,
+                attention_error.max_abs);
+            CHECK(attention_error.nrmse <= 1.0e-6 &&
+                      attention_error.cosine >= 0.999999999 &&
+                      attention_error.max_abs <= 2.0e-6,
+                  "MLA attention batch matches sequential same-GGUF execution");
+        }
+        const std::vector<float> &attention_result =
+            mla_attention_batch ? attention_batch : attention_sequential;
+        const char *attention_dump_path =
+            std::getenv("DS4_GLM5_MLA_OUTPUT_DUMP");
+        if (attention_dump_path &&
+            mla_attention_sequential != mla_attention_batch) {
+            FILE *dump_file = std::fopen(attention_dump_path, "wb");
+            CHECK(dump_file != nullptr &&
+                      std::fwrite(attention_result.data(), sizeof(float),
+                                  attention_result.size(), dump_file) ==
+                          attention_result.size() &&
+                      std::fclose(dump_file) == 0,
+                  "dump isolated MLA-attention output");
+        }
         if (mla_attention_only) {
             const uint64_t attention_hash = fnv64(
-                attention_batch.data(),
-                attention_batch.size() * sizeof(float));
+                attention_result.data(),
+                attention_result.size() * sizeof(float));
             char attention_hash_error[256] = {};
             CHECK(ds4_tp_hash_check(
                       tp.tp, UINT64_C(0x474c4d354d4c4154), attention_hash,
