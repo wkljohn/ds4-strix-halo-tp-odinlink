@@ -76,12 +76,27 @@ case $RDMA_PROFILE in
     COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
     LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-odl_tb5_0}
     PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-odl_tb5_0}
+    # A RoCE-oriented bench.env.local may leave mlx5 names exported.  Never
+    # let those stale values reach an OdinLink run: the provider would be
+    # loaded explicitly while DS4 probes the wrong device and fails with an
+    # opaque "no active port" error.  Require the provider namespace here so
+    # profile switches are fail-closed and explicit.
+    [[ $LOCAL_RDMA_DEVICE == odl_tb5_* && $PEER_RDMA_DEVICE == odl_tb5_* ]] || {
+      echo "error: odinlink profile requires odl_tb5_* devices (got $LOCAL_RDMA_DEVICE / $PEER_RDMA_DEVICE)" >&2
+      echo "error: set DS4_LOCAL_RDMA_DEVICE=odl_tb5_0 and DS4_PEER_RDMA_DEVICE=odl_tb5_0" >&2
+      exit 2
+    }
     ;;
   roce-v2)
     COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
     LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
     PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
     RDMA_GID_INDEX=${DS4_RDMA_GID_INDEX:-3}
+    [[ $LOCAL_RDMA_DEVICE == mlx5_* && $PEER_RDMA_DEVICE == mlx5_* ]] || {
+      echo "error: roce-v2 profile requires mlx5_* devices (got $LOCAL_RDMA_DEVICE / $PEER_RDMA_DEVICE)" >&2
+      echo "error: set DS4_LOCAL_RDMA_DEVICE and DS4_PEER_RDMA_DEVICE to the ConnectX devices" >&2
+      exit 2
+    }
     ;;
   *)
     echo "error: DS4_BENCH_RDMA_PROFILE must be odinlink or roce-v2" >&2
