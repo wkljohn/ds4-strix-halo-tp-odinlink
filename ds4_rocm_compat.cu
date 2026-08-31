@@ -394,6 +394,12 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
     if (hipGetLastError() != hipSuccess ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_GATED_NORM)) return 0;
 
+    /* Preserve the historical fence by default. The batched executor's
+     * following TP exchange provides ordering for its host-visible payload;
+     * this opt-in probe measures whether the per-layer fence is redundant. */
+    const char *async_begin = getenv("DS4_ROCM_GLM5_KDA_ASYNC_BEGIN");
+    if (async_begin && async_begin[0] == '1' && async_begin[1] == '\0')
+        return hipGetLastError() == hipSuccess;
     return hipStreamSynchronize(0) == hipSuccess;
 #endif
 }
