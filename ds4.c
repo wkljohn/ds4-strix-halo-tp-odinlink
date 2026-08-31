@@ -51595,10 +51595,17 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
     if (ok) ok = ds4_glm5_next_embed_tokens(&s->glm5_next_exec, ids,
                                              n_tokens, cur);
     uint32_t failed_layer = UINT32_MAX;
+    const bool layer_profile = getenv("DS4_GLM5_LAYER_PROFILE") != NULL;
     for (uint32_t il = 0u; ok && il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        const double layer_t0 = layer_profile ? now_sec() : 0.0;
         ok = ds4_glm5_next_layer_forward_batch(
             &s->glm5_next_exec, il, &s->glm5_next_state, w,
             cur, out, n_tokens);
+        if (layer_profile) {
+            fprintf(stderr,
+                    "ds4: GLM5 batch layer=%u rows=%u elapsed_ms=%.3f ok=%d\n",
+                    il, n_tokens, (now_sec() - layer_t0) * 1000.0, ok ? 1 : 0);
+        }
         if (!ok) failed_layer = il;
         ds4_gpu_tensor *tmp = cur; cur = out; out = tmp;
     }
