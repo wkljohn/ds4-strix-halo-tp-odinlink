@@ -37,6 +37,12 @@ enum {
 _Static_assert((DS4_GLM5_KDA_CHANNELS % 2u) == 0u,
                "KDA TP output K slices require an even channel count");
 
+static double glm5_exec_now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 static int kda_output_kslice_contract(uint32_t rank, uint32_t n_tokens,
                                       uint64_t *k_off, uint64_t *k_cnt,
                                       uint64_t *local_bytes) {
@@ -2666,7 +2672,10 @@ static int kda_routed_rows_forward(const ds4_glm5_next_exec_ctx *ctx,
         kda->token_count > UINT32_MAX ||
         n_tokens > UINT32_MAX - (uint32_t)kda->token_count) return 0;
     const uint32_t token_ordinal = (uint32_t)kda->token_count;
+    const bool phase_profile = getenv("DS4_GLM5_PHASE_PROFILE") != NULL;
+    const double phase_t0 = phase_profile ? glm5_exec_now_sec() : 0.0;
     int ok = kda_attention_rows(ctx, il, state, w, hc_in, n_tokens);
+    const double phase_t1 = phase_profile ? glm5_exec_now_sec() : 0.0;
 #ifdef DS4_TP_TEST_HOOKS
     uint32_t trace_token = token_ordinal + n_tokens - 1u;
     uint32_t trace_row = n_tokens - 1u;
@@ -2691,6 +2700,12 @@ static int kda_routed_rows_forward(const ds4_glm5_next_exec_ctx *ctx,
 #endif
     if (ok) ok = routed_ffn_rows(
         ctx, il, token_ordinal, w, hc_out, n_tokens);
+    if (phase_profile) {
+        fprintf(stderr,
+                "ds4: GLM5 phase layer=%u rows=%u attention_ms=%.3f ffn_ms=%.3f ok=%d\n",
+                il, n_tokens, (phase_t1 - phase_t0) * 1000.0,
+                (glm5_exec_now_sec() - phase_t1) * 1000.0, ok ? 1 : 0);
+    }
 #ifdef DS4_TP_TEST_HOOKS
     if (ok) ok = layer_completion_diagnostic(hc_out, n_tokens);
     if (ok) ok = hc_batch_hash_trace(ctx, il, hc_out, n_tokens);
