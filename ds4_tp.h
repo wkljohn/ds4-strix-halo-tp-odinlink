@@ -119,6 +119,16 @@ static inline uint32_t ds4_tp_glm5_kda_tp_feature(
         ? DS4_TP_FEATURE_GLM5_KDA_TP : 0u;
 }
 
+static inline uint32_t ds4_tp_glm5_small_gate_feature(
+        const char *env,
+        int glm5_next,
+        int rocm_ready,
+        int mtp_or_dspark) {
+    return env && env[0] == '1' && env[1] == '\0' && glm5_next &&
+           rocm_ready && !mtp_or_dspark
+        ? DS4_TP_FEATURE_GLM5_SMALL_GATE : 0u;
+}
+
 static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(
         const char *env,
         uint32_t runtime_features,

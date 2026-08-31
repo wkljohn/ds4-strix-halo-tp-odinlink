@@ -13,6 +13,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -201,10 +202,13 @@ int main(int argc, char **argv) {
     const uint32_t peer_rank = rank ^ 1u;
     uint64_t sequence = 0u;
     uint64_t checked = 0u;
+    double prompt_ms = 0.0;
+    double decode_ms = 0.0;
     bool ok = true;
 
     for (uint32_t cycle = 0u; ok && cycle < kCycles; ++cycle) {
         /* One multi-row prompt batch fires one bulk exchange per graph gate. */
+        const auto prompt_start = std::chrono::steady_clock::now();
         for (const Gate &g : schedule) {
             const uint64_t seq = ++sequence;
             fill_payload<<<1, 256>>>(stage, rank, seq);
@@ -239,6 +243,9 @@ int main(int argc, char **argv) {
             if (!ok) break;
         }
 
+        prompt_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - prompt_start).count();
+        const auto decode_start = std::chrono::steady_clock::now();
         for (uint32_t token = 0u; ok && token < kDecodeTokens; ++token) {
             for (const Gate &g : schedule) {
                 const uint64_t seq = ++sequence;
@@ -275,15 +282,18 @@ int main(int argc, char **argv) {
                 if (!ok) break;
             }
         }
+        decode_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - decode_start).count();
     }
 
     std::printf("provider_device=%s rank=%u allocator=%s cycles=%u "
                 "prompt_gates=%zu decode_tokens=%u checked=%llu "
-                "final_seq=%llu verdict=%s\n",
+                "final_seq=%llu prompt_ms=%.3f decode_ms=%.3f verdict=%s\n",
                 device, rank, mapped_host ? "hipHostMallocMapped" : "hipMalloc",
                 kCycles, schedule.size(), kDecodeTokens,
                 (unsigned long long)checked,
-                (unsigned long long)sequence, ok ? "PASS" : "FAIL");
+                (unsigned long long)sequence, prompt_ms, decode_ms,
+                ok ? "PASS" : "FAIL");
 
     (void)hipFree(received);
     (void)hipFree(stage);

@@ -53543,6 +53543,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     uint32_t glm5_kda_features = ds4_tp_glm5_kda_tp_feature(
         getenv("DS4_GLM5_KDA_TP"), glm5_next, 1, mtp_or_dspark,
         all_kda_layouts_valid);
+    glm5_kda_features |= ds4_tp_glm5_small_gate_feature(
+        getenv("DS4_GLM5_SMALL_GATE"), glm5_next, 1, mtp_or_dspark);
     glm5_kda_features |= ds4_tp_glm5_kda_output_kslice_feature(
         getenv("DS4_GLM5_KDA_OUTPUT_KSLICE"), glm5_kda_features,
         all_kda_outputs_bf16);

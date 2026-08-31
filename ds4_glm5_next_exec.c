@@ -1012,6 +1012,15 @@ static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
     if (!tp_context_valid_bytes(ctx, bytes) || gate >= DS4_TP_GATES_PER_LAYER ||
         *ctx->tp_sequence == UINT64_MAX) return 0;
 
+    const char *cache_fence = getenv("DS4_ROCM_RDMA_CACHE_FENCE");
+    const int fence_release = cache_fence &&
+        (strcmp(cache_fence, "release") == 0 ||
+         strcmp(cache_fence, "both") == 0);
+    const int fence_acquire = cache_fence &&
+        (strcmp(cache_fence, "acquire") == 0 ||
+         strcmp(cache_fence, "both") == 0);
+    if (cache_fence && !fence_release && !fence_acquire) return 0;
+
     const int small_gate_requested = n_tokens == 1u &&
         (ds4_tp_runtime_features(ctx->tp) &
          DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u;
@@ -1032,8 +1041,16 @@ static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
             ds4_tp_mark_failed(ctx->tp);
             return 0;
         }
+        if (fence_release && !ds4_rocm_rdma_cache_release()) {
+            ds4_tp_mark_failed(ctx->tp);
+            return 0;
+        }
         const uint64_t sequence = ++*ctx->tp_sequence;
         if (!ds4_tp_gate_exchange(ctx->tp, layer, gate, sequence)) {
+            ds4_tp_mark_failed(ctx->tp);
+            return 0;
+        }
+        if (fence_acquire && !ds4_rocm_rdma_cache_acquire()) {
             ds4_tp_mark_failed(ctx->tp);
             return 0;
         }
@@ -1054,14 +1071,6 @@ static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
     }
 
     if (!ds4_gpu_synchronize()) return 0;
-    const char *cache_fence = getenv("DS4_ROCM_RDMA_CACHE_FENCE");
-    const int fence_release = cache_fence &&
-        (strcmp(cache_fence, "release") == 0 ||
-         strcmp(cache_fence, "both") == 0);
-    const int fence_acquire = cache_fence &&
-        (strcmp(cache_fence, "acquire") == 0 ||
-         strcmp(cache_fence, "both") == 0);
-    if (cache_fence && !fence_release && !fence_acquire) return 0;
     if (fence_release && !ds4_rocm_rdma_cache_release()) return 0;
     const uint64_t sequence = ++*ctx->tp_sequence;
     if (!ds4_tp_big_gate_exchange(ctx->tp, layer, sequence,

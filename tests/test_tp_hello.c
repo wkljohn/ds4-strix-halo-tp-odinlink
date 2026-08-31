@@ -321,6 +321,19 @@ int main(void) {
     } else {
         fprintf(stderr, "PASS GLM5 KDA-TP advertisement predicate\n");
     }
+    if (ds4_tp_glm5_small_gate_feature("1", 1, 1, 0) !=
+            DS4_TP_FEATURE_GLM5_SMALL_GATE ||
+        ds4_tp_glm5_small_gate_feature(NULL, 1, 1, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("0", 1, 1, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("true", 1, 1, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("1", 0, 1, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("1", 1, 0, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("1", 1, 1, 1) != 0u) {
+        fprintf(stderr, "FAIL GLM5 small-gate advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS GLM5 small-gate advertisement predicate\n");
+    }
     if (ds4_tp_glm5_kda_output_kslice_feature(
             "1", DS4_TP_FEATURE_GLM5_KDA_TP, 1) !=
             DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE ||
