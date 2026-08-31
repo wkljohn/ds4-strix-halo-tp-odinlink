@@ -1580,17 +1580,26 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         const dim3 block(rows_per_block * 32u);
         const size_t shared_bytes = (size_t)in_dim * sizeof(float);
         if (!decode_mlp64_disabled && in_dim >= 4096u) {
-        static const int split_order =
+            static const int split_order =
                 (getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER") != NULL &&
                  strcmp(getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER"), "1") == 0);
-            matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel<<<
-                    grid, block, shared_bytes>>>(
-                    (float *)out->ptr,
-                    (const uint16_t *)wptr,
-                    (const float *)x->ptr,
-                    (uint32_t)in_dim,
-                    out_dim,
-                    split_order && in_dim == 8192u);
+            if (split_order && in_dim == 8192u) {
+                matmul_bf16_f32_sharedx_mlp64_split4096_warp_rows_w32_kernel<<<
+                        grid, block, shared_bytes>>>(
+                        (float *)out->ptr,
+                        (const uint16_t *)wptr,
+                        (const float *)x->ptr,
+                        out_dim);
+            } else {
+                matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel<<<
+                        grid, block, shared_bytes>>>(
+                        (float *)out->ptr,
+                        (const uint16_t *)wptr,
+                        (const float *)x->ptr,
+                        (uint32_t)in_dim,
+                        out_dim,
+                        0);
+            }
         } else {
             matmul_bf16_f32_sharedx_warp_rows_w32_kernel<<<
                     grid, block, shared_bytes>>>(
@@ -1706,6 +1715,20 @@ extern "C" int ds4_gpu_matmul_bf16_kslice_rows_tensor(
             getenv("DS4_ROCM_KSLICE_PAIR_ACCUM") != NULL;
         static const int kahan_accum =
             getenv("DS4_ROCM_KSLICE_KAHAN_ACCUM") != NULL;
+        static const int exact_half_reduce =
+            getenv("DS4_ROCM_DISABLE_KSLICE_EXACT_HALF_REDUCE") == NULL;
+        if (exact_half_reduce && count == 4096u && !compensated_reduce &&
+            !pair_accum && !kahan_accum) {
+            matmul_bf16_f32_sharedx_mlp64_kslice_exact4096_warp_rows_w32_kernel<<<
+                    (rows + rows_per_block - 1u) / rows_per_block,
+                    rows_per_block * 32u,
+                    (size_t)count * sizeof(float)>>>(
+                (float *)out->ptr, (const uint16_t *)wptr,
+                (const float *)x->ptr, full, off, rows);
+            return cuda_ok(
+                cudaGetLastError(),
+                "matmul_bf16 kslice exact4096 sharedx launch");
+        }
         matmul_bf16_f32_sharedx_mlp64_kslice_warp_rows_w32_kernel<<<
                 (rows + rows_per_block - 1u) / rows_per_block,
                 rows_per_block * 32u,

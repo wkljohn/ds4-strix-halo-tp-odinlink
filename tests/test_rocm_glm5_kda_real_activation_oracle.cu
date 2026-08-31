@@ -5,6 +5,8 @@ extern "C" {
 }
 #include "tests/glm5_gguf_test.hpp"
 
+#include <hip/hip_runtime.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -99,6 +101,16 @@ double cosine(const Stats &stats) {
     return (double)(stats.dot / denominator);
 }
 
+uint64_t fnv1a64(const void *data, size_t bytes) {
+    const unsigned char *p = static_cast<const unsigned char *>(data);
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t i = 0u; i < bytes; ++i) {
+        hash ^= p[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 void print_stats(const char *arm, const char *comparison,
                  const Stats &stats) {
     std::printf(
@@ -112,6 +124,22 @@ void print_stats(const char *arm, const char *comparison,
         stats.count ? (double)(stats.signed_sum / stats.count) : 0.0,
         stats.count ? (double)stats.positive / stats.count : 0.0,
         stats.finite ? 1 : 0);
+}
+
+void print_exact(const char *arm, const std::vector<float> &reference,
+                 const std::vector<float> &candidate) {
+    uint64_t mismatches = 0u;
+    if (reference.size() != candidate.size()) {
+        mismatches = std::max(reference.size(), candidate.size());
+    } else {
+        for (size_t i = 0u; i < reference.size(); ++i) {
+            if (std::memcmp(&reference[i], &candidate[i], sizeof(float)) != 0)
+                ++mismatches;
+        }
+    }
+    std::printf("EXACT arm=%s count=%llu mismatches=%llu identical=%d\n",
+                arm, (unsigned long long)reference.size(),
+                (unsigned long long)mismatches, mismatches == 0u ? 1 : 0);
 }
 
 bool read_f32(const std::string &path, uint64_t count,
@@ -219,10 +247,87 @@ bool replay_gpu(const Glm5TestGGUF &gguf, uint64_t weight_offset, Arm &arm) {
           ds4_gpu_tensor_read(sum, 0u, arm.gpu_kslice.data(),
                               kOut * sizeof(float)),
           "read real activation GPU replay");
+    if (std::getenv("DS4_GLM5_KDA_BENCHMARK") != nullptr) {
+        constexpr uint32_t kWarmup = 8u;
+        constexpr uint32_t kRepeats = 64u;
+        double elapsed_ms[2] = {};
+        for (uint32_t rank = 0u; rank < 2u; ++rank) {
+            for (uint32_t i = 0u; i < kWarmup; ++i) {
+                CHECK(ds4_gpu_matmul_bf16_kslice_rows_tensor(
+                          partial[rank], gguf.map, gguf.size, weight_offset,
+                          kFull, kOut, rank * kHalf, kHalf, half_x[rank], 1u),
+                      "warm real activation K-slice benchmark");
+            }
+            hipEvent_t begin = nullptr, end = nullptr;
+            CHECK(hipEventCreate(&begin) == hipSuccess &&
+                  hipEventCreate(&end) == hipSuccess &&
+                  hipEventRecord(begin) == hipSuccess,
+                  "create real activation K-slice benchmark events");
+            for (uint32_t i = 0u; i < kRepeats; ++i) {
+                CHECK(ds4_gpu_matmul_bf16_kslice_rows_tensor(
+                          partial[rank], gguf.map, gguf.size, weight_offset,
+                          kFull, kOut, rank * kHalf, kHalf, half_x[rank], 1u),
+                      "launch real activation K-slice benchmark");
+            }
+            CHECK(hipEventRecord(end) == hipSuccess &&
+                  hipEventSynchronize(end) == hipSuccess,
+                  "complete real activation K-slice benchmark events");
+            float total_ms = 0.0f;
+            CHECK(hipEventElapsedTime(&total_ms, begin, end) == hipSuccess &&
+                  hipEventDestroy(end) == hipSuccess &&
+                  hipEventDestroy(begin) == hipSuccess,
+                  "read real activation K-slice benchmark events");
+            elapsed_ms[rank] = (double)total_ms / kRepeats;
+        }
+        std::printf(
+            "BENCH KDA_KSLICE rows=%u k=%u rank0_ms=%.9g rank1_ms=%.9g "
+            "critical_ms=%.9g repeats=%u\n",
+            kOut, kHalf, elapsed_ms[0], elapsed_ms[1],
+            std::max(elapsed_ms[0], elapsed_ms[1]), kRepeats);
+    }
+    return true;
+}
+
+bool replay_synthetic_scales(const Glm5TestGGUF &gguf,
+                             uint64_t weight_offset) {
+    for (const float scale : {1.0e-4f, 1.0f, 1024.0f}) {
+        Arm synthetic;
+        synthetic.name = "synthetic";
+        synthetic.input.resize(kFull);
+        uint32_t state = UINT32_C(0x243f6a88);
+        for (uint32_t i = 0u; i < kFull; ++i) {
+            state = state * UINT32_C(1664525) + UINT32_C(1013904223);
+            const int32_t centered = (int32_t)((state >> 8u) & 0xffffu) -
+                                     32768;
+            synthetic.input[i] = scale * (float)centered *
+                                 (1.0f / 32768.0f);
+        }
+        CHECK(replay_gpu(gguf, weight_offset, synthetic),
+              "replay synthetic-scale KDA input");
+        const bool identical =
+            synthetic.gpu_full.size() == synthetic.gpu_kslice.size() &&
+            std::memcmp(synthetic.gpu_full.data(),
+                        synthetic.gpu_kslice.data(),
+                        synthetic.gpu_full.size() * sizeof(float)) == 0;
+        std::printf(
+            "SYNTHETIC_EXACT scale=%.9g count=%u identical=%d "
+            "full_fnv=%016llx kslice_fnv=%016llx\n",
+            scale, kOut, identical ? 1 : 0,
+            (unsigned long long)fnv1a64(
+                synthetic.gpu_full.data(),
+                synthetic.gpu_full.size() * sizeof(float)),
+            (unsigned long long)fnv1a64(
+                synthetic.gpu_kslice.data(),
+                synthetic.gpu_kslice.size() * sizeof(float)));
+        CHECK(identical,
+              "synthetic split-order full and K-slice are byte-identical");
+    }
     return true;
 }
 
 bool report_arm(const Arm &arm, bool captured_is_kslice) {
+    const bool require_exact =
+        std::getenv("DS4_GLM5_KDA_REQUIRE_EXACT") != nullptr;
     print_stats(arm.name.c_str(), "captured-vs-sequential",
                 compare(arm.sequential, arm.captured));
     print_stats(arm.name.c_str(), "full-vs-sequential",
@@ -235,6 +340,7 @@ bool report_arm(const Arm &arm, bool captured_is_kslice) {
                 compare(arm.half_grouped, arm.gpu_kslice));
     print_stats(arm.name.c_str(), "full-vs-kslice",
                 compare(arm.gpu_full, arm.gpu_kslice));
+    print_exact(arm.name.c_str(), arm.gpu_full, arm.gpu_kslice);
     const std::vector<float> &replay =
         captured_is_kslice ? arm.gpu_kslice : arm.gpu_full;
     const Stats captured_replay = compare(replay, arm.captured);
@@ -253,8 +359,20 @@ bool report_arm(const Arm &arm, bool captured_is_kslice) {
     std::printf(
         "CLOSER arm=%s oracle=sequential kslice=%u full=%u tied=%u\n",
         arm.name.c_str(), kslice_closer, full_closer, tied);
-    CHECK(captured_replay.finite && captured_replay.max_abs <= 2.0e-7,
+    /* Exact split-order mode intentionally replaces the archived full-path
+     * reduction with the K-slice reduction.  Its layer-44 one-ULP-scale drift
+     * from the old capture is expected; the strict assertion in this mode is
+     * full-vs-K-slice identity below, not identity with obsolete arithmetic. */
+    const double capture_tolerance = require_exact ? 2.0e-6 : 2.0e-7;
+    CHECK(captured_replay.finite &&
+          captured_replay.max_abs <= capture_tolerance,
           "captured path agrees with current same-input replay");
+    if (require_exact) {
+        CHECK(arm.gpu_full.size() == arm.gpu_kslice.size() &&
+              std::memcmp(arm.gpu_full.data(), arm.gpu_kslice.data(),
+                          arm.gpu_full.size() * sizeof(float)) == 0,
+              "split-order full and K-slice replays are byte-identical");
+    }
     return true;
 }
 
@@ -306,6 +424,10 @@ bool run() {
     CHECK(replay_gpu(gguf, weight_offset, full) &&
           replay_gpu(gguf, weight_offset, kslice),
           "replay both real activation arms");
+    if (std::getenv("DS4_GLM5_KDA_REQUIRE_EXACT") != nullptr) {
+        CHECK(replay_synthetic_scales(gguf, weight_offset),
+              "replay synthetic-scale exactness matrix");
+    }
     CHECK(report_arm(full, false) && report_arm(kslice, true),
           "report real activation oracle metrics");
     std::printf(
