@@ -1925,12 +1925,23 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
 #else
     g_bg_trace = 0;
 #endif
-    static int signal_each_cached = -1;
-    if (signal_each_cached < 0) {
-        const char *env = getenv("DS4_TP_BIGGATE_SIG_ALL");
-        signal_each_cached = !env || !env[0] || strcmp(env, "0") != 0;
+    static int signal_mode_cached = -2;
+    if (signal_mode_cached == -2) {
+        const char *all_env = getenv("DS4_TP_BIGGATE_SIG_ALL");
+        const char *stride_env = getenv("DS4_TP_BIGGATE_SIG_STRIDE");
+        if (all_env && all_env[0] && strcmp(all_env, "0") != 0) {
+            signal_mode_cached = 1;
+        } else if (stride_env && stride_env[0]) {
+            char *end = NULL;
+            errno = 0;
+            long value = strtol(stride_env, &end, 10);
+            if (errno || !end || *end || value < 1 || value > 256) {
+                fprintf(stderr, "ds4-tp: invalid DS4_TP_BIGGATE_SIG_STRIDE='%s' (valid range 1..256)\n", stride_env);
+                signal_mode_cached = -1;
+            } else signal_mode_cached = (int)value;
+        } else signal_mode_cached = 0;
     }
-    const bool signal_each = signal_each_cached != 0;
+    if (signal_mode_cached < 0) return 0;
     const double bg_t0 = g_bg_trace ? tp_now_sec() : 0.0;
     double bg_copy = 0.0;
 
@@ -1997,6 +2008,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
         struct ibv_send_wr send_wr[DS4_TP_RDMA_BULK_SLOTS];
         memset(send_wr, 0, sizeof(send_wr));
+        uint32_t sends_signaled = 0;
         for (uint32_t i = 0; i < chunks; i++) {
             send_sge[i] = (struct ibv_sge) {
                 .addr = direct ? out_lo + off + chunk_off[i] :
@@ -2024,8 +2036,13 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
              * completion round-trips per bulk gate for no reason anymore. */
             /* Keep all sends signaled by default; the opt-in experiment
              * signals only the final linked WR to reduce send CQ traffic. */
-            send_wr[i].send_flags =
-                (signal_each || i + 1u == chunks) ? IBV_SEND_SIGNALED : 0;
+            const bool signaled = signal_mode_cached == 1 ||
+                (signal_mode_cached == 0 && i + 1u == chunks) ||
+                (signal_mode_cached > 1 &&
+                 ((i + 1u) % (uint32_t)signal_mode_cached == 0u ||
+                  i + 1u == chunks));
+            send_wr[i].send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+            if (signaled) sends_signaled++;
             send_wr[i].next = i + 1u < chunks ? &send_wr[i + 1u] : NULL;
         }
         struct ibv_send_wr *bad_send = NULL;
@@ -2044,8 +2061,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         uint32_t peer_poll = 0;
         bool bg_seen_first = false;
         uint64_t bg_empty_this_round = 0;
-        while (recv_done < chunks ||
-               (signal_each ? send_done < chunks : send_done == 0u)) {
+        while (recv_done < chunks || send_done < sends_signaled) {
             struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
             int n = ibv_poll_cq(r->cq,
                                (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
@@ -2082,9 +2098,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 } else {
                     /* The final signaled WR is a local completion fence for
                      * all earlier linked sends on this QP. */
-                    send_done = signal_each ? send_done + 1u : chunks;
+                    send_done++;
                     if (g_bg_trace &&
-                        send_done == (signal_each ? chunks : 1u))
+                        send_done == sends_signaled)
                         g_bg_towait_lastsend_s += tp_now_sec() - ps1;
                 }
             }
@@ -2098,7 +2114,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                         "ds4-tp: timeout waiting for bulk RDMA round "
                         "(%u/%u recvs, %u/%u sends)\n",
                         recv_done, chunks, send_done,
-                        signal_each ? chunks : 1u);
+                        sends_signaled);
                 return 0;
             }
         }
