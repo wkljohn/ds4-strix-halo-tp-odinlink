@@ -51345,6 +51345,7 @@ struct ds4_session {
      * sessions never touch them. */
     ds4_glm5_next_state glm5_next_state;
     ds4_glm5_next_workspace *glm5_next_ws;
+    ds4_glm5_next_workspace *glm5_next_prefill_ws;
     ds4_glm5_next_exec_ctx glm5_next_exec;
     ds4_gpu_tensor *glm5_next_cur;
     ds4_gpu_tensor *glm5_next_out;
@@ -51449,9 +51450,22 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
                 capacity, big_capacity);
         return 0;
     }
+    uint32_t workspace_capacity = 1u;
+    const char *batch_env = getenv("DS4_GLM5_NEXT_PREFILL_BATCH");
+    const char *reuse_env = getenv("DS4_GLM5_REUSE_PREFILL_WS");
+    if (reuse_env && strcmp(reuse_env, "1") == 0 && batch_env && batch_env[0]) {
+        unsigned long requested = strtoul(batch_env, NULL, 10);
+        if (requested >= 2ul && requested <= (unsigned long)capacity)
+            workspace_capacity = (uint32_t)requested;
+    }
     s->glm5_next_ws = ds4_glm5_next_workspace_create_capacity_context(
         1u, capacity);
+    if (workspace_capacity > 1u)
+        s->glm5_next_prefill_ws =
+            ds4_glm5_next_workspace_create_capacity_context(
+                workspace_capacity, capacity);
     if (!s->glm5_next_ws ||
+        (workspace_capacity > 1u && !s->glm5_next_prefill_ws) ||
         !ds4_glm5_next_state_init(&s->glm5_next_state,
                                   &e->glm5_next->offsets,
                                   capacity, stderr)) {
@@ -51508,12 +51522,14 @@ static void ds4_session_glm5_next_release(ds4_session *s) {
     ds4_gpu_tensor_free(s->glm5_next_out);
     ds4_gpu_tensor_free(s->glm5_next_cur);
     ds4_glm5_next_workspace_destroy(s->glm5_next_ws);
+    ds4_glm5_next_workspace_destroy(s->glm5_next_prefill_ws);
     ds4_glm5_next_state_free(&s->glm5_next_state);
     memset(&s->glm5_next_exec, 0, sizeof(s->glm5_next_exec));
     s->glm5_next_logits = NULL;
     s->glm5_next_out = NULL;
     s->glm5_next_cur = NULL;
     s->glm5_next_ws = NULL;
+    s->glm5_next_prefill_ws = NULL;
     s->glm5_next_ready = false;
 }
 
@@ -51583,9 +51599,11 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
     const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const char *reuse_ws_env = getenv("DS4_GLM5_REUSE_PREFILL_WS");
     const bool reuse_ws = reuse_ws_env &&
-        strcmp(reuse_ws_env, "1") == 0 && s->glm5_next_ws;
+        strcmp(reuse_ws_env, "1") == 0 && s->glm5_next_prefill_ws &&
+        ds4_glm5_next_workspace_capacity(s->glm5_next_prefill_ws) >= n_tokens;
     ds4_glm5_next_workspace *w = reuse_ws ? s->glm5_next_ws :
         ds4_glm5_next_workspace_create_capacity(n_tokens);
+    if (reuse_ws) w = s->glm5_next_prefill_ws;
     ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc((uint64_t)n_tokens * sizeof(uint32_t));
     ds4_gpu_tensor *cur = ds4_gpu_tensor_alloc((uint64_t)n_tokens * row_bytes * 4u);
     ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * row_bytes * 4u);

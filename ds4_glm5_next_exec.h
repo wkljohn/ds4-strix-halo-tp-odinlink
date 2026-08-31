@@ -48,6 +48,8 @@ typedef struct {
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void);
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity(
         uint32_t capacity_tokens);
+uint32_t ds4_glm5_next_workspace_capacity(
+        const ds4_glm5_next_workspace *workspace);
 /* Decode sparse-MLA scratch is sized from the session context independently
  * of the token-tile capacity. */
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity_context(

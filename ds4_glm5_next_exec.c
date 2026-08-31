@@ -438,6 +438,11 @@ ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity(
         capacity_tokens, capacity_tokens);
 }
 
+uint32_t ds4_glm5_next_workspace_capacity(
+        const ds4_glm5_next_workspace *workspace) {
+    return workspace ? workspace->capacity_tokens : 0u;
+}
+
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void) {
     return ds4_glm5_next_workspace_create_capacity(1u);
 }
