@@ -2869,9 +2869,12 @@ static int mla_routed_dense_selection_rows_forward(
     const uint32_t trace_token = token_ordinal;
     const uint32_t trace_row = n_tokens - 1u;
 #endif
-    const int ok =
-        mla_dense_selection_attention_rows(
-            ctx, il, state, w, hc_in, n_tokens) &&
+    const int phase_profile = getenv("DS4_GLM5_PHASE_PROFILE") != NULL;
+    const double phase_t0 = phase_profile ? glm5_exec_now_sec() : 0.0;
+    const int attn_ok = mla_dense_selection_attention_rows(
+            ctx, il, state, w, hc_in, n_tokens);
+    const double phase_t1 = phase_profile ? glm5_exec_now_sec() : 0.0;
+    const int ok = attn_ok &&
 #ifdef DS4_TP_TEST_HOOKS
         glm5_capture_mla_stages(
             ctx, il, mla, w, hc_in, token_ordinal, n_tokens) &&
@@ -2939,6 +2942,15 @@ static int mla_routed_dense_selection_rows_forward(
                          (uint64_t)GLM5_HC_WIDTH * sizeof(float)) &&
         routed_ffn_rows(
             ctx, il, token_ordinal, w, hc_out, n_tokens);
+    if (phase_profile) {
+        fprintf(stderr,
+                "ds4: GLM5 phase mla_layer=%u rows=%u token=%u "
+                "attention_ms=%.3f ffn_ms=%.3f attn_ok=%d ok=%d\n",
+                il, n_tokens, token_ordinal,
+                (phase_t1 - phase_t0) * 1000.0,
+                (glm5_exec_now_sec() - phase_t1) * 1000.0,
+                attn_ok ? 1 : 0, ok ? 1 : 0);
+    }
 #ifdef DS4_TP_TEST_HOOKS
     if (ok && !layer_completion_diagnostic(hc_out, n_tokens))
         return 0;
