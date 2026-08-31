@@ -51594,10 +51594,12 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
                                       (uint64_t)n_tokens * sizeof(*id_host));
     if (ok) ok = ds4_glm5_next_embed_tokens(&s->glm5_next_exec, ids,
                                              n_tokens, cur);
+    uint32_t failed_layer = UINT32_MAX;
     for (uint32_t il = 0u; ok && il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
         ok = ds4_glm5_next_layer_forward_batch(
             &s->glm5_next_exec, il, &s->glm5_next_state, w,
             cur, out, n_tokens);
+        if (!ok) failed_layer = il;
         ds4_gpu_tensor *tmp = cur; cur = out; out = tmp;
     }
     if (ok) {
@@ -51614,7 +51616,12 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
         for (uint32_t i = 0u; i < n_tokens; ++i) token_vec_push(&s->checkpoint, tokens[i]);
         s->checkpoint_valid = true;
     } else if (errlen) {
-        snprintf(err, errlen, "GLM5 prompt tile failed at position %u", pos0);
+        if (failed_layer != UINT32_MAX)
+            snprintf(err, errlen, "GLM5 prompt tile failed at position %u layer %u",
+                     pos0, failed_layer);
+        else
+            snprintf(err, errlen, "GLM5 prompt tile failed at position %u before layer execution",
+                     pos0);
     }
     free(id_host);
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(cur); ds4_gpu_tensor_free(ids);

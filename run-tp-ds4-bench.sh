@@ -111,6 +111,11 @@ else
   PEER_OUT=$DS4_PEER_RESEARCH_ROOT/bench-runs
 fi
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
+# 1 captures the complete runtime domain, including asynchronous memory-copy
+# records.  2 captures HIP runtime calls plus kernels and markers, avoiding a
+# rocprofiler-sdk 1.3.x shutdown hang when an HSA copy completion callback is
+# lost.  3 captures only kernels and markers when the SDK's HIP selected-region
+# pause itself fails to drain. All modes preserve the selected-region boundary.
 ROCPROF_RUNTIME=${DS4_BENCH_ROCPROF_RUNTIME:-1}
 ROCPROF_REGION=${DS4_BENCH_ROCPROF_REGION:-decode}
 ROCPROF_RANK=${DS4_BENCH_ROCPROF_RANK:-coordinator}
@@ -165,8 +170,13 @@ if [[ $ROCPROF_RANK != coordinator && $ROCPROF_RANK != worker ]]; then
   echo "error: DS4_BENCH_ROCPROF_RANK must be coordinator or worker" >&2
   exit 2
 fi
-if [[ $ROCPROF == 1 && $ROCPROF_RUNTIME != 1 ]]; then
-  echo "error: kernel-only rocprof is unsafe for asymmetric TP; use DS4_BENCH_ROCPROF_RUNTIME=1" >&2
+if [[ $ROCPROF == 1 && $ROCPROF_RUNTIME != 1 && $ROCPROF_RUNTIME != 2 &&
+      $ROCPROF_RUNTIME != 3 ]]; then
+  echo "error: DS4_BENCH_ROCPROF_RUNTIME must be 1 (full runtime), 2 (HIP API + kernel), or 3 (kernel only)" >&2
+  exit 2
+fi
+if [[ $ROCPROF == 1 && $ROCPROF_RUNTIME == 3 && $TP_TIMEOUT_SEC -lt 600 ]]; then
+  echo "error: asymmetric kernel tracing requires DS4_BENCH_TP_TIMEOUT_SEC >= 600" >&2
   exit 2
 fi
 if [[ -n ${DS4_TP_EXPERT_SPLIT+x} ]]; then
@@ -558,6 +568,7 @@ REMOTE_WORKER_LOG="$PEER_OUT/worker-$TAG.log"
 CSV="$OUT/$TAG.csv"
 MANIFEST="$OUT/$TAG.manifest"
 WORKER_PIDFILE="$PEER_OUT/worker-$TAG.pid"
+WORKER_STATUSFILE="$PEER_OUT/worker-$TAG.status"
 mkdir -p "$OUT"
 
 sample_fingerprint() {
@@ -740,7 +751,7 @@ fi
 
 WORKER_STARTED=0
 worker_is_running() {
-  "${PEER_SSH[@]}" "test -r '$WORKER_PIDFILE' || exit 1; p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 1;; esac; test -r /proc/\$p/cmdline || exit 1; tr '\\0' ' ' < /proc/\$p/cmdline | grep -q -- './ds4 --role worker --tensor-parallel'"
+  "${PEER_SSH[@]}" "test -r '$WORKER_PIDFILE' || exit 1; p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 1;; esac; test -r /proc/\$p/cmdline || exit 1; tr '\\0' ' ' < /proc/\$p/cmdline | grep -q -- 'tp-worker-supervisor'"
 }
 
 wait_worker() {
@@ -756,7 +767,7 @@ terminate_owned_worker() {
   (( WORKER_STARTED == 1 )) || return 0
   worker_is_running || return 0
   echo "warning: worker did not exit after coordinator disconnect; sending TERM to its verified PID" >&2
-  "${PEER_SSH[@]}" "p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 1;; esac; test -r /proc/\$p/cmdline || exit 0; tr '\\0' ' ' < /proc/\$p/cmdline | grep -q -- './ds4 --role worker --tensor-parallel' || exit 1; kill -TERM \"\$p\""
+  "${PEER_SSH[@]}" "p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 1;; esac; test -r /proc/\$p/cmdline || exit 0; tr '\\0' ' ' < /proc/\$p/cmdline | grep -q -- 'tp-worker-supervisor' || exit 1; kill -TERM \"\$p\""
   wait_worker 60 || {
     echo "error: owned worker ignored TERM; leaving it intact to avoid unsafe GPU/RDMA teardown" >&2
     return 1
@@ -828,8 +839,15 @@ if [[ $ROCPROF == 1 && $ROCPROF_RANK == worker ]]; then
   # The worker has no benchmark-level ROCTx boundary. Trace its complete
   # runtime and separate prefill by kernel family/count; model residency is
   # dominated by page warming and copies rather than these compute kernels.
+  if [[ $ROCPROF_RUNTIME == 1 ]]; then
+    WORKER_TRACE=(--runtime-trace)
+  elif [[ $ROCPROF_RUNTIME == 2 ]]; then
+    WORKER_TRACE=(--hip-runtime-trace --kernel-trace --marker-trace)
+  else
+    WORKER_TRACE=(--kernel-trace --marker-trace)
+  fi
   WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}"
-              rocprofv3 --runtime-trace --stats --summary
+              rocprofv3 "${WORKER_TRACE[@]}" --stats --summary
               --summary-units usec --output-directory "$ROCPROF_OUT" --
               "${WORKER_APP[@]}")
 fi
@@ -837,14 +855,29 @@ printf -v WORKER_CMD_Q '%q ' "${WORKER_CMD[@]}"
 printf -v PEER_REPO_Q '%q' "$PEER_REPO"
 printf -v WORKER_LOG_Q '%q' "$REMOTE_WORKER_LOG"
 printf -v WORKER_PIDFILE_Q '%q' "$WORKER_PIDFILE"
-"${PEER_SSH[@]}" "cd $PEER_REPO_Q || exit 1; nohup setsid $WORKER_CMD_Q > $WORKER_LOG_Q 2>&1 < /dev/null & p=\$!; echo \$p > $WORKER_PIDFILE_Q"
+printf -v WORKER_STATUSFILE_Q '%q' "$WORKER_STATUSFILE"
+SUPERVISOR="$REPO/scripts/tp-worker-supervisor.sh"
+SUPERVISOR_HASH=$(sha256sum "$SUPERVISOR" | awk '{print $1}')
+PEER_SUPERVISOR_HASH=$("${PEER_SSH[@]}" "sha256sum '$PEER_REPO/scripts/tp-worker-supervisor.sh' 2>/dev/null | awk '{print \$1}'")
+if [[ $SUPERVISOR_HASH != "$PEER_SUPERVISOR_HASH" ]]; then
+  "${PEER_SCP[@]}" "$SUPERVISOR" "$PEER_MGMT:$PEER_REPO/scripts/tp-worker-supervisor.sh"
+  "${PEER_SSH[@]}" "chmod 755 '$PEER_REPO/scripts/tp-worker-supervisor.sh'"
+fi
+"${PEER_SSH[@]}" ": > $WORKER_STATUSFILE_Q; cd $PEER_REPO_Q || exit 1; nohup setsid '$PEER_REPO/scripts/tp-worker-supervisor.sh' $WORKER_STATUSFILE_Q $WORKER_CMD_Q > $WORKER_LOG_Q 2>&1 < /dev/null & p=\$!; echo \$p > $WORKER_PIDFILE_Q"
 WORKER_STARTED=1
 
 COORD_CMD=("$REPO/ds4-bench-tp")
 if [[ $ROCPROF == 1 && $ROCPROF_RANK == coordinator ]]; then
   ROCPROF_OUT="$OUT/rocprof-$TAG"
   mkdir -p "$ROCPROF_OUT"
-  ROCPROF_TRACE=(--runtime-trace --selected-regions)
+  if [[ $ROCPROF_RUNTIME == 1 ]]; then
+    ROCPROF_TRACE=(--runtime-trace --selected-regions)
+  elif [[ $ROCPROF_RUNTIME == 2 ]]; then
+    ROCPROF_TRACE=(--hip-runtime-trace --kernel-trace --marker-trace
+                   --selected-regions)
+  else
+    ROCPROF_TRACE=(--kernel-trace --marker-trace --selected-regions)
+  fi
   COORD_ENV+=(DS4_BENCH_ROCPROF_SELECTED_REGIONS=1
              DS4_BENCH_ROCPROF_REGION="$ROCPROF_REGION")
   COORD_CMD=(rocprofv3 "${ROCPROF_TRACE[@]}"
@@ -875,6 +908,11 @@ wait_worker 180 || {
 WORKER_STARTED=0
 trap - EXIT
 "${PEER_SCP[@]}" "$PEER_MGMT:$REMOTE_WORKER_LOG" "$WORKER_LOG"
+if ! "${PEER_SSH[@]}" "test -r '$WORKER_STATUSFILE'"; then
+  echo "error: worker exit-status record is missing" >&2
+  exit 1
+fi
+"${PEER_SSH[@]}" "cat '$WORKER_STATUSFILE'" > "$OUT/worker-$TAG.status"
 if [[ $MODEL_ARCH == glm5-next ]]; then
   "$REPO/scripts/check-glm5-prefill-proof.sh" \
     "$COORD_LOG" "$WORKER_LOG" "$GLM5_PREFILL_BATCH" "$FRONTIER"
