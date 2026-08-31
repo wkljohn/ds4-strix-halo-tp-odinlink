@@ -51581,7 +51581,10 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
         fflush(stderr);
     }
     const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    ds4_glm5_next_workspace *w =
+    const char *reuse_ws_env = getenv("DS4_GLM5_REUSE_PREFILL_WS");
+    const bool reuse_ws = reuse_ws_env &&
+        strcmp(reuse_ws_env, "1") == 0 && s->glm5_next_ws;
+    ds4_glm5_next_workspace *w = reuse_ws ? s->glm5_next_ws :
         ds4_glm5_next_workspace_create_capacity(n_tokens);
     ds4_gpu_tensor *ids = ds4_gpu_tensor_alloc((uint64_t)n_tokens * sizeof(uint32_t));
     ds4_gpu_tensor *cur = ds4_gpu_tensor_alloc((uint64_t)n_tokens * row_bytes * 4u);
@@ -51589,7 +51592,7 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
     if (!w || !ids || !cur || !out) {
         if (errlen) snprintf(err, errlen, "GLM5 prompt tile allocation failed");
         ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(cur); ds4_gpu_tensor_free(ids);
-        ds4_glm5_next_workspace_destroy(w);
+        if (!reuse_ws) ds4_glm5_next_workspace_destroy(w);
         return 1;
     }
     if (phase_trace) {
@@ -51662,7 +51665,7 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
     }
     free(id_host);
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(cur); ds4_gpu_tensor_free(ids);
-    ds4_glm5_next_workspace_destroy(w);
+    if (!reuse_ws) ds4_glm5_next_workspace_destroy(w);
     return ok ? 0 : 1;
 }
 #endif
