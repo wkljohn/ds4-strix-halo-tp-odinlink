@@ -1194,7 +1194,7 @@ tests/test_rocm_q8_kslice_rows: tests/test_rocm_q8_kslice_rows.o ds4_rocm.o ds4_
 test-rocm-q8-kslice-rows: tests/test_rocm_q8_kslice_rows
 	./tests/test_rocm_q8_kslice_rows
 
-.PHONY: test-rocm-q8-kslice-production
+.PHONY: test-rocm-q8-kslice-production test-rocm-q4k-device-repack
 tests/test_rocm_q8_kslice_production.o: tests/test_rocm_q8_kslice_production.cu ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(HIPFLAGS) -I. -c $< -o $@
 
@@ -1203,6 +1203,15 @@ tests/test_rocm_q8_kslice_production: tests/test_rocm_q8_kslice_production.o ds4
 
 test-rocm-q8-kslice-production: tests/test_rocm_q8_kslice_production
 	./tests/test_rocm_q8_kslice_production
+
+tests/test_rocm_q4k_device_repack.o: tests/test_rocm_q4k_device_repack.cu
+	$(HIPCC) $(HIPFLAGS) -I. -c $< -o $@
+
+tests/test_rocm_q4k_device_repack: tests/test_rocm_q4k_device_repack.o
+	$(HIPCC) $(HIPFLAGS) $^ -o $@ $(ROCM_LDLIBS)
+
+test-rocm-q4k-device-repack: tests/test_rocm_q4k_device_repack
+	./tests/test_rocm_q4k_device_repack
 
 .PHONY: test-rocm-bf16-batch-gemm
 tests/test_rocm_bf16_batch_gemm: tests/test_rocm_bf16_batch_gemm.cu rocm/ds4_rocm_bf16_toktile.cuh
