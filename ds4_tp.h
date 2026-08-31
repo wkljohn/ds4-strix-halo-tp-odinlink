@@ -119,6 +119,16 @@ static inline uint32_t ds4_tp_glm5_kda_tp_feature(
         ? DS4_TP_FEATURE_GLM5_KDA_TP : 0u;
 }
 
+static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(
+        const char *env,
+        uint32_t runtime_features,
+        int all_kda_outputs_bf16) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u &&
+           all_kda_outputs_bf16
+        ? DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE : 0u;
+}
+
 static inline uint32_t ds4_tp_glm5_resident_kda_feature(
         int glm5_next,
         int rocm_ready,

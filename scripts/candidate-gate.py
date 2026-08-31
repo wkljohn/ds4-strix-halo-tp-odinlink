@@ -51,10 +51,29 @@ LANE_KINDS = {
     },
 }
 DSPARK_KINDS = {"same-stack-ordinary", "verifier-logits", "dspark-acceptance"}
+BASE_WORKLOAD_MANIFEST_FIELDS = (
+    "prompt_sha256", "frontier", "generated_tokens", "context",
+    "prefill_chunk", "dspark",
+)
 
 
 class GateError(RuntimeError):
     pass
+
+
+def workload_manifest_fields(workload: dict) -> tuple[str, ...]:
+    """Return identity fields, including an explicitly scoped prefill batch."""
+    fields = BASE_WORKLOAD_MANIFEST_FIELDS
+    if "prefill_batch" in workload:
+        try:
+            batch = int(workload["prefill_batch"])
+        except (TypeError, ValueError) as error:
+            raise GateError("workload prefill_batch is not an integer") from error
+        if batch < 2 or batch > 1024:
+            raise GateError(
+                "promotion prefill_batch must describe batched prefill (2..1024)")
+        fields += ("prefill_batch",)
+    return fields
 
 
 def run_git(repo: Path, *args: str) -> str:
@@ -534,8 +553,7 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
             raise GateError("baseline genesis benchmark identity mismatch")
         verify_tp_layout_manifest(manifest, layout,
                                   "baseline genesis benchmark layout")
-        for field in ("prompt_sha256", "frontier", "generated_tokens",
-                      "context", "prefill_chunk", "dspark"):
+        for field in workload_manifest_fields(workload):
             if manifest.get(field) != str(workload.get(field, "")):
                 raise GateError(f"baseline genesis benchmark differs in {field}")
         local_binary = str(manifest.get("ds4_sha256", ""))
@@ -1173,9 +1191,13 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         baseline_workload = baseline["key"].get("workload")
         if not isinstance(baseline_workload, dict):
             raise GateError("predecessor baseline has no benchmark workload contract")
+        baseline_workload_fields = workload_manifest_fields(baseline_workload)
+        if "prefill_batch" in baseline_workload:
+            if workload.get("prefill_batch") != baseline_workload["prefill_batch"]:
+                raise GateError(
+                    "candidate prefill_batch differs from predecessor baseline")
         for _, manifest, _ in benchmark_rows:
-            for key in ("prompt_sha256", "frontier", "generated_tokens", "context",
-                        "prefill_chunk", "dspark"):
+            for key in baseline_workload_fields:
                 if manifest.get(key) != str(baseline_workload.get(key, "")):
                     raise GateError(f"candidate benchmark differs from baseline workload: {key}")
             if manifest.get("rdma_profile") not in providers:
@@ -1244,8 +1266,8 @@ def promote_candidate(repo: Path, root: Path, candidate_id: str) -> None:
                 "workload_id": workload["workload_id"],
                 "workload": {
                     key: derived["benchmark_manifests"][0][key]
-                    for key in ("prompt_sha256", "frontier", "generated_tokens",
-                                "context", "prefill_chunk", "dspark")
+                    for key in workload_manifest_fields(
+                        derived["baseline"]["key"]["workload"])
                 },
                 "rdma_providers": sorted(value["transport"]["providers"]),
             },

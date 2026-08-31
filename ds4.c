@@ -53457,25 +53457,81 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
                 (const uint8_t *)e->model.map + down->abs_offset);
     }
     const char *glm5_q4k_wmma = getenv("DS4_ROCM_GLM5_Q4K_WMMA");
+    const char *glm5_q4k_kshard =
+        getenv("DS4_ROCM_GLM5_Q4K_KSHARD");
+    const bool glm5_q4k_kshard_requested = glm5_q4k_kshard &&
+        glm5_q4k_kshard[0] == '1' && glm5_q4k_kshard[1] == '\0';
     if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 && glm5_q4k_wmma &&
         glm5_q4k_wmma[0] == '1' && glm5_q4k_wmma[1] == '\0') {
         /* GLM-5.3 binds routed tensors through its offset contract instead of
          * the legacy e->weights layer table. Probe the exact per-rank packed
          * half consumed by ds4_glm5_next_exec; the launcher repeats these
          * shape checks against the real window pointers before dispatch. */
+        bool glm5_all_q4k = e->glm5_next != NULL;
+        uint32_t glm5_routed = 0u;
+        for (uint32_t il = DS4_GLM5_NEXT_LEADING_DENSE;
+             glm5_all_q4k && il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+            const ds4_glm5_next_layer_weights *l =
+                &e->glm5_next->layer[il];
+            const ds4_tensor *gate = l->ffn_gate_exps;
+            const ds4_tensor *up = l->ffn_up_exps;
+            const ds4_tensor *down = l->ffn_down_exps;
+            glm5_all_q4k = gate && up && down &&
+                gate->type == DS4_TENSOR_Q4_K &&
+                up->type == DS4_TENSOR_Q4_K &&
+                down->type == DS4_TENSOR_Q4_K &&
+                gate->ndim == 3u && up->ndim == 3u && down->ndim == 3u &&
+                gate->dim[0] == 4096u && gate->dim[1] == 2048u &&
+                gate->dim[2] == 288u &&
+                up->dim[0] == 4096u && up->dim[1] == 2048u &&
+                up->dim[2] == 288u &&
+                down->dim[0] == 2048u && down->dim[1] == 4096u &&
+                down->dim[2] == 288u &&
+                routed_expert_row_bytes(gate) == 16u * 144u &&
+                routed_expert_row_bytes(up) == 16u * 144u &&
+                routed_expert_row_bytes(down) == 8u * 144u;
+            if (glm5_all_q4k) ++glm5_routed;
+        }
+        saw_routed_layer = glm5_q4k_kshard_requested &&
+                           glm5_routed != 0u;
+        all_routed_q4k_kshard_layout = glm5_q4k_kshard_requested &&
+            glm5_all_q4k &&
+            glm5_routed == DS4_GLM5_NEXT_TRUNK_COUNT -
+                           DS4_GLM5_NEXT_LEADING_DENSE;
         const uint64_t q4_row_bytes =
             16u * gguf_types[DS4_TENSOR_Q4_K].block_bytes;
         const uint64_t down_row_bytes =
             4u * gguf_types[DS4_TENSOR_Q4_K].block_bytes;
         const uint8_t *aligned_probe = (const uint8_t *)e->model.map;
-        saw_q4k_layer = true;
-        q4k_features &= ds4_gpu_q4k_wmma_runtime_features(
+        saw_q4k_layer = glm5_all_q4k &&
+            glm5_routed == DS4_GLM5_NEXT_TRUNK_COUNT -
+                           DS4_GLM5_NEXT_LEADING_DENSE;
+        if (saw_q4k_layer) q4k_features &= ds4_gpu_q4k_wmma_runtime_features(
             1, 4096u, 1024u, 1024u * q4_row_bytes, q4_row_bytes,
             aligned_probe, aligned_probe, 1, 1024u, 4096u,
             4096u * down_row_bytes, down_row_bytes, aligned_probe);
     }
     const bool mtp_or_dspark = e->mtp_ready ||
         (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+    const bool glm5_next = DS4_MODEL_VARIANT == DS4_VARIANT_GLM53 &&
+        e->glm5_next != NULL;
+    const bool all_kda_layouts_valid = glm5_next &&
+        ds4_glm5_next_model_offsets_validate(&e->glm5_next->offsets);
+    bool all_kda_outputs_bf16 = all_kda_layouts_valid;
+    for (uint32_t il = 0u;
+        all_kda_outputs_bf16 && il < DS4_GLM5_NEXT_LAYER_COUNT; ++il) {
+        if (!ds4_glm5_next_layer_is_mla(il) &&
+            e->glm5_next->offsets.layer[il].kda.output_type !=
+                DS4_TENSOR_BF16) {
+            all_kda_outputs_bf16 = false;
+        }
+    }
+    uint32_t glm5_kda_features = ds4_tp_glm5_kda_tp_feature(
+        getenv("DS4_GLM5_KDA_TP"), glm5_next, 1, mtp_or_dspark,
+        all_kda_layouts_valid);
+    glm5_kda_features |= ds4_tp_glm5_kda_output_kslice_feature(
+        getenv("DS4_GLM5_KDA_OUTPUT_KSLICE"), glm5_kda_features,
+        all_kda_outputs_bf16);
     const char *q4k_kshard_legacy =
         getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
     const char *q4k_kshard_disable =
@@ -53493,6 +53549,7 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     return (saw_q4k_layer ? q4k_features : 0u) |
            (saw_iq2_layer ? iq2_features : 0u) |
            hc_features | indexer_features | q4k_kshard_feature |
+           glm5_kda_features |
            placement_features;
 #endif
 }
@@ -60952,6 +61009,13 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     ds4_gpu_set_tp_runtime_features((uint32_t)ds4_tp_rank(tp),
                                     ds4_tp_runtime_features(tp));
 #endif
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
+        const uint32_t features = ds4_tp_runtime_features(tp);
+        ds4_log(stderr, DS4_LOG_OK,
+                "GLM5 TP features: kda_tp=%d kda_output_kslice=%d\n",
+                (features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u,
+                (features & DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE) != 0u);
+    }
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
 #ifdef DS4_ROCM_BUILD
@@ -60969,8 +61033,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     /* Install the negotiated all-expert K-half before the first request.  This
      * keeps representation setup out of prefill timing and makes every prompt,
      * including a replacement prompt, use the same resident layout. */
-    if (DS4_MODEL_VARIANT != DS4_VARIANT_GLM53 &&
-        (ds4_tp_runtime_features(tp) &
+    if ((ds4_tp_runtime_features(tp) &
          DS4_TP_FEATURE_Q4K_KSHARD) != 0u &&
         !ds4_engine_activate_q4k_kshard(e, err, errlen)) {
         return 0;
@@ -61011,6 +61074,144 @@ static bool ds4_engine_activate_q4k_kshard(ds4_engine *e,
         return true;
     }
     if (e->q4k_kshard_active) return true;
+
+    if (DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
+        const char *legacy_resident =
+            getenv("DS4_GLM5_NEXT_RESIDENT_EXPERTS");
+        if (!e->glm5_next || (legacy_resident &&
+            legacy_resident[0] == '1' && legacy_resident[1] == '\0')) {
+            if (errlen) snprintf(
+                err, errlen,
+                "GLM5 compact K-shard conflicts with legacy expert residency");
+            return false;
+        }
+
+        ds4_model_map_span_vec dense;
+        if (!glm5_next_model_map_sharded_spans(
+                &e->model, e->tp.rank, &dense)) {
+            if (errlen) snprintf(err, errlen,
+                                 "GLM5 compact K-shard dense span build failed");
+            return false;
+        }
+        const uint32_t n_routed = DS4_GLM5_NEXT_TRUNK_COUNT -
+                                  DS4_GLM5_NEXT_LEADING_DENSE;
+        uint64_t *dense_offsets = xmalloc(
+            (size_t)dense.len * sizeof(dense_offsets[0]));
+        uint64_t *dense_sizes = xmalloc(
+            (size_t)dense.len * sizeof(dense_sizes[0]));
+        ds4_gpu_q4k_kshard_layer *layers = xcalloc(
+            n_routed, sizeof(layers[0]));
+        uint64_t dense_bytes = 0u;
+        for (uint32_t i = 0u; i < dense.len; ++i) {
+            dense_offsets[i] = dense.v[i].off;
+            dense_sizes[i] = dense.v[i].end - dense.v[i].off;
+            if (dense_sizes[i] > UINT64_MAX - dense_bytes) {
+                dense_bytes = UINT64_MAX;
+            } else if (dense_bytes != UINT64_MAX) {
+                dense_bytes += dense_sizes[i];
+            }
+        }
+
+        uint32_t out = 0u;
+        bool layout_ok = true;
+        for (uint32_t il = DS4_GLM5_NEXT_LEADING_DENSE;
+             layout_ok && il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+            const ds4_glm5_next_layer_weights *l =
+                &e->glm5_next->layer[il];
+            const ds4_tensor *gate = l->ffn_gate_exps;
+            const ds4_tensor *up = l->ffn_up_exps;
+            const ds4_tensor *down = l->ffn_down_exps;
+            layout_ok = gate && up && down &&
+                gate->type == DS4_TENSOR_Q4_K &&
+                up->type == DS4_TENSOR_Q4_K &&
+                down->type == DS4_TENSOR_Q4_K &&
+                gate->ndim == 3u && up->ndim == 3u && down->ndim == 3u &&
+                gate->dim[0] == 4096u && gate->dim[1] == 2048u &&
+                gate->dim[2] == 288u &&
+                up->dim[0] == 4096u && up->dim[1] == 2048u &&
+                up->dim[2] == 288u &&
+                down->dim[0] == 2048u && down->dim[1] == 4096u &&
+                down->dim[2] == 288u &&
+                routed_expert_row_bytes(gate) == 16u * 144u &&
+                routed_expert_row_bytes(up) == 16u * 144u &&
+                routed_expert_row_bytes(down) == 8u * 144u;
+            if (!layout_ok) break;
+            layers[out++] = (ds4_gpu_q4k_kshard_layer) {
+                .gate_offset = gate->abs_offset,
+                .up_offset = up->abs_offset,
+                .down_offset = down->abs_offset,
+                .n_expert = 288u,
+                .expert_in_dim = 4096u,
+                .expert_mid_dim = 2048u,
+                .out_dim = 4096u,
+                .gate_row_bytes = routed_expert_row_bytes(gate),
+                .up_row_bytes = routed_expert_row_bytes(up),
+                .down_row_bytes = routed_expert_row_bytes(down),
+            };
+        }
+        const uint64_t packed_expert_bytes =
+            2u * 1024u * 16u * 144u + 4096u * 4u * 144u;
+        const uint64_t packed_bytes =
+            (uint64_t)n_routed * 288u * packed_expert_bytes;
+        const uint64_t reserve_bytes = UINT64_C(2) << 30u;
+        uint64_t free_bytes = 0u, total_bytes = 0u;
+        const bool memory_ok = dense_bytes != UINT64_MAX &&
+            packed_bytes <= UINT64_MAX - dense_bytes &&
+            ds4_gpu_memory_info(&free_bytes, &total_bytes) != 0 &&
+            dense_bytes + packed_bytes <= free_bytes &&
+            reserve_bytes <= free_bytes - (dense_bytes + packed_bytes);
+        if (!memory_ok) {
+            fprintf(stderr,
+                    "ds4: GLM5 compact K-shard refused: dense=%.2f GiB "
+                    "packed=%.2f GiB free=%.2f GiB reserve=%.2f GiB\n",
+                    (double)dense_bytes / 1073741824.0,
+                    (double)packed_bytes / 1073741824.0,
+                    (double)free_bytes / 1073741824.0,
+                    (double)reserve_bytes / 1073741824.0);
+        }
+        const bool installed = layout_ok && out == n_routed && memory_ok &&
+            ds4_gpu_synchronize() != 0 &&
+            ds4_gpu_q4k_kshard_install(
+                e->model.map, e->model.size, e->model.fd,
+                (uint32_t)e->tp.rank,
+                dense_offsets, dense_sizes, dense.len,
+                dense.max_tensor_bytes, layers, n_routed) != 0;
+        ds4_gpu_q4k_kshard_windows windows;
+        const bool windows_ok = installed &&
+            ds4_gpu_q4k_kshard_windows_get(&windows) != 0 &&
+            windows.rank == (uint32_t)e->tp.rank &&
+            windows.n_layers == n_routed && windows.n_expert == 288u &&
+            windows.expert_in_dim == 4096u &&
+            windows.expert_mid_dim == 1024u &&
+            windows.out_dim == 4096u &&
+            windows.row_base == (uint32_t)e->tp.rank * 1024u &&
+            windows.row_count == 1024u &&
+            windows.down_column_byte_base ==
+                (uint64_t)e->tp.rank * 4u * 144u &&
+            windows.down_column_byte_count == 4u * 144u &&
+            ds4_gpu_q4k_packed_slice_bytes() == packed_bytes;
+        free(layers);
+        free(dense_sizes);
+        free(dense_offsets);
+        free(dense.v);
+        if (!windows_ok) {
+            if (installed) ds4_gpu_q4k_kshard_release();
+            if (errlen) snprintf(
+                err, errlen, "GLM5 compact K-shard installation failed");
+            return false;
+        }
+        e->q4k_kshard_active = true;
+        fprintf(stderr,
+                "ds4: GLM5 compact Q4_K K-shard active: rank=%d "
+                "layers=%u rows=%u:%u down-bytes=%llu:%llu\n",
+                e->tp.rank, windows.n_layers, windows.row_base,
+                windows.row_base + windows.row_count,
+                (unsigned long long)windows.down_column_byte_base,
+                (unsigned long long)(windows.down_column_byte_base +
+                                     windows.down_column_byte_count));
+        ds4_gpu_print_memory_report("after GLM5 compact K-shard");
+        return true;
+    }
 
     ds4_model_map_span_vec dense;
     memset(&dense, 0, sizeof(dense));
@@ -62959,6 +63160,15 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         uint32_t batch = batch_env && batch_env[0] ? (uint32_t)strtoul(batch_env, NULL, 10) : 1u;
         if (batch < 2u) batch = 1u;
         if (batch > 1024u) batch = 1024u;
+        const char *prefill_proof_env = getenv("DS4_GLM5_PREFILL_PROOF");
+        const bool prefill_proof = prefill_proof_env &&
+            prefill_proof_env[0] == '1' && prefill_proof_env[1] == '\0';
+        const int prefill_start = start;
+        uint32_t batched_tiles = 0u;
+        uint32_t batched_rows = 0u;
+        uint32_t scalar_rows = 0u;
+        uint32_t min_tile = 0u;
+        uint32_t max_tile = 0u;
         for (int i = start; i < prompt->len; ) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
@@ -62967,6 +63177,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             const uint32_t remaining = (uint32_t)(prompt->len - i);
             const uint32_t chunk = ds4_glm5_next_prefill_chunk(
                 (uint32_t)i, remaining, batch);
+            if (chunk > 1u) {
+                ++batched_tiles;
+                batched_rows += chunk;
+                if (min_tile == 0u || chunk < min_tile) min_tile = chunk;
+                if (chunk > max_tile) max_tile = chunk;
+            } else {
+                ++scalar_rows;
+            }
             const int rc = chunk > 1u ?
                 ds4_session_glm5_next_forward_rows(
                     s, prompt->v + i, chunk, (uint32_t)i, err, errlen) :
@@ -62979,6 +63197,15 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             }
             i += (int)chunk;
             if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
+        }
+        if (prefill_proof) {
+            fprintf(stderr,
+                    "ds4: GLM5 prefill execution rank=%d start=%d "
+                    "prompt_tokens=%d requested_batch=%u batched_tiles=%u "
+                    "batched_rows=%u scalar_rows=%u min_tile=%u max_tile=%u\n",
+                    e->tp.active ? e->tp.rank : -1, prefill_start,
+                    prompt->len, batch, batched_tiles, batched_rows,
+                    scalar_rows, min_tile, max_tile);
         }
         return 0;
     }

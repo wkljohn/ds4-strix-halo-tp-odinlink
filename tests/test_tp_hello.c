@@ -321,6 +321,25 @@ int main(void) {
     } else {
         fprintf(stderr, "PASS GLM5 KDA-TP advertisement predicate\n");
     }
+    if (ds4_tp_glm5_kda_output_kslice_feature(
+            "1", DS4_TP_FEATURE_GLM5_KDA_TP, 1) !=
+            DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE ||
+        ds4_tp_glm5_kda_output_kslice_feature(
+            NULL, DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+        ds4_tp_glm5_kda_output_kslice_feature(
+            "0", DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+        ds4_tp_glm5_kda_output_kslice_feature(
+            "true", DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+        ds4_tp_glm5_kda_output_kslice_feature("1", 0u, 1) != 0u ||
+        ds4_tp_glm5_kda_output_kslice_feature(
+            "1", DS4_TP_FEATURE_GLM5_KDA_TP, 0) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 KDA output K-slice advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 KDA output K-slice advertisement predicate\n");
+    }
     const char *invalid_kshard_env[] = {
         NULL, "", "0", "true", "10", "1 ", "1\n"
     };

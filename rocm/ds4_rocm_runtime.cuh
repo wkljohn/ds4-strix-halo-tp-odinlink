@@ -151,6 +151,13 @@ struct ds4_gpu_q4k_window_cache {
     double profile_prepare_sec;
     uint32_t n_expert;
     uint32_t slots;
+    cudaStream_t copy_stream;
+    cudaEvent_t fill_event;
+    int overlap_enabled;
+    const ds4_gpu_tensor *prepared_ids;
+    const ds4_gpu_tensor *prepared_weights;
+    uint32_t prepared_count;
+    int prepared_valid;
     std::vector<int32_t> expert_to_slot;
     std::vector<cuda_q4k_window_cache_entry> entries;
 };
@@ -6825,7 +6832,8 @@ static int cuda_q4k_packed_slice_load_expert_impl(
         const void *model_map, uint64_t tensor_offset,
         uint32_t row_base, uint32_t row_count,
         uint64_t column_byte_base, uint64_t column_byte_count,
-        uint32_t expert, ds4_gpu_tensor *dst, int synchronize_before) {
+        uint32_t expert, ds4_gpu_tensor *dst, int synchronize_before,
+        cudaStream_t transfer_stream) {
     cuda_q4k_packed_slice *p = cuda_q4k_packed_slice_find(
         model_map, tensor_offset, row_base, row_count,
         column_byte_base, column_byte_count);
@@ -6862,10 +6870,12 @@ static int cuda_q4k_packed_slice_load_expert_impl(
     }
     const char *async_window = getenv("DS4_ROCM_GLM5_WINDOW_ASYNC");
     const int use_async = async_window && strcmp(async_window, "1") == 0;
+    const cudaStream_t stream = transfer_stream ? transfer_stream :
+                                (cudaStream_t)0;
     if (contiguous) {
         err = use_async ? cudaMemcpyAsync(
             dst->ptr, source, (size_t)p->packed_expert_bytes,
-            cudaMemcpyHostToDevice, (cudaStream_t)0) :
+            cudaMemcpyHostToDevice, stream) :
             cudaMemcpy(dst->ptr, source, (size_t)p->packed_expert_bytes,
                        cudaMemcpyHostToDevice);
     } else {
@@ -6876,7 +6886,7 @@ static int cuda_q4k_packed_slice_load_expert_impl(
             dst->ptr, (size_t)p->column_byte_count,
             source + p->column_byte_base, (size_t)p->source_row_bytes,
             (size_t)p->column_byte_count, p->row_count,
-            hipMemcpyHostToDevice, (hipStream_t)0) :
+            hipMemcpyHostToDevice, stream) :
             hipMemcpy2D(dst->ptr, (size_t)p->column_byte_count,
                         source + p->column_byte_base,
                         (size_t)p->source_row_bytes,
@@ -6918,7 +6928,7 @@ extern "C" int ds4_gpu_q4k_packed_slice_load_expert(
         uint32_t expert, ds4_gpu_tensor *dst) {
     return cuda_q4k_packed_slice_load_expert_impl(
         model_map, tensor_offset, row_base, row_count,
-        column_byte_base, column_byte_count, expert, dst, 1);
+        column_byte_base, column_byte_count, expert, dst, 1, 0);
 }
 
 extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
@@ -7019,6 +7029,14 @@ extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
     cache->capacity_bytes = total;
     cache->n_expert = config->n_expert;
     cache->slots = config->slots;
+    cache->copy_stream = (cudaStream_t)0;
+    cache->fill_event = (cudaEvent_t)0;
+    const char *overlap_env = getenv("DS4_ROCM_GLM5_WINDOW_OVERLAP");
+    cache->overlap_enabled = overlap_env && strcmp(overlap_env, "1") == 0;
+    cache->prepared_ids = NULL;
+    cache->prepared_weights = NULL;
+    cache->prepared_count = 0u;
+    cache->prepared_valid = 0;
     cache->base = NULL;
     cache->slot_ids_device = NULL;
     cache->slot_ids_capacity = 0u;
@@ -7041,9 +7059,22 @@ extern "C" ds4_gpu_q4k_window_cache *ds4_gpu_q4k_window_cache_create(
         delete cache;
         return NULL;
     }
+    if (cache->overlap_enabled &&
+        (cudaStreamCreateWithFlags(&cache->copy_stream,
+                                   cudaStreamNonBlocking) != cudaSuccess ||
+         cudaEventCreateWithFlags(&cache->fill_event,
+                                  cudaEventDisableTiming) != cudaSuccess)) {
+        if (cache->fill_event) (void)cudaEventDestroy(cache->fill_event);
+        if (cache->copy_stream) (void)cudaStreamDestroy(cache->copy_stream);
+        (void)cudaFree(cache->base);
+        delete cache;
+        return NULL;
+    }
     try {
         g_q4k_window_caches.push_back(cache);
     } catch (...) {
+        if (cache->fill_event) (void)cudaEventDestroy(cache->fill_event);
+        if (cache->copy_stream) (void)cudaStreamDestroy(cache->copy_stream);
         (void)cudaFree(cache->base);
         delete cache;
         return NULL;
@@ -7142,6 +7173,10 @@ extern "C" int ds4_gpu_q4k_window_cache_rebind(
     cache->fills = cache->evictions = 0u;
     cache->profile_upload_bytes = cache->profile_control_bytes = 0u;
     cache->profile_prepare_sec = 0.0;
+    cache->prepared_valid = 0;
+    cache->prepared_ids = NULL;
+    cache->prepared_weights = NULL;
+    cache->prepared_count = 0u;
     return 1;
 }
 
@@ -7173,6 +7208,8 @@ extern "C" void ds4_gpu_q4k_window_cache_destroy(
                 cache->slots, (double)cache->capacity_bytes / 1048576.0);
     }
     if (cache->slot_ids_device) (void)cudaFree(cache->slot_ids_device);
+    if (cache->fill_event) (void)cudaEventDestroy(cache->fill_event);
+    if (cache->copy_stream) (void)cudaStreamDestroy(cache->copy_stream);
     if (cache->base) (void)cudaFree(cache->base);
     g_q4k_window_caches.erase(found);
     delete cache;
@@ -7230,7 +7267,15 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
     /* All three tables share the null stream. One epoch-level wait is enough
      * before overwriting cache slots; individual blocking copies remain
      * ordered and published only after gate/up/down all succeed. */
-    if (needs_fill && cudaDeviceSynchronize() != cudaSuccess) {
+    const char *overlap_wait_env =
+        getenv("DS4_ROCM_GLM5_WINDOW_OVERLAP");
+    const char *scratch_wait_env =
+        getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
+    const bool prior_layer_fenced = overlap_wait_env &&
+        strcmp(overlap_wait_env, "1") == 0 && scratch_wait_env &&
+        strcmp(scratch_wait_env, "1") == 0 && cache->overlap_enabled;
+    if (needs_fill && !prior_layer_fenced &&
+        cudaDeviceSynchronize() != cudaSuccess) {
         (void)cudaGetLastError();
         return 0;
     }
@@ -7293,19 +7338,19 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
                 gate_slice.row_base, gate_slice.row_count,
                 gate_slice.column_byte_base,
                 gate_slice.column_byte_count,
-                (uint32_t)expert, &gate_dst, 0) ||
+                (uint32_t)expert, &gate_dst, 0, cache->copy_stream) ||
             !cuda_q4k_packed_slice_load_expert_impl(
                 cache->model_map, up_slice.tensor_offset,
                 up_slice.row_base, up_slice.row_count,
                 up_slice.column_byte_base,
                 up_slice.column_byte_count,
-                (uint32_t)expert, &up_dst, 0) ||
+                (uint32_t)expert, &up_dst, 0, cache->copy_stream) ||
             !cuda_q4k_packed_slice_load_expert_impl(
                 cache->model_map, down_slice.tensor_offset,
                 down_slice.row_base, down_slice.row_count,
                 down_slice.column_byte_base,
                 down_slice.column_byte_count,
-                (uint32_t)expert, &down_dst, 0)) {
+                (uint32_t)expert, &down_dst, 0, cache->copy_stream)) {
             entry.expert = -1;
             entry.valid = 0;
             return 0;
@@ -7326,7 +7371,12 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
         /* Scratch decode queues the routed consumer on the same stream and
          * the layer epilogue synchronizes before slab rebind.  Avoid a host
          * wait here; retain the old conservative wait for every other arm. */
-        if (!same_stream_fenced && async_window &&
+        if (cache->overlap_enabled && cache->fill_event &&
+            cudaEventRecord(cache->fill_event, cache->copy_stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        if (!cache->overlap_enabled && !same_stream_fenced && async_window &&
             strcmp(async_window, "1") == 0 &&
             cudaDeviceSynchronize() != cudaSuccess) {
             (void)cudaGetLastError();
@@ -7359,6 +7409,17 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare_device(
                   cache) == g_q4k_window_caches.end() ||
         !expert_ids || !expert_ids->ptr || !weights || !weights->ptr ||
         !slot_ids || pair_count == 0u || pair_count > 1048576u) return 0;
+    if (cache->overlap_enabled && cache->prepared_valid &&
+        cache->prepared_ids == expert_ids &&
+        cache->prepared_weights == weights &&
+        cache->prepared_count == pair_count && cache->slot_ids_device) {
+        slot_ids->ptr = cache->slot_ids_device;
+        slot_ids->bytes = (uint64_t)pair_count * sizeof(int32_t);
+        slot_ids->owner = 0;
+        slot_ids->device_id = expert_ids->device_id;
+        slot_ids->host_ptr = NULL;
+        return 1;
+    }
     uint64_t id_bytes = 0, weight_bytes = 0;
     if (!cuda_u64_mul_checked(pair_count, sizeof(int32_t), &id_bytes) ||
         !cuda_u64_mul_checked(pair_count, sizeof(float), &weight_bytes) ||
@@ -7381,9 +7442,7 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare_device(
     }
     /* Blocking null-stream copies are load-bearing here: the router and the
      * current Q4_K MoE consumer also use the null stream, so this D2H observes
-     * the producer and the later H2D cannot overtake the previous consumer.
-     * Any future compute/transport overlap must replace this with explicit
-     * events or double-buffered compact IDs before using another stream. */
+     * the producer and the later H2D cannot overtake the previous consumer. */
     if (cudaMemcpy(host_ids.data(), expert_ids->ptr, (size_t)id_bytes,
                    cudaMemcpyDeviceToHost) != cudaSuccess ||
         cudaMemcpy(host_weights.data(), weights->ptr, (size_t)weight_bytes,
@@ -7429,6 +7488,12 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare_device(
     slot_ids->owner = 0;
     slot_ids->device_id = expert_ids->device_id;
     slot_ids->host_ptr = NULL;
+    if (cache->overlap_enabled) {
+        cache->prepared_ids = expert_ids;
+        cache->prepared_weights = weights;
+        cache->prepared_count = pair_count;
+        cache->prepared_valid = 1;
+    }
     if (profile) {
         const uint64_t filled = cache->fills - fills_before;
         cache->profile_prepare_sec += cuda_wall_sec() - profile_started;
@@ -7437,6 +7502,25 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare_device(
         cache->profile_control_bytes += 2u * id_bytes + weight_bytes;
     }
     return 1;
+}
+
+extern "C" int ds4_gpu_q4k_window_cache_wait(
+        const ds4_gpu_q4k_window_cache *cache) {
+    if (!cache || !cache->overlap_enabled || !cache->fill_event ||
+        std::find(g_q4k_window_caches.begin(), g_q4k_window_caches.end(),
+                  cache) == g_q4k_window_caches.end()) return 1;
+    return hipStreamWaitEvent((hipStream_t)0, cache->fill_event, 0) ==
+           cudaSuccess;
+}
+
+extern "C" int ds4_gpu_q4k_window_cache_prefetch(
+        ds4_gpu_q4k_window_cache *cache,
+        const ds4_gpu_tensor *expert_ids,
+        const ds4_gpu_tensor *weights,
+        uint32_t pair_count) {
+    ds4_gpu_tensor slot_ids = {};
+    return ds4_gpu_q4k_window_cache_prepare_device(
+        cache, expert_ids, weights, pair_count, &slot_ids);
 }
 
 extern "C" int ds4_gpu_q4k_window_cache_device_view(
@@ -10096,6 +10180,22 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             (double)g_q8_f16_bytes / 1073741824.0,
             (double)g_cuda_tmp_bytes / 1073741824.0);
     fprintf(stderr, "\n");
+}
+
+extern "C" int ds4_gpu_memory_info(uint64_t *free_bytes,
+                                     uint64_t *total_bytes) {
+    if (free_bytes) *free_bytes = 0u;
+    if (total_bytes) *total_bytes = 0u;
+    if (!free_bytes || !total_bytes) return 0;
+    size_t free_b = 0u, total_b = 0u;
+    const cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    *free_bytes = (uint64_t)free_b;
+    *total_bytes = (uint64_t)total_b;
+    return 1;
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {

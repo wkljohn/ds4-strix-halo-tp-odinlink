@@ -36,7 +36,48 @@ def dump(path: Path, logits: list[float], quality: bool = False,
         "teacher_gap": logits[order[0]] - logits[3],
         "logits": logits,
     }
+    if source == "ds4-score-official-frozen-teacher":
+        value["case_id"] = "case_000"
+        value["case_step"] = 0
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def score_manifest(path: Path, *, arm: str,
+                   model_hash: str = "model-hash",
+                   full_split_order: bool = False) -> None:
+    selectors = {
+        "kda-off": ("0", "0"),
+        "kda-tp": ("1", "0"),
+        "kda-kslice": ("1", "1"),
+    }
+    kda_tp, kslice = selectors[arm]
+    fields = {
+        "producer": "gguf-tools/quality-testing/score_official.c",
+        "source_commit": "source-commit",
+        "source_dirty": "0",
+        "model": "/model.gguf",
+        "model_size": "123",
+        "model_sample_sha256": model_hash,
+        "ds4_sha256": "ds4-hash",
+        "scorer_sha256": "scorer-hash",
+        "quality_input_sha256": "quality-hash",
+        "start_case": "0",
+        "cases": "3",
+        "teacher_positions": "381",
+        "rdma_profile": "roce-v2",
+        "teacher_arm": arm,
+        "extra_env": (f"DS4_GLM5_KDA_TP={kda_tp} "
+                      f"DS4_GLM5_KDA_OUTPUT_KSLICE={kslice} "
+                      "DS4_GLM5_NEXT_PREFILL_BATCH=512 " +
+                      ("DS4_ROCM_BF16_FULL_SPLIT_ORDER=1 "
+                       if full_split_order else "")),
+        "coordinator_features": (f"GLM5 TP features: kda_tp={kda_tp} "
+                                 f"kda_output_kslice={kslice}"),
+        "worker_features": (f"GLM5 TP features: kda_tp={kda_tp} "
+                            f"kda_output_kslice={kslice}"),
+    }
+    path.write_text("".join(f"{key}={value}\n" for key, value in fields.items()),
+                    encoding="utf-8")
 
 
 def run(*args: str) -> subprocess.CompletedProcess[str]:
@@ -57,7 +98,13 @@ def main() -> int:
         dump(candidate / "decode_000000.logits.json", [0.0, 1.0, 2.0, 3.0])
         exact = run(str(reference), str(candidate))
         assert exact.returncode == 0, exact.stderr
-        assert json.loads(exact.stdout)["argmax_mismatches"] == 0
+        exact_summary = json.loads(exact.stdout)
+        assert exact_summary["argmax_mismatches"] == 0
+        assert exact_summary["distributions"]["max_abs"]["max"] == 0.0
+        assert exact_summary["distributions"]["teacher_nll_delta"]["mean"] == 0.0
+        assert exact_summary["case_summaries"] == []
+        assert exact_summary["argmax_mismatch_reference_margin"] is None
+        assert exact_summary["max_argmax_mismatch_reference_margin"] is None
 
         dump(reference / "decode_000000.logits.json", [0.0, 1.0, 2.0, 3.0],
              source="ds4-canonical-oracle")
@@ -79,6 +126,9 @@ def main() -> int:
         diagnostic = run(str(reference), str(candidate))
         assert diagnostic.returncode == 0, diagnostic.stderr
         assert json.loads(diagnostic.stdout)["argmax_mismatches"] == 1
+        diagnostic_summary = json.loads(diagnostic.stdout)
+        assert diagnostic_summary["max_argmax_mismatch_reference_margin"] == 1.0
+        assert diagnostic_summary["argmax_mismatch_reference_margin"]["max"] == 1.0
 
         thresholds = root / "thresholds.json"
         thresholds.write_text(json.dumps({
@@ -129,6 +179,54 @@ def main() -> int:
                        "--thresholds", str(thresholds))
         assert far_flip.returncode != 0
         assert json.loads(far_flip.stdout)["far_margin_inversions"] == 1
+
+        dump(reference / "decode_000000.logits.json", [0.0, 1.0, 2.0, 3.0],
+             source="ds4-score-official-frozen-teacher")
+        dump(candidate / "decode_000000.logits.json", [0.0, 1.0, 2.0, 3.0],
+             source="ds4-score-official-frozen-teacher")
+        score_manifest(reference / "manifest", arm="kda-tp")
+        score_manifest(candidate / "manifest", arm="kda-kslice")
+        score_exact = run(str(reference), str(candidate),
+                          "--score-arm-mode", "kda-kslice")
+        assert score_exact.returncode == 0, score_exact.stderr
+        score_summary = json.loads(score_exact.stdout)
+        assert len(score_summary["case_summaries"]) == 1
+        assert score_summary["case_summaries"][0]["case_id"] == "case_000"
+        assert score_summary["case_summaries"][0]["steps"] == 1
+        score_manifest(candidate / "manifest", arm="kda-kslice",
+                       model_hash="wrong-model")
+        score_mismatch = run(str(reference), str(candidate),
+                             "--score-arm-mode", "kda-kslice")
+        assert score_mismatch.returncode == 1
+        assert "manifest model_sample_sha256" in score_mismatch.stderr
+
+        score_manifest(reference / "manifest", arm="kda-tp")
+        score_manifest(candidate / "manifest", arm="kda-tp",
+                       full_split_order=True)
+        reorder_null = run(str(reference), str(candidate),
+                           "--score-arm-mode", "full-split-order-null")
+        assert reorder_null.returncode == 0, reorder_null.stderr
+        score_manifest(reference / "manifest", arm="kda-tp",
+                       full_split_order=True)
+        invalid_null = run(str(reference), str(candidate),
+                           "--score-arm-mode", "full-split-order-null")
+        assert invalid_null.returncode == 1
+        assert "legal reorder only in the candidate" in invalid_null.stderr
+
+        score_manifest(reference / "manifest", arm="kda-tp",
+                       full_split_order=True)
+        score_manifest(candidate / "manifest", arm="kda-kslice")
+        null_vs_kslice = run(str(reference), str(candidate),
+                             "--score-arm-mode", "null-vs-kslice")
+        assert null_vs_kslice.returncode == 0, null_vs_kslice.stderr
+        score_manifest(candidate / "manifest", arm="kda-kslice",
+                       full_split_order=True)
+        invalid_null_vs_kslice = run(
+            str(reference), str(candidate),
+            "--score-arm-mode", "null-vs-kslice")
+        assert invalid_null_vs_kslice.returncode == 1
+        assert "legal reorder only in the reference" in \
+            invalid_null_vs_kslice.stderr
     print("test_compare_teacher_logits: PASS")
     return 0
 

@@ -127,6 +127,7 @@ EXPECTED_TEACHER_FNV64=${DS4_BENCH_EXPECT_TEACHER_FNV64:-}
 RECORD_TEACHER_BASELINE=${DS4_BENCH_RECORD_TEACHER_BASELINE:-0}
 QUALITY=${DS4_BENCH_QUALITY:-0}
 ALLOW_NONSTANDARD_SPLIT=${DS4_BENCH_ALLOW_NONSTANDARD_SPLIT:-0}
+ALLOW_GLM_BATCH1=${DS4_BENCH_ALLOW_GLM_BATCH1:-0}
 VALIDATE_CONFIG_ONLY=${DS4_BENCH_VALIDATE_CONFIG_ONLY:-0}
 DUMP_FRONTIER_LOGITS_DIR=${DS4_BENCH_DUMP_FRONTIER_LOGITS_DIR:-}
 FROZEN_TOKEN_FILE=${DS4_BENCH_FROZEN_TOKEN_FILE:-}
@@ -134,6 +135,8 @@ FROZEN_LOGITS_DIR=${DS4_BENCH_FROZEN_LOGITS_DIR:-}
 DECLARED_TOOLCHAIN_ID=${DS4_BENCH_TOOLCHAIN_ID:-}
 EXPECTED_TOOLCHAIN_SHA256=${DS4_BENCH_EXPECT_TOOLCHAIN_SHA256:-}
 EXPECT_GREEDY_TOP2=0
+GLM5_PREFILL_BATCH=
+GLM5_PREFILL_BATCH_SEEN=0
 CANDIDATE_ARGS=()
 CLEAN_ENV=(env -i PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8)
 PEER_SSH=(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes
@@ -219,6 +222,22 @@ for env_kv in "${EXTRA_ENV[@]}"; do
     exit 2
   }
   case $env_kv in
+    DS4_GLM5_NEXT_PREFILL_BATCH=*)
+      (( GLM5_PREFILL_BATCH_SEEN == 0 )) || {
+        echo "error: DS4_GLM5_NEXT_PREFILL_BATCH was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_PREFILL_BATCH=${env_kv#*=}
+      GLM5_PREFILL_BATCH_SEEN=1
+      [[ $GLM5_PREFILL_BATCH =~ ^[1-9][0-9]*$ ]] || {
+        echo "error: DS4_GLM5_NEXT_PREFILL_BATCH must be an integer from 1 to 1024" >&2
+        exit 2
+      }
+      (( GLM5_PREFILL_BATCH <= 1024 )) || {
+        echo "error: DS4_GLM5_NEXT_PREFILL_BATCH must be at most 1024" >&2
+        exit 2
+      }
+      ;;
     DS4_ROCM_ENABLE_Q8_F16_CACHE=*|DS4_ROCM_STREAM_Q8_F16_CACHE_GB=*)
       echo "error: ds4-bench-tp results must not use the memory-heavy Q8-to-FP16 cache" >&2
       exit 2
@@ -319,6 +338,24 @@ MODEL_ARCH=$(python3 "$REPO/scripts/gguf_tensor_types.py" --architecture "$MODEL
   echo "error: unable to inspect general.architecture in $MODEL" >&2
   exit 1
 }
+if [[ $MODEL_ARCH == glm5-next ]]; then
+  (( GLM5_PREFILL_BATCH_SEEN == 1 )) || {
+    echo "error: GLM5 benchmark runs must explicitly set DS4_GLM5_NEXT_PREFILL_BATCH" >&2
+    echo "error: batch=1 is only a scalar regression guard; use a fixed batch >1 for prefill candidates" >&2
+    exit 2
+  }
+  if (( GLM5_PREFILL_BATCH == 1 )); then
+    [[ $CANDIDATE == 0 && $ALLOW_GLM_BATCH1 == 1 ]] || {
+      echo "error: GLM5 batch=1 is not batched-prefill evidence" >&2
+      echo "error: set DS4_BENCH_ALLOW_GLM_BATCH1=1 only for a non-candidate scalar regression guard" >&2
+      exit 2
+    }
+    echo "warning: GLM5 batch=1 run is a scalar regression guard, not prefill performance evidence" >&2
+  fi
+elif (( GLM5_PREFILL_BATCH_SEEN == 1 )); then
+  echo "error: DS4_GLM5_NEXT_PREFILL_BATCH applies only to GLM5 benchmarks" >&2
+  exit 2
+fi
 CURRENT_OPT_ENV=()
 if [[ $DSPARK == 1 ]]; then
   [[ $MODEL_ARCH != glm5-next ]] || {
@@ -348,6 +385,7 @@ else
     # into this independently quality-gated arithmetic path.
     CURRENT_OPT_ENV+=(
       DS4_GLM5_NEXT_ENABLE_ORDINARY=1
+      DS4_GLM5_PREFILL_PROOF=1
       DS4_TP_BIG_DIRECT=1
       DS4_TP_GREEDY_TOP2=0
       DS4_ROCM_TEMPORAL_COMPRESSOR=0
@@ -403,7 +441,7 @@ fi
 }
 
 if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
-  echo "validated_config model_arch=$MODEL_ARCH rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK prefill_arg=$([[ $MODEL_ARCH == glm5-next ]] && echo omitted || echo passed) routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE candidate_lane=$CANDIDATE_LANE baseline_id=${BASELINE_ID:-n/a} tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ $MODEL_ARCH == deepseek4 && ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
+  echo "validated_config model_arch=$MODEL_ARCH rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK prefill_batch=${GLM5_PREFILL_BATCH:-n/a} prefill_arg=$([[ $MODEL_ARCH == glm5-next ]] && echo omitted || echo passed) routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE candidate_lane=$CANDIDATE_LANE baseline_id=${BASELINE_ID:-n/a} tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ $MODEL_ARCH == deepseek4 && ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
   exit 0
 fi
 
@@ -674,6 +712,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'generated_tokens=%s\n' "$TOKENS"
   printf 'context=%s\n' "$CONTEXT"
   printf 'prefill_chunk=%s\n' "$PREFILL_CHUNK"
+  printf 'prefill_batch=%s\n' "${GLM5_PREFILL_BATCH:-n/a}"
   printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
   printf 'coordinator_addr=%s\n' "$COORDINATOR_ADDR"
   printf 'coordinator_rdma_device=%s\n' "$LOCAL_RDMA_DEVICE"
@@ -765,7 +804,7 @@ done
 
 echo "=== ds4-bench $TAG ==="
 echo "model: $MODEL"
-echo "workload: frontier=$FRONTIER frontier_max=$FRONTIER_MAX step_incr=$STEP_INCR step_mul=$STEP_MUL generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK"
+echo "workload: frontier=$FRONTIER frontier_max=$FRONTIER_MAX step_incr=$STEP_INCR step_mul=$STEP_MUL generated_tokens=$TOKENS context=$CONTEXT prefill_chunk=$PREFILL_CHUNK prefill_batch=${GLM5_PREFILL_BATCH:-n/a}"
 echo "rdma_profile: $RDMA_PROFILE coordinator_device=$LOCAL_RDMA_DEVICE worker_device=$PEER_RDMA_DEVICE"
 if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
 if [[ $DSPARK == 0 ]]; then echo "routed_expert_family: $ROUTED_FAMILY"; fi
@@ -836,6 +875,10 @@ wait_worker 180 || {
 WORKER_STARTED=0
 trap - EXIT
 "${PEER_SCP[@]}" "$PEER_MGMT:$REMOTE_WORKER_LOG" "$WORKER_LOG"
+if [[ $MODEL_ARCH == glm5-next ]]; then
+  "$REPO/scripts/check-glm5-prefill-proof.sh" \
+    "$COORD_LOG" "$WORKER_LOG" "$GLM5_PREFILL_BATCH" "$FRONTIER"
+fi
 if [[ $DECODE_SELF_CHECK == 1 ]]; then
   grep -q 'ds4-bench: decode self-check complete .*argmax_mismatches=0 ' \
     "$COORD_LOG" || {

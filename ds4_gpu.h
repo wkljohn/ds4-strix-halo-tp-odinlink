@@ -374,6 +374,15 @@ int ds4_gpu_q4k_window_cache_prepare_device(
         const ds4_gpu_tensor      *weights,
         uint32_t                   pair_count,
         ds4_gpu_tensor            *slot_ids);
+/* Enqueue the routed consumer's wait for an opt-in copy-stream fill.  A
+ * no-op for ordinary/ephemeral caches. */
+int ds4_gpu_q4k_window_cache_wait(
+        const ds4_gpu_q4k_window_cache *cache);
+int ds4_gpu_q4k_window_cache_prefetch(
+        ds4_gpu_q4k_window_cache *cache,
+        const ds4_gpu_tensor      *expert_ids,
+        const ds4_gpu_tensor      *weights,
+        uint32_t                   pair_count);
 int ds4_gpu_q4k_window_cache_device_view(
         const ds4_gpu_q4k_window_cache *cache,
         const void                    **gate,
@@ -581,6 +590,7 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
 void ds4_gpu_print_memory_report(const char *label);
+int ds4_gpu_memory_info(uint64_t *free_bytes, uint64_t *total_bytes);
 
 /* Tensor-parallel per-layer gates (Metal only).  The encoder calls
  * ds4_gpu_tp_gate_encode() right after the kernels that produce a partial

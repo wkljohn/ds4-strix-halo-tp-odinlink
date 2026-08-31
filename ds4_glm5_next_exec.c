@@ -742,6 +742,17 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
         (n_tokens == 1u ||
          (getenv("DS4_ROCM_GLM5_BATCH_KSLICE_OUTPUT") != NULL &&
           strcmp(getenv("DS4_ROCM_GLM5_BATCH_KSLICE_OUTPUT"), "1") == 0));
+    if (output_kslice) {
+        static int logged_output_kslice[2] = {0, 0};
+        const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
+        if (!logged_output_kslice[rank]) {
+            fprintf(stderr,
+                    "ds4: GLM5 KDA output K-slice engaged rank=%u "
+                    "tokens=%u layer=%u\n",
+                    ctx->tp_rank, n_tokens, il);
+            logged_output_kslice[rank] = 1;
+        }
+    }
     if (output_kslice && layer->kda.output_type != 30u) {
         ds4_glm5_next_state_invalidate(state);
         return 0;
@@ -2041,6 +2052,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                           f->up_exps_type == 16u &&
                           f->down_exps_type == 10u;
     ds4_gpu_q4k_window_cache *cache = NULL;
+    bool overlap_prefetched = false;
     const int q4_residency = mixed_q2 ? 0 :
         local_q4k_half_residency(ctx, layer);
     int ok = ds4_gpu_rms_norm_plain_rows_tensor(
@@ -2165,6 +2177,29 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
         } else {
             cache = ok ? ds4_gpu_q4k_window_cache_create(&config) : NULL;
         }
+        const char *overlap_env = getenv("DS4_ROCM_GLM5_WINDOW_OVERLAP");
+        overlap_prefetched = ok && use_scratch && overlap_env &&
+            strcmp(overlap_env, "1") == 0;
+        if (overlap_prefetched) {
+            /* Start selected-expert uploads before the shared Q8 path.  The
+             * routed helper repeats the metadata check and waits on the
+             * cache event immediately before its consumer kernel. */
+            ok = ds4_gpu_q4k_window_cache_prefetch(
+                cache, w->router_selected, w->router_weights,
+                GLM5_EXPERTS_USED);
+        }
+        if (ok && overlap_prefetched) ok =
+            ds4_gpu_matmul_q8_0_tensor(
+                w->shared_gate, ctx->model_map, ctx->model_size,
+                f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+                GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u) &&
+            ds4_gpu_matmul_q8_0_tensor(
+                w->shared_up, ctx->model_map, ctx->model_size,
+                f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
+                GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u) &&
+            ds4_gpu_swiglu_tensor(
+                w->shared_mid, w->shared_gate, w->shared_up,
+                GLM5_RANK_MID, 10.0f, 1.0f);
         ok = cache && ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
                  w->routed_out, w->routed_gate, w->routed_up, w->routed_mid,
                  w->routed_experts, cache, w->router_selected,
@@ -2176,17 +2211,17 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                 il, ctx->tp_rank, mixed_q2 ? 1 : 0);
         goto routed_one_done;
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+    if (ok && !overlap_prefetched) ok = ds4_gpu_matmul_q8_0_tensor(
             w->shared_gate, ctx->model_map, ctx->model_size,
             f->gate_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared gate rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(
+    if (ok && !overlap_prefetched) ok = ds4_gpu_matmul_q8_0_tensor(
             w->shared_up, ctx->model_map, ctx->model_size,
             f->up_shexp + (uint64_t)rank_mid_base * q8_gate_row_bytes,
             GLM5_WIDTH, GLM5_RANK_MID, w->ffn_hidden, 1u);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared up rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }
-    if (ok) ok = ds4_gpu_swiglu_tensor(
+    if (ok && !overlap_prefetched) ok = ds4_gpu_swiglu_tensor(
             w->shared_mid, w->shared_gate, w->shared_up,
             GLM5_RANK_MID, 10.0f, 1.0f);
     if (!ok) { fprintf(stderr, "ds4: GLM5 routed layer %u failed at shared SwiGLU rank=%u\n", il, ctx->tp_rank); goto routed_one_done; }

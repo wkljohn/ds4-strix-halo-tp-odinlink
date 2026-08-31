@@ -82,7 +82,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-quality-gates test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap test-rocm-glm5-q2-expert-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
+.PHONY: all help clean test test-quality-gates test-glm5-prefill-proof test-moe-wave-plan test-rocm-moe-wave-plan test-rocm-glm5-kda-ref test-rocm-glm5-conv-ref test-rocm-glm5-kda-layer test-rocm-glm5-kda-real-activation-oracle test-tp-hello test-roce-v2-mr test-rocm-gtt-residency test-tp-completion-ordering test-tp-dual-stream-progress test-tp-big-gate-overlap test-rocm-tp-split-gate test-rocm-prefill-wavefront-projections test-rocm-long-context test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch test-rocm-attention-output-tp test-rocm-attention-prefill-static-flash test-rocm-attention-static-flash-direct-bench test-rocm-q4k-skip-unowned test-rocm-q4k-fused-mid test-rocm-q4k-one-token-oracle test-rocm-q4k-staged-midq-oracle test-rocm-q4k-ffn-row-balance-oracle test-rocm-q4k-slot-balance-oracle test-rocm-compressor-row-shard-oracle test-rocm-shared-routed-overlap test-rocm-glm5-q2-expert-oracle dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression check-rocm-strix strix-halo strix-halo-quality-score rocm
 
 test-quality-gates:
 	python3 tests/test_frontier_logits_gate.py
@@ -90,6 +90,10 @@ test-quality-gates:
 	python3 tests/test_compare_quality_scores.py
 	python3 tests/test_lane_c_oracle_gate.py
 	./tests/test_candidate_gate.sh
+	./tests/test_glm5_prefill_proof.sh
+
+test-glm5-prefill-proof:
+	./tests/test_glm5_prefill_proof.sh
 
 test-moe-wave-plan:
 	python3 tests/test_moe_wave_plan.py
@@ -1207,6 +1211,19 @@ tests/test_rocm_glm5_kda_bf16_rowslice: tests/test_rocm_glm5_kda_bf16_rowslice.o
 test-rocm-glm5-kda-bf16-rowslice: tests/test_rocm_glm5_kda_bf16_rowslice
 	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/test_rocm_glm5_kda_bf16_rowslice
 
+tests/test_rocm_glm5_kda_real_activation_oracle.o: tests/test_rocm_glm5_kda_real_activation_oracle.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
+
+tests/test_rocm_glm5_kda_real_activation_oracle: tests/test_rocm_glm5_kda_real_activation_oracle.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-kda-real-activation-oracle: tests/test_rocm_glm5_kda_real_activation_oracle
+	@test -n "$(DS4_RESEARCH_ROOT)" || { echo "error: set DS4_RESEARCH_ROOT" >&2; exit 2; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" \
+	DS4_GLM5_KDA_ORACLE_ROOT="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/kda-real-activation-oracle-20260831" \
+	DS4_GLM5_KDA_ORACLE_LAYER=5 \
+		./tests/test_rocm_glm5_kda_real_activation_oracle
+
 .PHONY: test-rocm-bf16-decode-mlp
 tests/test_rocm_bf16_decode_mlp: tests/test_rocm_bf16_decode_mlp.cu tests/glm5_gguf_test.hpp
 	$(HIPCC) $(ROCM_CFLAGS) -I. -o $@ $<
@@ -1340,4 +1357,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_tp_hello tests/test_tp_completion_ordering tests/test_tp_glm5_phase_transition tests/test_tp_dual_stream_progress tests/test_metal_session_batch tests/test_gpu_xdev tests/test_rocm_attention_output_tp tests/test_rocm_attention_decode_mixed tests/test_rocm_attention_decode_indexed_seqtile tests/test_rocm_attention_prefill_static_flash tests/attn_static_flash_lds_bench tests/test_rocm_q4k_decode_bench tests/test_rocm_shared_routed_overlap tests/test_rocm_q4k_fused_mid tests/test_rocm_q4k_staged_midq_oracle tests/test_rocm_q4k_ffn_row_balance_oracle tests/test_rocm_q4k_packed_slice_registry tests/test_rocm_shared_gu_swiglu_fused tests/test_rocm_q8_pair_pack4 tests/test_rocm_q8_kslice_rows tests/test_rocm_attention_q_b_fused tests/test_rocm_glm5_kda_layer tests/test_rocm_glm5_kda_bf16_rowslice tests/test_rocm_glm5_mhc_layer tests/test_rocm_glm5_bf16_embedding tests/test_rocm_glm53_expert_window tests/test_rocm_glm5_q4k_shard_compose tests/test_rocm_glm5_router_realweight tests/test_glm5_kda_binding tests/test_glm5_kda_state tests/test_glm5_next_runtime_offsets tests/test_glm5_next_text_codec tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/rocm_long_context_smoke tests/rocm_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-bench-tp ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o tests/test_q4k_dot tests/test_tp_hello tests/test_tp_completion_ordering tests/test_tp_glm5_phase_transition tests/test_tp_dual_stream_progress tests/test_metal_session_batch tests/test_gpu_xdev tests/test_rocm_attention_output_tp tests/test_rocm_attention_decode_mixed tests/test_rocm_attention_decode_indexed_seqtile tests/test_rocm_attention_prefill_static_flash tests/attn_static_flash_lds_bench tests/test_rocm_q4k_decode_bench tests/test_rocm_shared_routed_overlap tests/test_rocm_q4k_fused_mid tests/test_rocm_q4k_staged_midq_oracle tests/test_rocm_q4k_ffn_row_balance_oracle tests/test_rocm_q4k_packed_slice_registry tests/test_rocm_shared_gu_swiglu_fused tests/test_rocm_q8_pair_pack4 tests/test_rocm_q8_kslice_rows tests/test_rocm_attention_q_b_fused tests/test_rocm_glm5_kda_layer tests/test_rocm_glm5_kda_bf16_rowslice tests/test_rocm_glm5_kda_real_activation_oracle tests/test_rocm_glm5_mhc_layer tests/test_rocm_glm5_bf16_embedding tests/test_rocm_glm53_expert_window tests/test_rocm_glm5_q4k_shard_compose tests/test_rocm_glm5_router_realweight tests/test_glm5_kda_binding tests/test_glm5_kda_state tests/test_glm5_next_runtime_offsets tests/test_glm5_next_text_codec tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/rocm_long_context_smoke tests/rocm_long_context_smoke.o

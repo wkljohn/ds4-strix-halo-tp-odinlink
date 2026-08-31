@@ -13,6 +13,15 @@ static int routed_moe_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
 #ifndef DS4_TP_FEATURE_Q4K_FUSED_MID
 #define DS4_TP_FEATURE_Q4K_FUSED_MID (UINT32_C(1) << 16)
 #endif
+#ifndef DS4_TP_FEATURE_Q4K_KSHARD
+#define DS4_TP_FEATURE_Q4K_KSHARD (UINT32_C(1) << 19)
+#endif
+#ifndef DS4_TP_FEATURE_GLM5_KDA_TP
+#define DS4_TP_FEATURE_GLM5_KDA_TP (UINT32_C(1) << 22)
+#endif
+#ifndef DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE
+#define DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE (UINT32_C(1) << 23)
+#endif
 
 static int routed_moe_align256_checked(uint64_t v, uint64_t *out) {
     if (!out || v > UINT64_MAX - 255ull) return 0;
@@ -264,13 +273,21 @@ extern "C" void ds4_gpu_set_tp_runtime_features(uint32_t rank,
     const int q4k = (features & DS4_TP_FEATURE_Q4K_WMMA) != 0;
     const int q4k_fused_mid =
         (features & DS4_TP_FEATURE_Q4K_FUSED_MID) != 0;
+    const int q4k_kshard =
+        (features & DS4_TP_FEATURE_Q4K_KSHARD) != 0;
+    const int glm5_kda_tp =
+        (features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0;
+    const int glm5_kda_output_kslice =
+        (features & DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE) != 0;
     const int iq2_i8 = (features & DS4_TP_FEATURE_IQ2_I8_WMMA) != 0;
     fprintf(stderr, DS4_GPU_LOG_PREFIX
             "Q4_K WMMA startup rank=%u negotiated=0x%08x gate=%d up=%d "
-            "down=%d sorted_min_tokens=%u gate_up_threshold=%u "
+            "down=%d kshard=%d kda_tp=%d kda_output_kslice=%d "
+            "sorted_min_tokens=%u gate_up_threshold=%u "
             "down_threshold=1 fused_active=%d iq2_i8=%d quality=%d "
             "kill_switch=%d\n",
-            rank, features, q4k, q4k, q4k,
+            rank, features, q4k, q4k, q4k, q4k_kshard,
+            glm5_kda_tp, glm5_kda_output_kslice,
             routed_moe_q4k_sorted_min_tokens(),
             routed_moe_q4k_wmma_min_count(), q4k_fused_mid,
             iq2_i8, g_quality_mode, cfg->disabled);
@@ -4192,6 +4209,7 @@ extern "C" int ds4_gpu_routed_moe_one_packed_q4k_window_tensor(
     ds4_gpu_tensor compact_selected = {};
     if (!ds4_gpu_q4k_window_cache_prepare_device(
             cache, selected, weights, n_expert, &compact_selected)) return 0;
+    if (!ds4_gpu_q4k_window_cache_wait(cache)) return 0;
     int add_fused = 0;
     const int rc = routed_moe_launch(
         out, gate, up, mid, down, view.model_map, view.model_size,

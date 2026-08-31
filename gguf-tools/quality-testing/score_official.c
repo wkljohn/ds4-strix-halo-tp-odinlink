@@ -24,6 +24,8 @@ static void usage(const char *prog) {
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
             "[--ssd-streaming-preload-experts N] [--max-cases N] "
+            "[--start-case N] "
+            "[--teacher-logits-dir DIR] "
             "[--role coordinator --tensor-parallel --listen HOST PORT "
             "--transport rdma]\n",
             prog);
@@ -43,6 +45,18 @@ static int parse_positive_int(const char *s, const char *opt) {
     long v = strtol(s, &end, 10);
     if (errno != 0 || end == s || !end || *end != '\0' || v <= 0 || v > INT_MAX) {
         fprintf(stderr, "%s must be a positive integer\n", opt);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static int parse_nonnegative_int(const char *s, const char *opt) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || end == s || !end || *end != '\0' ||
+        v < 0 || v > INT_MAX) {
+        fprintf(stderr, "%s must be a non-negative integer\n", opt);
         exit(2);
     }
     return (int)v;
@@ -510,6 +524,96 @@ static double safe_ratio(long num, long den) {
     return den ? (double)num / (double)den : 0.0;
 }
 
+static void json_write_string(FILE *fp, const char *value) {
+    fputc('"', fp);
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        switch (*p) {
+        case '"': fputs("\\\"", fp); break;
+        case '\\': fputs("\\\\", fp); break;
+        case '\b': fputs("\\b", fp); break;
+        case '\f': fputs("\\f", fp); break;
+        case '\n': fputs("\\n", fp); break;
+        case '\r': fputs("\\r", fp); break;
+        case '\t': fputs("\\t", fp); break;
+        default:
+            if (*p < 0x20) fprintf(fp, "\\u%04x", (unsigned)*p);
+            else fputc(*p, fp);
+            break;
+        }
+    }
+    fputc('"', fp);
+}
+
+static bool write_teacher_logits(const char *dir, const char *model_path,
+                                 const char *case_id, long global_step,
+                                 int case_step, int prefix_tokens,
+                                 int teacher_token, int quant_bits,
+                                 const float *logits, int n_vocab) {
+    int top1 = -1;
+    int top2 = -1;
+    for (int i = 0; i < n_vocab; i++) {
+        if (!isfinite(logits[i])) return false;
+        if (top1 < 0 || logits[i] > logits[top1]) {
+            top2 = top1;
+            top1 = i;
+        } else if (top2 < 0 || logits[i] > logits[top2]) {
+            top2 = i;
+        }
+    }
+    if (teacher_token < 0 || teacher_token >= n_vocab || top2 < 0) return false;
+
+    const size_t path_cap = strlen(dir) + 64;
+    char *path = malloc(path_cap);
+    if (!path) return false;
+    const int path_n = snprintf(path, path_cap, "%s/decode_%06ld.logits.json",
+                                dir, global_step);
+    if (path_n <= 0 || (size_t)path_n >= path_cap) {
+        free(path);
+        return false;
+    }
+    FILE *fp = fopen(path, "wbx");
+    if (!fp) {
+        fprintf(stderr, "open exclusive %s: %s\n", path, strerror(errno));
+        free(path);
+        return false;
+    }
+    fputs("{\n  \"source\":\"ds4-score-official-frozen-teacher\",\n"
+          "  \"model\":", fp);
+    json_write_string(fp, model_path);
+    fputs(",\n  \"case_id\":", fp);
+    json_write_string(fp, case_id);
+    fprintf(fp,
+            ",\n  \"backend\":\"rocm\",\n  \"quality\":false,\n"
+            "  \"dspark\":false,\n  \"dspark_strict\":false,\n"
+            "  \"quant_bits\":%d,\n  \"prefix_tokens\":%d,\n"
+            "  \"decode_step\":%ld,\n  \"case_step\":%d,\n"
+            "  \"position\":%d,\n  \"vocab\":%d,\n"
+            "  \"teacher_token\":%d,\n  \"teacher_logit\":%.9g,\n"
+            "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n"
+            "  \"runner_up_id\":%d,\n  \"runner_up_logit\":%.9g,\n"
+            "  \"top1_margin\":%.9g,\n  \"teacher_gap\":%.9g,\n"
+            "  \"logits\":[",
+            quant_bits, prefix_tokens, global_step, case_step,
+            prefix_tokens + case_step, n_vocab, teacher_token,
+            logits[teacher_token], top1, logits[top1], top2, logits[top2],
+            logits[top1] - logits[top2], logits[top1] - logits[teacher_token]);
+    for (int i = 0; i < n_vocab; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 8) == 0) fputs("\n    ", fp);
+        fprintf(fp, "%.9g", logits[i]);
+    }
+    fputs("\n  ]\n}\n", fp);
+    const bool write_ok = !ferror(fp);
+    const bool close_ok = fclose(fp) == 0;
+    const bool ok = write_ok && close_ok;
+    if (!ok) {
+        fprintf(stderr, "write %s failed\n", path);
+        remove(path);
+    }
+    free(path);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     if (argc < 4) {
         usage(argv[0]);
@@ -527,6 +631,8 @@ int main(int argc, char **argv) {
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
     int max_cases = 0;
+    int start_case = 0;
+    const char *teacher_logits_dir = NULL;
     ds4_distributed_options dist = {0};
     ds4_tp_options tp = {0};
 
@@ -573,6 +679,11 @@ int main(int argc, char **argv) {
                 (uint32_t)parse_positive_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--max-cases")) {
             max_cases = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--start-case")) {
+            start_case = parse_nonnegative_int(
+                need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--teacher-logits-dir")) {
+            teacher_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--rocm")) {
             /* DS4_BACKEND_CUDA names both CUDA and the ROCm compatibility
              * backend; the build selects the implementation. */
@@ -691,10 +802,12 @@ int main(int argc, char **argv) {
 
     char line[8192];
     int case_n = 0;
+    int manifest_case_n = 0;
     double total_nll = 0.0;
     long total_tokens = 0;
     long total_lcp = 0;
     long first_matches = 0;
+    long teacher_logit_step = 0;
     long total_api_ref_tokens = 0;
     api_metrics total_api = {0};
     char err[256];
@@ -702,6 +815,7 @@ int main(int argc, char **argv) {
     while (fgets(line, sizeof(line), mf)) {
         strip_newline(line);
         if (!line[0] || line[0] == '#') continue;
+        if (manifest_case_n++ < start_case) continue;
         if (max_cases > 0 && case_n >= max_cases) break;
 
         char *id = strtok(line, "\t");
@@ -757,6 +871,17 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "%s logits failed at target token %d\n", id, i);
                 return 1;
             }
+            if (teacher_logits_dir &&
+                !write_teacher_logits(teacher_logits_dir, model_path, id,
+                                      teacher_logit_step, i, prompt.len,
+                                      target.v[i],
+                                      ds4_engine_routed_quant_bits(engine),
+                                      logits, n_vocab)) {
+                fprintf(stderr, "%s teacher-logit dump failed at target token %d\n",
+                        id, i);
+                return 1;
+            }
+            teacher_logit_step++;
 
             if (i == 0) first_match = (greedy == target.v[i]);
             if (still_matching && greedy == target.v[i]) lcp++;
