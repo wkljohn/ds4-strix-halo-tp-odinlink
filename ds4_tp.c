@@ -1939,7 +1939,14 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 fprintf(stderr, "ds4-tp: invalid DS4_TP_BIGGATE_SIG_STRIDE='%s' (valid range 1..256)\n", stride_env);
                 signal_mode_cached = -1;
             } else signal_mode_cached = (int)value;
-        } else signal_mode_cached = 0;
+        } else {
+            /* No override preserves the production-safe all-signaled
+             * behavior.  Final-only signaling is intentionally opt-in via
+             * DS4_TP_BIGGATE_SIG_ALL=0; silently selecting it here can leave
+             * generic providers with unsignaled sends that are not retired
+             * as expected. */
+            signal_mode_cached = 1;
+        }
     }
     if (signal_mode_cached < 0) return 0;
     const double bg_t0 = g_bg_trace ? tp_now_sec() : 0.0;
