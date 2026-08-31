@@ -16,7 +16,7 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
      TP rank 0       OdinLink or RoCE v2           TP rank 1
 ```
 
-## Performance (DeepSeek V4 Flash 0731; GLM-5.3 Flash row uses its staged TP harness)
+## Performance (DeepSeek V4 Flash 0731)
 
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
@@ -25,7 +25,17 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **233.04 t/s** | **19.17 t/s** | three-run median, exact fingerprint |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **280.58 t/s** | **21.30 t/s** | recorded candidate control; rollback 276.59/21.24, FNV unchanged |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
-| **GLM-5.3 Flash Q4_K over RoCE v2** | full-trunk staged TP=2, 33-token diverse prompt + 8 decode | **8.03 t/s** | **8.62 t/s** | complete staged run; cross-rank FNV `e4a64ca66d7bea9e` |
+
+### Preliminary GLM-5.3 Flash TP=2 data
+
+These measurements are included for transparency, but are not production
+claims or promotion gates. The GLM path is still staged and opt-in.
+
+| Configuration | Measurement | Prefill | Decode | Status |
+|---|---|---:|---:|---|
+| **GLM-5.3 Flash Q4_K over RoCE v2** | 2,048-token prefill + 300-token decode, batch 256 | **32.09–32.40 t/s** | **2.79–2.98 t/s** | opt-in batched MLA output; cross-run fingerprint is not yet stable |
+| **GLM-5.3 Flash Q4_K over OdinLink** | same workload and staged TP=2 harness | **32.00 t/s** | **7.33 t/s** | single provider-parity run; experimental |
+| **GLM-5.3 Flash Q2 over RoCE v2** | same workload and staged TP=2 harness | **21.87–21.95 t/s** | **3.48–3.49 t/s** | opt-in mixed IQ2_XXS/Q2_K path; repeated fingerprint matched |
 
 Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
 generated tokens over mandatory RDMA. The current Q4_K rows use the Antirez
@@ -59,6 +69,7 @@ policy, and maintainer gates are preserved locally under
 |---|---|---|
 | [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the current Q4_K OdinLink and RoCE v2 rows. |
 | [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. The Q2_K file is used for the current Q2_K row. |
+| [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | **Experimental only.** TP=2 staged support; not yet an ordinary production server path. |
 | Unsloth DeepSeek V4 Flash 0731 `UD-*` target weights | — | **Not supported:** their mixed-precision tensor layouts do not match the currently validated DS4 target paths. |
 
 The Unsloth warning applies to `UD-*` target-model weights, not to a separately
