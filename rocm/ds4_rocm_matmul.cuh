@@ -1580,9 +1580,32 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         const dim3 block(rows_per_block * 32u);
         const size_t shared_bytes = (size_t)in_dim * sizeof(float);
         if (!decode_mlp64_disabled && in_dim >= 4096u) {
-            static const int split_order =
-                (getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER") != NULL &&
-                 strcmp(getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER"), "1") == 0);
+            static const char *split_order_value =
+                getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER");
+            static const char *legacy_split_order_value =
+                getenv("DS4_ROCM_BF16_FULL_LEGACY_SPLIT_ORDER");
+            static const int split_order = split_order_value != NULL &&
+                strcmp(split_order_value, "1") == 0;
+            static const int legacy_split_order =
+                legacy_split_order_value != NULL &&
+                strcmp(legacy_split_order_value, "1") == 0;
+            static const int split_order_env_valid =
+                (split_order_value == NULL ||
+                 strcmp(split_order_value, "0") == 0 || split_order) &&
+                (legacy_split_order_value == NULL ||
+                 strcmp(legacy_split_order_value, "0") == 0 ||
+                 legacy_split_order) &&
+                !(split_order && legacy_split_order);
+            if (!split_order_env_valid) {
+                static int invalid_reported;
+                if (!invalid_reported) {
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX
+                            "invalid or conflicting BF16 full split-order "
+                            "diagnostic selectors\n");
+                    invalid_reported = 1;
+                }
+                return 0;
+            }
             if (split_order && in_dim == 8192u) {
                 matmul_bf16_f32_sharedx_mlp64_split4096_warp_rows_w32_kernel<<<
                         grid, block, shared_bytes>>>(
@@ -1590,6 +1613,21 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
                         (const uint16_t *)wptr,
                         (const float *)x->ptr,
                         out_dim);
+            } else if (legacy_split_order && in_dim == 8192u) {
+                /* Independent lawful-reorder null.  Keep the historical
+                 * two-accumulator source path available under a distinct
+                 * diagnostic selector: the repaired split-order control above
+                 * intentionally shares its exact half-reduction body with the
+                 * TP K-slice and therefore cannot calibrate recurrent
+                 * sensitivity independently. */
+                matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel<<<
+                        grid, block, shared_bytes>>>(
+                        (float *)out->ptr,
+                        (const uint16_t *)wptr,
+                        (const float *)x->ptr,
+                        (uint32_t)in_dim,
+                        out_dim,
+                        1);
             } else {
                 matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel<<<
                         grid, block, shared_bytes>>>(
