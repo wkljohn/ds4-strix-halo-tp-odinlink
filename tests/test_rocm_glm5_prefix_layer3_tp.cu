@@ -625,6 +625,150 @@ bool finite_nonzero_vector(const std::vector<float> &values) {
     return nonzero;
 }
 
+bool run_mla_longkey_attention_test(const char *role, ds4_tp *tp) {
+    constexpr uint32_t kTokens = 256u;
+    constexpr uint32_t kPos0 = 1792u;
+    constexpr uint32_t kSelected = 2048u;
+    constexpr uint32_t kHeads = 1u;
+    constexpr uint32_t kQkNope = 256u;
+    constexpr uint32_t kKvWidth = 512u;
+    constexpr uint32_t kCacheCap = kSelected;
+    const uint64_t q_count = (uint64_t)kTokens * kHeads * kQkNope;
+    const uint64_t low_count = (uint64_t)kTokens * kHeads * kKvWidth;
+    const uint64_t kv_count = (uint64_t)kCacheCap * kKvWidth;
+    const uint64_t out_count = low_count;
+
+    std::vector<float> host_q(q_count, 0.0f);
+    std::vector<float> host_low(low_count);
+    std::vector<float> host_kv(kv_count);
+    auto bounded_value = [](uint64_t index, uint32_t salt) {
+        uint32_t x = (uint32_t)index ^ salt;
+        x ^= x >> 16u;
+        x *= UINT32_C(0x7feb352d);
+        x ^= x >> 15u;
+        x *= UINT32_C(0x846ca68b);
+        x ^= x >> 16u;
+        return ((float)(x & UINT32_C(0x00ffffff)) /
+                (float)UINT32_C(0x00800000)) - 1.0f;
+    };
+    for (uint64_t i = 0u; i < low_count; ++i)
+        host_low[i] = bounded_value(i, UINT32_C(0x13579bdf));
+    for (uint64_t i = 0u; i < kv_count; ++i)
+        host_kv[i] = bounded_value(i, UINT32_C(0x2468ace1));
+
+    TensorGuard q, low, kv, scalar_out, gemm_out;
+    CHECK((q.value = ds4_gpu_tensor_alloc(q_count * sizeof(float))) != nullptr &&
+              (low.value = ds4_gpu_tensor_alloc(
+                   low_count * sizeof(float))) != nullptr &&
+              (kv.value = ds4_gpu_tensor_alloc(kv_count * sizeof(float))) != nullptr &&
+              (scalar_out.value = ds4_gpu_tensor_alloc(
+                   out_count * sizeof(float))) != nullptr &&
+              (gemm_out.value = ds4_gpu_tensor_alloc(
+                   out_count * sizeof(float))) != nullptr &&
+              ds4_gpu_tensor_write(q.value, 0u, host_q.data(),
+                                   q_count * sizeof(float)) &&
+              ds4_gpu_tensor_write(low.value, 0u, host_low.data(),
+                                   low_count * sizeof(float)) &&
+              ds4_gpu_tensor_write(kv.value, 0u, host_kv.data(),
+                                   kv_count * sizeof(float)),
+          "allocate deterministic 256x2048 MLA attention fixture");
+
+    CHECK(unsetenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE") == 0 &&
+              unsetenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32") == 0 &&
+              ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+                  scalar_out.value, q.value, low.value, kv.value, nullptr,
+                  kTokens, kPos0, kSelected, kCacheCap, false, kHeads,
+                  kKvWidth, kQkNope, 0u, 0u,
+                  10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+          "execute scalar 256x2048 NoPE attention oracle");
+    CHECK(setenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE", "1", 1) == 0 &&
+              setenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32", "1", 1) == 0 &&
+              ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+                  gemm_out.value, q.value, low.value, kv.value, nullptr,
+                  kTokens, kPos0, kSelected, kCacheCap, false, kHeads,
+                  kKvWidth, kQkNope, 0u, 0u,
+                  10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+          "execute FP32 GEMM 256x2048 NoPE attention candidate");
+
+    std::vector<float> scalar(out_count), gemm(out_count);
+    CHECK(ds4_gpu_tensor_read(scalar_out.value, 0u, scalar.data(),
+                               out_count * sizeof(float)) &&
+              ds4_gpu_tensor_read(gemm_out.value, 0u, gemm.data(),
+                                   out_count * sizeof(float)),
+          "read scalar and GEMM long-key attention outputs");
+    const VectorError full_error = vector_error(scalar, gemm);
+
+    const uint32_t token = kTokens - 1u;
+    const float scale = 1.0f / std::sqrt((float)kQkNope);
+    std::vector<long double> probability(kSelected);
+    long double maximum = -INFINITY;
+    for (uint32_t row = 0u; row < kSelected; ++row) {
+        long double score = 0.0L;
+        for (uint32_t j = 0u; j < kKvWidth; ++j) {
+            score += (long double)host_low[(uint64_t)token * kKvWidth + j] *
+                     (long double)host_kv[(uint64_t)row * kKvWidth + j];
+        }
+        probability[row] = score * (long double)scale;
+        maximum = std::max(maximum, probability[row]);
+    }
+    long double denominator = 0.0L;
+    for (long double &value : probability) {
+        value = std::exp(value - maximum);
+        denominator += value;
+    }
+    std::vector<float> reference(kKvWidth);
+    for (uint32_t j = 0u; j < kKvWidth; ++j) {
+        long double value = 0.0L;
+        for (uint32_t row = 0u; row < kSelected; ++row) {
+            value += probability[row] *
+                     (long double)host_kv[(uint64_t)row * kKvWidth + j];
+        }
+        reference[j] = (float)(value / denominator);
+    }
+    const float *scalar_last = scalar.data() + (uint64_t)token * kKvWidth;
+    const float *gemm_last = gemm.data() + (uint64_t)token * kKvWidth;
+    const VectorError scalar_reference = vector_error_data(
+        reference.data(), scalar_last, kKvWidth);
+    const VectorError gemm_reference = vector_error_data(
+        reference.data(), gemm_last, kKvWidth);
+    const uint64_t scalar_hash = fnv64(
+        scalar.data(), scalar.size() * sizeof(float));
+    const uint64_t gemm_hash = fnv64(
+        gemm.data(), gemm.size() * sizeof(float));
+    char hash_error[256] = {};
+    CHECK(ds4_tp_hash_check(tp, UINT64_C(0x474c4d354c4b5343),
+                            scalar_hash, hash_error,
+                            sizeof(hash_error)) == 1 &&
+              ds4_tp_hash_check(tp, UINT64_C(0x474c4d354c4b474d),
+                                gemm_hash, hash_error,
+                                sizeof(hash_error)) == 1,
+          hash_error[0] ? hash_error :
+              "long-key attention outputs agree across ranks");
+    std::fprintf(stderr,
+        "GLM5 MLA long-key attention role=%s tokens=%u pos0=%u rows=%u "
+        "full_nrmse=%.9g full_cosine=%.12g full_max_abs=%.9g "
+        "scalar_fp64_nrmse=%.9g scalar_fp64_max_abs=%.9g "
+        "gemm_fp64_nrmse=%.9g gemm_fp64_max_abs=%.9g "
+        "scalar=%016llx gemm=%016llx rdma=1\n",
+        role, kTokens, kPos0, kSelected,
+        full_error.nrmse, full_error.cosine, full_error.max_abs,
+        scalar_reference.nrmse, scalar_reference.max_abs,
+        gemm_reference.nrmse, gemm_reference.max_abs,
+        (unsigned long long)scalar_hash,
+        (unsigned long long)gemm_hash);
+    CHECK(finite_error(full_error) &&
+              finite_error(scalar_reference) &&
+              finite_error(gemm_reference) &&
+              full_error.nrmse <= 1.0e-5 &&
+              full_error.cosine >= 0.9999999999 &&
+              full_error.max_abs <= 2.0e-5,
+          "FP32 GEMM long-key attention stays inside predeclared T1 bounds");
+    std::fprintf(stderr,
+        "PASS GLM5 MLA long-key attention role=%s geometry=256x2048x512 "
+        "window_cache_bytes=0 rdma=1\n", role);
+    return true;
+}
+
 bool compare_full_prompt_states(const char *role,
                                 const ds4_glm5_next_state &reference,
                                 const ds4_glm5_next_state &candidate,
@@ -945,6 +1089,13 @@ bool run() {
     CHECK(!mla_sparse_boundary_env || mla_sparse_boundary_test ||
               std::strcmp(mla_sparse_boundary_env, "0") == 0,
           "MLA sparse boundary selector is exactly 0 or 1");
+    const char *mla_longkey_env =
+        std::getenv("DS4_GLM5_MLA_LONGKEY_ATTENTION_TEST");
+    const bool mla_longkey_test = mla_longkey_env &&
+        std::strcmp(mla_longkey_env, "1") == 0;
+    CHECK(!mla_longkey_env || mla_longkey_test ||
+              std::strcmp(mla_longkey_env, "0") == 0,
+          "MLA long-key attention selector is exactly 0 or 1");
     const char *mla_batch_rows_env =
         std::getenv("DS4_GLM5_MLA_ROUTED_BATCH_ROWS");
     char *mla_batch_rows_end = nullptr;
@@ -1093,6 +1244,10 @@ bool run() {
               (!full_trunk && !text_mode && !kda_batch_test &&
                !mla_batch_test),
           "MLA sparse boundary is an isolated layer-3 gate");
+    CHECK(!mla_longkey_test ||
+              (!full_trunk && !text_mode && !kda_batch_test &&
+               !mla_batch_test && !mla_sparse_boundary_test),
+          "MLA long-key attention is an isolated component gate");
     CodecGuard codec;
     TokensGuard prompt_tokens;
     if (text_mode) {
@@ -1105,7 +1260,7 @@ bool run() {
         CHECK(prompt_tokens.value.len > 0 && prompt_tokens.value.len <= 128,
               "real chat prompt token count is bounded to tested 1..128");
     }
-    const uint32_t context_capacity = text_mode ?
+    const uint32_t context_capacity = mla_longkey_test ? 2048u : text_mode ?
         (uint32_t)prompt_tokens.value.len + text_generate :
         mla_sparse_boundary_test ? 9u :
         kda_batch_test ? kda_batch_rows + kda_continuation_rows :
@@ -1222,6 +1377,7 @@ bool run() {
         (uint64_t)mla_prefix_rows,
         (uint64_t)mla_continuation_rows,
         (uint64_t)mla_sparse_boundary_test,
+        (uint64_t)mla_longkey_test,
         (uint64_t)batch_prefill,
         (uint64_t)batch_prefill_compare,
         prompt_hash,
@@ -1318,7 +1474,7 @@ bool run() {
             (unsigned long long)(free_before_install - free_after_install));
     }
 
-    if (text_mode || kda_batch_test || mla_batch_test ||
+    if (text_mode || kda_batch_test || mla_batch_test || mla_longkey_test ||
         mla_sparse_boundary_test) {
         char ready_error[256] = {};
         CHECK(ds4_gpu_synchronize() &&
@@ -1328,6 +1484,10 @@ bool run() {
                       sizeof(ready_error)) == 1,
               ready_error[0] ? ready_error :
                   "both ranks ready after full-trunk residency");
+    }
+
+    if (mla_longkey_test) {
+        return run_mla_longkey_attention_test(role, tp.tp);
     }
 
     if (mla_sparse_boundary_test) {

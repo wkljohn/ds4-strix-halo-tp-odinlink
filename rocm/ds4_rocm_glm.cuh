@@ -3670,9 +3670,12 @@ static int glm_attention_indexed_lora_launch(
         if (!notice_printed) {
             fprintf(stderr,
                     DS4_GPU_LOG_PREFIX
-                    "GLM causal indexed prefill using fp16 "
+                    "GLM causal indexed prefill using %s "
                     DS4_GPU_BLAS_NAME
                     " attention GEMMs (tokens=%u rows=%u cache=%s)\n",
+                    qk_rope == 0u && cuda_env_present(getenv(
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32")) ?
+                        "fp32" : "fp16",
                     n_tokens,
                     n_selected,
                     cache_f16 ? "f16" : "f32");
