@@ -385,6 +385,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--teacher-force-logits-dir DIR", "Write full-vocabulary logits before every frozen teacher token.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
+    opt(fp, c, "--dump-generated-token-file FILE", "Write generated token IDs for a single fixed-frontier diagnostic.");
     fputc('\n', fp);
 }
 

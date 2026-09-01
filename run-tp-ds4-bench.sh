@@ -150,6 +150,7 @@ ALLOW_NONSTANDARD_SPLIT=${DS4_BENCH_ALLOW_NONSTANDARD_SPLIT:-0}
 ALLOW_GLM_BATCH1=${DS4_BENCH_ALLOW_GLM_BATCH1:-0}
 VALIDATE_CONFIG_ONLY=${DS4_BENCH_VALIDATE_CONFIG_ONLY:-0}
 DUMP_FRONTIER_LOGITS_DIR=${DS4_BENCH_DUMP_FRONTIER_LOGITS_DIR:-}
+DUMP_GENERATED_TOKEN_FILE=${DS4_BENCH_DUMP_GENERATED_TOKEN_FILE:-}
 FROZEN_TOKEN_FILE=${DS4_BENCH_FROZEN_TOKEN_FILE:-}
 FROZEN_LOGITS_DIR=${DS4_BENCH_FROZEN_LOGITS_DIR:-}
 DECLARED_TOOLCHAIN_ID=${DS4_BENCH_TOOLCHAIN_ID:-}
@@ -531,6 +532,22 @@ if [[ -n $DUMP_FRONTIER_LOGITS_DIR ]]; then
   mkdir -p "$DUMP_FRONTIER_LOGITS_DIR"
   COORD_ARGS+=(--dump-frontier-logits-dir "$DUMP_FRONTIER_LOGITS_DIR")
 fi
+if [[ -n $DUMP_GENERATED_TOKEN_FILE ]]; then
+  case $DUMP_GENERATED_TOKEN_FILE in
+    "$DS4_RESEARCH_ROOT"/*) ;;
+    *) echo "error: generated-token file must be under $DS4_RESEARCH_ROOT" >&2; exit 2 ;;
+  esac
+  [[ $FRONTIER == "$FRONTIER_MAX" && $TOKENS -gt 0 ]] || {
+    echo "error: generated-token export requires one fixed frontier and positive generation" >&2
+    exit 2
+  }
+  [[ $CANDIDATE == 0 && ! -e $DUMP_GENERATED_TOKEN_FILE ]] || {
+    echo "error: generated-token export is diagnostic-only and must not overwrite evidence" >&2
+    exit 2
+  }
+  mkdir -p "$(dirname -- "$DUMP_GENERATED_TOKEN_FILE")"
+  COORD_ARGS+=(--dump-generated-token-file "$DUMP_GENERATED_TOKEN_FILE")
+fi
 if [[ -n $FROZEN_TOKEN_FILE ]]; then
   [[ -r $FROZEN_TOKEN_FILE ]] || {
     echo "error: missing frozen token file: $FROZEN_TOKEN_FILE" >&2
@@ -723,6 +740,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'prompt=%s\n' "$PROMPT_FILE"
   printf 'prompt_size=%s\n' "$PROMPT_SIZE"
   printf 'prompt_sha256=%s\n' "$PROMPT_HASH"
+  printf 'dump_generated_token_file=%s\n' "$DUMP_GENERATED_TOKEN_FILE"
   printf 'frozen_token_file=%s\n' "$FROZEN_TOKEN_FILE"
   printf 'frozen_token_sha256=%s\n' "$FROZEN_TOKEN_HASH"
   printf 'frozen_logits_dir=%s\n' "$FROZEN_LOGITS_DIR"
@@ -1004,6 +1022,22 @@ if [[ -n $FROZEN_TOKEN_FILE ]]; then
   echo "frozen_logits_manifest=$FROZEN_LOGITS_DIR/manifest"
   echo "TP_FROZEN_TEACHER_LOGITS_RECORDED_NOT_BENCHMARKED"
   exit 0
+fi
+if [[ -n $DUMP_GENERATED_TOKEN_FILE ]]; then
+  DUMP_GENERATED_TOKEN_COUNT=$(wc -l < "$DUMP_GENERATED_TOKEN_FILE")
+  [[ $DUMP_GENERATED_TOKEN_COUNT == "$TOKENS" ]] || {
+    echo "error: generated-token file count mismatch: expected=$TOKENS actual=$DUMP_GENERATED_TOKEN_COUNT" >&2
+    exit 1
+  }
+  awk 'BEGIN { ok=1 } !/^[0-9]+$/ { ok=0 } END { exit !ok }' \
+    "$DUMP_GENERATED_TOKEN_FILE" || {
+      echo "error: generated-token file contains a malformed token ID" >&2
+      exit 1
+    }
+  DUMP_GENERATED_TOKEN_SHA256=$(sha256sum "$DUMP_GENERATED_TOKEN_FILE" |
+    awk '{print $1}')
+  printf 'dump_generated_token_sha256=%s\n' \
+    "$DUMP_GENERATED_TOKEN_SHA256" >> "$MANIFEST"
 fi
 "$REPO/scripts/check-ds4-bench-result.sh" \
   "$CSV" "$COORD_LOG" "$WORKER_LOG" "$EXPECTED_FNV64" "$TOKENS" "$CANDIDATE" \
