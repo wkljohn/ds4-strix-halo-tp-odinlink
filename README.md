@@ -77,15 +77,23 @@ documented optional DSpark drafter.
 
 ## Quick start
 
-Both nodes need ROCm support for `gfx1151`, passwordless SSH between them, and
-their own local copy of the same repository commit and GGUF at the same
-absolute paths. Their filesystems are not shared.
+Both nodes need ROCm support for `gfx1151`, passwordless SSH from the
+coordinator to the worker, and their own local copy of the same repository
+commit and GGUF at the same absolute paths. Their filesystems are not shared.
+
+Follow [DS4 on Strix Halo](STRIXHALO.md) for the Ubuntu 26.04 ROCm 7.14
+tarball, rocWMMA header isolation, memory-layout decision, Secure Boot check,
+and coordinator-to-worker SSH setup. Ubuntu 26.04 apt currently supplies ROCm
+7.1; it is not a substitute for the validated 7.14 bundle.
 
 Build on both nodes:
 
 ```sh
 git clone https://github.com/wkljohn/ds4-strix-halo-tp-odinlink.git
 cd ds4-strix-halo-tp-odinlink
+HIP_PATH=/absolute/path/to/rocm-7.14.0 \
+CPATH=/absolute/path/to/rocm-7.14.0/include \
+CPLUS_INCLUDE_PATH=/absolute/path/to/rocm-7.14.0/include \
 DS4_ROCM_HOME=/absolute/path/to/rocm-7.14.0 \
   make -j"$(nproc)" strix-halo
 ```
@@ -129,16 +137,19 @@ validated userspace provider is pinned below:
 
 ```sh
 sudo apt install build-essential cmake linux-headers-"$(uname -r)" \
-  libibverbs-dev rdma-core pkg-config
+  libibverbs-dev rdma-core pkg-config libglib2.0-dev
 git clone https://github.com/wkljohn/OdinLink-Five.git
 git -C OdinLink-Five checkout 8a77ccbf051b5a615a2b4d9a75ede10af524614a
 cmake -S OdinLink-Five -B OdinLink-Five/build \
-  -DBUILD_VERBS=ON -DBUILD_TRAY=OFF
+  -DBUILD_VERBS=ON -DBUILD_DAEMON=ON -DBUILD_TRAY=OFF
 cmake --build OdinLink-Five/build -j"$(nproc)" \
-  --target odl_tb5_verbs odl_tb5_verbs_provider
+  --target driver odl_tb5_cli odl_tb5_verbs odl_tb5_verbs_provider
 ```
 
-After loading the driver, verify the device and link before loading the model:
+Disable Secure Boot or enroll a trusted module-signing key before loading the
+out-of-tree driver. Load it on both nodes; the character device is created only
+after both peers advertise the OdinLink Thunderbolt service. Then verify the
+device and link before loading the model:
 
 ```sh
 ls -l /dev/odl_tb5_0
