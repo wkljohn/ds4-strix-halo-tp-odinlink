@@ -168,6 +168,7 @@ struct Arm {
     std::vector<float> half_grouped;
     std::vector<float> gpu_full;
     std::vector<float> gpu_kslice;
+    std::vector<float> gpu_rowslice;
 };
 
 bool load_arm(const std::string &root, const char *name, Arm &arm) {
@@ -219,8 +220,11 @@ bool replay_gpu(const Glm5TestGGUF &gguf, uint64_t weight_offset, Arm &arm) {
     ds4_gpu_tensor *full_y = tensors.f32(kOut);
     ds4_gpu_tensor *partial[2] = {tensors.f32(kOut), tensors.f32(kOut)};
     ds4_gpu_tensor *sum = tensors.f32(kOut);
+    ds4_gpu_tensor *row_half[2] = {tensors.f32(kOut / 2u),
+                                   tensors.f32(kOut / 2u)};
     CHECK(full_x && half_x[0] && half_x[1] && full_y && partial[0] &&
-          partial[1] && sum, "allocate real activation replay tensors");
+          partial[1] && sum && row_half[0] && row_half[1],
+          "allocate real activation replay tensors");
     CHECK(ds4_gpu_tensor_write(full_x, 0u, arm.input.data(),
                                kFull * sizeof(float)) &&
           ds4_gpu_tensor_write(half_x[0], 0u, arm.input.data(),
@@ -237,16 +241,34 @@ bool replay_gpu(const Glm5TestGGUF &gguf, uint64_t weight_offset, Arm &arm) {
           ds4_gpu_matmul_bf16_kslice_rows_tensor(
               partial[1], gguf.map, gguf.size, weight_offset,
               kFull, kOut, kHalf, kHalf, half_x[1], 1u) &&
+          /* Output-row oracle: use the existing full-K kernel twice, with
+           * only a row-aligned weight/output offset.  This intentionally
+           * contains no TP or production-graph change. */
+          ds4_gpu_matmul_bf16_tensor(
+              row_half[0], gguf.map, gguf.size, weight_offset,
+              kFull, kOut / 2u, full_x, 1u) &&
+          ds4_gpu_matmul_bf16_tensor(
+              row_half[1], gguf.map, gguf.size,
+              weight_offset + (uint64_t)(kOut / 2u) * kFull * sizeof(uint16_t),
+              kFull, kOut / 2u, full_x, 1u) &&
           ds4_gpu_add_tensor(sum, partial[0], partial[1], kOut) &&
           ds4_gpu_synchronize(),
           "execute real activation full and K-slice replay");
     arm.gpu_full.resize(kOut);
     arm.gpu_kslice.resize(kOut);
+    arm.gpu_rowslice.resize(kOut);
+    std::vector<float> row0(kOut / 2u), row1(kOut / 2u);
     CHECK(ds4_gpu_tensor_read(full_y, 0u, arm.gpu_full.data(),
                               kOut * sizeof(float)) &&
           ds4_gpu_tensor_read(sum, 0u, arm.gpu_kslice.data(),
-                              kOut * sizeof(float)),
+                              kOut * sizeof(float)) &&
+          ds4_gpu_tensor_read(row_half[0], 0u, row0.data(),
+                              (kOut / 2u) * sizeof(float)) &&
+          ds4_gpu_tensor_read(row_half[1], 0u, row1.data(),
+                              (kOut / 2u) * sizeof(float)),
           "read real activation GPU replay");
+    std::copy(row0.begin(), row0.end(), arm.gpu_rowslice.begin());
+    std::copy(row1.begin(), row1.end(), arm.gpu_rowslice.begin() + kOut / 2u);
     if (std::getenv("DS4_GLM5_KDA_BENCHMARK") != nullptr) {
         constexpr uint32_t kWarmup = 8u;
         constexpr uint32_t kRepeats = 64u;
@@ -338,9 +360,12 @@ bool report_arm(const Arm &arm, bool captured_is_kslice) {
                 compare(arm.half_grouped, arm.gpu_full));
     print_stats(arm.name.c_str(), "kslice-vs-half-grouped",
                 compare(arm.half_grouped, arm.gpu_kslice));
+    print_stats(arm.name.c_str(), "rowslice-vs-full",
+                compare(arm.gpu_full, arm.gpu_rowslice));
     print_stats(arm.name.c_str(), "full-vs-kslice",
                 compare(arm.gpu_full, arm.gpu_kslice));
     print_exact(arm.name.c_str(), arm.gpu_full, arm.gpu_kslice);
+    print_exact(arm.name.c_str(), arm.gpu_full, arm.gpu_rowslice);
     const std::vector<float> &replay =
         captured_is_kslice ? arm.gpu_kslice : arm.gpu_full;
     const Stats captured_replay = compare(replay, arm.captured);
