@@ -134,6 +134,10 @@ if [[ -n $TEACHER_LOGITS_DIR ]]; then
       EXPECTED_KDA_TP=1; EXPECTED_KDA_KSLICE=1 ;;
     attn-scalar)
       EXPECTED_KDA_TP=1; EXPECTED_KDA_KSLICE=0
+      [[ " ${EXTRA_ENV[*]} " == *' DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT=0 '* ]] || {
+        echo "error: attn-scalar teacher arm requires exact-split rollback" >&2
+        exit 2
+      }
       [[ " ${EXTRA_ENV[*]} " != *' DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE='* &&
          " ${EXTRA_ENV[*]} " != *' DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32='* ]] || {
         echo "error: attn-scalar teacher arm forbids NoPE GEMM selectors" >&2
@@ -141,9 +145,24 @@ if [[ -n $TEACHER_LOGITS_DIR ]]; then
       } ;;
     attn-gemm-f32)
       EXPECTED_KDA_TP=1; EXPECTED_KDA_KSLICE=0
+      [[ " ${EXTRA_ENV[*]} " == *' DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT=0 '* ]] || {
+        echo "error: attn-gemm-f32 teacher arm requires exact-split rollback" >&2
+        exit 2
+      }
       [[ " ${EXTRA_ENV[*]} " == *' DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE=1 '* &&
          " ${EXTRA_ENV[*]} " == *' DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32=1 '* ]] || {
         echo "error: attn-gemm-f32 teacher arm requires both NoPE GEMM selectors" >&2
+        exit 2
+      } ;;
+    attn-exact-split)
+      EXPECTED_KDA_TP=1; EXPECTED_KDA_KSLICE=0
+      [[ " ${EXTRA_ENV[*]} " != *' DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT=0 '* &&
+         " ${EXTRA_ENV[*]} " != *' DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE='* &&
+         " ${EXTRA_ENV[*]} " != *' DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32='* &&
+         " ${EXTRA_ENV[*]} " != *' DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV='* &&
+         " ${EXTRA_ENV[*]} " != *' DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR='* &&
+         " ${EXTRA_ENV[*]} " != *' DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR='* ]] || {
+        echo "error: attn-exact-split teacher arm requires the unmodified default" >&2
         exit 2
       } ;;
     *)
@@ -389,7 +408,7 @@ if [[ " ${EXTRA_ENV[*]} " == *' DS4_GLM5_KDA_OUTPUT_KSLICE=1 '* ]]; then
     }
   done
 fi
-if [[ $TEACHER_ARM == attn-gemm-f32 ]]; then
+if [[ $TEACHER_ARM == attn-gemm-f32 || $TEACHER_ARM == attn-exact-split ]]; then
   for log in "$COORD_LOG" "$WORKER_LOG"; do
     grep -Eq 'GLM causal indexed prefill using fp32([-a-z]+)? .* attention GEMMs' "$log" || {
       echo "error: FP32 NoPE GEMM teacher arm never engaged in $log" >&2

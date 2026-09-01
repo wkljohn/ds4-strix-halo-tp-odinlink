@@ -48,13 +48,15 @@ def score_manifest(path: Path, *, arm: str,
                    fallback_mlp64: bool = False,
                    attention_f32_gemm: bool = False,
                    attention_repair: str | None = None,
-                   attention_repairs: tuple[str, ...] = ()) -> None:
+                   attention_repairs: tuple[str, ...] = (),
+                   attention_exact_split: str | None = None) -> None:
     selectors = {
         "kda-off": ("0", "0"),
         "kda-tp": ("1", "0"),
         "kda-kslice": ("1", "1"),
         "attn-scalar": ("1", "0"),
         "attn-gemm-f32": ("1", "0"),
+        "attn-exact-split": ("1", "0"),
     }
     kda_tp, kslice = selectors[arm]
     fields = {
@@ -83,7 +85,9 @@ def score_manifest(path: Path, *, arm: str,
                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32=1 "
                        if attention_f32_gemm else "") +
                       (f"{attention_repair}=1 " if attention_repair else "") +
-                      "".join(f"{repair}=1 " for repair in attention_repairs)),
+                      "".join(f"{repair}=1 " for repair in attention_repairs) +
+                      (f"DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT={attention_exact_split} "
+                       if attention_exact_split is not None else "")),
         "coordinator_features": (f"GLM5 TP features: kda_tp={kda_tp} "
                                  f"kda_output_kslice={kslice}"),
         "worker_features": (f"GLM5 TP features: kda_tp={kda_tp} "
@@ -337,6 +341,14 @@ def main() -> int:
             str(reference), str(candidate), "--score-arm-mode",
             "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar")
         assert score_pv_scalar.returncode == 0, score_pv_scalar.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar",
+                       attention_exact_split="0")
+        score_manifest(candidate / "manifest", arm="attn-exact-split")
+        exact_split = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-exact-split")
+        assert exact_split.returncode == 0, exact_split.stderr
 
         score_manifest(reference / "manifest", arm="attn-scalar")
         score_manifest(candidate / "manifest", arm="attn-scalar")

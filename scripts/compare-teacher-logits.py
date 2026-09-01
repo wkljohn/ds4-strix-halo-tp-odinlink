@@ -223,6 +223,7 @@ def main() -> int:
             "attn-scalar-vs-f32-gemm-postdiv-pv-scalar",
             "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math",
             "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar",
+            "attn-scalar-vs-exact-split",
             "attn-repeat"),
         help="required arm relationship for score_official GLM5 diagnostics")
     args = parser.parse_args()
@@ -290,6 +291,8 @@ def main() -> int:
                     ("attn-scalar", "attn-gemm-f32"),
                 "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar":
                     ("attn-scalar", "attn-gemm-f32"),
+                "attn-scalar-vs-exact-split":
+                    ("attn-scalar", "attn-exact-split"),
                 "attn-repeat": ("attn-scalar", "attn-scalar"),
             }[args.score_arm_mode]
             actual_arms = (reference_manifest.get("teacher_arm"),
@@ -331,6 +334,24 @@ def main() -> int:
                         "fallback-vs-kslice requires the independent BF16 "
                         "fallback only in the reference arm")
                 selectors.add(fallback_key)
+            elif args.score_arm_mode == "attn-scalar-vs-exact-split":
+                exact_key = "DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT"
+                research_keys = {
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC",
+                }
+                if ref_env.get(exact_key) != "0" or exact_key in cand_env or \
+                        any(key in ref_env or key in cand_env
+                            for key in research_keys):
+                    raise ValueError(
+                        "exact-split comparison requires rollback only in the "
+                        "scalar arm and no research selectors")
+                selectors.add(exact_key)
             elif args.score_arm_mode.startswith("attn-scalar-vs-f32-gemm"):
                 nope_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE"
                 f32_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32"
@@ -436,6 +457,7 @@ def main() -> int:
                 "kda-kslice": ("1", "1"),
                 "attn-scalar": ("1", "0"),
                 "attn-gemm-f32": ("1", "0"),
+                "attn-exact-split": ("1", "0"),
             }
             for manifest, env, arm in (
                     (reference_manifest, ref_env, actual_arms[0]),

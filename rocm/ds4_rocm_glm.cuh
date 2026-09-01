@@ -2443,6 +2443,17 @@ __global__ static void glm_causal_gemm_score_scalar_f32_kernel(
     }
 }
 
+static bool glm_causal_attn_exact_split_enabled(void) {
+    const char *env =
+        getenv("DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT");
+    if (env != NULL) return cuda_env_present(env);
+#if defined(DS4_GFX1151_WAVE32)
+    return true;
+#else
+    return false;
+#endif
+}
+
 __global__ static void glm_causal_gemm_softmax_f16_kernel(
         __half *probs,
         float *scores,
@@ -3034,21 +3045,23 @@ static int glm_attention_indexed_lora_causal_gemm(
         float attn_factor,
         float beta_fast,
         float beta_slow) {
+    const bool exact_split = qk_rope == 0u &&
+        glm_causal_attn_exact_split_enabled();
     const bool nope_f32 = qk_rope == 0u &&
-        cuda_env_present(
-            getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32"));
+        (exact_split || cuda_env_present(
+            getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32")));
     const bool nope_f32_postdiv = nope_f32 &&
-        cuda_env_present(getenv(
-            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV"));
+        (exact_split || cuda_env_present(getenv(
+            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV")));
     const bool nope_f32_default_math = nope_f32 &&
         cuda_env_present(getenv(
             "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH"));
     const bool nope_f32_pv_scalar = nope_f32 &&
-        cuda_env_present(getenv(
-            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR"));
+        (exact_split || cuda_env_present(getenv(
+            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR")));
     const bool nope_f32_score_scalar = nope_f32 &&
-        cuda_env_present(getenv(
-            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR"));
+        (exact_split || cuda_env_present(getenv(
+            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR")));
     if (!g_cublas_ready || !lora_out || !q || !qk_low ||
         !kv_lora_cache || (qk_rope != 0u && !k_rope_cache) ||
         (nope_f32 && cache_f16) ||
@@ -3953,6 +3966,8 @@ static int glm_attention_indexed_lora_launch(
         getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM");
     const char *causal_attn_gemm_nope_env =
         getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE");
+    const bool causal_attn_exact_split = qk_rope == 0u &&
+        glm_causal_attn_exact_split_enabled();
     bool causal_attn_nope_pos_enabled = true;
     const char *causal_attn_nope_min_pos_text =
         getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_MIN_POS0");
@@ -3975,7 +3990,8 @@ static int glm_attention_indexed_lora_launch(
             "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32")) &&
         cuda_env_present(getenv("DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE"));
     const bool causal_attn_gemm_geometry = qk_rope != 0u ||
-        (cuda_env_present(causal_attn_gemm_nope_env) &&
+        ((causal_attn_exact_split ||
+          cuda_env_present(causal_attn_gemm_nope_env)) &&
          causal_attn_nope_pos_enabled);
     if (causal_attn_gemm_geometry && causal_range && !has_selected &&
         (causal_attn_gemm_env == NULL ||
@@ -4029,6 +4045,8 @@ static int glm_attention_indexed_lora_launch(
                     "GLM causal indexed prefill using %s "
                     DS4_GPU_BLAS_NAME
                     " attention GEMMs (tokens=%u rows=%u cache=%s)\n",
+                    causal_attn_exact_split ?
+                        "fp32-postdiv-score-pv-scalar" :
                     qk_rope == 0u && cuda_env_present(getenv(
                         "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32")) ?
                         (cuda_env_present(getenv(
