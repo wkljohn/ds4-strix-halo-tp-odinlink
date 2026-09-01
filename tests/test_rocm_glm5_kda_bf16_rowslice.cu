@@ -1,6 +1,7 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 extern "C" {
+#include "ds4_glm5_next_runtime.h"
 #include "ds4_tp.h"
 }
 #include "tests/glm5_gguf_test.hpp"
@@ -550,6 +551,167 @@ bool benchmark_output_rowslice(const Glm5TestGGUF &gguf,
     return true;
 }
 
+bool benchmark_decode_qkv_half(const Glm5TestGGUF &gguf,
+                               const char *name,
+                               uint64_t weight_offset) {
+    constexpr uint32_t kIn = 4096u;
+    constexpr uint32_t kFullOut = 8192u;
+    constexpr uint32_t kLocalOut = kFullOut / 2u;
+    std::vector<float> host_input(kIn);
+    for (uint32_t i = 0u; i < kIn; ++i) {
+        const int32_t centered =
+            (int32_t)(((uint64_t)i * 193u + 17u) % 1021u) - 510;
+        host_input[i] = (float)centered * (1.0f / 4096.0f) +
+            0.0078125f * std::sin((double)i * 0.019);
+    }
+
+    Tensors tensors;
+    ds4_gpu_tensor *input = tensors.f32(kIn);
+    ds4_gpu_tensor *output[2] = {
+        tensors.f32(kLocalOut), tensors.f32(kLocalOut),
+    };
+    CHECK(input && output[0] && output[1],
+          "allocate BF16 decode-QKV benchmark tensors");
+    CHECK(ds4_gpu_tensor_write(input, 0u, host_input.data(),
+                               (uint64_t)kIn * sizeof(float)),
+          "upload BF16 decode-QKV benchmark input");
+    const uint64_t local_weight_bytes =
+        (uint64_t)kLocalOut * kIn * sizeof(uint16_t);
+    const auto launch = [&](uint32_t rank) {
+        return rank < 2u && ds4_gpu_matmul_bf16_tensor(
+            output[rank], gguf.map, gguf.size,
+            weight_offset + (uint64_t)rank * local_weight_bytes,
+            kIn, kLocalOut, input, 1u) != 0;
+    };
+    CHECK(launch(0u) && launch(1u) && ds4_gpu_synchronize(),
+          "execute BF16 decode-QKV benchmark identity arms");
+    std::vector<float> host_output[2] = {
+        std::vector<float>(kLocalOut), std::vector<float>(kLocalOut),
+    };
+    CHECK(ds4_gpu_tensor_read(output[0], 0u, host_output[0].data(),
+                              (uint64_t)kLocalOut * sizeof(float)) &&
+          ds4_gpu_tensor_read(output[1], 0u, host_output[1].data(),
+                              (uint64_t)kLocalOut * sizeof(float)),
+          "read BF16 decode-QKV benchmark outputs");
+
+    constexpr uint32_t warmup = 16u;
+    constexpr uint32_t repeats = 256u;
+    const auto time_rank = [&](uint32_t rank) -> double {
+        for (uint32_t i = 0u; i < warmup; ++i)
+            CHECK(launch(rank), "warm BF16 decode-QKV timing arm");
+        hipEvent_t begin = nullptr, end = nullptr;
+        CHECK(hipEventCreate(&begin) == hipSuccess &&
+              hipEventCreate(&end) == hipSuccess &&
+              hipEventRecord(begin) == hipSuccess,
+              "create BF16 decode-QKV timing events");
+        for (uint32_t i = 0u; i < repeats; ++i)
+            CHECK(launch(rank), "launch BF16 decode-QKV timing arm");
+        CHECK(hipEventRecord(end) == hipSuccess &&
+              hipEventSynchronize(end) == hipSuccess,
+              "complete BF16 decode-QKV timing events");
+        float elapsed_ms = 0.0f;
+        CHECK(hipEventElapsedTime(&elapsed_ms, begin, end) == hipSuccess &&
+              hipEventDestroy(end) == hipSuccess &&
+              hipEventDestroy(begin) == hipSuccess,
+              "read BF16 decode-QKV timing events");
+        return (double)elapsed_ms / repeats;
+    };
+    const double ms[2] = {time_rank(0u), time_rank(1u)};
+    const double weight_gb = (double)local_weight_bytes / 1.0e9;
+    std::fprintf(stderr,
+        "MEASURE GLM5 BF16 decode-QKV tensor=%s shape=%ux%u "
+        "rank0_ms=%.6f rank1_ms=%.6f critical_ms=%.6f "
+        "rank0_gbps=%.3f rank1_gbps=%.3f "
+        "rank0_fnv=%016llx rank1_fnv=%016llx repeats=%u\n",
+        name, kIn, kLocalOut, ms[0], ms[1], std::max(ms[0], ms[1]),
+        weight_gb / (ms[0] / 1000.0), weight_gb / (ms[1] / 1000.0),
+        (unsigned long long)fnv1a64(
+            host_output[0].data(), (uint64_t)kLocalOut * sizeof(float)),
+        (unsigned long long)fnv1a64(
+            host_output[1].data(), (uint64_t)kLocalOut * sizeof(float)),
+        repeats);
+    return ms[0] > 0.0 && ms[1] > 0.0;
+}
+
+bool benchmark_decode_qkv_stream(const Glm5TestGGUF &gguf,
+                                 const std::vector<uint64_t> &offsets) {
+    constexpr uint32_t kIn = 4096u;
+    constexpr uint32_t kLocalOut = 4096u;
+    const uint64_t local_weight_bytes =
+        (uint64_t)kLocalOut * kIn * sizeof(uint16_t);
+    CHECK(offsets.size() == 102u,
+          "34-layer GLM5 KDA Q/K/V stream geometry");
+    std::vector<float> host_input(kIn);
+    for (uint32_t i = 0u; i < kIn; ++i) {
+        const int32_t centered =
+            (int32_t)(((uint64_t)i * 193u + 17u) % 1021u) - 510;
+        host_input[i] = (float)centered * (1.0f / 4096.0f) +
+            0.0078125f * std::sin((double)i * 0.019);
+    }
+    Tensors tensors;
+    ds4_gpu_tensor *input = tensors.f32(kIn);
+    ds4_gpu_tensor *output = tensors.f32(kLocalOut);
+    CHECK(input && output &&
+          ds4_gpu_tensor_write(input, 0u, host_input.data(),
+                               (uint64_t)kIn * sizeof(float)),
+          "allocate and upload BF16 decode-QKV stream tensors");
+    const auto launch_stream = [&](uint32_t rank) {
+        if (rank > 1u) return false;
+        for (uint64_t offset : offsets) {
+            if (!ds4_gpu_matmul_bf16_tensor(
+                    output, gguf.map, gguf.size,
+                    offset + (uint64_t)rank * local_weight_bytes,
+                    kIn, kLocalOut, input, 1u)) return false;
+        }
+        return true;
+    };
+    /* One complete 3.42 GB/rank traversal faults in every required model
+     * range but is far larger than the cache hierarchy.  Subsequent repeats
+     * therefore model production's layer-to-layer stream instead of the
+     * misleading 32 MiB single-matrix cache loop above. */
+    CHECK(launch_stream(0u) && launch_stream(1u) && ds4_gpu_synchronize(),
+          "warm complete BF16 decode-QKV stream");
+    constexpr uint32_t repeats = 4u;
+    const auto time_rank = [&](uint32_t rank) -> double {
+        hipEvent_t begin = nullptr, end = nullptr;
+        CHECK(hipEventCreate(&begin) == hipSuccess &&
+              hipEventCreate(&end) == hipSuccess &&
+              hipEventRecord(begin) == hipSuccess,
+              "create BF16 decode-QKV stream timing events");
+        for (uint32_t i = 0u; i < repeats; ++i)
+            CHECK(launch_stream(rank), "launch BF16 decode-QKV stream arm");
+        CHECK(hipEventRecord(end) == hipSuccess &&
+              hipEventSynchronize(end) == hipSuccess,
+              "complete BF16 decode-QKV stream timing events");
+        float elapsed_ms = 0.0f;
+        CHECK(hipEventElapsedTime(&elapsed_ms, begin, end) == hipSuccess &&
+              hipEventDestroy(end) == hipSuccess &&
+              hipEventDestroy(begin) == hipSuccess,
+              "read BF16 decode-QKV stream timing events");
+        return (double)elapsed_ms / repeats;
+    };
+    const double ms[2] = {time_rank(0u), time_rank(1u)};
+    CHECK(ds4_gpu_synchronize(), "finish BF16 decode-QKV stream benchmark");
+    std::vector<float> host_output(kLocalOut);
+    CHECK(ds4_gpu_tensor_read(output, 0u, host_output.data(),
+                              (uint64_t)kLocalOut * sizeof(float)),
+          "read BF16 decode-QKV stream terminal output");
+    const double stream_gb =
+        (double)(local_weight_bytes * offsets.size()) / 1.0e9;
+    std::fprintf(stderr,
+        "DECISION GLM5 BF16 decode-QKV stream projections=%zu "
+        "bytes_gb=%.6f rank0_ms=%.6f rank1_ms=%.6f critical_ms=%.6f "
+        "rank0_gbps=%.3f rank1_gbps=%.3f terminal_fnv=%016llx "
+        "repeats=%u\n",
+        offsets.size(), stream_gb, ms[0], ms[1],
+        std::max(ms[0], ms[1]),
+        stream_gb / (ms[0] / 1000.0), stream_gb / (ms[1] / 1000.0),
+        (unsigned long long)fnv1a64(
+            host_output.data(), (uint64_t)kLocalOut * sizeof(float)),
+        repeats);
+    return ms[0] > 0.0 && ms[1] > 0.0;
+}
+
 bool run_test() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     CHECK(model && model[0], "DS4_GLM5_MODEL environment");
@@ -577,6 +739,24 @@ bool run_test() {
           gguf.tensor("blk.0.kda_dt_bias.weight", {8192u}, 0u, dt_bias) &&
           gguf.tensor("blk.0.kda_a_log.weight", {64u}, 0u, a_log),
           "bind real layer-0 KDA head-local tensors");
+
+    std::vector<uint64_t> qkv_stream;
+    for (uint32_t il = 0u; il < DS4_GLM5_NEXT_TRUNK_COUNT; ++il) {
+        if (ds4_glm5_next_layer_is_mla(il)) continue;
+        for (const char *suffix : {"kda_q", "kda_k", "kda_v"}) {
+            char tensor_name[64];
+            const int written = std::snprintf(
+                tensor_name, sizeof(tensor_name), "blk.%u.%s.weight",
+                il, suffix);
+            uint64_t offset = 0u;
+            CHECK(written > 0 && (size_t)written < sizeof(tensor_name) &&
+                  gguf.tensor(tensor_name, {4096u, 8192u}, 30u, offset),
+                  "bind complete GLM5 KDA Q/K/V stream");
+            qkv_stream.push_back(offset);
+        }
+    }
+    CHECK(qkv_stream.size() == 102u,
+          "bind exactly 34 GLM5 KDA Q/K/V triples");
 
     const auto check_f32_halves = [&](const char *name, uint64_t offset,
                                       uint64_t values) {
@@ -618,6 +798,17 @@ bool run_test() {
           ds4_gpu_set_model_map(gguf.map, gguf.size),
           "initialize gfx1151 and register GLM5 model map");
     runtime.active = true;
+
+    if (std::getenv("DS4_GLM5_KDA_BF16_DECODE_BENCH_ONLY") != nullptr) {
+        CHECK(benchmark_decode_qkv_half(gguf, "kda_q", q) &&
+              benchmark_decode_qkv_half(gguf, "kda_k", k) &&
+              benchmark_decode_qkv_half(gguf, "kda_v", v) &&
+              benchmark_decode_qkv_stream(gguf, qkv_stream),
+              "GLM5 BF16 decode-QKV geometry benchmark");
+        std::fprintf(stderr,
+                     "PASS GLM5 BF16 decode-QKV benchmark-only gate\n");
+        return true;
+    }
 
     for (uint32_t tokens : {1u, 3u, 4u, 33u}) {
         CHECK(run_shape(gguf, "kda_q", q, 4096u, 8192u, tokens),

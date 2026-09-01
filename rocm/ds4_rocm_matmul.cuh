@@ -1572,14 +1572,92 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
     if (n_tok == 1u && in_dim <= 8192u &&
         in_dim * sizeof(float) <= 65536u &&
         getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") == NULL) {
-        const uint32_t rows_per_block = 32u;
+        static const char *decode_qkv_prefetch_value =
+            getenv("DS4_ROCM_GLM5_BF16_QKV_PREFETCH");
+        static const char *decode_qkv_rows_value =
+            getenv("DS4_ROCM_GLM5_BF16_QKV_ROWS_PER_BLOCK");
+        static const char *decode_qkv_nontemporal_value =
+            getenv("DS4_ROCM_GLM5_BF16_QKV_NONTEMPORAL");
+        static const uint32_t decode_qkv_prefetch =
+            decode_qkv_prefetch_value == NULL ? 0u :
+            strcmp(decode_qkv_prefetch_value, "0") == 0 ? 0u :
+            strcmp(decode_qkv_prefetch_value, "4") == 0 ? 4u :
+            strcmp(decode_qkv_prefetch_value, "8") == 0 ? 8u :
+            strcmp(decode_qkv_prefetch_value, "16") == 0 ? 16u :
+            strcmp(decode_qkv_prefetch_value, "32") == 0 ? 32u :
+            strcmp(decode_qkv_prefetch_value, "64") == 0 ? 64u : UINT32_MAX;
+        static const int decode_qkv_prefetch_valid =
+            decode_qkv_prefetch != UINT32_MAX;
+        static const int decode_qkv_nontemporal =
+            decode_qkv_nontemporal_value != NULL &&
+            strcmp(decode_qkv_nontemporal_value, "1") == 0;
+        static const int decode_qkv_nontemporal_valid =
+            decode_qkv_nontemporal_value == NULL ||
+            strcmp(decode_qkv_nontemporal_value, "0") == 0 ||
+            decode_qkv_nontemporal;
+        static const uint32_t decode_qkv_rows_per_block =
+            decode_qkv_rows_value == NULL ? 32u :
+            strcmp(decode_qkv_rows_value, "8") == 0 ? 8u :
+            strcmp(decode_qkv_rows_value, "16") == 0 ? 16u :
+            strcmp(decode_qkv_rows_value, "32") == 0 ? 32u : 0u;
+        if (!decode_qkv_prefetch_valid || !decode_qkv_nontemporal_valid ||
+            (decode_qkv_nontemporal && decode_qkv_prefetch == 0u) ||
+            decode_qkv_rows_per_block == 0u) {
+            static int invalid_reported;
+            if (!invalid_reported) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "invalid GLM5 BF16 QKV exact-order research selector\n");
+                invalid_reported = 1;
+            }
+            return 0;
+        }
+        const int decode_qkv_shape = in_dim == 4096u && out_dim == 4096u;
+        const uint32_t rows_per_block = decode_qkv_shape
+            ? decode_qkv_rows_per_block : 32u;
         static const int decode_mlp64_disabled =
             getenv("DS4_ROCM_DISABLE_BF16_DECODE_MLP64") != NULL;
         const dim3 grid(
             ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block);
         const dim3 block(rows_per_block * 32u);
         const size_t shared_bytes = (size_t)in_dim * sizeof(float);
-        if (!decode_mlp64_disabled && in_dim >= 4096u) {
+        if (decode_qkv_shape && decode_qkv_prefetch != 0u) {
+#define DS4_LAUNCH_BF16_QKV_PREFETCH(P, NT) \
+            matmul_bf16_f32_sharedx_exact_prefetch_warp_rows_w32_kernel< \
+                    P, NT><<<grid, block, shared_bytes>>>( \
+                    (float *)out->ptr, (const uint16_t *)wptr, \
+                    (const float *)x->ptr, (uint32_t)in_dim, out_dim)
+            if (decode_qkv_prefetch == 4u) {
+                if (decode_qkv_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(4u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(4u, false);
+            } else if (decode_qkv_prefetch == 8u) {
+                if (decode_qkv_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(8u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(8u, false);
+            } else if (decode_qkv_prefetch == 16u) {
+                if (decode_qkv_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(16u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(16u, false);
+            } else if (decode_qkv_prefetch == 32u) {
+                if (decode_qkv_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(32u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(32u, false);
+            } else {
+                if (decode_qkv_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(64u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(64u, false);
+            }
+#undef DS4_LAUNCH_BF16_QKV_PREFETCH
+            static int prefetch_reported;
+            if (!prefetch_reported) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "GLM5 BF16 QKV exact prefetch engaged "
+                        "window=%u rows_per_block=%u nontemporal=%d\n",
+                        decode_qkv_prefetch, rows_per_block,
+                        decode_qkv_nontemporal);
+                prefetch_reported = 1;
+            }
+        } else if (!decode_mlp64_disabled && in_dim >= 4096u) {
             static const char *split_order_value =
                 getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER");
             static const char *legacy_split_order_value =

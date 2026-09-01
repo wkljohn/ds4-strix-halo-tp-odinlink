@@ -1224,7 +1224,7 @@ test-rocm-bf16-batch-gemm: tests/test_rocm_bf16_batch_gemm
 tests/test_rocm_glm5_kda_bf16_rowslice.o: tests/test_rocm_glm5_kda_bf16_rowslice.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -I. -c -o $@ $<
 
-tests/test_rocm_glm5_kda_bf16_rowslice: tests/test_rocm_glm5_kda_bf16_rowslice.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+tests/test_rocm_glm5_kda_bf16_rowslice: tests/test_rocm_glm5_kda_bf16_rowslice.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_glm5_next_runtime.o
 	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 test-rocm-glm5-kda-bf16-rowslice: tests/test_rocm_glm5_kda_bf16_rowslice
