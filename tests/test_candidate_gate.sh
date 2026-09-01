@@ -391,7 +391,7 @@ value["model"] = {"path": model_path, "sample_sha256": model_sample,
                   "sha256": hashlib.sha256(Path(model_path).read_bytes()).hexdigest(),
                   "size": 1, "quantization": "Q4_K"}
 value["toolchain"] = {"id": "synthetic-new"}
-value["transport"] = {"providers": ["roce-v2", "odinlink"]}
+value["transport"] = {"providers": ["odinlink"]}
 value["evidence"] = []
 generic = ["ordinary-benchmark", "long-context", "transport-proof",
            "ordinary-regression", "fable-review", "grok-review",

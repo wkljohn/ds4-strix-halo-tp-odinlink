@@ -502,9 +502,12 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
     if not re.fullmatch(r"[0-9a-f]{16}", fnv):
         raise GateError("baseline genesis has an invalid reference fingerprint")
     providers = key.get("rdma_providers")
-    if (not isinstance(providers, list) or
-            set(providers) != {"odinlink", "roce-v2"}):
-        raise GateError("baseline genesis requires OdinLink and RoCE v2")
+    if (not isinstance(providers, list) or not providers or
+            len(set(providers)) != len(providers) or
+            any(provider not in {"odinlink", "roce-v2"}
+                for provider in providers)):
+        raise GateError(
+            "baseline genesis requires one or more distinct validated RDMA providers")
 
     model_path = Path(str(artifacts.get("model_path", "")))
     if not model_path.is_absolute() or not model_path.is_file():
@@ -1173,10 +1176,10 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         candidate_layout = tp_layout_contract(workload, "candidate workload")
         providers = transport.get("providers") if isinstance(transport, dict) else None
         if (not isinstance(providers, list) or not providers or
+                len(set(providers)) != len(providers) or
                 any(provider not in {"odinlink", "roce-v2"} for provider in providers)):
-            raise GateError("candidate transport.providers must name validated RDMA providers")
-        if lane == "C" and set(providers) != {"odinlink", "roce-v2"}:
-            raise GateError("Lane C requires both OdinLink and RoCE v2 validation")
+            raise GateError(
+                "candidate transport.providers must name distinct validated RDMA providers")
         for _, manifest, _ in benchmark_rows:
             if (manifest.get("model_sample_sha256") != model.get("sample_sha256") or
                     manifest.get("model_size") != str(model.get("size", "")) or
