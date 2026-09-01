@@ -22,6 +22,12 @@ deploy/ds4-tp-caddy.sh status
 `config.env.local`. Startup fails closed if that pin does not match, so a stale
 coordinator cannot use a different TP gate schedule from the worker.
 
+Run the launcher on the coordinator. It opens an SSH session from the
+coordinator to `PEER_MGMT`; install that coordinator user's public key on the
+worker and verify `ssh -o BatchMode=yes` succeeds first. Keep `PEER_MGMT` on an
+independent NetworkManager-managed Ethernet or Wi-Fi address, not an OdinLink
+or Thunderbolt address.
+
 The launcher starts both independent model loads together, validates the
 selected RDMA provider plus matching binary and sampled model fingerprints,
 and refuses to replace unrelated processes. It uses a 262,144-token context
@@ -77,9 +83,35 @@ deploy/ds4-tp-caddy.sh stop
 caddy validate --config /etc/caddy/Caddyfile
 ```
 
-The local Caddy route should proxy to `127.0.0.1:8090` with streaming flush
-enabled and a response timeout long enough for initial model loading. Keep
-port 8090 loopback-only; do not bypass Caddy's authentication at the firewall.
+The launcher requires Caddy to be installed, configured, and active before
+`start`. A fresh Ubuntu image can be bootstrapped with:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y caddy
+sudoedit /etc/caddy/Caddyfile
+```
+
+A minimal local configuration for the initial preflight is:
+
+```caddyfile
+:8080 {
+    reverse_proxy 127.0.0.1:8090
+}
+```
+
+Validate and activate it:
+
+```sh
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl enable --now caddy
+systemctl is-active caddy
+```
+
+Replace the bootstrap listener with the production TLS/authentication route as
+appropriate. It should proxy to `127.0.0.1:8090` with streaming flush enabled
+and a response timeout long enough for initial model loading. Keep port 8090
+loopback-only; do not bypass Caddy's authentication at the firewall.
 
 ## Agent-client completion limits
 
