@@ -3181,6 +3181,171 @@ static int glm_attention_indexed_lora_causal_gemm(
     return 1;
 }
 
+/* Diagnostic-only differential for the live all-head MLA tensors.  This is
+ * deliberately selected by an explicit environment variable and performs a
+ * device synchronization plus two full device-to-host copies, so it must
+ * never be enabled in a performance run.  The scalar result is computed from
+ * the same inputs, while lora_out retains the GEMM result used by the graph. */
+static int glm_attention_indexed_lora_causal_compare(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_selected,
+        uint32_t cache_cap,
+        bool cache_f16,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope,
+        uint32_t qk_rope,
+        uint32_t n_ctx_orig,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const char *pos_text =
+        getenv("DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE_POS0");
+    if (pos_text && pos_text[0]) {
+        char *end = NULL;
+        errno = 0;
+        const unsigned long selected_pos = strtoul(pos_text, &end, 10);
+        if (errno != 0 || !end || *end != '\0' ||
+            selected_pos > UINT32_MAX) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "invalid DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE_POS0\n");
+            return 0;
+        }
+        if ((uint32_t)selected_pos != pos0) {
+            return glm_attention_indexed_lora_causal_gemm(
+                lora_out, q, qk_low, kv_lora_cache, k_rope_cache,
+                n_tokens, pos0, n_selected, cache_f16, n_head,
+                kv_lora_dim, qk_nope, qk_rope, n_ctx_orig, freq_base,
+                freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        }
+    }
+
+    uint64_t token_heads = 0u, count = 0u, bytes = 0u;
+    if (!cuda_u64_mul_checked(n_tokens, n_head, &token_heads) ||
+        !cuda_u64_mul_checked(token_heads, kv_lora_dim, &count) ||
+        !cuda_u64_mul_checked(count, sizeof(float), &bytes) ||
+        bytes == 0u || bytes > SIZE_MAX) {
+        return 0;
+    }
+
+    float *scalar_dev = NULL;
+    float *scalar_host = NULL;
+    float *gemm_host = NULL;
+    int ok = cuda_ok(cudaMalloc((void **)&scalar_dev, (size_t)bytes),
+                         "glm causal compare scalar allocation");
+    if (!ok) goto compare_done;
+
+    {
+        dim3 grid(n_head, n_tokens, 1u);
+        const size_t shmem = ((size_t)512u + n_selected) * sizeof(float);
+        glm_attention_indexed_lora_kernel<<<grid, 256, shmem>>>(
+            scalar_dev,
+            (const float *)q->ptr,
+            (const float *)qk_low->ptr,
+            (const char *)kv_lora_cache->ptr,
+            k_rope_cache ? (const char *)k_rope_cache->ptr : NULL,
+            NULL,
+            n_tokens,
+            pos0,
+            n_selected,
+            cache_cap,
+            cache_f16,
+            n_head,
+            kv_lora_dim,
+            qk_nope,
+            qk_rope,
+            n_ctx_orig,
+            true,
+            false,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow);
+    }
+    ok = cuda_ok(cudaGetLastError(), "glm causal compare scalar launch") &&
+         glm_attention_indexed_lora_causal_gemm(
+             lora_out, q, qk_low, kv_lora_cache, k_rope_cache,
+             n_tokens, pos0, n_selected, cache_f16, n_head,
+             kv_lora_dim, qk_nope, qk_rope, n_ctx_orig, freq_base,
+             freq_scale, ext_factor, attn_factor, beta_fast, beta_slow) &&
+         cuda_ok(cudaDeviceSynchronize(),
+                 "glm causal compare synchronization");
+    if (!ok) goto compare_done;
+
+    scalar_host = (float *)malloc((size_t)bytes);
+    gemm_host = (float *)malloc((size_t)bytes);
+    if (!scalar_host || !gemm_host) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "GLM causal compare host allocation failed bytes=%llu\n",
+                (unsigned long long)bytes);
+        ok = 0;
+        goto compare_done;
+    }
+    ok = cuda_ok(cudaMemcpy(scalar_host, scalar_dev, (size_t)bytes,
+                            cudaMemcpyDeviceToHost),
+                 "glm causal compare scalar read") &&
+         cuda_ok(cudaMemcpy(gemm_host, lora_out->ptr, (size_t)bytes,
+                            cudaMemcpyDeviceToHost),
+                 "glm causal compare GEMM read");
+    if (!ok) goto compare_done;
+
+    {
+        long double diff2 = 0.0L, scalar2 = 0.0L;
+        long double dot = 0.0L, gemm2 = 0.0L;
+        double max_abs = 0.0;
+        uint64_t nonfinite = 0u;
+        for (uint64_t i = 0u; i < count; ++i) {
+            const double a = scalar_host[i];
+            const double b = gemm_host[i];
+            if (!isfinite(a) || !isfinite(b)) {
+                nonfinite++;
+                continue;
+            }
+            const long double d = (long double)b - (long double)a;
+            diff2 += d * d;
+            scalar2 += (long double)a * a;
+            dot += (long double)a * b;
+            gemm2 += (long double)b * b;
+            max_abs = fmax(max_abs, fabs(b - a));
+        }
+        const double nrmse = scalar2 > 0.0L ?
+            sqrt((double)(diff2 / scalar2)) :
+            (diff2 == 0.0L ? 0.0 : INFINITY);
+        const double cosine = scalar2 > 0.0L && gemm2 > 0.0L ?
+            (double)(dot / sqrtl(scalar2 * gemm2)) : 0.0;
+        static uint64_t compare_ordinal = 0u;
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "GLM causal live differential ordinal=%llu tokens=%u "
+                "pos0=%u selected=%u heads=%u width=%u count=%llu "
+                "nrmse=%.9g cosine=%.12g max_abs=%.9g nonfinite=%llu\n",
+                (unsigned long long)compare_ordinal++, n_tokens, pos0,
+                n_selected, n_head, kv_lora_dim,
+                (unsigned long long)count, nrmse, cosine, max_abs,
+                (unsigned long long)nonfinite);
+        ok = nonfinite == 0u;
+    }
+
+compare_done:
+    free(gemm_host);
+    free(scalar_host);
+    if (scalar_dev) (void)cudaFree(scalar_dev);
+    return ok;
+}
+
 static int glm_attention_indexed_lora_selected_gemm(
         ds4_gpu_tensor *lora_out,
         const ds4_gpu_tensor *q,
@@ -3641,12 +3806,56 @@ static int glm_attention_indexed_lora_launch(
         getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM");
     const char *causal_attn_gemm_nope_env =
         getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE");
-    const bool causal_attn_gemm_geometry =
-        qk_rope != 0u || cuda_env_present(causal_attn_gemm_nope_env);
+    bool causal_attn_nope_pos_enabled = true;
+    const char *causal_attn_nope_min_pos_text =
+        getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_MIN_POS0");
+    if (qk_rope == 0u && causal_attn_nope_min_pos_text &&
+        causal_attn_nope_min_pos_text[0]) {
+        char *end = NULL;
+        errno = 0;
+        const unsigned long min_pos =
+            strtoul(causal_attn_nope_min_pos_text, &end, 10);
+        if (errno != 0 || !end || *end != '\0' || min_pos > UINT32_MAX) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "invalid DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_MIN_POS0\n");
+            return 0;
+        }
+        causal_attn_nope_pos_enabled = pos0 >= (uint32_t)min_pos;
+    }
+    const bool causal_attn_compare = qk_rope == 0u &&
+        cuda_env_present(getenv(
+            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32")) &&
+        cuda_env_present(getenv("DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE"));
+    const bool causal_attn_gemm_geometry = qk_rope != 0u ||
+        (cuda_env_present(causal_attn_gemm_nope_env) &&
+         causal_attn_nope_pos_enabled);
     if (causal_attn_gemm_geometry && causal_range && !has_selected &&
         (causal_attn_gemm_env == NULL ||
          cuda_env_present(causal_attn_gemm_env)) &&
-        glm_attention_indexed_lora_causal_gemm(lora_out,
+        (causal_attn_compare ?
+         glm_attention_indexed_lora_causal_compare(lora_out,
+                                                q,
+                                                qk_low,
+                                                kv_lora_cache,
+                                                k_rope_cache,
+                                                n_tokens,
+                                                pos0,
+                                                n_selected,
+                                                cache_cap,
+                                                cache_f16,
+                                                n_head,
+                                                kv_lora_dim,
+                                                qk_nope,
+                                                qk_rope,
+                                                n_ctx_orig,
+                                                freq_base,
+                                                freq_scale,
+                                                ext_factor,
+                                                attn_factor,
+                                                beta_fast,
+                                                beta_slow) :
+         glm_attention_indexed_lora_causal_gemm(lora_out,
                                                 q,
                                                 qk_low,
                                                 kv_lora_cache,
@@ -3665,7 +3874,7 @@ static int glm_attention_indexed_lora_launch(
                                                 ext_factor,
                                                 attn_factor,
                                                 beta_fast,
-                                                beta_slow)) {
+                                                beta_slow))) {
         static int notice_printed = 0;
         if (!notice_printed) {
             fprintf(stderr,

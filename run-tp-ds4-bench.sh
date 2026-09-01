@@ -291,7 +291,7 @@ for env_kv in "${EXTRA_ENV[@]}"; do
   esac
   if [[ $CANDIDATE == 1 ]]; then
     case $env_kv in
-      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*)
+      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*|DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE=*)
         echo "error: candidate timing cannot enable graph dumps, profilers, or reference oracles: ${env_kv%%=*}" >&2
         exit 2
         ;;
