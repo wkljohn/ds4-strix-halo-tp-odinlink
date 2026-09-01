@@ -13,4 +13,6 @@ if "tp_exchange_aux_bytes(ctx, il, row_bytes)" not in source:
     raise SystemExit("FAIL rowslice transport exchange anchor is missing")
 if "w->down, ctx->model_map, ctx->model_size" not in source:
     raise SystemExit("FAIL local rowslice must use device-resident scratch")
+if "ds4_gpu_tensor_copy(w->up, 0u, w->attention, 0u" not in source:
+    raise SystemExit("FAIL rank 1 local rowslice does not preserve its high half")
 print("PASS rowslice local diagnostic switch and transport anchor exist")

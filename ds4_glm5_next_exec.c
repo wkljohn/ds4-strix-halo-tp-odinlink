@@ -463,18 +463,29 @@ static int trace_tensor(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
     void *host = malloc((size_t)bytes);
     if (!host) return 0;
     char path[768];
+    char ranked_prefix[768];
+    const char *prefix = ctx->trace_prefix;
+    if (getenv("DS4_GLM5_TRACE_RANKED") != NULL) {
+        const int pn = snprintf(ranked_prefix, sizeof(ranked_prefix),
+                                "%s.r%u", ctx->trace_prefix, ctx->tp_rank);
+        if (pn <= 0 || (size_t)pn >= sizeof(ranked_prefix)) {
+            free(host);
+            return 0;
+        }
+        prefix = ranked_prefix;
+    }
     int n = 0;
     if (ctx->trace_layer == UINT32_MAX && ctx->trace_token == UINT32_MAX)
         n = snprintf(path, sizeof(path), "%s.l%u.t%u.%s",
-                     ctx->trace_prefix, layer, token, name);
+                     prefix, layer, token, name);
     else if (ctx->trace_layer == UINT32_MAX)
         n = snprintf(path, sizeof(path), "%s.l%u.%s",
-                     ctx->trace_prefix, layer, name);
+                     prefix, layer, name);
     else if (ctx->trace_token == UINT32_MAX)
-        n = snprintf(path, sizeof(path), "%s.t%u.%s", ctx->trace_prefix,
+        n = snprintf(path, sizeof(path), "%s.t%u.%s", prefix,
                      token, name);
     else
-        n = snprintf(path, sizeof(path), "%s.%s", ctx->trace_prefix, name);
+        n = snprintf(path, sizeof(path), "%s.%s", prefix, name);
     int ok = n > 0 && (size_t)n < sizeof(path) &&
              ds4_gpu_tensor_read(tensor, 0u, host, bytes);
     FILE *fp = ok ? fopen(path, "wb") : NULL;
@@ -502,11 +513,22 @@ static int trace_tensor_row(const ds4_glm5_next_exec_ctx *ctx, uint32_t layer,
     void *host = malloc((size_t)row_bytes);
     if (!host) return 0;
     char path[768];
+    char ranked_prefix[768];
+    const char *prefix = ctx->trace_prefix;
+    if (getenv("DS4_GLM5_TRACE_RANKED") != NULL) {
+        const int pn = snprintf(ranked_prefix, sizeof(ranked_prefix),
+                                "%s.r%u", ctx->trace_prefix, ctx->tp_rank);
+        if (pn <= 0 || (size_t)pn >= sizeof(ranked_prefix)) {
+            free(host);
+            return 0;
+        }
+        prefix = ranked_prefix;
+    }
     const int n = ctx->trace_layer == UINT32_MAX ?
         snprintf(path, sizeof(path), "%s.batch.l%u.t%u.%s",
-                 ctx->trace_prefix, layer, token, name) :
+                 prefix, layer, token, name) :
         snprintf(path, sizeof(path), "%s.batch.t%u.%s",
-                 ctx->trace_prefix, token, name);
+                 prefix, token, name);
     int ok = n > 0 && (size_t)n < sizeof(path) &&
              ds4_gpu_tensor_read(tensor, (uint64_t)row * row_bytes,
                                  host, row_bytes);
@@ -919,6 +941,9 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
         if (!ds4_glm5_kda_compose_head_halves(
                 w->kda.recurrent_out, rank0_gated, rank1_gated,
                 n_tokens) ||
+            !trace_tensor(ctx, il, (uint32_t)kda->token_count,
+                          "kda_composed_gated.f32", w->kda.recurrent_out,
+                          (uint64_t)DS4_GLM5_KDA_CHANNELS * sizeof(float)) ||
             !ds4_gpu_matmul_bf16_tensor(
                 w->attention, ctx->model_map, ctx->model_size,
                 row_weight_offset, DS4_GLM5_KDA_CHANNELS,
@@ -947,8 +972,18 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
                                              ctx->tp_big_out, 0u,
                                              row_bytes))))) ||
             (rowslice_local &&
-             !ds4_gpu_tensor_copy(w->attention, row_bytes, w->down,
-                                  0u, row_bytes)) ||
+             (ctx->tp_rank == 0u ?
+                  !ds4_gpu_tensor_copy(w->attention, row_bytes, w->down,
+                                       0u, row_bytes) :
+                  (!ds4_gpu_tensor_copy(w->up, 0u, w->attention, 0u,
+                                        row_bytes) ||
+                   !ds4_gpu_tensor_copy(w->attention, 0u, w->down, 0u,
+                                        row_bytes) ||
+                   !ds4_gpu_tensor_copy(w->attention, row_bytes, w->up, 0u,
+                                        row_bytes)))) ||
+            !trace_tensor(ctx, il, (uint32_t)kda->token_count,
+                          "kda_projected.f32", w->attention,
+                          (uint64_t)GLM5_WIDTH * sizeof(float)) ||
             !ds4_glm5_kda_layer_commit(&local, n_tokens) ||
             !ds4_gpu_hc_expand_split_tensor(
                 w->after_attention, w->attention, hc_in, w->hc_split,
@@ -975,9 +1010,15 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
     const int suffix_ok =
         ds4_glm5_kda_compose_head_halves(
             w->kda.recurrent_out, rank0, rank1, n_tokens) &&
+        trace_tensor(ctx, il, (uint32_t)kda->token_count,
+                     "kda_composed_gated.f32", w->kda.recurrent_out,
+                     (uint64_t)DS4_GLM5_KDA_CHANNELS * sizeof(float)) &&
         ds4_glm5_kda_layer_finish(
             &local, &layer->kda, ctx->model_map, ctx->model_size,
             w->kda.recurrent_out, w->attention, n_tokens) &&
+        trace_tensor(ctx, il, (uint32_t)kda->token_count,
+                     "kda_projected.f32", w->attention,
+                     (uint64_t)GLM5_WIDTH * sizeof(float)) &&
         ds4_gpu_hc_expand_split_tensor(
             w->after_attention, w->attention, hc_in, w->hc_split,
             GLM5_WIDTH, GLM5_HC);

@@ -51424,6 +51424,17 @@ struct ds4_session {
 };
 
 #ifndef DS4_NO_GPU
+static uint32_t ds4_glm5_trace_index_env(const char *name) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return UINT32_MAX;
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed > (unsigned long)UINT32_MAX) return UINT32_MAX;
+    return (uint32_t)parsed;
+}
+
 /* Initialize the session-owned GLM5 executor only for the explicit research
  * opt-in.  The staged executor uses the same mapped GGUF and TP slab as the
  * validated harness; no weight expansion or private transport allocation is
@@ -51493,6 +51504,9 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         .tp_big_in = ds4_gpu_tensor_view(
             e->tp.slab, ds4_tp_slab_big_in_offset(e->tp.ctx), big_bytes),
         .tp_sequence = &e->tp.glm5_gate_seq,
+        .trace_prefix = getenv("DS4_GLM5_TRACE_PREFIX"),
+        .trace_layer = ds4_glm5_trace_index_env("DS4_GLM5_TRACE_LAYER"),
+        .trace_token = ds4_glm5_trace_index_env("DS4_GLM5_TRACE_TOKEN"),
     };
     if (!s->glm5_next_exec.tp_big_out || !s->glm5_next_exec.tp_big_in) {
         fprintf(stderr, "ds4: GLM5 ordinary executor big-gate views failed\n");
