@@ -441,6 +441,115 @@ bool run_output_kslice(const Glm5TestGGUF &gguf, uint64_t weight_offset,
     return true;
 }
 
+bool benchmark_output_rowslice(const Glm5TestGGUF &gguf,
+                               uint64_t weight_offset,
+                               uint32_t tokens) {
+    constexpr uint32_t kIn = 8192u;
+    constexpr uint32_t kOut = 4096u;
+    constexpr uint32_t kLocalOut = kOut / 2u;
+    const uint64_t input_count = (uint64_t)tokens * kIn;
+    const uint64_t full_count = (uint64_t)tokens * kOut;
+    const uint64_t local_count = (uint64_t)tokens * kLocalOut;
+    std::vector<float> host_input((size_t)input_count);
+    for (uint64_t i = 0u; i < input_count; ++i) {
+        const int32_t centered =
+            (int32_t)((i * UINT64_C(131) + tokens * 17u) % 1021u) - 510;
+        host_input[(size_t)i] = (float)centered * (1.0f / 4096.0f) +
+            0.0078125f * std::sin((double)(i % 32749u) * 0.011);
+    }
+
+    Tensors tensors;
+    ds4_gpu_tensor *input = tensors.f32(input_count);
+    ds4_gpu_tensor *full = tensors.f32(full_count);
+    ds4_gpu_tensor *half[2] = {
+        tensors.f32(local_count), tensors.f32(local_count),
+    };
+    CHECK(input && full && half[0] && half[1],
+          "allocate BF16 output-row benchmark tensors");
+    CHECK(ds4_gpu_tensor_write(input, 0u, host_input.data(),
+                               input_count * sizeof(float)),
+          "upload BF16 output-row benchmark input");
+
+    const uint64_t half_weight_bytes =
+        (uint64_t)kLocalOut * kIn * sizeof(uint16_t);
+    const auto launch = [&](uint32_t operation) {
+        if (operation == 0u) {
+            return ds4_gpu_matmul_bf16_tensor(
+                full, gguf.map, gguf.size, weight_offset,
+                kIn, kOut, input, tokens) != 0;
+        }
+        const uint32_t rank = operation - 1u;
+        return rank < 2u && ds4_gpu_matmul_bf16_tensor(
+            half[rank], gguf.map, gguf.size,
+            weight_offset + (uint64_t)rank * half_weight_bytes,
+            kIn, kLocalOut, input, tokens) != 0;
+    };
+    CHECK(launch(0u) && launch(1u) && launch(2u) && ds4_gpu_synchronize(),
+          "execute BF16 output-row benchmark identity arms");
+
+    std::vector<float> full_host((size_t)full_count);
+    std::vector<float> half_host[2] = {
+        std::vector<float>((size_t)local_count),
+        std::vector<float>((size_t)local_count),
+    };
+    CHECK(ds4_gpu_tensor_read(full, 0u, full_host.data(),
+                              full_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(half[0], 0u, half_host[0].data(),
+                              local_count * sizeof(float)) &&
+          ds4_gpu_tensor_read(half[1], 0u, half_host[1].data(),
+                              local_count * sizeof(float)),
+          "read BF16 output-row benchmark identity arms");
+    for (uint32_t token = 0u; token < tokens; ++token) {
+        for (uint32_t rank = 0u; rank < 2u; ++rank) {
+            CHECK(std::memcmp(
+                      full_host.data() + (uint64_t)token * kOut +
+                          (uint64_t)rank * kLocalOut,
+                      half_host[rank].data() +
+                          (uint64_t)token * kLocalOut,
+                      (size_t)kLocalOut * sizeof(float)) == 0,
+                  "BF16 output-row benchmark preserves exact rows");
+        }
+    }
+
+    const uint32_t warmup = tokens >= 2048u ? 2u :
+                            (tokens >= 256u ? 4u : 8u);
+    const uint32_t repeats = tokens >= 2048u ? 6u :
+                             (tokens >= 256u ? 12u : 64u);
+    const auto time_operation = [&](uint32_t operation) -> double {
+        for (uint32_t i = 0u; i < warmup; ++i)
+            CHECK(launch(operation), "warm BF16 output-row timing arm");
+        hipEvent_t begin = nullptr, end = nullptr;
+        CHECK(hipEventCreate(&begin) == hipSuccess &&
+              hipEventCreate(&end) == hipSuccess &&
+              hipEventRecord(begin) == hipSuccess,
+              "create BF16 output-row timing events");
+        for (uint32_t i = 0u; i < repeats; ++i)
+            CHECK(launch(operation), "launch BF16 output-row timing arm");
+        CHECK(hipEventRecord(end) == hipSuccess &&
+              hipEventSynchronize(end) == hipSuccess,
+              "complete BF16 output-row timing events");
+        float total_ms = 0.0f;
+        CHECK(hipEventElapsedTime(&total_ms, begin, end) == hipSuccess &&
+              hipEventDestroy(end) == hipSuccess &&
+              hipEventDestroy(begin) == hipSuccess,
+              "read BF16 output-row timing events");
+        return (double)total_ms / repeats;
+    };
+    const double full_ms = time_operation(0u);
+    const double rank0_ms = time_operation(1u);
+    const double rank1_ms = time_operation(2u);
+    CHECK(full_ms > 0.0 && rank0_ms > 0.0 && rank1_ms > 0.0,
+          "valid BF16 output-row timing results");
+    const double critical_ms = std::max(rank0_ms, rank1_ms);
+    std::fprintf(stderr,
+        "MEASURE GLM5 KDA BF16 output-row tokens=%u full_ms=%.6f "
+        "rank0_ms=%.6f rank1_ms=%.6f critical_ms=%.6f speedup=%.4fx "
+        "saved_ms=%.6f repeats=%u exact=1\n",
+        tokens, full_ms, rank0_ms, rank1_ms, critical_ms,
+        full_ms / critical_ms, full_ms - critical_ms, repeats);
+    return true;
+}
+
 bool run_test() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     CHECK(model && model[0], "DS4_GLM5_MODEL environment");
@@ -538,6 +647,10 @@ bool run_test() {
     }
     CHECK(run_output_kslice(gguf, output, 2048u, true),
           "KDA output K-slice 2048-row correctness and timing oracle");
+    for (uint32_t tokens : {1u, 256u, 2048u}) {
+        CHECK(benchmark_output_rowslice(gguf, output, tokens),
+              "KDA output-row M=1/256/2048 geometry benchmark");
+    }
     std::fprintf(stderr,
                  "PASS complete real-GGUF GLM5 KDA BF16 row-slice gate\n");
     return true;
