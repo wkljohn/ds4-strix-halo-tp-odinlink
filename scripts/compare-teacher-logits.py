@@ -214,7 +214,8 @@ def main() -> int:
     parser.add_argument(
         "--score-arm-mode", choices=(
             "kda-tp", "kda-kslice", "repeat", "full-split-order-null",
-            "null-vs-kslice", "fallback-vs-kslice"),
+            "null-vs-kslice", "fallback-vs-kslice",
+            "attn-scalar-vs-f32-gemm"),
         help="required arm relationship for score_official GLM5 diagnostics")
     args = parser.parse_args()
     try:
@@ -268,6 +269,7 @@ def main() -> int:
                 "full-split-order-null": ("kda-tp", "kda-tp"),
                 "null-vs-kslice": ("kda-tp", "kda-kslice"),
                 "fallback-vs-kslice": ("kda-tp", "kda-kslice"),
+                "attn-scalar-vs-f32-gemm": ("attn-scalar", "attn-gemm-f32"),
             }[args.score_arm_mode]
             actual_arms = (reference_manifest.get("teacher_arm"),
                            candidate_manifest.get("teacher_arm"))
@@ -308,6 +310,16 @@ def main() -> int:
                         "fallback-vs-kslice requires the independent BF16 "
                         "fallback only in the reference arm")
                 selectors.add(fallback_key)
+            elif args.score_arm_mode == "attn-scalar-vs-f32-gemm":
+                nope_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE"
+                f32_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32"
+                if (nope_key in ref_env or f32_key in ref_env or
+                        cand_env.get(nope_key) != "1" or
+                        cand_env.get(f32_key) != "1"):
+                    raise ValueError(
+                        "attention comparison requires FP32 NoPE GEMM only "
+                        "in the candidate arm")
+                selectors.update((nope_key, f32_key))
             if ({k: v for k, v in ref_env.items() if k not in selectors} !=
                     {k: v for k, v in cand_env.items() if k not in selectors}):
                 raise ValueError("score arms differ outside the KDA selectors")
@@ -315,6 +327,8 @@ def main() -> int:
                 "kda-off": ("0", "0"),
                 "kda-tp": ("1", "0"),
                 "kda-kslice": ("1", "1"),
+                "attn-scalar": ("1", "0"),
+                "attn-gemm-f32": ("1", "0"),
             }
             for manifest, env, arm in (
                     (reference_manifest, ref_env, actual_arms[0]),
