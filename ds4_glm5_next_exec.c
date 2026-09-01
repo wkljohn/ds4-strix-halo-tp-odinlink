@@ -929,6 +929,9 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
         const int rowslice_local =
             getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE_LOCAL") != NULL &&
             strcmp(getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE_LOCAL"), "1") == 0;
+        const int rowslice_full_gemm = rowslice_local &&
+            getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE_FULL_GEMM") != NULL &&
+            strcmp(getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE_FULL_GEMM"), "1") == 0;
         const uint64_t row_weight_bytes =
             (uint64_t)(GLM5_WIDTH / 2u) * DS4_GLM5_KDA_CHANNELS *
             sizeof(uint16_t);
@@ -944,12 +947,21 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
             !trace_tensor(ctx, il, (uint32_t)kda->token_count,
                           "kda_composed_gated.f32", w->kda.recurrent_out,
                           (uint64_t)DS4_GLM5_KDA_CHANNELS * sizeof(float)) ||
-            !ds4_gpu_matmul_bf16_tensor(
-                w->attention, ctx->model_map, ctx->model_size,
-                row_weight_offset, DS4_GLM5_KDA_CHANNELS,
-                GLM5_WIDTH / 2u, w->kda.recurrent_out, n_tokens) ||
-            (rowslice_local ?
+            (rowslice_full_gemm ?
+                 (!ds4_gpu_matmul_bf16_tensor(
+                      w->down, ctx->model_map, ctx->model_size,
+                      layer->kda.output, DS4_GLM5_KDA_CHANNELS,
+                      GLM5_WIDTH, w->kda.recurrent_out, n_tokens) ||
+                  !ds4_gpu_tensor_copy(w->attention, 0u, w->down,
+                                       0u, row_bytes) ||
+                  !ds4_gpu_tensor_copy(w->attention, row_bytes, w->down,
+                                       row_bytes, row_bytes)) :
                  !ds4_gpu_matmul_bf16_tensor(
+                      w->attention, ctx->model_map, ctx->model_size,
+                      row_weight_offset, DS4_GLM5_KDA_CHANNELS,
+                      GLM5_WIDTH / 2u, w->kda.recurrent_out, n_tokens)) ||
+            (rowslice_local ?
+                 (rowslice_full_gemm ? 0 : !ds4_gpu_matmul_bf16_tensor(
                       /* Keep the locally computed peer half device-resident
                        * until it is copied into the final output.  The TP
                        * slab may be mapped host memory and is reserved for
@@ -959,7 +971,7 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
                       layer->kda.output + (uint64_t)(1u - ctx->tp_rank) *
                           row_weight_bytes,
                       DS4_GLM5_KDA_CHANNELS, GLM5_WIDTH / 2u,
-                      w->kda.recurrent_out, n_tokens) :
+                      w->kda.recurrent_out, n_tokens)) :
                  (!ds4_gpu_tensor_copy(ctx->tp_big_out, 0u, w->attention,
                                        0u, row_bytes) ||
                   !tp_exchange_aux_bytes(ctx, il, row_bytes) ||
@@ -971,7 +983,7 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
                         !ds4_gpu_tensor_copy(w->attention, row_bytes,
                                              ctx->tp_big_out, 0u,
                                              row_bytes))))) ||
-            (rowslice_local &&
+            (rowslice_local && !rowslice_full_gemm &&
              (ctx->tp_rank == 0u ?
                   !ds4_gpu_tensor_copy(w->attention, row_bytes, w->down,
                                        0u, row_bytes) :

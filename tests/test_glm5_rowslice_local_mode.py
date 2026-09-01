@@ -15,4 +15,6 @@ if "w->down, ctx->model_map, ctx->model_size" not in source:
     raise SystemExit("FAIL local rowslice must use device-resident scratch")
 if "ds4_gpu_tensor_copy(w->up, 0u, w->attention, 0u" not in source:
     raise SystemExit("FAIL rank 1 local rowslice does not preserve its high half")
+if "DS4_GLM5_KDA_OUTPUT_ROWSLICE_FULL_GEMM" not in source:
+    raise SystemExit("FAIL full-GEMM rowslice control is missing")
 print("PASS rowslice local diagnostic switch and transport anchor exist")
