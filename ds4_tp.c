@@ -177,6 +177,17 @@ typedef struct {
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 32
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
+#define DS4_TP_RDMA_AUX_WR_TAG (UINT64_C(1) << 62)
+#define DS4_TP_AUX_MAGIC UINT32_C(0x44534158) /* DSAX */
+#define DS4_TP_AUX_PAYLOAD_BYTES UINT64_C(8192)
+#define DS4_TP_AUX_STRIDE UINT64_C(8256)
+
+typedef struct {
+    uint32_t magic;
+    uint16_t layer;
+    uint16_t reserved;
+    uint64_t seq;
+} ds4_tp_aux_header;
 
 typedef struct {
     ds4_tp_verbs_api api;
@@ -200,6 +211,8 @@ typedef struct {
     ds4_tp_rdma_info peer;
     uint32_t send_outstanding;  /* signaled sends not yet reaped */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
+    uint64_t aux_recv_done;     /* highest tagged dependent recv completed */
+    uint64_t aux_send_done;     /* highest tagged dependent send completed */
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
     pthread_mutex_t post_lock;
@@ -316,6 +329,9 @@ struct ds4_tp {
     uint64_t gpu_flags_off;     /* GPU-written gate-ready flags (u32/slot) */
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
+    uint64_t aux_out_off;       /* [layer] header + KDA output-row payload */
+    uint64_t aux_in_off;        /* [layer] header + peer KDA output-row payload */
+    uint64_t aux_payload_bytes; /* 8192 only for negotiated row-slice */
     uint64_t big_out_off;       /* direct=1 prefill big-gate local partial, opt-in */
     uint64_t big_in_off;        /* direct=1 prefill big-gate peer partial, opt-in */
     uint32_t big_capacity_rows; /* 0 unless DS4_TP_BIG_DIRECT=1 */
@@ -877,6 +893,13 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->batch_out_off = tp->gpu_flags_off + slots * 4;
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->aux_payload_bytes =
+        (tp->runtime_features & DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE) != 0u
+            ? DS4_TP_AUX_PAYLOAD_BYTES : 0u;
+    tp->aux_out_off = tp->batch_in_off +
+                      (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->aux_in_off = tp->aux_out_off +
+        (tp->aux_payload_bytes ? (uint64_t)tp->n_layer * DS4_TP_AUX_STRIDE : 0u);
     tp->big_capacity_rows = tp_big_direct_max_rows();
 #ifdef DS4_TP_HAVE_VERBS
     /* ConnectX-4 Lx on the reference gfx1151 nodes can pin/register the
@@ -885,8 +908,8 @@ static void tp_slab_layout(ds4_tp *tp) {
     if (tp->rdma.is_mlx5 && tp->big_capacity_rows > 2048u)
         tp->big_capacity_rows = 2048u;
 #endif
-    tp->big_out_off = tp->batch_in_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->big_out_off = tp->aux_in_off +
+        (tp->aux_payload_bytes ? (uint64_t)tp->n_layer * DS4_TP_AUX_STRIDE : 0u);
     tp->big_in_off = tp->big_out_off + (uint64_t)tp->big_capacity_rows * vec;
     tp->slab_bytes = tp->big_in_off + (uint64_t)tp->big_capacity_rows * vec;
 }
@@ -898,6 +921,22 @@ uint64_t ds4_tp_alloc_slab_bytes(const ds4_tp *tp) {
 uint64_t ds4_tp_slab_big_out_offset(const ds4_tp *tp) { return tp->big_out_off; }
 uint64_t ds4_tp_slab_big_in_offset(const ds4_tp *tp) { return tp->big_in_off; }
 uint32_t ds4_tp_big_capacity_rows(const ds4_tp *tp) { return tp->big_capacity_rows; }
+
+uint64_t ds4_tp_slab_aux_out_payload_offset(const ds4_tp *tp, uint32_t layer) {
+    if (!tp || layer >= tp->n_layer || !tp->aux_payload_bytes) return UINT64_MAX;
+    return tp->aux_out_off + (uint64_t)layer * DS4_TP_AUX_STRIDE +
+           sizeof(ds4_tp_aux_header);
+}
+
+uint64_t ds4_tp_slab_aux_in_payload_offset(const ds4_tp *tp, uint32_t layer) {
+    if (!tp || layer >= tp->n_layer || !tp->aux_payload_bytes) return UINT64_MAX;
+    return tp->aux_in_off + (uint64_t)layer * DS4_TP_AUX_STRIDE +
+           sizeof(ds4_tp_aux_header);
+}
+
+uint64_t ds4_tp_aux_payload_bytes(const ds4_tp *tp) {
+    return tp ? tp->aux_payload_bytes : 0u;
+}
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
     return tp->gpu_flags_off;
@@ -1219,6 +1258,17 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
                    r->decode_max_msg);
         return 0;
     }
+    if (tp->aux_payload_bytes &&
+        sizeof(ds4_tp_aux_header) + tp->aux_payload_bytes >
+            r->decode_max_msg) {
+        tp_set_err(err, errlen,
+                   "tp rdma: paired GLM5 aux message needs %llu bytes, "
+                   "negotiated limit is %u",
+                   (unsigned long long)(sizeof(ds4_tp_aux_header) +
+                                        tp->aux_payload_bytes),
+                   r->decode_max_msg);
+        return 0;
+    }
 
     /* INIT -> RTR -> RTS with the exact recipe the driver accepts (same as
      * JACCL): MTU 1024 and GRH via the IPv4-mapped GID. */
@@ -1403,6 +1453,22 @@ static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
                             tp->gates_per_token, tp->n_slots, seq);
 }
 
+/* A paired dependent receive follows only GLM-5.3 KDA attention slots.
+ * Keeping this predicate independent of transport posting makes the normal
+ * and drain paths share one exact schedule definition. */
+static int tp_aux_gate_eligible_raw(uint32_t runtime_features,
+                                    uint32_t n_layer, uint32_t slot) {
+    const uint32_t layer = slot / DS4_TP_GATES_PER_LAYER;
+    return (runtime_features & DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE) != 0u &&
+           slot % DS4_TP_GATES_PER_LAYER == 0u && layer < n_layer &&
+           (layer & 3u) != 3u;
+}
+
+static int tp_aux_gate_eligible(const ds4_tp *tp, uint64_t seq) {
+    return tp && tp_aux_gate_eligible_raw(tp->runtime_features, tp->n_layer,
+                                          tp_gate_slot(tp, seq));
+}
+
 #ifdef DS4_TP_TEST_HOOKS
 int ds4_tp_test_gate_schedule_validate(
         const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
@@ -1417,6 +1483,10 @@ uint32_t ds4_tp_test_gate_slot(
         uint32_t start, uint32_t step, uint32_t per_token,
         uint32_t n_slots, uint64_t seq) {
     return tp_gate_slot_raw(mask, start, step, per_token, n_slots, seq);
+}
+int ds4_tp_test_aux_gate_eligible(uint32_t runtime_features,
+                                  uint32_t n_layer, uint32_t slot) {
+    return tp_aux_gate_eligible_raw(runtime_features, n_layer, slot);
 }
 #endif
 
@@ -1438,9 +1508,17 @@ static int tp_rdma_drain_cq_observe(ds4_tp *tp, uint64_t target_seq,
                     (unsigned long long)wc[i].wr_id);
             return 0;
         }
+        const uint64_t wr_seq =
+            wc[i].wr_id & ~(DS4_TP_RDMA_BULK_WR_TAG | DS4_TP_RDMA_AUX_WR_TAG);
         if (wc[i].opcode & IBV_WC_RECV) {
-            if (target_recv && wc[i].wr_id == target_seq) *target_recv = 1;
-            if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
+            if (wc[i].wr_id & DS4_TP_RDMA_AUX_WR_TAG) {
+                if (wr_seq > r->aux_recv_done) r->aux_recv_done = wr_seq;
+            } else {
+                if (target_recv && wc[i].wr_id == target_seq) *target_recv = 1;
+                if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
+            }
+        } else if (wc[i].wr_id & DS4_TP_RDMA_AUX_WR_TAG) {
+            if (wr_seq > r->aux_send_done) r->aux_send_done = wr_seq;
         } else if (!(wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) &&
                    r->send_outstanding > 0) {
             if (target_send && wc[i].wr_id == target_seq) *target_send = 1;
@@ -1455,6 +1533,45 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
 }
 
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+
+typedef struct {
+    uint64_t calls;
+    double post_s;
+    double wait_s;
+    double total_s;
+} ds4_tp_rdma_aux_profile_stat;
+static ds4_tp_rdma_aux_profile_stat g_tp_rdma_aux_profile;
+static int g_tp_rdma_aux_profile_enabled = -1;
+static int g_tp_rdma_aux_profile_registered;
+static int g_tp_rdma_aux_profile_rank;
+
+static void tp_rdma_aux_profile_print(void) {
+    const ds4_tp_rdma_aux_profile_stat *s = &g_tp_rdma_aux_profile;
+    if (!s->calls) return;
+    fprintf(stderr,
+            "{\"ds4_tp_rdma_aux_profile\":true,\"rank\":%d,"
+            "\"calls\":%llu,\"post_us\":%.3f,\"wait_us\":%.3f,"
+            "\"total_us\":%.3f}\n",
+            g_tp_rdma_aux_profile_rank, (unsigned long long)s->calls,
+            s->post_s * 1e6 / (double)s->calls,
+            s->wait_s * 1e6 / (double)s->calls,
+            s->total_s * 1e6 / (double)s->calls);
+}
+
+static int tp_rdma_aux_profile_is_enabled(const ds4_tp *tp) {
+    if (g_tp_rdma_aux_profile_enabled < 0) {
+        const char *s = getenv("DS4_TP_RDMA_AUX_PROFILE");
+        g_tp_rdma_aux_profile_enabled =
+            s && s[0] != '\0' && strcmp(s, "0") != 0;
+        if (g_tp_rdma_aux_profile_enabled &&
+            !g_tp_rdma_aux_profile_registered) {
+            g_tp_rdma_aux_profile_rank = tp->rank;
+            atexit(tp_rdma_aux_profile_print);
+            g_tp_rdma_aux_profile_registered = 1;
+        }
+    }
+    return g_tp_rdma_aux_profile_enabled;
+}
 
 typedef struct {
     uint64_t gates;
@@ -1622,7 +1739,117 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
         }
         off += len;
     }
+    if (tp_aux_gate_eligible(tp, seq)) {
+        const uint32_t layer = tp_gate_slot(tp, seq) / DS4_TP_GATES_PER_LAYER;
+        const uintptr_t aux = (uintptr_t)(tp->slab + tp->aux_in_off +
+            (uint64_t)layer * DS4_TP_AUX_STRIDE);
+        struct ibv_sge sge = {
+            .addr = aux,
+            .length = (uint32_t)(sizeof(ds4_tp_aux_header) +
+                                 tp->aux_payload_bytes),
+            .lkey = tp_rdma_lkey(tp, (void *)aux,
+                                 sizeof(ds4_tp_aux_header) +
+                                 tp->aux_payload_bytes),
+        };
+        struct ibv_recv_wr wr = {0}, *bad = NULL;
+        wr.wr_id = DS4_TP_RDMA_AUX_WR_TAG | seq;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        if (ibv_post_recv(r->qp, &wr, &bad) != 0) {
+            fprintf(stderr, "ds4-tp: rdma aux post_recv(seq %llu): %s\n",
+                    (unsigned long long)seq, strerror(errno));
+            return 0;
+        }
+    }
     return 1;
+}
+
+static int tp_rdma_aux_gate_exchange(ds4_tp *tp, uint32_t layer) {
+    ds4_tp_rdma *r = &tp->rdma;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const int profile = tp_rdma_aux_profile_is_enabled(tp);
+    const double profile_t0 = profile ? tp_now_sec() : 0.0;
+#endif
+    /* The latency-QP sequence belongs to the GPU row-gate channel.  It is
+     * intentionally independent of the executor's bulk/control sequence,
+     * which may already have advanced through an initial prompt.  Pair with
+     * the transport's just-consumed logical receive rather than accepting a
+     * caller-owned counter. */
+    const uint64_t seq = r->last_gate_seq;
+    if (seq == 0u || seq >= DS4_TP_RDMA_AUX_WR_TAG ||
+        !tp_aux_gate_eligible(tp, seq) ||
+        tp_gate_slot(tp, seq) / DS4_TP_GATES_PER_LAYER != layer ||
+        tp->aux_payload_bytes != DS4_TP_AUX_PAYLOAD_BYTES) {
+        fprintf(stderr,
+                "ds4-tp: invalid paired aux gate layer=%u seq=%llu\n",
+                layer, (unsigned long long)seq);
+        return 0;
+    }
+    ds4_tp_aux_header *out = (ds4_tp_aux_header *)(tp->slab +
+        tp->aux_out_off + (uint64_t)layer * DS4_TP_AUX_STRIDE);
+    ds4_tp_aux_header *in = (ds4_tp_aux_header *)(tp->slab +
+        tp->aux_in_off + (uint64_t)layer * DS4_TP_AUX_STRIDE);
+    *out = (ds4_tp_aux_header) { DS4_TP_AUX_MAGIC, (uint16_t)layer, 0u, seq };
+    atomic_thread_fence(memory_order_release);
+
+    pthread_mutex_lock(&r->post_lock);
+    struct ibv_sge sge = {
+        .addr = (uintptr_t)out,
+        .length = (uint32_t)(sizeof(*out) + tp->aux_payload_bytes),
+        .lkey = tp_rdma_lkey(tp, out, sizeof(*out) + tp->aux_payload_bytes),
+    };
+    struct ibv_send_wr wr = {0}, *bad = NULL;
+    wr.wr_id = DS4_TP_RDMA_AUX_WR_TAG | seq;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    int ok = ibv_post_send(r->qp, &wr, &bad) == 0;
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    const double profile_post = profile ? tp_now_sec() : 0.0;
+#endif
+    if (!ok)
+        fprintf(stderr, "ds4-tp: rdma aux post_send: %s\n", strerror(errno));
+
+    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    uint32_t peer_poll = 0u;
+    while (ok && (r->aux_recv_done < seq || r->aux_send_done < seq)) {
+        ok = tp_rdma_drain_cq(tp);
+        if (ok && (peer_poll++ & 0x3fffu) == 0u && tp_peer_closed(tp)) {
+            fprintf(stderr, "ds4-tp: peer disconnected during paired aux gate\n");
+            ok = 0;
+        }
+        if (ok && tp_now_sec() > deadline) {
+            fprintf(stderr,
+                    "ds4-tp: timeout waiting paired aux seq %llu "
+                    "(recv %llu send %llu)\n",
+                    (unsigned long long)seq,
+                    (unsigned long long)r->aux_recv_done,
+                    (unsigned long long)r->aux_send_done);
+            ok = 0;
+        }
+    }
+    atomic_thread_fence(memory_order_acquire);
+    if (ok && (in->magic != DS4_TP_AUX_MAGIC || in->layer != layer ||
+               in->reserved != 0u || in->seq != seq)) {
+        fprintf(stderr,
+                "ds4-tp: paired aux desync: got l=%u seq=%llu, "
+                "want l=%u seq=%llu\n",
+                in->layer, (unsigned long long)in->seq,
+                layer, (unsigned long long)seq);
+        ok = 0;
+    }
+#if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
+    if (profile && ok) {
+        const double done = tp_now_sec();
+        g_tp_rdma_aux_profile.calls++;
+        g_tp_rdma_aux_profile.post_s += profile_post - profile_t0;
+        g_tp_rdma_aux_profile.wait_s += done - profile_post;
+        g_tp_rdma_aux_profile.total_s += done - profile_t0;
+    }
+#endif
+    pthread_mutex_unlock(&r->post_lock);
+    return ok;
 }
 
 /* One decode gate: ensure the receive window is armed, send our partial,
@@ -1793,16 +2020,14 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     ds4_tp_rdma *r = &tp->rdma;
     if (!r->recv_window_active) return 1;
 
-    const uint32_t chunks_per_gate =
-        (uint32_t)((tp->vec_bytes + r->decode_max_msg - 1u) /
-                   r->decode_max_msg);
-    const uint32_t nwr = DS4_TP_RDMA_RECV_WINDOW * chunks_per_gate;
-    struct ibv_sge sge[DS4_TP_RDMA_RECV_WINDOW * 2u];
-    struct ibv_send_wr wr[DS4_TP_RDMA_RECV_WINDOW * 2u];
+    const uint32_t max_wr = DS4_TP_RDMA_RECV_WINDOW * 3u;
+    struct ibv_sge sge[DS4_TP_RDMA_RECV_WINDOW * 3u];
+    struct ibv_send_wr wr[DS4_TP_RDMA_RECV_WINDOW * 3u];
     memset(wr, 0, sizeof(wr));
     uint8_t *scratch = tp->slab + tp->batch_out_off;
     uint32_t wi = 0;
     for (uint32_t gate = 0; gate < DS4_TP_RDMA_RECV_WINDOW; gate++) {
+        const uint64_t seq = r->last_gate_seq + (uint64_t)gate + 1u;
         for (uint64_t off = 0; off < tp->vec_bytes; ) {
             const uint64_t len = tp->vec_bytes - off > r->decode_max_msg ?
                 r->decode_max_msg : tp->vec_bytes - off;
@@ -1815,12 +2040,30 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
             wr[wi].sg_list = &sge[wi];
             wr[wi].num_sge = 1;
             wr[wi].opcode = IBV_WR_SEND;
-            wr[wi].send_flags = wi + 1u == nwr ? IBV_SEND_SIGNALED : 0;
             if (wi > 0) wr[wi - 1u].next = &wr[wi];
             wi++;
             off += len;
         }
+        if (tp_aux_gate_eligible(tp, seq)) {
+            sge[wi] = (struct ibv_sge) {
+                .addr = (uintptr_t)scratch,
+                .length = (uint32_t)(sizeof(ds4_tp_aux_header) +
+                                     tp->aux_payload_bytes),
+                .lkey = tp_rdma_lkey(tp, scratch,
+                                     sizeof(ds4_tp_aux_header) +
+                                     tp->aux_payload_bytes),
+            };
+            wr[wi].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)wi + 1u);
+            wr[wi].sg_list = &sge[wi];
+            wr[wi].num_sge = 1;
+            wr[wi].opcode = IBV_WR_SEND;
+            if (wi > 0) wr[wi - 1u].next = &wr[wi];
+            wi++;
+        }
     }
+    const uint32_t nwr = wi;
+    if (nwr == 0u || nwr > max_wr) return 0;
+    wr[nwr - 1u].send_flags = IBV_SEND_SIGNALED;
 
     pthread_mutex_lock(&r->post_lock);
     struct ibv_send_wr *bad = NULL;
@@ -1836,9 +2079,9 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
     const double deadline = tp_now_sec() + (double)tp->timeout_sec;
     uint32_t peer_poll = 0;
     while (recv_done < nwr || !send_done) {
-        struct ibv_wc wc[DS4_TP_RDMA_RECV_WINDOW * 2u + 1u];
+        struct ibv_wc wc[DS4_TP_RDMA_RECV_WINDOW * 3u + 1u];
         int n = ibv_poll_cq(r->cq,
-                           (int)(DS4_TP_RDMA_RECV_WINDOW * 2u + 1u), wc);
+                           (int)(DS4_TP_RDMA_RECV_WINDOW * 3u + 1u), wc);
         if (n < 0) {
             pthread_mutex_unlock(&r->post_lock);
             return 0;
@@ -1873,6 +2116,8 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
         }
     }
     r->recv_done = r->last_gate_seq;
+    r->aux_recv_done = r->last_gate_seq;
+    r->aux_send_done = r->last_gate_seq;
     r->recv_window_active = false;
     pthread_mutex_unlock(&r->post_lock);
     return 1;
@@ -2486,6 +2731,17 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
                       tp->vec_bytes))
         return 0;
     return 1;
+}
+
+int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer) {
+    DS4_TP_TEST_COUNT_EXCHANGE();
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp && tp->rdma_active)
+        return tp_rdma_aux_gate_exchange(tp, layer);
+#endif
+    fprintf(stderr,
+            "ds4-tp: paired GLM5 auxiliary gate requires explicit RDMA\n");
+    return 0;
 }
 
 /* Verify-block batch gate: one exchange per layer moving all block rows at

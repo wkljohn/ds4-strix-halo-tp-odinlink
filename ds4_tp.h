@@ -154,7 +154,10 @@ static inline uint32_t ds4_tp_glm5_kda_output_rowslice_feature(
         uint32_t runtime_features,
         int all_kda_outputs_bf16) {
     return env && env[0] == '1' && env[1] == '\0' &&
-           (runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u &&
+           (runtime_features & (DS4_TP_FEATURE_GLM5_KDA_TP |
+                                DS4_TP_FEATURE_GLM5_SMALL_GATE)) ==
+               (DS4_TP_FEATURE_GLM5_KDA_TP |
+                DS4_TP_FEATURE_GLM5_SMALL_GATE) &&
            all_kda_outputs_bf16
         ? DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE : 0u;
 }
@@ -319,6 +322,8 @@ uint32_t ds4_tp_test_gate_slot(
         const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
         uint32_t start, uint32_t step, uint32_t per_token,
         uint32_t n_slots, uint64_t seq);
+int ds4_tp_test_aux_gate_eligible(uint32_t runtime_features,
+                                  uint32_t n_layer, uint32_t slot);
 uint32_t ds4_tp_test_rdma_provider_decode_max_msg(const char *device_name);
 uint32_t ds4_tp_test_rdma_negotiate_decode_max_msg(uint32_t local,
                                                    uint32_t peer);
@@ -357,12 +362,20 @@ uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
 uint64_t ds4_tp_slab_big_out_offset(const ds4_tp *tp);
 uint64_t ds4_tp_slab_big_in_offset(const ds4_tp *tp);
 uint32_t ds4_tp_big_capacity_rows(const ds4_tp *tp);
+/* GLM-5.3 KDA output-row auxiliary payloads.  These live in the latency
+ * slab and are available only when the negotiated row-slice feature is on. */
+uint64_t ds4_tp_slab_aux_out_payload_offset(const ds4_tp *tp, uint32_t layer);
+uint64_t ds4_tp_slab_aux_in_payload_offset(const ds4_tp *tp, uint32_t layer);
+uint64_t ds4_tp_aux_payload_bytes(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
 
 /* Exchange one gate: send out[layer][gate] to the peer's in[layer][gate]
  * and wait until the peer's partial for `seq` has fully landed locally.
  * Called from the GPU gate service thread.  Returns 0 on failure. */
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq);
+/* Exchange the dependent KDA output-row half paired with the preceding
+ * logical attention gate.  It does not consume or advance a gate sequence. */
+int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer);
 
 /* Verify-block batch gate: exchange `rows` row partials for one layer in one
  * bulk RDMA transfer, with a symmetric TCP transfer as fallback. Called from

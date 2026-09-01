@@ -975,17 +975,24 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
                           row_weight_bytes,
                       DS4_GLM5_KDA_CHANNELS, GLM5_WIDTH / 2u,
                       w->kda.recurrent_out, n_tokens)) :
-                 (!ds4_gpu_tensor_copy(ctx->tp_big_out, 0u, w->attention,
-                                       0u, row_bytes) ||
+                 (!ds4_gpu_tensor_copy(
+                       ctx->tp_slab,
+                       ds4_tp_slab_aux_out_payload_offset(ctx->tp, il),
+                       w->attention, 0u, row_bytes) ||
                   !tp_exchange_aux_bytes(ctx, il, row_bytes) ||
                   (ctx->tp_rank == 0u ?
                        !ds4_gpu_tensor_copy(w->attention, row_bytes,
-                                            ctx->tp_big_in, 0u, row_bytes) :
+                            ctx->tp_slab,
+                            ds4_tp_slab_aux_in_payload_offset(ctx->tp, il),
+                            row_bytes) :
                        (!ds4_gpu_tensor_copy(w->attention, 0u,
-                                             ctx->tp_big_in, 0u, row_bytes) ||
+                            ctx->tp_slab,
+                            ds4_tp_slab_aux_in_payload_offset(ctx->tp, il),
+                            row_bytes) ||
                         !ds4_gpu_tensor_copy(w->attention, row_bytes,
-                                             ctx->tp_big_out, 0u,
-                                             row_bytes))))) ||
+                            ctx->tp_slab,
+                            ds4_tp_slab_aux_out_payload_offset(ctx->tp, il),
+                            row_bytes))))) ||
             (rowslice_local && !rowslice_full_gemm &&
              (ctx->tp_rank == 0u ?
                   !ds4_gpu_tensor_copy(w->attention, row_bytes, w->down,
@@ -1313,7 +1320,14 @@ static int tp_exchange_aux_bytes(const ds4_glm5_next_exec_ctx *ctx,
                                  uint32_t layer, uint64_t bytes) {
     if (!ctx || !ctx->tp || !ctx->tp_sequence ||
         *ctx->tp_sequence == UINT64_MAX || bytes == 0u ||
-        !tp_context_valid_bytes(ctx, bytes)) return 0;
+        !ctx->tp_slab || bytes != ds4_tp_aux_payload_bytes(ctx->tp)) return 0;
+    const uint64_t out_off =
+        ds4_tp_slab_aux_out_payload_offset(ctx->tp, layer);
+    const uint64_t in_off =
+        ds4_tp_slab_aux_in_payload_offset(ctx->tp, layer);
+    if (out_off == UINT64_MAX || in_off == UINT64_MAX ||
+        ds4_gpu_tensor_bytes(ctx->tp_slab) < out_off + bytes ||
+        ds4_gpu_tensor_bytes(ctx->tp_slab) < in_off + bytes) return 0;
     const char *cache_fence = getenv("DS4_ROCM_RDMA_CACHE_FENCE");
     const int fence_release = cache_fence &&
         (strcmp(cache_fence, "release") == 0 ||
@@ -1324,9 +1338,7 @@ static int tp_exchange_aux_bytes(const ds4_glm5_next_exec_ctx *ctx,
     if (cache_fence && !fence_release && !fence_acquire) return 0;
     if (!ds4_gpu_synchronize()) return 0;
     if (fence_release && !ds4_rocm_rdma_cache_release()) return 0;
-    const int ok = ds4_tp_big_gate_exchange(
-        ctx->tp, layer, *ctx->tp_sequence,
-        ctx->tp_big_out_host, ctx->tp_big_in_host, bytes);
+    const int ok = ds4_tp_aux_gate_exchange(ctx->tp, layer);
     if (!ok) return 0;
     if (fence_acquire && !ds4_rocm_rdma_cache_acquire()) return 0;
     return 1;

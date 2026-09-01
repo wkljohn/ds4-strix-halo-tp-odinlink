@@ -170,9 +170,35 @@ static int check_invalid_gate_schedules(void) {
     return 1;
 }
 
+static int check_glm53_aux_schedule(void) {
+    uint32_t count = 0u;
+    for (uint32_t slot = 0u; slot < 92u; ++slot) {
+        const int eligible = ds4_tp_test_aux_gate_eligible(
+            DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE, 45u, slot);
+        const uint32_t layer = slot / DS4_TP_GATES_PER_LAYER;
+        const int want = (slot & 1u) == 0u && layer < 45u &&
+                         (layer & 3u) != 3u;
+        if (eligible != want) {
+            fprintf(stderr,
+                    "FAIL GLM53 aux schedule slot=%u got=%d want=%d\n",
+                    slot, eligible, want);
+            return 0;
+        }
+        count += (uint32_t)eligible;
+    }
+    if (count != 34u ||
+        ds4_tp_test_aux_gate_eligible(0u, 46u, 0u)) {
+        fprintf(stderr, "FAIL GLM53 aux schedule count=%u\n", count);
+        return 0;
+    }
+    fprintf(stderr, "PASS GLM53 paired auxiliary schedule (34 receives)\n");
+    return 1;
+}
+
 int main(void) {
     int ok = 1;
     ok &= check_glm53_gate_schedule();
+    ok &= check_glm53_aux_schedule();
     ok &= check_invalid_gate_schedules();
     ok &= check("hello equal-enabled",
                 DS4_TP_FEATURE_Q4K_WMMA, DS4_TP_FEATURE_Q4K_WMMA, 1, NULL);
@@ -385,18 +411,22 @@ int main(void) {
         fprintf(stderr,
                 "PASS GLM5 KDA output K-slice advertisement predicate\n");
     }
+    const uint32_t rowslice_base = DS4_TP_FEATURE_GLM5_KDA_TP |
+                                    DS4_TP_FEATURE_GLM5_SMALL_GATE;
     if (ds4_tp_glm5_kda_output_rowslice_feature(
-            "1", DS4_TP_FEATURE_GLM5_KDA_TP, 1) !=
+            "1", rowslice_base, 1) !=
             DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE ||
         ds4_tp_glm5_kda_output_rowslice_feature(
-            NULL, DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+            NULL, rowslice_base, 1) != 0u ||
         ds4_tp_glm5_kda_output_rowslice_feature(
-            "0", DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+            "0", rowslice_base, 1) != 0u ||
         ds4_tp_glm5_kda_output_rowslice_feature(
-            "true", DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+            "true", rowslice_base, 1) != 0u ||
         ds4_tp_glm5_kda_output_rowslice_feature("1", 0u, 1) != 0u ||
         ds4_tp_glm5_kda_output_rowslice_feature(
-            "1", DS4_TP_FEATURE_GLM5_KDA_TP, 0) != 0u) {
+            "1", DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            "1", rowslice_base, 0) != 0u) {
         fprintf(stderr,
                 "FAIL GLM5 KDA output row-slice advertisement predicate\n");
         ok = 0;
