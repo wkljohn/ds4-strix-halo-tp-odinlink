@@ -273,6 +273,7 @@ bool replay_gpu(const Glm5TestGGUF &gguf, uint64_t weight_offset, Arm &arm) {
         constexpr uint32_t kWarmup = 8u;
         constexpr uint32_t kRepeats = 64u;
         double elapsed_ms[2] = {};
+        double row_elapsed_ms[2] = {};
         for (uint32_t rank = 0u; rank < 2u; ++rank) {
             for (uint32_t i = 0u; i < kWarmup; ++i) {
                 CHECK(ds4_gpu_matmul_bf16_kslice_rows_tensor(
@@ -301,11 +302,46 @@ bool replay_gpu(const Glm5TestGGUF &gguf, uint64_t weight_offset, Arm &arm) {
                   "read real activation K-slice benchmark events");
             elapsed_ms[rank] = (double)total_ms / kRepeats;
         }
+        for (uint32_t half = 0u; half < 2u; ++half) {
+            for (uint32_t i = 0u; i < kWarmup; ++i) {
+                CHECK(ds4_gpu_matmul_bf16_tensor(
+                          row_half[half], gguf.map, gguf.size,
+                          weight_offset + (uint64_t)half * (kOut / 2u) *
+                              kFull * sizeof(uint16_t),
+                          kFull, kOut / 2u, full_x, 1u),
+                      "warm real activation output-row benchmark");
+            }
+            hipEvent_t begin = nullptr, end = nullptr;
+            CHECK(hipEventCreate(&begin) == hipSuccess &&
+                  hipEventCreate(&end) == hipSuccess &&
+                  hipEventRecord(begin) == hipSuccess,
+                  "create real activation output-row benchmark events");
+            for (uint32_t i = 0u; i < kRepeats; ++i) {
+                CHECK(ds4_gpu_matmul_bf16_tensor(
+                          row_half[half], gguf.map, gguf.size,
+                          weight_offset + (uint64_t)half * (kOut / 2u) *
+                              kFull * sizeof(uint16_t),
+                          kFull, kOut / 2u, full_x, 1u),
+                      "launch real activation output-row benchmark");
+            }
+            CHECK(hipEventRecord(end) == hipSuccess &&
+                  hipEventSynchronize(end) == hipSuccess,
+                  "complete real activation output-row benchmark events");
+            float total_ms = 0.0f;
+            CHECK(hipEventElapsedTime(&total_ms, begin, end) == hipSuccess &&
+                  hipEventDestroy(end) == hipSuccess &&
+                  hipEventDestroy(begin) == hipSuccess,
+                  "read real activation output-row benchmark events");
+            row_elapsed_ms[half] = (double)total_ms / kRepeats;
+        }
         std::printf(
             "BENCH KDA_KSLICE rows=%u k=%u rank0_ms=%.9g rank1_ms=%.9g "
-            "critical_ms=%.9g repeats=%u\n",
+            "critical_ms=%.9g rowslice0_ms=%.9g rowslice1_ms=%.9g "
+            "rowslice_sum_ms=%.9g repeats=%u\n",
             kOut, kHalf, elapsed_ms[0], elapsed_ms[1],
-            std::max(elapsed_ms[0], elapsed_ms[1]), kRepeats);
+            std::max(elapsed_ms[0], elapsed_ms[1]), row_elapsed_ms[0],
+            row_elapsed_ms[1], row_elapsed_ms[0] + row_elapsed_ms[1],
+            kRepeats);
     }
     return true;
 }
