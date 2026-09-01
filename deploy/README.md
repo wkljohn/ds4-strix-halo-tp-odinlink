@@ -76,6 +76,15 @@ The launcher verifies that effective process limit and checks the peer's
 SSH-session limit before model loading. OdinLink retains its transient user
 service and does not acquire this requirement.
 
+Set `DS4_TP_CONTAINER=1` (plus the image, volume, and optional init command)
+to run both ranks in podman containers instead, for hosts where ROCm exists
+only inside a container image. The memlock requirement then moves into the
+container (`--ulimit memlock=-1`), the coordinator runs as a `systemd --user`
+transient unit supervising a foreground `podman run`, the peer worker is a
+detached `--rm` container, and passwordless `sudo` is not required. The
+launcher probes the image, GPU/InfiniBand device access, and the memlock
+limit inside a throwaway container on both nodes before model loading.
+
 Useful commands:
 
 ```sh
