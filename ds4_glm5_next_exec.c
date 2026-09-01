@@ -932,6 +932,9 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
         const int rowslice_full_gemm = rowslice_local &&
             getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE_FULL_GEMM") != NULL &&
             strcmp(getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE_FULL_GEMM"), "1") == 0;
+        const int rowslice_sync = rowslice_local &&
+            getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE_SYNC") != NULL &&
+            strcmp(getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE_SYNC"), "1") == 0;
         const uint64_t row_weight_bytes =
             (uint64_t)(GLM5_WIDTH / 2u) * DS4_GLM5_KDA_CHANNELS *
             sizeof(uint16_t);
@@ -993,6 +996,7 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
                                         row_bytes) ||
                    !ds4_gpu_tensor_copy(w->attention, row_bytes, w->up, 0u,
                                         row_bytes)))) ||
+            (rowslice_sync && !ds4_gpu_synchronize()) ||
             !trace_tensor(ctx, il, (uint32_t)kda->token_count,
                           "kda_projected.f32", w->attention,
                           (uint64_t)GLM5_WIDTH * sizeof(float)) ||

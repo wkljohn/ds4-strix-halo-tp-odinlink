@@ -17,4 +17,6 @@ if "ds4_gpu_tensor_copy(w->up, 0u, w->attention, 0u" not in source:
     raise SystemExit("FAIL rank 1 local rowslice does not preserve its high half")
 if "DS4_GLM5_KDA_OUTPUT_ROWSLICE_FULL_GEMM" not in source:
     raise SystemExit("FAIL full-GEMM rowslice control is missing")
+if "DS4_GLM5_KDA_OUTPUT_ROWSLICE_SYNC" not in source:
+    raise SystemExit("FAIL rowslice synchronization control is missing")
 print("PASS rowslice local diagnostic switch and transport anchor exist")
