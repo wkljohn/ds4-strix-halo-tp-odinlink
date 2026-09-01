@@ -269,6 +269,13 @@ def main() -> int:
         assert invalid_attention.returncode == 1
         assert "FP32 NoPE GEMM only in the candidate" in \
             invalid_attention.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(candidate / "manifest", arm="attn-scalar")
+        attention_repeat = run(
+            str(reference), str(candidate),
+            "--score-arm-mode", "attn-repeat")
+        assert attention_repeat.returncode == 0, attention_repeat.stderr
     print("test_compare_teacher_logits: PASS")
     return 0
 

@@ -215,7 +215,7 @@ def main() -> int:
         "--score-arm-mode", choices=(
             "kda-tp", "kda-kslice", "repeat", "full-split-order-null",
             "null-vs-kslice", "fallback-vs-kslice",
-            "attn-scalar-vs-f32-gemm"),
+            "attn-scalar-vs-f32-gemm", "attn-repeat"),
         help="required arm relationship for score_official GLM5 diagnostics")
     args = parser.parse_args()
     try:
@@ -270,6 +270,7 @@ def main() -> int:
                 "null-vs-kslice": ("kda-tp", "kda-kslice"),
                 "fallback-vs-kslice": ("kda-tp", "kda-kslice"),
                 "attn-scalar-vs-f32-gemm": ("attn-scalar", "attn-gemm-f32"),
+                "attn-repeat": ("attn-scalar", "attn-scalar"),
             }[args.score_arm_mode]
             actual_arms = (reference_manifest.get("teacher_arm"),
                            candidate_manifest.get("teacher_arm"))
