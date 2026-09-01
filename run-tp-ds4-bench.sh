@@ -126,6 +126,7 @@ else
   PEER_OUT=$DS4_PEER_RESEARCH_ROOT/bench-runs
 fi
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
+ROCPROF_BIN=${DS4_BENCH_ROCPROF_BIN:-rocprofv3}
 # 1 captures the complete runtime domain, including asynchronous memory-copy
 # records.  2 captures HIP runtime calls plus kernels and markers, avoiding a
 # rocprofiler-sdk 1.3.x shutdown hang when an HSA copy completion callback is
@@ -190,6 +191,24 @@ if [[ $ROCPROF == 1 && $ROCPROF_RUNTIME != 1 && $ROCPROF_RUNTIME != 2 &&
       $ROCPROF_RUNTIME != 3 ]]; then
   echo "error: DS4_BENCH_ROCPROF_RUNTIME must be 1 (full runtime), 2 (HIP API + kernel), or 3 (kernel only)" >&2
   exit 2
+fi
+if [[ $ROCPROF == 1 ]]; then
+  if [[ $ROCPROF_BIN == */* ]]; then
+    [[ -x $ROCPROF_BIN ]] || {
+      echo "error: profiler is not executable: $ROCPROF_BIN" >&2
+      exit 2
+    }
+    ROCPROF_RESOLVED=$ROCPROF_BIN
+  else
+    ROCPROF_RESOLVED=$(command -v "$ROCPROF_BIN") || {
+      echo "error: profiler is not on PATH: $ROCPROF_BIN" >&2
+      exit 2
+    }
+  fi
+  ROCPROF_SHA256=$(sha256sum "$ROCPROF_RESOLVED" | awk '{print $1}')
+else
+  ROCPROF_RESOLVED=
+  ROCPROF_SHA256=
 fi
 if [[ $ROCPROF == 1 && $ROCPROF_RUNTIME == 3 && $TP_TIMEOUT_SEC -lt 600 ]]; then
   echo "error: asymmetric kernel tracing requires DS4_BENCH_TP_TIMEOUT_SEC >= 600" >&2
@@ -749,6 +768,8 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'binary_toolchain_comment=%s\n' "$BINARY_TOOLCHAIN_COMMENT"
   printf 'binary_runpath=%s\n' "$BINARY_RUNPATH"
   printf 'expected_binary_toolchain_sha256=%s\n' "$EXPECTED_TOOLCHAIN_SHA256"
+  printf 'rocprof_binary=%s\n' "$ROCPROF_RESOLVED"
+  printf 'rocprof_sha256=%s\n' "$ROCPROF_SHA256"
   printf 'frontier=%s\n' "$FRONTIER"
   printf 'frontier_max=%s\n' "$FRONTIER_MAX"
   printf 'step_incr=%s\n' "$STEP_INCR"
@@ -852,7 +873,7 @@ echo "workload: frontier=$FRONTIER frontier_max=$FRONTIER_MAX step_incr=$STEP_IN
 echo "rdma_profile: $RDMA_PROFILE coordinator_device=$LOCAL_RDMA_DEVICE worker_device=$PEER_RDMA_DEVICE"
 if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
 if [[ $DSPARK == 0 ]]; then echo "routed_expert_family: $ROUTED_FAMILY"; fi
-if [[ $ROCPROF == 1 ]]; then echo "rocprof: rank=$ROCPROF_RANK kernel trace (diagnostic; timing is not benchmark evidence)"; fi
+if [[ $ROCPROF == 1 ]]; then echo "rocprof: binary=$ROCPROF_RESOLVED rank=$ROCPROF_RANK kernel trace (diagnostic; timing is not benchmark evidence)"; fi
 echo "ds4_sha256: $LOCAL_DS4_HASH"
 echo "ds4_bench_tp_sha256: $LOCAL_BENCH_HASH"
 echo "model_sample_sha256: $LOCAL_MODEL_FINGERPRINT"
@@ -880,7 +901,7 @@ if [[ $ROCPROF == 1 && $ROCPROF_RANK == worker ]]; then
     WORKER_TRACE=(--kernel-trace --marker-trace)
   fi
   WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}"
-              rocprofv3 "${WORKER_TRACE[@]}" --stats --summary
+              "$ROCPROF_RESOLVED" "${WORKER_TRACE[@]}" --stats --summary
               --summary-units usec --output-directory "$ROCPROF_OUT" --
               "${WORKER_APP[@]}")
 fi
@@ -913,7 +934,7 @@ if [[ $ROCPROF == 1 && $ROCPROF_RANK == coordinator ]]; then
   fi
   COORD_ENV+=(DS4_BENCH_ROCPROF_SELECTED_REGIONS=1
              DS4_BENCH_ROCPROF_REGION="$ROCPROF_REGION")
-  COORD_CMD=(rocprofv3 "${ROCPROF_TRACE[@]}"
+  COORD_CMD=("$ROCPROF_RESOLVED" "${ROCPROF_TRACE[@]}"
              --stats --summary --summary-units usec
              --output-directory "$ROCPROF_OUT" -- "$REPO/ds4-bench-tp")
 elif [[ $ROCPROF != 0 && $ROCPROF != 1 ]]; then
