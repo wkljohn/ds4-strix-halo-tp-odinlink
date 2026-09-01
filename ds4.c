@@ -53602,6 +53602,9 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
     glm5_kda_features |= ds4_tp_glm5_kda_output_kslice_feature(
         getenv("DS4_GLM5_KDA_OUTPUT_KSLICE"), glm5_kda_features,
         all_kda_outputs_bf16);
+    glm5_kda_features |= ds4_tp_glm5_kda_output_rowslice_feature(
+        getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE"), glm5_kda_features,
+        all_kda_outputs_bf16);
     const char *q4k_kshard_legacy =
         getenv("DS4_ROCM_Q4K_KSHARD_RESEARCH");
     const char *q4k_kshard_disable =

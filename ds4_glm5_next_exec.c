@@ -661,6 +661,11 @@ int ds4_glm5_next_output_logits(const ds4_glm5_next_exec_ctx *ctx,
 static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
                             uint32_t layer, uint32_t gate,
                             uint32_t n_tokens);
+static int tp_exchange_bytes(const ds4_glm5_next_exec_ctx *ctx,
+                             uint32_t layer, uint32_t gate,
+                             uint64_t bytes);
+static int tp_exchange_aux_bytes(const ds4_glm5_next_exec_ctx *ctx,
+                                 uint32_t layer, uint64_t bytes);
 static int tp_context_valid_bytes(const ds4_glm5_next_exec_ctx *ctx,
                                   uint64_t bytes);
 
@@ -769,6 +774,13 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
         (n_tokens == 1u ||
          (getenv("DS4_ROCM_GLM5_BATCH_KSLICE_OUTPUT") != NULL &&
           strcmp(getenv("DS4_ROCM_GLM5_BATCH_KSLICE_OUTPUT"), "1") == 0));
+    const int output_rowslice =
+        (tp_features & DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE) != 0u &&
+        n_tokens == 1u;
+    if (output_kslice && output_rowslice) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
     if (output_kslice) {
         static int logged_output_kslice[2] = {0, 0};
         const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
@@ -781,6 +793,10 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
         }
     }
     if (output_kslice && layer->kda.output_type != 30u) {
+        ds4_glm5_next_state_invalidate(state);
+        return 0;
+    }
+    if (output_rowslice && layer->kda.output_type != 30u) {
         ds4_glm5_next_state_invalidate(state);
         return 0;
     }
@@ -884,6 +900,54 @@ static int kda_attention_rows(const ds4_glm5_next_exec_ctx *ctx,
         kda_half_state_free(&local);
         if (!suffix_ok) ds4_glm5_next_state_invalidate(state);
         return suffix_ok;
+    }
+    if (output_rowslice) {
+        const uint64_t row_bytes =
+            (uint64_t)(GLM5_WIDTH / 2u) * sizeof(float);
+        const uint64_t row_weight_bytes =
+            (uint64_t)(GLM5_WIDTH / 2u) * DS4_GLM5_KDA_CHANNELS *
+            sizeof(uint16_t);
+        const uint64_t row_weight_offset =
+            layer->kda.output + (uint64_t)ctx->tp_rank * row_weight_bytes;
+        const ds4_gpu_tensor *rank0_gated =
+            ctx->tp_rank == 0u ? ctx->tp_big_out : ctx->tp_big_in;
+        const ds4_gpu_tensor *rank1_gated =
+            ctx->tp_rank == 0u ? ctx->tp_big_in : ctx->tp_big_out;
+        if (!ds4_glm5_kda_compose_head_halves(
+                w->kda.recurrent_out, rank0_gated, rank1_gated,
+                n_tokens) ||
+            !ds4_gpu_matmul_bf16_tensor(
+                w->attention, ctx->model_map, ctx->model_size,
+                row_weight_offset, DS4_GLM5_KDA_CHANNELS,
+                GLM5_WIDTH / 2u, w->kda.recurrent_out, n_tokens) ||
+            !ds4_gpu_tensor_copy(ctx->tp_big_out, 0u, w->attention, 0u,
+                                 row_bytes) ||
+            !tp_exchange_aux_bytes(ctx, il, row_bytes) ||
+            (ctx->tp_rank == 0u ?
+                 !ds4_gpu_tensor_copy(w->attention, row_bytes,
+                                      ctx->tp_big_in, 0u, row_bytes) :
+                 (!ds4_gpu_tensor_copy(w->attention, 0u,
+                                       ctx->tp_big_in, 0u, row_bytes) ||
+                  !ds4_gpu_tensor_copy(w->attention, row_bytes,
+                                       ctx->tp_big_out, 0u, row_bytes))) ||
+            !ds4_glm5_kda_layer_commit(&local, n_tokens) ||
+            !ds4_gpu_hc_expand_split_tensor(
+                w->after_attention, w->attention, hc_in, w->hc_split,
+                GLM5_WIDTH, GLM5_HC)) {
+            ds4_glm5_kda_layer_abort(&local);
+            kda_half_state_free(&local);
+            ds4_glm5_next_state_invalidate(state);
+            return 0;
+        }
+        kda->token_count = local.token_count;
+        kda_half_state_free(&local);
+        static int rowslice_reported;
+        if (!rowslice_reported) {
+            fprintf(stderr,
+                    "ds4: GLM5 KDA output row-slice engaged (decode-only)\n");
+            rowslice_reported = 1;
+        }
+        return 1;
     }
     const ds4_gpu_tensor *rank0 =
         ctx->tp_rank == 0u ? ctx->tp_big_out : ctx->tp_big_in;
@@ -1029,12 +1093,10 @@ static int tp_context_valid(const ds4_glm5_next_exec_ctx *ctx) {
         ctx, (uint64_t)GLM5_WIDTH * sizeof(float));
 }
 
-static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
-                            uint32_t layer, uint32_t gate,
-                            uint32_t n_tokens) {
-    if (n_tokens == 0u) return 0;
-    const uint64_t bytes =
-        (uint64_t)n_tokens * GLM5_WIDTH * sizeof(float);
+static int tp_exchange_bytes(const ds4_glm5_next_exec_ctx *ctx,
+                             uint32_t layer, uint32_t gate,
+                             uint64_t bytes) {
+    if (bytes == 0u) return 0;
     if (!tp_context_valid_bytes(ctx, bytes) || gate >= DS4_TP_GATES_PER_LAYER ||
         *ctx->tp_sequence == UINT64_MAX) return 0;
 
@@ -1047,11 +1109,11 @@ static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
          strcmp(cache_fence, "both") == 0);
     if (cache_fence && !fence_release && !fence_acquire) return 0;
 
-    const int small_gate_requested = n_tokens == 1u &&
+    const int small_gate_requested = bytes == ds4_tp_vec_bytes(ctx->tp) &&
         (ds4_tp_runtime_features(ctx->tp) &
          DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u;
     if (small_gate_requested) {
-        if (!ctx->tp_slab || bytes != ds4_tp_vec_bytes(ctx->tp)) {
+        if (!ctx->tp_slab) {
             ds4_tp_mark_failed(ctx->tp);
             return 0;
         }
@@ -1135,23 +1197,62 @@ static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
         return 1;
     }
 
-    glm5_phase_trace(ctx, "gate_gpu_sync_enter", layer, n_tokens);
+    const uint64_t trace_row_bytes = (uint64_t)GLM5_WIDTH * sizeof(float);
+    const uint32_t trace_rows = (uint32_t)(
+        (bytes + trace_row_bytes - 1u) / trace_row_bytes);
+    glm5_phase_trace(ctx, "gate_gpu_sync_enter", layer, trace_rows);
     if (!ds4_gpu_synchronize()) return 0;
-    glm5_phase_trace(ctx, "gate_gpu_sync_done", layer, n_tokens);
+    glm5_phase_trace(ctx, "gate_gpu_sync_done", layer, trace_rows);
     if (fence_release && !ds4_rocm_rdma_cache_release()) return 0;
     const uint64_t sequence = ++*ctx->tp_sequence;
-    glm5_phase_trace(ctx, "gate_rdma_enter", layer, n_tokens);
+    glm5_phase_trace(ctx, "gate_rdma_enter", layer, trace_rows);
     if (!ds4_tp_big_gate_exchange(ctx->tp, layer, sequence,
                                   ctx->tp_big_out_host,
                                   ctx->tp_big_in_host, bytes)) {
         ds4_tp_mark_failed(ctx->tp);
         return 0;
     }
-    glm5_phase_trace(ctx, "gate_rdma_done", layer, n_tokens);
+    glm5_phase_trace(ctx, "gate_rdma_done", layer, trace_rows);
     if (fence_acquire && !ds4_rocm_rdma_cache_acquire()) {
         ds4_tp_mark_failed(ctx->tp);
         return 0;
     }
+    return 1;
+}
+
+static int tp_exchange_rows(const ds4_glm5_next_exec_ctx *ctx,
+                            uint32_t layer, uint32_t gate,
+                            uint32_t n_tokens) {
+    if (n_tokens == 0u) return 0;
+    return tp_exchange_bytes(ctx, layer, gate,
+                             (uint64_t)n_tokens * GLM5_WIDTH * sizeof(float));
+}
+
+/* Exchange a second dependent payload without consuming a logical decode-gate
+ * slot.  Output-row KDA sharding needs the normal gated-head exchange first,
+ * then this small registered RDMA payload.  The header sequence is the
+ * current logical sequence on both ranks; it is deliberately not incremented
+ * so the existing attention/FFN receive-window schedule remains unchanged. */
+static int tp_exchange_aux_bytes(const ds4_glm5_next_exec_ctx *ctx,
+                                 uint32_t layer, uint64_t bytes) {
+    if (!ctx || !ctx->tp || !ctx->tp_sequence ||
+        *ctx->tp_sequence == UINT64_MAX || bytes == 0u ||
+        !tp_context_valid_bytes(ctx, bytes)) return 0;
+    const char *cache_fence = getenv("DS4_ROCM_RDMA_CACHE_FENCE");
+    const int fence_release = cache_fence &&
+        (strcmp(cache_fence, "release") == 0 ||
+         strcmp(cache_fence, "both") == 0);
+    const int fence_acquire = cache_fence &&
+        (strcmp(cache_fence, "acquire") == 0 ||
+         strcmp(cache_fence, "both") == 0);
+    if (cache_fence && !fence_release && !fence_acquire) return 0;
+    if (!ds4_gpu_synchronize()) return 0;
+    if (fence_release && !ds4_rocm_rdma_cache_release()) return 0;
+    const int ok = ds4_tp_big_gate_exchange(
+        ctx->tp, layer, *ctx->tp_sequence,
+        ctx->tp_big_out_host, ctx->tp_big_in_host, bytes);
+    if (!ok) return 0;
+    if (fence_acquire && !ds4_rocm_rdma_cache_acquire()) return 0;
     return 1;
 }
 

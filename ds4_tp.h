@@ -111,6 +111,11 @@ enum {
      * graph-thread exchange.  The wire verb and slab layout stay unchanged,
      * but both ranks must choose the same gate sequence source. */
     DS4_TP_FEATURE_GLM5_GPU_ROW_GATE = UINT32_C(1) << 24,
+    /* GLM-5.3 KDA preserves the incumbent full-K reduction while assigning
+     * disjoint output rows to the two ranks.  It performs one auxiliary
+     * registered-slab exchange after the normal attention gate, outside the
+     * decode receive-window sequence, so both ranks must opt in together. */
+    DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE = UINT32_C(1) << 25,
 };
 
 static inline uint32_t ds4_tp_glm5_kda_tp_feature(
@@ -142,6 +147,16 @@ static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(
            (runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u &&
            all_kda_outputs_bf16
         ? DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_kda_output_rowslice_feature(
+        const char *env,
+        uint32_t runtime_features,
+        int all_kda_outputs_bf16) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u &&
+           all_kda_outputs_bf16
+        ? DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE : 0u;
 }
 
 static inline uint32_t ds4_tp_glm5_gpu_row_gate_feature(

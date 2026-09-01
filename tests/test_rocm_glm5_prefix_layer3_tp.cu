@@ -319,6 +319,8 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
         identity.runtime_features |= DS4_TP_FEATURE_GLM5_KDA_TP;
     const char *kda_output_kslice =
         std::getenv("DS4_GLM5_KDA_OUTPUT_KSLICE");
+    const char *kda_output_rowslice =
+        std::getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE");
     CHECK(!kda_output_kslice || std::strcmp(kda_output_kslice, "0") == 0 ||
               std::strcmp(kda_output_kslice, "1") == 0,
           "KDA output K-slice selector is exactly 0 or 1");
@@ -329,6 +331,19 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
               "KDA output K-slice requires BF16 output and KDA-TP");
         identity.runtime_features |=
             DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE;
+    }
+    CHECK(!kda_output_rowslice || std::strcmp(kda_output_rowslice, "0") == 0 ||
+              std::strcmp(kda_output_rowslice, "1") == 0,
+          "KDA output row-slice selector is exactly 0 or 1");
+    if (kda_output_rowslice && std::strcmp(kda_output_rowslice, "1") == 0) {
+        CHECK(!mixed_q2_model &&
+                  (identity.runtime_features &
+                   DS4_TP_FEATURE_GLM5_KDA_TP) != 0u &&
+                  !(identity.runtime_features &
+                    DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE),
+              "KDA output row-slice requires BF16 output, KDA-TP, and no K-slice");
+        identity.runtime_features |=
+            DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE;
     }
     const char *gpu_row_gate = std::getenv("DS4_GLM5_GPU_ROW_GATE");
     if (gpu_row_gate && std::strcmp(gpu_row_gate, "1") == 0 &&

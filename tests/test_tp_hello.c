@@ -240,6 +240,12 @@ int main(void) {
     ok &= check("hello mismatched-glm5-kda-output-kslice",
                 DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00800000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-kda-output-rowslice",
+                DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE,
+                DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE, 1, NULL);
+    ok &= check("hello mismatched-glm5-kda-output-rowslice",
+                DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x02000000 peer=0x00000000)");
     ok &= check("hello q4k-wmma-kshard mismatch",
                 DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD,
                 DS4_TP_FEATURE_Q4K_WMMA, 0,
@@ -288,8 +294,18 @@ int main(void) {
         DS4_TP_FEATURE_GLM5_RESIDENT_KDA |
         DS4_TP_FEATURE_GLM5_SMALL_GATE |
         DS4_TP_FEATURE_GLM5_KDA_TP |
-        DS4_TP_FEATURE_GLM5_GPU_ROW_GATE;
-    if ((DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE & prior_features) != 0u) {
+        DS4_TP_FEATURE_GLM5_GPU_ROW_GATE |
+        DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE;
+    if ((DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE & prior_features) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 KDA output row-slice feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 KDA output row-slice feature is disjoint\n");
+    }
+    if ((DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE &
+         (prior_features & ~DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE)) != 0u) {
         fprintf(stderr,
                 "FAIL GLM5 KDA output K-slice feature overlaps prior bits\n");
         ok = 0;
@@ -368,6 +384,25 @@ int main(void) {
     } else {
         fprintf(stderr,
                 "PASS GLM5 KDA output K-slice advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_kda_output_rowslice_feature(
+            "1", DS4_TP_FEATURE_GLM5_KDA_TP, 1) !=
+            DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            NULL, DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            "0", DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            "true", DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature("1", 0u, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            "1", DS4_TP_FEATURE_GLM5_KDA_TP, 0) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 KDA output row-slice advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 KDA output row-slice advertisement predicate\n");
     }
     const char *invalid_kshard_env[] = {
         NULL, "", "0", "true", "10", "1 ", "1\n"

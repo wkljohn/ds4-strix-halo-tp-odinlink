@@ -125,6 +125,7 @@ BIGGATE_PROFILE=${DS4_TP_BIGGATE_PROFILE:-}
 SMALL_GATE_DISABLE=${DS4_GLM5_DISABLE_SMALL_GATE:-}
 KDA_TP=${DS4_GLM5_KDA_TP:-}
 KDA_OUTPUT_KSLICE=${DS4_GLM5_KDA_OUTPUT_KSLICE:-}
+KDA_OUTPUT_ROWSLICE=${DS4_GLM5_KDA_OUTPUT_ROWSLICE:-}
 GPU_ROW_GATE=${DS4_GLM5_GPU_ROW_GATE:-}
 SMALL_GATE=${DS4_GLM5_SMALL_GATE:-}
 RESIDENT_EXPERTS=${DS4_GLM5_NEXT_RESIDENT_EXPERTS:-}
@@ -428,6 +429,10 @@ done
   echo "error: DS4_GLM5_KDA_OUTPUT_KSLICE must be empty or 1" >&2
   exit 2
 }
+[[ -z $KDA_OUTPUT_ROWSLICE || $KDA_OUTPUT_ROWSLICE == 1 ]] || {
+  echo "error: DS4_GLM5_KDA_OUTPUT_ROWSLICE must be empty or 1" >&2
+  exit 2
+}
 [[ -z $GPU_ROW_GATE || $GPU_ROW_GATE == 1 ]] || {
   echo "error: DS4_GLM5_GPU_ROW_GATE must be empty or 1" >&2
   exit 2
@@ -438,6 +443,14 @@ done
 }
 [[ -z $KDA_OUTPUT_KSLICE || -n $KDA_TP ]] || {
   echo "error: DS4_GLM5_KDA_OUTPUT_KSLICE requires DS4_GLM5_KDA_TP=1" >&2
+  exit 2
+}
+[[ -z $KDA_OUTPUT_ROWSLICE || -n $KDA_TP ]] || {
+  echo "error: DS4_GLM5_KDA_OUTPUT_ROWSLICE requires DS4_GLM5_KDA_TP=1" >&2
+  exit 2
+}
+[[ -z $KDA_OUTPUT_KSLICE || -z $KDA_OUTPUT_ROWSLICE ]] || {
+  echo "error: KDA output K-slice and output row-slice are mutually exclusive" >&2
   exit 2
 }
 [[ -z $EXPECTED_GENERATED_FNV ||
@@ -729,6 +742,9 @@ printf 'kda_tp=%s\n' "$([[ -n $KDA_TP ]] && printf 1 || printf 0)" \
 printf 'kda_output_kslice=%s\n' \
   "$([[ -n $KDA_OUTPUT_KSLICE ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
+printf 'kda_output_rowslice=%s\n' \
+  "$([[ -n $KDA_OUTPUT_ROWSLICE ]] && printf 1 || printf 0)" \
+  >>"$OUT/run.env"
 printf 'resident_experts=%s\n' \
   "$([[ -n $RESIDENT_EXPERTS ]] && printf 1 || printf 0)" >>"$OUT/run.env"
 printf 'warm_resident=%s\n' \
@@ -851,6 +867,10 @@ fi
 if [[ -n $KDA_OUTPUT_KSLICE ]]; then
   local_candidate_env+=(DS4_GLM5_KDA_OUTPUT_KSLICE=1)
   remote_candidate_env+=' DS4_GLM5_KDA_OUTPUT_KSLICE=1'
+fi
+if [[ -n $KDA_OUTPUT_ROWSLICE ]]; then
+  local_candidate_env+=(DS4_GLM5_KDA_OUTPUT_ROWSLICE=1)
+  remote_candidate_env+=' DS4_GLM5_KDA_OUTPUT_ROWSLICE=1'
 fi
 if [[ -n $GPU_ROW_GATE ]]; then
   local_candidate_env+=(DS4_GLM5_GPU_ROW_GATE=1)
