@@ -32,8 +32,13 @@ case $RDMA_PROFILE in
     PEER_RDMA_DEVICE=${PEER_RDMA_DEVICE:-mlx5_1}
     RDMA_GID_INDEX=${RDMA_GID_INDEX:-3}
     ;;
+  ib-mlx4)
+    LOCAL_RDMA_DEVICE=${LOCAL_RDMA_DEVICE:-ibp195s0}
+    PEER_RDMA_DEVICE=${PEER_RDMA_DEVICE:-ibp195s0}
+    RDMA_GID_INDEX=${RDMA_GID_INDEX:-0}
+    ;;
   *)
-    echo "error: RDMA_PROFILE must be odinlink or roce-v2" >&2
+    echo "error: RDMA_PROFILE must be odinlink, roce-v2, or ib-mlx4" >&2
     exit 2
     ;;
 esac
@@ -128,7 +133,7 @@ pid_matches() {
 }
 
 coord_is_active() {
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  if [[ $RDMA_PROFILE != odinlink ]]; then
     sudo -n systemctl is-active --quiet "$COORD_UNIT.service"
   else
     systemctl --user is-active --quiet "$COORD_UNIT.service"
@@ -136,7 +141,7 @@ coord_is_active() {
 }
 
 coord_main_pid() {
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  if [[ $RDMA_PROFILE != odinlink ]]; then
     sudo -n systemctl show -p MainPID --value "$COORD_UNIT.service"
   else
     systemctl --user show -p MainPID --value "$COORD_UNIT.service"
@@ -144,7 +149,7 @@ coord_main_pid() {
 }
 
 coord_stop_service() {
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  if [[ $RDMA_PROFILE != odinlink ]]; then
     sudo -n systemctl stop "$COORD_UNIT.service"
   else
     systemctl --user stop "$COORD_UNIT.service"
@@ -175,21 +180,36 @@ preflight() {
     }
   else
     sudo -n true || {
-      echo "error: passwordless sudo is required to give the RoCE service unlimited memlock" >&2
+      echo "error: passwordless sudo is required to give the RDMA service unlimited memlock" >&2
       exit 1
     }
-    grep -qx 'RoCE v2' \
-      "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX" || {
-      echo "error: local mlx5 GID is not available as RoCE v2" >&2; exit 1;
-    }
-    "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX')\" = 'RoCE v2'" || {
-      echo "error: peer binary/model or RoCE v2 GID is unavailable" >&2; exit 1;
-    }
+    if [[ $RDMA_PROFILE == roce-v2 ]]; then
+      grep -qx 'RoCE v2' \
+        "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX" || {
+        echo "error: local mlx5 GID is not available as RoCE v2" >&2; exit 1;
+      }
+      "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX')\" = 'RoCE v2'" || {
+        echo "error: peer binary/model or RoCE v2 GID is unavailable" >&2; exit 1;
+      }
+    else
+      [[ "$(cat "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/link_layer" 2>/dev/null)" == InfiniBand ]] || {
+        echo "error: local $LOCAL_RDMA_DEVICE is not a native InfiniBand port" >&2; exit 1;
+      }
+      [[ "$(cat "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/state" 2>/dev/null)" == "4: ACTIVE" ]] || {
+        echo "error: local $LOCAL_RDMA_DEVICE port is not ACTIVE" >&2; exit 1;
+      }
+      [[ "$(cat "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/lid" 2>/dev/null)" != 0x0 ]] || {
+        echo "error: local $LOCAL_RDMA_DEVICE has no LID; is a subnet manager running?" >&2; exit 1;
+      }
+      "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/link_layer')\" = InfiniBand && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/state')\" = '4: ACTIVE' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/lid')\" != '0x0'" || {
+        echo "error: peer binary/model or native-InfiniBand port is unavailable" >&2; exit 1;
+      }
+    fi
     local peer_memlock
     peer_memlock=$("${SSH[@]}" 'ulimit -l')
     if [[ $peer_memlock != unlimited ]] &&
        { [[ ! $peer_memlock =~ ^[0-9]+$ ]] || (( peer_memlock < 131072 )); }; then
-      echo "error: peer locked-memory limit is ${peer_memlock} KiB; RoCE deployment requires at least 128 MiB" >&2
+      echo "error: peer locked-memory limit is ${peer_memlock} KiB; RDMA deployment requires at least 128 MiB" >&2
       exit 1
     fi
   fi
@@ -324,10 +344,11 @@ start() {
   # POSIX shells background the whole AND-list and `$!` names a wrapper shell.
   "${SSH[@]}" "cd $repo_q || exit 1; nohup setsid $worker_q >$log_q 2>&1 </dev/null & p=\$!; echo \$p >$pid_q"
 
-  # RoCE registration needs more than the user manager's inherited 8 MiB hard
-  # memlock limit. A system transient unit can genuinely raise that limit;
-  # `systemctl --user show` only reports the requested, not effective, value.
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  # Mellanox RDMA registration needs more than the user manager's inherited
+  # 8 MiB hard memlock limit. A system transient unit can genuinely raise that
+  # limit; `systemctl --user show` only reports the requested, not effective,
+  # value.
+  if [[ $RDMA_PROFILE != odinlink ]]; then
     sudo -n systemd-run --unit="$COORD_UNIT" --collect --service-type=exec \
       --uid="$(id -u)" --gid="$(id -g)" \
       --property="WorkingDirectory=$REPO" \
@@ -348,7 +369,7 @@ start() {
     echo "error: coordinator service failed to start" >&2
     return 1
   }
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  if [[ $RDMA_PROFILE != odinlink ]]; then
     local effective_memlock
     effective_memlock=$(awk '$1 == "Max" && $2 == "locked" && $3 == "memory" { print $4 }' "/proc/$coord_pid/limits")
     [[ $effective_memlock == unlimited ]] || {

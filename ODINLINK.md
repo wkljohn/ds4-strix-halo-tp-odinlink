@@ -14,8 +14,10 @@ export LD_LIBRARY_PATH=/path/to/odinlink/lib
 ```
 
 Without `DS4_TP_VERBS_LIB`, DS4 loads the system `libibverbs` directly. This
-keeps native providers such as Mellanox `mlx5` outside the OdinLink shim and
-preserves the existing generic 16 KiB decode-message framing. OdinLink devices
+keeps native providers such as Mellanox `mlx5` and `mlx4` outside the OdinLink
+shim and preserves the existing generic 16 KiB decode-message framing.
+InfiniBand ports without an IPv4-mapped GID fall back to GID 0 automatically.
+OdinLink devices
 named `odl_tb5_*` negotiate a 128 KiB limit, allowing a normal 28,672-byte
 decode vector to use one message. `DS4_TP_RDMA_DECODE_MAX_MSG` can override the
 local advertised limit; the peers use the lower value.

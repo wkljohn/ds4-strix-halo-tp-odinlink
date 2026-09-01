@@ -62,12 +62,19 @@ be shared. Logs are retained under
 
 Set `RDMA_PROFILE=roce-v2`, `COORDINATOR_RDMA_ADDR=192.168.99.1`,
 `LOCAL_RDMA_DEVICE=mlx5_0`, `PEER_RDMA_DEVICE=mlx5_1`, and
-`RDMA_GID_INDEX=3` for Mellanox. `ODINLINK_ROOT` is then unnecessary.
-RoCE also requires passwordless `sudo` for the launcher: the coordinator runs
-as the system transient service `ds4-tp-coordinator.service` with an actually
-unlimited locked-memory limit. The launcher verifies that effective process
-limit and checks the peer's SSH-session limit before model loading. OdinLink
-retains its transient user service and does not acquire this requirement.
+`RDMA_GID_INDEX=3` for Mellanox RoCE v2. `ODINLINK_ROOT` is then unnecessary.
+For a direct Mellanox InfiniBand cable (ConnectX-3, `mlx4`), set
+`RDMA_PROFILE=ib-mlx4`, the coordinator's InfiniBand interface address as
+`COORDINATOR_RDMA_ADDR`, `LOCAL_RDMA_DEVICE`/`PEER_RDMA_DEVICE` from
+`ibv_devinfo -l` on each node, and `RDMA_GID_INDEX=0`. A subnet manager
+(`opensm`) must run on one node so both ports get LIDs; the launcher checks
+link layer, ACTIVE state, and LID on both sides before model loading.
+Mellanox RDMA (RoCE v2 or InfiniBand) also requires passwordless `sudo` for
+the launcher: the coordinator runs as the system transient service
+`ds4-tp-coordinator.service` with an actually unlimited locked-memory limit.
+The launcher verifies that effective process limit and checks the peer's
+SSH-session limit before model loading. OdinLink retains its transient user
+service and does not acquire this requirement.
 
 Useful commands:
 
