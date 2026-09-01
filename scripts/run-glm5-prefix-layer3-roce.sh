@@ -140,7 +140,7 @@ STRIDED_F32_ROWS_DISABLE=${DS4_ROCM_GLM5_DISABLE_STRIDED_F32_ROWS:-}
 ZERO_WORKSPACE=${DS4_GLM5_ZERO_WORKSPACE:-}
 ZERO_MOE_EACH_LAYER=${DS4_GLM5_ZERO_MOE_EACH_LAYER:-}
 ZERO_PERSISTENT_MLA=${DS4_GLM5_ZERO_PERSISTENT_MLA:-}
-ALLOW_Q4_BATCH_MLA_OUTPUT=${DS4_GLM5_ALLOW_Q4_BATCH_MLA_OUTPUT:-}
+DISABLE_Q4_BATCH_MLA_OUTPUT=${DS4_GLM5_DISABLE_Q4_BATCH_MLA_OUTPUT:-}
 CAUSAL_ATTN_GEMM_NOPE=${DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE:-}
 CAUSAL_ATTN_GEMM_NOPE_F32=${DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32:-}
 KDA_BATCH_KSLICE_OUTPUT=${DS4_ROCM_GLM5_BATCH_KSLICE_OUTPUT:-}
@@ -748,9 +748,9 @@ printf 'shared_down_f32_enabled=%s\n' \
 printf 'strided_f32_rows_disabled=%s\n' \
   "$([[ -n $STRIDED_F32_ROWS_DISABLE ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
-printf 'zero_workspace=%s\nallow_q4_batch_mla_output=%s\n' \
+printf 'zero_workspace=%s\nq4_batch_mla_output_disabled=%s\n' \
   "$([[ -n $ZERO_WORKSPACE ]] && printf 1 || printf 0)" \
-  "$([[ -n $ALLOW_Q4_BATCH_MLA_OUTPUT ]] && printf 1 || printf 0)" \
+  "$([[ -n $DISABLE_Q4_BATCH_MLA_OUTPUT ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
 printf 'batch_layer_trace=%s\ntrace_layer=%s\ntrace_token=%s\n' \
   "$([[ -n $BATCH_LAYER_TRACE ]] && printf 1 || printf 0)" \
@@ -940,9 +940,9 @@ if [[ -n $ZERO_PERSISTENT_MLA ]]; then
   local_candidate_env+=(DS4_GLM5_ZERO_PERSISTENT_MLA="$ZERO_PERSISTENT_MLA")
   remote_candidate_env+=" DS4_GLM5_ZERO_PERSISTENT_MLA='$ZERO_PERSISTENT_MLA'"
 fi
-if [[ -n $ALLOW_Q4_BATCH_MLA_OUTPUT ]]; then
-  local_candidate_env+=(DS4_GLM5_ALLOW_Q4_BATCH_MLA_OUTPUT="$ALLOW_Q4_BATCH_MLA_OUTPUT")
-  remote_candidate_env+=" DS4_GLM5_ALLOW_Q4_BATCH_MLA_OUTPUT='$ALLOW_Q4_BATCH_MLA_OUTPUT'"
+if [[ -n $DISABLE_Q4_BATCH_MLA_OUTPUT ]]; then
+  local_candidate_env+=(DS4_GLM5_DISABLE_Q4_BATCH_MLA_OUTPUT="$DISABLE_Q4_BATCH_MLA_OUTPUT")
+  remote_candidate_env+=" DS4_GLM5_DISABLE_Q4_BATCH_MLA_OUTPUT='$DISABLE_Q4_BATCH_MLA_OUTPUT'"
 fi
 if [[ -n $CAUSAL_ATTN_GEMM_NOPE ]]; then
   local_candidate_env+=(DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE="$CAUSAL_ATTN_GEMM_NOPE")

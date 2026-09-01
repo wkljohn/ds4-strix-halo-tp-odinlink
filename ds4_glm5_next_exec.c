@@ -1988,12 +1988,12 @@ static int mla_output_project_rows_batch(
         ds4_gpu_tensor_free(out);
         return ok;
     }
-    /* Q4's multi-row MLA output kernel was intermittently non-deterministic
-     * across both RDMA providers.  Keep Q2's validated batch path, but make
-     * Q4 use the established row kernel until a standalone oracle proves a
-     * replacement. */
+    /* The strided Q8 output projection is byte-identical to the one-row Q4
+     * path in the production-shape oracle and frozen teacher/full-run gates.
+     * Keep the old row loop as an explicit rollback, while Q2 continues to
+     * use the same batched entry point unconditionally. */
     const int batch = force_serial &&
-        getenv("DS4_GLM5_ALLOW_Q4_BATCH_MLA_OUTPUT") == NULL ? -1 :
+        getenv("DS4_GLM5_DISABLE_Q4_BATCH_MLA_OUTPUT") != NULL ? -1 :
         ds4_rocm_q8_kslice_f32_rows_strided(
             ctx->tp_big_out, ctx->model_map, ctx->model_size,
             offsets->output, full_heads, GLM5_WIDTH, in_start, half_heads,
