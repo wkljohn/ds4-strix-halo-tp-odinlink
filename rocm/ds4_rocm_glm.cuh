@@ -2418,6 +2418,31 @@ __global__ static void glm_causal_gemm_gather_head_f32_kernel(
     }
 }
 
+__global__ static void glm_causal_gemm_score_scalar_f32_kernel(
+        float *scores,
+        const float *low_head,
+        const float *kv_lora_cache,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_selected,
+        uint32_t kv_lora_dim) {
+    const uint32_t token = blockIdx.x;
+    if (token >= n_tokens) return;
+    const uint32_t visible = min(n_selected, pos0 + token + 1u);
+    const float *low = low_head + (uint64_t)token * kv_lora_dim;
+    float *score_row = scores + (uint64_t)token * n_selected;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
+        float acc = 0.0f;
+        if (s < visible) {
+            const float *key = kv_lora_cache + (uint64_t)s * kv_lora_dim;
+            for (uint32_t j = 0u; j < kv_lora_dim; ++j) {
+                acc += low[j] * key[j];
+            }
+        }
+        score_row[s] = acc;
+    }
+}
+
 __global__ static void glm_causal_gemm_softmax_f16_kernel(
         __half *probs,
         float *scores,
@@ -2469,6 +2494,7 @@ __global__ static void glm_causal_gemm_softmax_f16_kernel(
 
 __global__ static void glm_causal_gemm_softmax_f32_kernel(
         float *probs,
+        float *normalizers,
         float *scores,
         uint32_t n_tokens,
         uint32_t n_selected,
@@ -2509,16 +2535,19 @@ __global__ static void glm_causal_gemm_softmax_f32_kernel(
         }
         __syncthreads();
     }
-    const float inv = 1.0f / fmaxf(reduce[0], 1.0e-20f);
+    const float denom = fmaxf(reduce[0], 1.0e-20f);
+    if (normalizers && threadIdx.x == 0u) normalizers[token] = denom;
+    const float inv = 1.0f / denom;
     float *prob_row = probs + (uint64_t)token * n_selected;
     for (uint32_t s = threadIdx.x; s < n_selected; s += blockDim.x) {
-        prob_row[s] = row[s] * inv;
+        prob_row[s] = normalizers ? row[s] : row[s] * inv;
     }
 }
 
 __global__ static void glm_causal_gemm_scatter_head_kernel(
         float *out,
         const float *head_out,
+        const float *normalizers,
         uint32_t n_tokens,
         uint32_t head,
         uint32_t n_head,
@@ -2528,8 +2557,33 @@ __global__ static void glm_causal_gemm_scatter_head_kernel(
     if (i >= n) return;
     const uint32_t token = (uint32_t)(i / kv_lora_dim);
     const uint32_t j = (uint32_t)(i - (uint64_t)token * kv_lora_dim);
+    const float value = head_out[i];
     out[((uint64_t)token * n_head + head) * kv_lora_dim + j] =
-        head_out[i];
+        normalizers ? value / normalizers[token] : value;
+}
+
+__global__ static void glm_causal_gemm_value_scalar_f32_kernel(
+        float *head_out,
+        const float *weights,
+        const float *normalizers,
+        const float *kv_lora_cache,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_selected,
+        uint32_t kv_lora_dim) {
+    const uint32_t token = blockIdx.x;
+    if (token >= n_tokens) return;
+    const uint32_t visible = min(n_selected, pos0 + token + 1u);
+    const float *weight_row = weights + (uint64_t)token * n_selected;
+    for (uint32_t j = threadIdx.x; j < kv_lora_dim; j += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t s = 0u; s < visible; ++s) {
+            acc += weight_row[s] *
+                kv_lora_cache[(uint64_t)s * kv_lora_dim + j];
+        }
+        head_out[(uint64_t)token * kv_lora_dim + j] =
+            normalizers ? acc / normalizers[token] : acc;
+    }
 }
 
 __global__ static void glm_selected_gemm_kv_to_f16_kernel(
@@ -2800,6 +2854,35 @@ static int glm_causal_gemm_scratch_part(
     return 1;
 }
 
+class glm_cublas_math_scope {
+public:
+    explicit glm_cublas_math_scope(bool default_math)
+        : handle_(NULL), prior_(CUBLAS_DEFAULT_MATH), valid_(!default_math),
+          changed_(false) {
+        if (!default_math) return;
+        handle_ = g_cublas;
+        if (cublasGetMathMode(handle_, &prior_) != CUBLAS_STATUS_SUCCESS) return;
+        if (prior_ != CUBLAS_DEFAULT_MATH) {
+            if (cublasSetMathMode(handle_, CUBLAS_DEFAULT_MATH) !=
+                CUBLAS_STATUS_SUCCESS) return;
+            changed_ = true;
+        }
+        valid_ = true;
+    }
+
+    ~glm_cublas_math_scope() {
+        if (changed_) (void)cublasSetMathMode(handle_, prior_);
+    }
+
+    bool valid() const { return valid_; }
+
+private:
+    cublasHandle_t handle_;
+    cublasMath_t prior_;
+    bool valid_;
+    bool changed_;
+};
+
 enum glm_selected_gemm_profile_phase {
     GLM_SELECTED_PROFILE_KV_GATHER = 0,
     GLM_SELECTED_PROFILE_ROPE_GATHER,
@@ -2954,6 +3037,18 @@ static int glm_attention_indexed_lora_causal_gemm(
     const bool nope_f32 = qk_rope == 0u &&
         cuda_env_present(
             getenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32"));
+    const bool nope_f32_postdiv = nope_f32 &&
+        cuda_env_present(getenv(
+            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV"));
+    const bool nope_f32_default_math = nope_f32 &&
+        cuda_env_present(getenv(
+            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH"));
+    const bool nope_f32_pv_scalar = nope_f32 &&
+        cuda_env_present(getenv(
+            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR"));
+    const bool nope_f32_score_scalar = nope_f32 &&
+        cuda_env_present(getenv(
+            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR"));
     if (!g_cublas_ready || !lora_out || !q || !qk_low ||
         !kv_lora_cache || (qk_rope != 0u && !k_rope_cache) ||
         (nope_f32 && cache_f16) ||
@@ -2962,6 +3057,12 @@ static int glm_attention_indexed_lora_causal_gemm(
         (qk_rope & 1u) != 0u ||
         n_tokens > INT_MAX || n_selected > INT_MAX ||
         kv_lora_dim > INT_MAX || qk_rope > INT_MAX) {
+        return 0;
+    }
+    glm_cublas_math_scope math_scope(nope_f32_default_math);
+    if (!math_scope.valid()) {
+        fprintf(stderr, "ds4: failed to select default hipBLAS math for "
+                        "GLM causal attention\n");
         return 0;
     }
 
@@ -2979,7 +3080,8 @@ static int glm_attention_indexed_lora_causal_gemm(
 
     uint64_t kv_bytes = 0, rope_bytes = 0;
     uint64_t low_bytes = 0, qrope_bytes = 0;
-    uint64_t score_bytes = 0, prob_bytes = 0, head_bytes = 0;
+    uint64_t score_bytes = 0, prob_bytes = 0, normalizer_bytes = 0;
+    uint64_t head_bytes = 0;
     if (!cuda_u64_mul_checked(kv_count,
                               nope_f32 ? 0u : sizeof(__half), &kv_bytes) ||
         !cuda_u64_mul_checked(rope_count, sizeof(__half), &rope_bytes) ||
@@ -2991,6 +3093,9 @@ static int glm_attention_indexed_lora_causal_gemm(
         !cuda_u64_mul_checked(score_count,
                               nope_f32 ? sizeof(float) : sizeof(__half),
                               &prob_bytes) ||
+        !cuda_u64_mul_checked(n_tokens,
+                              nope_f32_postdiv ? sizeof(float) : 0u,
+                              &normalizer_bytes) ||
         !cuda_u64_mul_checked(head_count, sizeof(float), &head_bytes)) {
         return 0;
     }
@@ -2998,13 +3103,16 @@ static int glm_attention_indexed_lora_causal_gemm(
     uint64_t scratch_bytes = 0;
     uint64_t kv_offset = 0, rope_offset = 0;
     uint64_t low_offset = 0, qrope_offset = 0;
-    uint64_t score_offset = 0, prob_offset = 0, head_offset = 0;
+    uint64_t score_offset = 0, prob_offset = 0, normalizer_offset = 0;
+    uint64_t head_offset = 0;
     if (!glm_causal_gemm_scratch_part(&scratch_bytes, kv_bytes, &kv_offset) ||
         !glm_causal_gemm_scratch_part(&scratch_bytes, rope_bytes, &rope_offset) ||
         !glm_causal_gemm_scratch_part(&scratch_bytes, low_bytes, &low_offset) ||
         !glm_causal_gemm_scratch_part(&scratch_bytes, qrope_bytes, &qrope_offset) ||
         !glm_causal_gemm_scratch_part(&scratch_bytes, score_bytes, &score_offset) ||
         !glm_causal_gemm_scratch_part(&scratch_bytes, prob_bytes, &prob_offset) ||
+        !glm_causal_gemm_scratch_part(&scratch_bytes, normalizer_bytes,
+                                      &normalizer_offset) ||
         !glm_causal_gemm_scratch_part(&scratch_bytes, head_bytes, &head_offset)) {
         return 0;
     }
@@ -3020,6 +3128,8 @@ static int glm_attention_indexed_lora_causal_gemm(
     __half *probs = (__half *)(scratch + prob_offset);
     float *low_f = (float *)(scratch + low_offset);
     float *probs_f = (float *)(scratch + prob_offset);
+    float *normalizers = nope_f32_postdiv ?
+        (float *)(scratch + normalizer_offset) : NULL;
     float *head_out = (float *)(scratch + head_offset);
 
     if (!nope_f32) {
@@ -3089,7 +3199,20 @@ static int glm_attention_indexed_lora_causal_gemm(
                      "glm causal attention query gather launch")) {
             return 0;
         }
-        cublasStatus_t st = cublasGemmEx(g_cublas,
+        cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
+        if (nope_f32_score_scalar) {
+            glm_causal_gemm_score_scalar_f32_kernel<<<n_tokens, 256>>>(
+                scores,
+                low_f,
+                (const float *)kv_lora_cache->ptr,
+                n_tokens,
+                pos0,
+                n_selected,
+                kv_lora_dim);
+            if (!cuda_ok(cudaGetLastError(),
+                         "glm causal attention scalar score launch")) return 0;
+        } else {
+            st = cublasGemmEx(g_cublas,
                                          CUBLAS_OP_T,
                                          CUBLAS_OP_N,
                                          (int)n_selected,
@@ -3108,8 +3231,9 @@ static int glm_attention_indexed_lora_causal_gemm(
                                          (int)n_selected,
                                          CUBLAS_COMPUTE_32F,
                                          CUBLAS_GEMM_DEFAULT);
-        if (!cublas_ok(st, "glm causal attention lora score gemm")) {
-            return 0;
+            if (!cublas_ok(st, "glm causal attention lora score gemm")) {
+                return 0;
+            }
         }
         if (qk_rope != 0u) {
             st = cublasGemmEx(g_cublas,
@@ -3137,7 +3261,8 @@ static int glm_attention_indexed_lora_causal_gemm(
         }
         if (nope_f32) {
             glm_causal_gemm_softmax_f32_kernel<<<n_tokens, 256>>>(
-                probs_f, scores, n_tokens, n_selected, pos0, scale);
+                probs_f, normalizers, scores, n_tokens, n_selected, pos0,
+                scale);
         } else {
             glm_causal_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
                 probs, scores, n_tokens, n_selected, pos0, scale);
@@ -3146,7 +3271,20 @@ static int glm_attention_indexed_lora_causal_gemm(
                      "glm causal attention softmax launch")) {
             return 0;
         }
-        st = cublasGemmEx(g_cublas,
+        if (nope_f32_pv_scalar) {
+            glm_causal_gemm_value_scalar_f32_kernel<<<n_tokens, 256>>>(
+                head_out,
+                probs_f,
+                normalizers,
+                (const float *)kv_lora_cache->ptr,
+                n_tokens,
+                pos0,
+                n_selected,
+                kv_lora_dim);
+            if (!cuda_ok(cudaGetLastError(),
+                         "glm causal attention scalar PV launch")) return 0;
+        } else {
+            st = cublasGemmEx(g_cublas,
                           CUBLAS_OP_N,
                           CUBLAS_OP_N,
                           (int)kv_lora_dim,
@@ -3165,10 +3303,12 @@ static int glm_attention_indexed_lora_causal_gemm(
                           (int)kv_lora_dim,
                           CUBLAS_COMPUTE_32F,
                           CUBLAS_GEMM_DEFAULT);
-        if (!cublas_ok(st, "glm causal attention value gemm")) return 0;
+            if (!cublas_ok(st, "glm causal attention value gemm")) return 0;
+        }
         glm_causal_gemm_scatter_head_kernel<<<scatter_blocks, 256>>>(
             (float *)lora_out->ptr,
             head_out,
+            nope_f32_pv_scalar ? NULL : normalizers,
             n_tokens,
             head,
             n_head,
@@ -3177,6 +3317,12 @@ static int glm_attention_indexed_lora_causal_gemm(
                      "glm causal attention head scatter launch")) {
             return 0;
         }
+    }
+    if (nope_f32 && cuda_env_present(getenv(
+            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC")) &&
+        !cuda_ok(cudaDeviceSynchronize(),
+                 "glm causal attention diagnostic synchronization")) {
+        return 0;
     }
     return 1;
 }
@@ -3669,6 +3815,7 @@ static int glm_attention_indexed_lora_selected_gemm(
             glm_causal_gemm_scatter_head_kernel<<<scatter_blocks, 256>>>(
                 (float *)lora_out->ptr,
                 head_out,
+                NULL,
                 n_tokens,
                 head0,
                 n_head,
@@ -3884,7 +4031,23 @@ static int glm_attention_indexed_lora_launch(
                     " attention GEMMs (tokens=%u rows=%u cache=%s)\n",
                     qk_rope == 0u && cuda_env_present(getenv(
                         "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32")) ?
-                        "fp32" : "fp16",
+                        (cuda_env_present(getenv(
+                            "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV")) ?
+                            (cuda_env_present(getenv(
+                                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH")) ?
+                                "fp32-postdiv-default-math" :
+                                (cuda_env_present(getenv(
+                                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR")) ?
+                                    (cuda_env_present(getenv(
+                                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR")) ?
+                                        "fp32-postdiv-score-pv-scalar" :
+                                        "fp32-postdiv-pv-scalar") : "fp32-postdiv")) :
+                            (cuda_env_present(getenv(
+                                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH")) ?
+                                "fp32-default-math" :
+                                (cuda_env_present(getenv(
+                                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR")) ?
+                                    "fp32-pv-scalar" : "fp32"))) : "fp16",
                     n_tokens,
                     n_selected,
                     cache_f16 ? "f16" : "f32");

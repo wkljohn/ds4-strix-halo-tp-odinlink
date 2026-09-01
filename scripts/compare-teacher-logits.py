@@ -215,7 +215,15 @@ def main() -> int:
         "--score-arm-mode", choices=(
             "kda-tp", "kda-kslice", "repeat", "full-split-order-null",
             "null-vs-kslice", "fallback-vs-kslice",
-            "attn-scalar-vs-f32-gemm", "attn-repeat"),
+            "attn-scalar-vs-f32-gemm",
+            "attn-scalar-vs-f32-gemm-sync",
+            "attn-scalar-vs-f32-gemm-postdiv",
+            "attn-scalar-vs-f32-gemm-default-math",
+            "attn-scalar-vs-f32-gemm-postdiv-default-math",
+            "attn-scalar-vs-f32-gemm-postdiv-pv-scalar",
+            "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math",
+            "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar",
+            "attn-repeat"),
         help="required arm relationship for score_official GLM5 diagnostics")
     args = parser.parse_args()
     try:
@@ -270,6 +278,18 @@ def main() -> int:
                 "null-vs-kslice": ("kda-tp", "kda-kslice"),
                 "fallback-vs-kslice": ("kda-tp", "kda-kslice"),
                 "attn-scalar-vs-f32-gemm": ("attn-scalar", "attn-gemm-f32"),
+                "attn-scalar-vs-f32-gemm-sync": ("attn-scalar", "attn-gemm-f32"),
+                "attn-scalar-vs-f32-gemm-postdiv": ("attn-scalar", "attn-gemm-f32"),
+                "attn-scalar-vs-f32-gemm-default-math":
+                    ("attn-scalar", "attn-gemm-f32"),
+                "attn-scalar-vs-f32-gemm-postdiv-default-math":
+                    ("attn-scalar", "attn-gemm-f32"),
+                "attn-scalar-vs-f32-gemm-postdiv-pv-scalar":
+                    ("attn-scalar", "attn-gemm-f32"),
+                "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math":
+                    ("attn-scalar", "attn-gemm-f32"),
+                "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar":
+                    ("attn-scalar", "attn-gemm-f32"),
                 "attn-repeat": ("attn-scalar", "attn-scalar"),
             }[args.score_arm_mode]
             actual_arms = (reference_manifest.get("teacher_arm"),
@@ -311,7 +331,7 @@ def main() -> int:
                         "fallback-vs-kslice requires the independent BF16 "
                         "fallback only in the reference arm")
                 selectors.add(fallback_key)
-            elif args.score_arm_mode == "attn-scalar-vs-f32-gemm":
+            elif args.score_arm_mode.startswith("attn-scalar-vs-f32-gemm"):
                 nope_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE"
                 f32_key = "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32"
                 if (nope_key in ref_env or f32_key in ref_env or
@@ -321,6 +341,92 @@ def main() -> int:
                         "attention comparison requires FP32 NoPE GEMM only "
                         "in the candidate arm")
                 selectors.update((nope_key, f32_key))
+                diagnostic = {
+                    "attn-scalar-vs-f32-gemm": None,
+                    "attn-scalar-vs-f32-gemm-sync":
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC",
+                    "attn-scalar-vs-f32-gemm-postdiv":
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                    "attn-scalar-vs-f32-gemm-default-math":
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                    "attn-scalar-vs-f32-gemm-postdiv-default-math": None,
+                    "attn-scalar-vs-f32-gemm-postdiv-pv-scalar": None,
+                    "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math":
+                        None,
+                    "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar": None,
+                }[args.score_arm_mode]
+                diagnostic_keys = {
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                    "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR",
+                }
+                if args.score_arm_mode == \
+                        "attn-scalar-vs-f32-gemm-postdiv-default-math":
+                    required = {
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                    }
+                    if any(cand_env.get(key) != "1" for key in required) or \
+                            any(key not in required and key in cand_env
+                                for key in diagnostic_keys):
+                        raise ValueError(
+                            "attention comparison requires postdiv and "
+                            "default-math selectors")
+                    selectors.update(required)
+                elif args.score_arm_mode == \
+                        "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar":
+                    required = {
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR",
+                    }
+                    if any(cand_env.get(key) != "1" for key in required) or \
+                            any(key not in required and key in cand_env
+                                for key in diagnostic_keys):
+                        raise ValueError(
+                            "attention comparison requires postdiv, scalar "
+                            "score, and scalar PV selectors")
+                    selectors.update(required)
+                elif args.score_arm_mode == \
+                        "attn-scalar-vs-f32-gemm-postdiv-pv-scalar":
+                    required = {
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                    }
+                    if any(cand_env.get(key) != "1" for key in required) or \
+                            any(key not in required and key in cand_env
+                                for key in diagnostic_keys):
+                        raise ValueError(
+                            "attention comparison requires postdiv and "
+                            "PV-scalar selectors")
+                    selectors.update(required)
+                elif args.score_arm_mode == \
+                        "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math":
+                    required = {
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH",
+                    }
+                    if any(cand_env.get(key) != "1" for key in required) or \
+                            any(key not in required and key in cand_env
+                                for key in diagnostic_keys):
+                        raise ValueError(
+                            "attention comparison requires postdiv, PV-scalar, "
+                            "and default-math selectors")
+                    selectors.update(required)
+                elif diagnostic is None:
+                    if any(key in cand_env for key in diagnostic_keys):
+                        raise ValueError(
+                            "base attention comparison forbids repair selectors")
+                else:
+                    if cand_env.get(diagnostic) != "1" or any(
+                            key != diagnostic and key in cand_env
+                            for key in diagnostic_keys):
+                        raise ValueError(
+                            f"attention comparison requires only {diagnostic}")
+                    selectors.add(diagnostic)
             if ({k: v for k, v in ref_env.items() if k not in selectors} !=
                     {k: v for k, v in cand_env.items() if k not in selectors}):
                 raise ValueError("score arms differ outside the KDA selectors")

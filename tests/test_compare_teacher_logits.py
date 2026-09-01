@@ -46,7 +46,9 @@ def score_manifest(path: Path, *, arm: str,
                    model_hash: str = "model-hash",
                    full_split_order: bool = False,
                    fallback_mlp64: bool = False,
-                   attention_f32_gemm: bool = False) -> None:
+                   attention_f32_gemm: bool = False,
+                   attention_repair: str | None = None,
+                   attention_repairs: tuple[str, ...] = ()) -> None:
     selectors = {
         "kda-off": ("0", "0"),
         "kda-tp": ("1", "0"),
@@ -79,7 +81,9 @@ def score_manifest(path: Path, *, arm: str,
                        if fallback_mlp64 else "") +
                       ("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE=1 "
                        "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32=1 "
-                       if attention_f32_gemm else "")),
+                       if attention_f32_gemm else "") +
+                      (f"{attention_repair}=1 " if attention_repair else "") +
+                      "".join(f"{repair}=1 " for repair in attention_repairs)),
         "coordinator_features": (f"GLM5 TP features: kda_tp={kda_tp} "
                                  f"kda_output_kslice={kslice}"),
         "worker_features": (f"GLM5 TP features: kda_tp={kda_tp} "
@@ -269,6 +273,70 @@ def main() -> int:
         assert invalid_attention.returncode == 1
         assert "FP32 NoPE GEMM only in the candidate" in \
             invalid_attention.stderr
+
+        for suffix, repair in (
+                ("sync", "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC"),
+                ("postdiv", "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV"),
+                ("default-math",
+                 "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH")):
+            score_manifest(reference / "manifest", arm="attn-scalar")
+            score_manifest(candidate / "manifest", arm="attn-gemm-f32",
+                           attention_f32_gemm=True,
+                           attention_repair=repair)
+            repaired = run(
+                str(reference), str(candidate),
+                "--score-arm-mode", f"attn-scalar-vs-f32-gemm-{suffix}")
+            assert repaired.returncode == 0, repaired.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(
+            candidate / "manifest", arm="attn-gemm-f32",
+            attention_f32_gemm=True,
+            attention_repairs=(
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH"))
+        combined = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-f32-gemm-postdiv-default-math")
+        assert combined.returncode == 0, combined.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(
+            candidate / "manifest", arm="attn-gemm-f32",
+            attention_f32_gemm=True,
+            attention_repairs=(
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR"))
+        pv_scalar = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-f32-gemm-postdiv-pv-scalar")
+        assert pv_scalar.returncode == 0, pv_scalar.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(
+            candidate / "manifest", arm="attn-gemm-f32",
+            attention_f32_gemm=True,
+            attention_repairs=(
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH"))
+        pv_scalar_default = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math")
+        assert pv_scalar_default.returncode == 0, pv_scalar_default.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(
+            candidate / "manifest", arm="attn-gemm-f32",
+            attention_f32_gemm=True,
+            attention_repairs=(
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR"))
+        score_pv_scalar = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar")
+        assert score_pv_scalar.returncode == 0, score_pv_scalar.stderr
 
         score_manifest(reference / "manifest", arm="attn-scalar")
         score_manifest(candidate / "manifest", arm="attn-scalar")

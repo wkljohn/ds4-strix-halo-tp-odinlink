@@ -391,7 +391,7 @@ if [[ " ${EXTRA_ENV[*]} " == *' DS4_GLM5_KDA_OUTPUT_KSLICE=1 '* ]]; then
 fi
 if [[ $TEACHER_ARM == attn-gemm-f32 ]]; then
   for log in "$COORD_LOG" "$WORKER_LOG"; do
-    grep -q 'GLM causal indexed prefill using fp32 .* attention GEMMs' "$log" || {
+    grep -Eq 'GLM causal indexed prefill using fp32([-a-z]+)? .* attention GEMMs' "$log" || {
       echo "error: FP32 NoPE GEMM teacher arm never engaged in $log" >&2
       exit 1
     }
