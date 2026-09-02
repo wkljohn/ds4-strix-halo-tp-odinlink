@@ -17,6 +17,7 @@ static inline bool ds4_bf16_rowtile2x16_dispatch_allowed(
         bool quality_mode,
         bool graph_dump) {
     const bool supported_shape =
+        (in_dim == 4096u && out_dim == 4096u) ||
         (in_dim == 4096u && out_dim == 8192u) ||
         (in_dim == 8192u && out_dim == 4096u);
     return selector_enabled && !batch_toktile_disabled && supported_shape &&

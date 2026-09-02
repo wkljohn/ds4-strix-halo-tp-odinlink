@@ -833,6 +833,9 @@ void run_rowtile_dispatch_guard() {
     if (!ds4_bf16_rowtile2x16_dispatch_allowed(
             true, false, 8192u, 4096u, 256u, false, false))
         fail("BF16 rowtile expected dispatch");
+    if (!ds4_bf16_rowtile2x16_dispatch_allowed(
+            true, false, 4096u, 4096u, 256u, false, false))
+        fail("BF16 rowtile expected TP=2 QKV dispatch");
     if (ds4_bf16_rowtile2x16_dispatch_allowed(
             true, true, 8192u, 4096u, 256u, false, false))
         fail("BF16 rowtile family rollback must disable dispatch");
@@ -847,6 +850,9 @@ void run_rowtile_dispatch_guard() {
         ds4_bf16_rowtile2x16_dispatch_allowed(
             true, false, 8192u, 4096u, 256u, false, true))
         fail("BF16 rowtile diagnostic modes must refuse dispatch");
+    if (ds4_bf16_rowtile2x16_dispatch_allowed(
+            true, false, 4096u, 12288u, 256u, false, false))
+        fail("BF16 rowtile unknown projection must refuse dispatch");
     std::printf("BF16 rowtile dispatch and rollback guards pass\n");
 }
 
@@ -1027,8 +1033,13 @@ int main() {
     run_skinny_exact_shape(device_weight, 4096u, 128u, 63u);
     run_rowtile_shape(device_weight, 4096u, 8192u);
     run_rowtile_shape(device_weight, 8192u, 4096u);
+    /* TP=2 presents each 4096->8192 KDA Q/K/V weight as one contiguous
+     * 4096-row rank view.  Measure that live square geometry before widening
+     * the production dispatch. */
+    run_rowtile_shape(device_weight, 4096u, 4096u);
     run_rowtile_m2048_guard(device_weight, 4096u, 8192u);
     run_rowtile_m2048_guard(device_weight, 8192u, 4096u);
+    run_rowtile_m2048_guard(device_weight, 4096u, 4096u);
     run_rowtile_dispatch_guard();
     run_lowrank128_tail_coverage(device_weight, 63u);
     for (const uint32_t tokens : {25u, 57u, 121u, 153u}) {
