@@ -1853,7 +1853,11 @@ static int tp_rdma_aux_gate_exchange(ds4_tp *tp, uint32_t layer) {
 }
 
 /* One decode gate: ensure the receive window is armed, send our partial,
- * wait for the peer's receive completion, and advance the window. */
+ * wait for the peer's receive completion, and advance the window.  A payload
+ * in the ordinary per-gate slab is not reused until the same gate next token,
+ * so that path need not wait for its local SEND CQE.  A registered producer
+ * row can be overwritten by the next GPU kernel immediately after return;
+ * keep it alive through the local SEND CQE, including any RC retransmission. */
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate,
                                  uint64_t seq,
                                  const void *registered_payload) {
@@ -1911,11 +1915,15 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate,
         wr.sg_list = &sge;
         wr.num_sge = 1;
         wr.opcode = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_SIGNALED;
+        /* For a direct producer row, only the final chunk needs a CQE.  QP
+         * ordering makes that CQE the lifetime fence for every earlier,
+         * unsignaled chunk carrying the same row. */
+        const int signaled = !registered_payload || off + len == tp->vec_bytes;
+        wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
         ok = ibv_post_send(r->qp, &wr, &bad) == 0;
         if (!ok) {
             fprintf(stderr, "ds4-tp: rdma post_send: %s\n", strerror(errno));
-        } else {
+        } else if (signaled) {
             r->send_outstanding++;
         }
         off += len;
@@ -1926,28 +1934,49 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate,
 
     double deadline = 0.0;
     uint32_t peer_poll = 0;
+    int direct_send_seen = registered_payload == NULL;
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     uint32_t profile_cqes = 0;
     uint64_t profile_poll_calls = 0;
     int profile_send_seen = 0;
     double profile_send_seen_at = 0.0;
+    int profile_recv_seen = r->recv_done >= seq;
+    double profile_recv_seen_at = profile_recv_seen ? post_send_end : 0.0;
 #endif
-    while (ok && r->recv_done < seq) {
+    while (ok && (r->recv_done < seq || !direct_send_seen)) {
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
         int saw_send = 0;
+        int saw_recv = 0;
         if (gate_profile) {
             profile_poll_calls++;
-            ok = tp_rdma_drain_cq_observe(tp, seq, &saw_send, NULL,
+            ok = tp_rdma_drain_cq_observe(tp, seq, &saw_send, &saw_recv,
                                           &profile_cqes);
             if (saw_send && !profile_send_seen) {
                 profile_send_seen = 1;
                 profile_send_seen_at = tp_now_sec();
             }
+            if (saw_send) direct_send_seen = 1;
+            if (saw_recv && !profile_recv_seen) {
+                profile_recv_seen = 1;
+                profile_recv_seen_at = tp_now_sec();
+            }
+        } else {
+            if (registered_payload) {
+                ok = tp_rdma_drain_cq_observe(tp, seq, &saw_send, NULL,
+                                              NULL);
+                if (saw_send) direct_send_seen = 1;
+            } else {
+                ok = tp_rdma_drain_cq(tp);
+            }
+        }
+#else
+        if (registered_payload) {
+            int saw_send = 0;
+            ok = tp_rdma_drain_cq_observe(tp, seq, &saw_send, NULL, NULL);
+            if (saw_send) direct_send_seen = 1;
         } else {
             ok = tp_rdma_drain_cq(tp);
         }
-#else
-        ok = tp_rdma_drain_cq(tp);
 #endif
         if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
             fprintf(stderr, "ds4-tp: peer disconnected during RDMA gate\n");
@@ -1955,13 +1984,19 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate,
         }
         if (deadline == 0.0) deadline = tp_now_sec() + (double)tp->timeout_sec;
         else if (tp_now_sec() > deadline) {
-            fprintf(stderr, "ds4-tp: timeout waiting gate seq %llu (recv_done %llu)\n",
-                    (unsigned long long)seq, (unsigned long long)r->recv_done);
+            fprintf(stderr,
+                    "ds4-tp: timeout waiting gate seq %llu "
+                    "(recv_done %llu local_send_done %d registered %d)\n",
+                    (unsigned long long)seq,
+                    (unsigned long long)r->recv_done,
+                    direct_send_seen,
+                    registered_payload != NULL);
             ok = 0;
         }
     }
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
-    const double peer_recv_end = gate_profile ? tp_now_sec() : 0.0;
+    const double peer_recv_end = gate_profile ?
+        (profile_recv_seen ? profile_recv_seen_at : tp_now_sec()) : 0.0;
     const double replenish_start = gate_profile ? tp_now_sec() : 0.0;
 #endif
     if (ok) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);

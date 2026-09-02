@@ -388,7 +388,8 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq);
 /* RDMA-only variant for a producer payload that already lies inside the
  * registered TP slab.  The receive still lands in the normal preposted gate
- * slot, so wire ordering and the consumer contract are unchanged. */
+ * slot, so wire ordering and the consumer contract are unchanged.  It does
+ * not return until the local SEND CQE makes producer-row reuse safe. */
 int ds4_tp_gate_exchange_from_registered(ds4_tp *tp, uint32_t layer,
                                          uint32_t gate, uint64_t seq,
                                          const void *payload);
