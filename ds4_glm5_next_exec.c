@@ -1207,10 +1207,14 @@ static int tp_exchange_bytes(const ds4_glm5_next_exec_ctx *ctx,
         const int gpu_row_gate =
             (ds4_tp_runtime_features(ctx->tp) &
              DS4_TP_FEATURE_GLM5_GPU_ROW_GATE) != 0u;
+        const int direct_send = !gpu_row_gate &&
+            (ds4_tp_runtime_features(ctx->tp) &
+             DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND) != 0u;
         if (ds4_gpu_tensor_bytes(ctx->tp_slab) < out_off + bytes ||
             ds4_gpu_tensor_bytes(ctx->tp_slab) < in_off + bytes ||
-            !ds4_gpu_tensor_copy(ctx->tp_slab, out_off,
-                                 ctx->tp_big_out, 0u, bytes)) {
+            (!direct_send &&
+             !ds4_gpu_tensor_copy(ctx->tp_slab, out_off,
+                                  ctx->tp_big_out, 0u, bytes))) {
             ds4_tp_mark_failed(ctx->tp);
             return 0;
         }
@@ -1256,7 +1260,11 @@ static int tp_exchange_bytes(const ds4_glm5_next_exec_ctx *ctx,
             return 0;
         }
         const uint64_t sequence = ++*ctx->tp_sequence;
-        if (!ds4_tp_gate_exchange(ctx->tp, layer, gate, sequence)) {
+        const int exchanged = direct_send ?
+            ds4_tp_gate_exchange_from_registered(
+                ctx->tp, layer, gate, sequence, ctx->tp_big_out_host) :
+            ds4_tp_gate_exchange(ctx->tp, layer, gate, sequence);
+        if (!exchanged) {
             ds4_tp_mark_failed(ctx->tp);
             return 0;
         }
@@ -1272,9 +1280,9 @@ static int tp_exchange_bytes(const ds4_glm5_next_exec_ctx *ctx,
         static int reported;
         if (!reported) {
             fprintf(stderr,
-                    "ds4: GLM5 one-token TP reductions use the "
-                    "preposted latency gate (%llu bytes)\n",
-                    (unsigned long long)bytes);
+                    "ds4: GLM5 one-token TP reductions use the preposted "
+                    "latency gate (%llu bytes, direct_send=%d)\n",
+                    (unsigned long long)bytes, direct_send);
             reported = 1;
         }
         return 1;

@@ -1854,7 +1854,9 @@ static int tp_rdma_aux_gate_exchange(ds4_tp *tp, uint32_t layer) {
 
 /* One decode gate: ensure the receive window is armed, send our partial,
  * wait for the peer's receive completion, and advance the window. */
-static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate,
+                                 uint64_t seq,
+                                 const void *registered_payload) {
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
@@ -1876,8 +1878,10 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
                 layer, gate, (unsigned long long)seq);
         return 0;
     }
-    const uintptr_t send_base =
-        (uintptr_t)(tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes);
+    const uintptr_t send_base = registered_payload ?
+        (uintptr_t)registered_payload :
+        (uintptr_t)(tp->slab + tp->out_off +
+                    (uint64_t)slot * tp->vec_bytes);
 #if defined(DS4_ENABLE_PROFILING) && DS4_ENABLE_PROFILING
     const double lock_start = gate_profile ? tp_now_sec() : 0.0;
 #endif
@@ -2692,7 +2696,8 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     DS4_TP_TEST_COUNT_EXCHANGE();
 #ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
+    if (tp->rdma_active)
+        return tp_rdma_gate_exchange(tp, layer, gate, seq, NULL);
 #endif
     /* TCP: both sides write their partial then read the peer's.  16KB per
      * direction fits comfortably in the socket buffers, so the symmetric
@@ -2731,6 +2736,25 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
                       tp->vec_bytes))
         return 0;
     return 1;
+}
+
+int ds4_tp_gate_exchange_from_registered(ds4_tp *tp, uint32_t layer,
+                                         uint32_t gate, uint64_t seq,
+                                         const void *payload) {
+    DS4_TP_TEST_COUNT_EXCHANGE();
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp && tp->rdma_active && payload &&
+        ds4_tp_big_gate_is_direct(tp, payload, payload, tp->vec_bytes)) {
+        return tp_rdma_gate_exchange(tp, layer, gate, seq, payload);
+    }
+#else
+    (void)tp;
+    (void)layer;
+    (void)gate;
+    (void)seq;
+    (void)payload;
+#endif
+    return 0;
 }
 
 int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer) {

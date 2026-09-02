@@ -116,6 +116,11 @@ enum {
      * registered-slab exchange after the normal attention gate, outside the
      * decode receive-window sequence, so both ranks must opt in together. */
     DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE = UINT32_C(1) << 25,
+    /* Skip the redundant one-token producer-to-ring copy and send directly
+     * from the already registered big-slab producer row.  Payload meaning and
+     * receive slots are unchanged, but both ranks must select the same
+     * scheduling path on their independent filesystems. */
+    DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND = UINT32_C(1) << 26,
 };
 
 static inline uint32_t ds4_tp_glm5_kda_tp_feature(
@@ -137,6 +142,14 @@ static inline uint32_t ds4_tp_glm5_small_gate_feature(
     return env && env[0] == '1' && env[1] == '\0' && glm5_next &&
            rocm_ready && !mtp_or_dspark
         ? DS4_TP_FEATURE_GLM5_SMALL_GATE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_small_gate_direct_send_feature(
+        const char *env, uint32_t runtime_features) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_GPU_ROW_GATE) == 0u
+        ? DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND : 0u;
 }
 
 static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(
@@ -373,6 +386,12 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
  * and wait until the peer's partial for `seq` has fully landed locally.
  * Called from the GPU gate service thread.  Returns 0 on failure. */
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq);
+/* RDMA-only variant for a producer payload that already lies inside the
+ * registered TP slab.  The receive still lands in the normal preposted gate
+ * slot, so wire ordering and the consumer contract are unchanged. */
+int ds4_tp_gate_exchange_from_registered(ds4_tp *tp, uint32_t layer,
+                                         uint32_t gate, uint64_t seq,
+                                         const void *payload);
 /* Exchange the dependent KDA output-row half paired with the preceding
  * logical attention gate.  It does not consume or advance a gate sequence. */
 int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer);
