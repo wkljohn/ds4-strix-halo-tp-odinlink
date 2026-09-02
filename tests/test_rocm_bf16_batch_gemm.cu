@@ -677,6 +677,158 @@ void run_skinny_exact_shape(const uint16_t *weight, uint32_t in_dim,
     hip_ok(hipFree(d_x), "free skinny exact input");
 }
 
+void run_rowtile_shape(const uint16_t *weight, uint32_t in_dim,
+                       uint32_t out_dim) {
+    constexpr uint32_t tokens = 256u;
+    const uint64_t x_count = (uint64_t)tokens * in_dim;
+    const uint64_t out_count = (uint64_t)tokens * out_dim;
+    std::vector<float> x(x_count);
+    for (uint64_t i = 0u; i < x_count; ++i)
+        x[i] = 0.29f * std::cos((double)(i % 8191u) * 0.007) +
+               0.11f * std::sin((double)i * 0.005);
+    float *d_x = nullptr, *d_reference = nullptr;
+    float *d_row2 = nullptr, *d_row4 = nullptr, *d_row8 = nullptr;
+    hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
+           "allocate rowtile input");
+    hip_ok(hipMalloc(&d_reference, out_count * sizeof(float)),
+           "allocate rowtile reference");
+    hip_ok(hipMalloc(&d_row2, out_count * sizeof(float)),
+           "allocate rowtile 2x16 output");
+    hip_ok(hipMalloc(&d_row4, out_count * sizeof(float)),
+           "allocate rowtile 4x8 output");
+    hip_ok(hipMalloc(&d_row8, out_count * sizeof(float)),
+           "allocate rowtile 8x4 output");
+    hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
+                     hipMemcpyHostToDevice), "copy rowtile input");
+    const auto reference = [&] {
+        launch_segmented_tiled(d_reference, weight, d_x, in_dim,
+                               out_dim, tokens);
+    };
+    const auto row2 = [&] {
+        matmul_bf16_f32_rowtile_w32_kernel<2u, 16u><<<
+            dim3((out_dim + 1u) / 2u, tokens / 16u), kThreads>>>(
+            d_row2, weight, d_x, in_dim, out_dim);
+        hip_ok(hipGetLastError(), "rowtile 2x16 launch");
+    };
+    const auto row4 = [&] {
+        matmul_bf16_f32_rowtile_w32_kernel<4u, 8u><<<
+            dim3((out_dim + 3u) / 4u, tokens / 8u), kThreads>>>(
+            d_row4, weight, d_x, in_dim, out_dim);
+        hip_ok(hipGetLastError(), "rowtile 4x8 launch");
+    };
+    const auto row8 = [&] {
+        matmul_bf16_f32_rowtile_w32_kernel<8u, 4u><<<
+            dim3((out_dim + 7u) / 8u, tokens / 4u), kThreads>>>(
+            d_row8, weight, d_x, in_dim, out_dim);
+        hip_ok(hipGetLastError(), "rowtile 8x4 launch");
+    };
+    const float reference_ms = time_ms(reference);
+    const float row2_ms = time_ms(row2);
+    const float row4_ms = time_ms(row4);
+    const float row8_ms = time_ms(row8);
+    reference();
+    row2();
+    row4();
+    row8();
+    hip_ok(hipDeviceSynchronize(), "rowtile synchronize");
+    std::vector<float> host_reference(out_count), host_row2(out_count);
+    std::vector<float> host_row4(out_count), host_row8(out_count);
+    hip_ok(hipMemcpy(host_reference.data(), d_reference,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read rowtile reference");
+    hip_ok(hipMemcpy(host_row2.data(), d_row2,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read rowtile 2x16");
+    hip_ok(hipMemcpy(host_row4.data(), d_row4,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read rowtile 4x8");
+    hip_ok(hipMemcpy(host_row8.data(), d_row8,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read rowtile 8x4");
+    const bool exact2 = std::memcmp(host_reference.data(), host_row2.data(),
+                                    out_count * sizeof(float)) == 0;
+    const bool exact4 = std::memcmp(host_reference.data(), host_row4.data(),
+                                    out_count * sizeof(float)) == 0;
+    const bool exact8 = std::memcmp(host_reference.data(), host_row8.data(),
+                                    out_count * sizeof(float)) == 0;
+    const Error error2 = compare(host_reference, host_row2);
+    const Error error4 = compare(host_reference, host_row4);
+    const Error error8 = compare(host_reference, host_row8);
+    std::printf(
+        "BF16 rowtile shape=%ux%ux%u residency=host-registered "
+        "reference_ms=%.4f row2x16_ms=%.4f row4x8_ms=%.4f "
+        "row8x4_ms=%.4f speedup2=%.3fx speedup4=%.3fx speedup8=%.3fx "
+        "exact2=%d exact4=%d exact8=%d nrmse2=%.9g nrmse4=%.9g "
+        "nrmse8=%.9g\n",
+        tokens, out_dim, in_dim, reference_ms, row2_ms, row4_ms, row8_ms,
+        reference_ms / row2_ms, reference_ms / row4_ms,
+        reference_ms / row8_ms, exact2 ? 1 : 0, exact4 ? 1 : 0,
+        exact8 ? 1 : 0, error2.nrmse, error4.nrmse, error8.nrmse);
+    if (!exact2 || !exact4 || !exact8)
+        fail("BF16 adjacent-row token tile bit identity");
+    hip_ok(hipFree(d_row8), "free rowtile 8x4 output");
+    hip_ok(hipFree(d_row4), "free rowtile 4x8 output");
+    hip_ok(hipFree(d_row2), "free rowtile 2x16 output");
+    hip_ok(hipFree(d_reference), "free rowtile reference");
+    hip_ok(hipFree(d_x), "free rowtile input");
+}
+
+void run_rowtile_m2048_guard(const uint16_t *weight, uint32_t in_dim,
+                             uint32_t out_dim) {
+    constexpr uint32_t tokens = 2048u;
+    const uint64_t x_count = (uint64_t)tokens * in_dim;
+    const uint64_t out_count = (uint64_t)tokens * out_dim;
+    std::vector<float> x(x_count);
+    for (uint64_t i = 0u; i < x_count; ++i)
+        x[i] = 0.17f * std::cos((double)(i % 12289u) * 0.003) -
+               0.13f * std::sin((double)i * 0.002);
+    float *d_x = nullptr, *d_reference = nullptr, *d_candidate = nullptr;
+    hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
+           "allocate M2048 rowtile input");
+    hip_ok(hipMalloc(&d_reference, out_count * sizeof(float)),
+           "allocate M2048 rowtile reference");
+    hip_ok(hipMalloc(&d_candidate, out_count * sizeof(float)),
+           "allocate M2048 rowtile candidate");
+    hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
+                     hipMemcpyHostToDevice), "copy M2048 rowtile input");
+    const auto reference = [&] {
+        launch_segmented_tiled(d_reference, weight, d_x, in_dim,
+                               out_dim, tokens);
+    };
+    const auto candidate = [&] {
+        matmul_bf16_f32_rowtile_w32_kernel<2u, 16u><<<
+            dim3((out_dim + 1u) / 2u, tokens / 16u), kThreads>>>(
+            d_candidate, weight, d_x, in_dim, out_dim);
+        hip_ok(hipGetLastError(), "M2048 rowtile 2x16 launch");
+    };
+    const float reference_ms = time_ms(reference);
+    const float candidate_ms = time_ms(candidate);
+    reference();
+    candidate();
+    hip_ok(hipDeviceSynchronize(), "M2048 rowtile synchronize");
+    std::vector<float> host_reference(out_count), host_candidate(out_count);
+    hip_ok(hipMemcpy(host_reference.data(), d_reference,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M2048 rowtile reference");
+    hip_ok(hipMemcpy(host_candidate.data(), d_candidate,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M2048 rowtile candidate");
+    const bool exact = std::memcmp(host_reference.data(),
+                                   host_candidate.data(),
+                                   out_count * sizeof(float)) == 0;
+    const Error error = compare(host_reference, host_candidate);
+    std::printf(
+        "BF16 rowtile guard shape=%ux%ux%u residency=host-registered "
+        "reference_ms=%.4f row2x16_ms=%.4f speedup=%.3fx exact=%d "
+        "nrmse=%.9g\n",
+        tokens, out_dim, in_dim, reference_ms, candidate_ms,
+        reference_ms / candidate_ms, exact ? 1 : 0, error.nrmse);
+    if (!exact) fail("BF16 M2048 adjacent-row token tile bit identity");
+    hip_ok(hipFree(d_candidate), "free M2048 rowtile candidate");
+    hip_ok(hipFree(d_reference), "free M2048 rowtile reference");
+    hip_ok(hipFree(d_x), "free M2048 rowtile input");
+}
+
 void run_lowrank128_tail_coverage(const uint16_t *weight, uint32_t tokens) {
     constexpr uint32_t in_dim = 128u;
     constexpr uint32_t out_dim = 8192u;
@@ -852,6 +1004,10 @@ int main() {
     run_skinny_exact_shape(device_weight, 4096u, 32u, 256u);
     run_skinny_exact_shape(device_weight, 4096u, 128u, 256u);
     run_skinny_exact_shape(device_weight, 4096u, 128u, 63u);
+    run_rowtile_shape(device_weight, 4096u, 8192u);
+    run_rowtile_shape(device_weight, 8192u, 4096u);
+    run_rowtile_m2048_guard(device_weight, 4096u, 8192u);
+    run_rowtile_m2048_guard(device_weight, 8192u, 4096u);
     run_lowrank128_tail_coverage(device_weight, 63u);
     for (const uint32_t tokens : {25u, 57u, 121u, 153u}) {
         run_tail25_candidate(device_weight, 4096u, 8192u, tokens);

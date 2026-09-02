@@ -1484,6 +1484,18 @@ static int matmul_bf16_f32_toktile_w32_launch(
     return first == n_tok;
 }
 
+static int matmul_bf16_f32_rowtile2x16_w32_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    if (n_tok == 0u || (n_tok % 16u) != 0u) return 0;
+    matmul_bf16_f32_rowtile_w32_kernel<2u, 16u><<<
+            dim3((out_dim + 1u) / 2u, n_tok / 16u),
+            kDs4Bf16ToktileThreads>>>(
+        out, weight, x, in_dim, out_dim);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_bf16 adjacent-row tile2x16 launch");
+}
+
 static int matmul_bf16_f32_skinny_exact_toktile_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
@@ -1813,6 +1825,43 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
     static const int lowrank128_toktile_disabled =
         getenv("DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE") != NULL;
+    static const char *rowtile2x16_value =
+        getenv("DS4_ROCM_GLM5_BF16_ROWTILE2X16");
+    static const int rowtile2x16_enabled = rowtile2x16_value != NULL &&
+        strcmp(rowtile2x16_value, "1") == 0;
+    static const int rowtile2x16_valid = rowtile2x16_value == NULL ||
+        strcmp(rowtile2x16_value, "0") == 0 || rowtile2x16_enabled;
+    if (!rowtile2x16_valid) {
+        static int invalid_reported;
+        if (!invalid_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "invalid GLM5 BF16 adjacent-row tile selector\n");
+            invalid_reported = 1;
+        }
+        return 0;
+    }
+    const bool rowtile2x16_shape = rowtile2x16_enabled &&
+        ((in_dim == 4096u && out_dim == 8192u) ||
+         (in_dim == 8192u && out_dim == 4096u));
+    if (rowtile2x16_shape && n_tok >= 16u && (n_tok % 16u) == 0u &&
+        in_dim <= UINT32_MAX && out_dim <= UINT32_MAX &&
+        n_tok <= UINT32_MAX && !g_quality_mode &&
+        !cuda_runtime_config()->graph_dump) {
+        static int rowtile2x16_reported;
+        if (!rowtile2x16_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 adjacent-row tile2x16 engaged: "
+                    "tokens=%llu in=%llu out=%llu\n",
+                    (unsigned long long)n_tok,
+                    (unsigned long long)in_dim,
+                    (unsigned long long)out_dim);
+            rowtile2x16_reported = 1;
+        }
+        return matmul_bf16_f32_rowtile2x16_w32_launch(
+            (float *)out->ptr, (const uint16_t *)wptr,
+            (const float *)x->ptr, (uint32_t)in_dim,
+            (uint32_t)out_dim, (uint32_t)n_tok);
+    }
     static const char *skinny_exact_value =
         getenv("DS4_ROCM_GLM5_BF16_SKINNY_EXACT_TOKTILE");
     static const int skinny_exact_enabled =

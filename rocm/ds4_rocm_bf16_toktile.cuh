@@ -64,6 +64,75 @@ __global__ static void matmul_bf16_f32_toktile_w32_kernel(
     }
 }
 
+/* Reuse each activation value across several adjacent output rows while
+ * retaining the token-tile kernel's per-thread K chains and wave32 reduction
+ * order.  Keep RowTile*TokenTile fixed at 32 so the accumulator footprint is
+ * comparable to the incumbent 1x32 kernel. Production dispatch keeps this
+ * behind an explicit, shape-checked research selector until its provider and
+ * diverse-prompt promotion gates are complete. */
+template <uint32_t RowTile, uint32_t TokenTile>
+__global__ static void matmul_bf16_f32_rowtile_w32_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    static_assert(RowTile >= 1u && TokenTile >= 1u,
+                  "BF16 row/token tiles must be nonzero");
+    static_assert(RowTile * TokenTile == 32u,
+                  "BF16 row/token tile keeps 32 accumulators");
+    const uint32_t row_base = blockIdx.x * RowTile;
+    const uint32_t token_base = blockIdx.y * TokenTile;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    float sums[RowTile][TokenTile] = {};
+    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        float activations[TokenTile];
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token)
+            activations[token] =
+                x[(uint64_t)(token_base + token) * in_dim + i];
+#pragma unroll
+        for (uint32_t row = 0u; row < RowTile; ++row) {
+            const uint32_t output_row = row_base + row;
+            const float weight = output_row < out_dim
+                ? __uint_as_float((uint32_t)w[
+                    (uint64_t)output_row * in_dim + i] << 16u)
+                : 0.0f;
+#pragma unroll
+            for (uint32_t token = 0u; token < TokenTile; ++token)
+                sums[row][token] += weight * activations[token];
+        }
+    }
+    __shared__ float
+        wave_sums[RowTile][TokenTile][kDs4Bf16ToktileWaves];
+#pragma unroll
+    for (uint32_t row = 0u; row < RowTile; ++row) {
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token) {
+            float value = sums[row][token];
+#pragma unroll
+            for (uint32_t offset = 16u; offset > 0u; offset >>= 1u)
+                value += __shfl_down(value, offset, 32u);
+            if (lane == 0u) wave_sums[row][token][wave] = value;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < RowTile * TokenTile) {
+        const uint32_t row = threadIdx.x / TokenTile;
+        const uint32_t token = threadIdx.x % TokenTile;
+        const uint32_t output_row = row_base + row;
+        if (output_row < out_dim) {
+            float value = 0.0f;
+#pragma unroll
+            for (uint32_t wv = 0u; wv < kDs4Bf16ToktileWaves; ++wv)
+                value += wave_sums[row][token][wv];
+            out[(uint64_t)(token_base + token) * out_dim + output_row] =
+                value;
+        }
+    }
+}
+
 /* Exact-order token tiling for narrow-output BF16 projections.  The generic
  * production kernel owns one [row, token] per block and reduces its 256
  * thread-local K chains through a 256-wide LDS butterfly.  Preserve those
