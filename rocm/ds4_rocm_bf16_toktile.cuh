@@ -64,6 +64,57 @@ __global__ static void matmul_bf16_f32_toktile_w32_kernel(
     }
 }
 
+/* Exact-order token tiling for narrow-output BF16 projections.  The generic
+ * production kernel owns one [row, token] per block and reduces its 256
+ * thread-local K chains through a 256-wide LDS butterfly.  Preserve those
+ * chains and that butterfly independently for each token, but reuse every
+ * weight load across a 32-token prompt tile.  This is deliberately distinct
+ * from the lower-LDS wave reduction above, whose association differs from the
+ * generic kernel. */
+template <uint32_t TokenTile>
+__global__ static void matmul_bf16_f32_skinny_exact_toktile_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    static_assert(TokenTile >= 1u && TokenTile <= 32u,
+                  "skinny exact BF16 token tile must be 1..32");
+    const uint32_t row = blockIdx.x;
+    const uint32_t token_base = blockIdx.y * TokenTile;
+    const uint32_t tid = threadIdx.x;
+    if (row >= out_dim || tid >= kDs4Bf16ToktileThreads) return;
+    const uint16_t *wr = w + (uint64_t)row * in_dim;
+    float sums[TokenTile] = {};
+    for (uint32_t i = tid; i < in_dim; i += kDs4Bf16ToktileThreads) {
+        const float weight = __uint_as_float((uint32_t)wr[i] << 16u);
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token)
+            sums[token] += weight *
+                x[(uint64_t)(token_base + token) * in_dim + i];
+    }
+    __shared__ float partial[TokenTile][kDs4Bf16ToktileThreads];
+#pragma unroll
+    for (uint32_t token = 0u; token < TokenTile; ++token)
+        partial[token][tid] = sums[token];
+    __syncthreads();
+    for (uint32_t stride = kDs4Bf16ToktileThreads >> 1u;
+         stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+#pragma unroll
+            for (uint32_t token = 0u; token < TokenTile; ++token)
+                partial[token][tid] += partial[token][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token)
+            out[(uint64_t)(token_base + token) * out_dim + row] =
+                partial[token][0];
+    }
+}
+
 template <uint32_t TokenTile>
 __global__ static void matmul_bf16_f32_kslice_toktile_w32_kernel(
         float *out,

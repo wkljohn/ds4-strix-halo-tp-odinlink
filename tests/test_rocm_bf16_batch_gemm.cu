@@ -542,6 +542,141 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
     hip_ok(hipFree(d_x), "free M256 F32 input");
 }
 
+void launch_skinny_exact_tiled(float *out, const uint16_t *weight,
+                               const float *x, uint32_t in_dim,
+                               uint32_t out_dim, uint32_t tokens) {
+    uint32_t first = 0u;
+    const uint32_t chunks32 = tokens / 32u;
+    if (chunks32 > 0u) {
+        matmul_bf16_f32_skinny_exact_toktile_kernel<32u><<<
+            dim3(out_dim, chunks32), kThreads>>>(
+            out, weight, x, in_dim, out_dim);
+        hip_ok(hipGetLastError(), "skinny exact tile32 launch");
+        first = chunks32 * 32u;
+    }
+#define LAUNCH_SKINNY_EXACT_TAIL(T) do {                                \
+        if (tokens - first >= (T)) {                                    \
+            matmul_bf16_f32_skinny_exact_toktile_kernel<(T)><<<         \
+                out_dim, kThreads>>>(                                   \
+                out + (uint64_t)first * out_dim, weight,                \
+                x + (uint64_t)first * in_dim, in_dim, out_dim);         \
+            hip_ok(hipGetLastError(), "skinny exact tail launch");     \
+            first += (T);                                               \
+        }                                                               \
+    } while (0)
+    LAUNCH_SKINNY_EXACT_TAIL(16u);
+    LAUNCH_SKINNY_EXACT_TAIL(8u);
+    LAUNCH_SKINNY_EXACT_TAIL(4u);
+    LAUNCH_SKINNY_EXACT_TAIL(2u);
+    LAUNCH_SKINNY_EXACT_TAIL(1u);
+#undef LAUNCH_SKINNY_EXACT_TAIL
+    if (first != tokens) fail("skinny exact token decomposition");
+}
+
+void run_skinny_exact_shape(const uint16_t *weight, uint32_t in_dim,
+                            uint32_t out_dim, uint32_t tokens) {
+    const uint64_t x_count = (uint64_t)tokens * in_dim;
+    const uint64_t out_count = (uint64_t)tokens * out_dim;
+    std::vector<float> x(x_count);
+    for (uint64_t i = 0u; i < x_count; ++i)
+        x[i] = 0.41f * std::cos((double)(i % 4093u) * 0.011) -
+               0.07f * std::sin((double)i * 0.003);
+    float *d_x = nullptr, *d_reference = nullptr, *d_candidate = nullptr;
+    float *d_candidate16 = nullptr, *d_candidate8 = nullptr;
+    hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
+           "allocate skinny exact input");
+    hip_ok(hipMalloc(&d_reference, out_count * sizeof(float)),
+           "allocate skinny exact reference");
+    hip_ok(hipMalloc(&d_candidate, out_count * sizeof(float)),
+           "allocate skinny exact candidate");
+    hip_ok(hipMalloc(&d_candidate16, out_count * sizeof(float)),
+           "allocate skinny exact candidate16");
+    hip_ok(hipMalloc(&d_candidate8, out_count * sizeof(float)),
+           "allocate skinny exact candidate8");
+    hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
+                     hipMemcpyHostToDevice), "copy skinny exact input");
+    const auto reference = [&] {
+        current_bf16_f32_kernel<<<
+            dim3(out_dim, tokens), kThreads>>>(
+            d_reference, weight, d_x, in_dim, out_dim, tokens);
+        hip_ok(hipGetLastError(), "skinny exact reference launch");
+    };
+    const auto candidate = [&] {
+        launch_skinny_exact_tiled(d_candidate, weight, d_x, in_dim,
+                                  out_dim, tokens);
+    };
+    const auto candidate16 = [&] {
+        if ((tokens % 16u) != 0u) fail("skinny exact tile16 divisibility");
+        matmul_bf16_f32_skinny_exact_toktile_kernel<16u><<<
+            dim3(out_dim, tokens / 16u), kThreads>>>(
+            d_candidate16, weight, d_x, in_dim, out_dim);
+        hip_ok(hipGetLastError(), "skinny exact candidate16 launch");
+    };
+    const auto candidate8 = [&] {
+        if ((tokens % 8u) != 0u) fail("skinny exact tile8 divisibility");
+        matmul_bf16_f32_skinny_exact_toktile_kernel<8u><<<
+            dim3(out_dim, tokens / 8u), kThreads>>>(
+            d_candidate8, weight, d_x, in_dim, out_dim);
+        hip_ok(hipGetLastError(), "skinny exact candidate8 launch");
+    };
+    const float reference_ms = time_ms(reference);
+    const float candidate_ms = time_ms(candidate);
+    const float candidate16_ms = (tokens % 16u) == 0u
+        ? time_ms(candidate16) : 0.0f;
+    const float candidate8_ms = (tokens % 8u) == 0u
+        ? time_ms(candidate8) : 0.0f;
+    reference();
+    candidate();
+    if ((tokens % 16u) == 0u) candidate16();
+    if ((tokens % 8u) == 0u) candidate8();
+    hip_ok(hipDeviceSynchronize(), "skinny exact synchronize");
+    std::vector<float> host_reference(out_count), host_candidate(out_count);
+    std::vector<float> host_candidate16(out_count), host_candidate8(out_count);
+    hip_ok(hipMemcpy(host_reference.data(), d_reference,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read skinny exact reference");
+    hip_ok(hipMemcpy(host_candidate.data(), d_candidate,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read skinny exact candidate");
+    if ((tokens % 16u) == 0u)
+        hip_ok(hipMemcpy(host_candidate16.data(), d_candidate16,
+                         out_count * sizeof(float), hipMemcpyDeviceToHost),
+               "read skinny exact candidate16");
+    if ((tokens % 8u) == 0u)
+        hip_ok(hipMemcpy(host_candidate8.data(), d_candidate8,
+                         out_count * sizeof(float), hipMemcpyDeviceToHost),
+               "read skinny exact candidate8");
+    const Error error = compare(host_reference, host_candidate);
+    const bool bit_exact =
+        std::memcmp(host_reference.data(), host_candidate.data(),
+                    out_count * sizeof(float)) == 0;
+    const bool bit_exact16 = (tokens % 16u) != 0u ||
+        std::memcmp(host_reference.data(), host_candidate16.data(),
+                    out_count * sizeof(float)) == 0;
+    const bool bit_exact8 = (tokens % 8u) != 0u ||
+        std::memcmp(host_reference.data(), host_candidate8.data(),
+                    out_count * sizeof(float)) == 0;
+    std::printf(
+        "BF16 skinny exact shape=%ux%ux%u residency=host-registered "
+        "generic_ms=%.4f tile32_ms=%.4f tile16_ms=%.4f tile8_ms=%.4f "
+        "tile32_speedup=%.3fx tile16_speedup=%.3fx tile8_speedup=%.3fx "
+        "nrmse=%.9g cosine=%.12g max_abs=%.9g "
+        "bit_exact32=%d bit_exact16=%d bit_exact8=%d\n",
+        tokens, out_dim, in_dim, reference_ms, candidate_ms,
+        candidate16_ms, candidate8_ms, reference_ms / candidate_ms,
+        candidate16_ms > 0.0f ? reference_ms / candidate16_ms : 0.0f,
+        candidate8_ms > 0.0f ? reference_ms / candidate8_ms : 0.0f,
+        error.nrmse, error.cosine, error.max_abs, bit_exact ? 1 : 0,
+        bit_exact16 ? 1 : 0, bit_exact8 ? 1 : 0);
+    if (!bit_exact || !bit_exact16 || !bit_exact8)
+        fail("skinny exact token tile bit identity");
+    hip_ok(hipFree(d_candidate8), "free skinny exact candidate8");
+    hip_ok(hipFree(d_candidate16), "free skinny exact candidate16");
+    hip_ok(hipFree(d_candidate), "free skinny exact candidate");
+    hip_ok(hipFree(d_reference), "free skinny exact reference");
+    hip_ok(hipFree(d_x), "free skinny exact input");
+}
+
 void run_lowrank128_tail_coverage(const uint16_t *weight, uint32_t tokens) {
     constexpr uint32_t in_dim = 128u;
     constexpr uint32_t out_dim = 8192u;
@@ -713,6 +848,10 @@ int main() {
     run_prefill_shape(handle, device_weight, 128u, 4096u);
     run_prefill_shape(handle, device_weight, 4096u, 64u);
     run_prefill_shape(handle, device_weight, 4096u, 128u);
+    run_skinny_exact_shape(device_weight, 16384u, 24u, 256u);
+    run_skinny_exact_shape(device_weight, 4096u, 32u, 256u);
+    run_skinny_exact_shape(device_weight, 4096u, 128u, 256u);
+    run_skinny_exact_shape(device_weight, 4096u, 128u, 63u);
     run_lowrank128_tail_coverage(device_weight, 63u);
     for (const uint32_t tokens : {25u, 57u, 121u, 153u}) {
         run_tail25_candidate(device_weight, 4096u, 8192u, tokens);

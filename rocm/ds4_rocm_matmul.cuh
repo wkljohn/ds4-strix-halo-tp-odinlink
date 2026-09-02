@@ -1484,6 +1484,40 @@ static int matmul_bf16_f32_toktile_w32_launch(
     return first == n_tok;
 }
 
+static int matmul_bf16_f32_skinny_exact_toktile_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    uint32_t first = 0u;
+    const uint32_t chunks32 = n_tok / 32u;
+    if (chunks32 > 0u) {
+        matmul_bf16_f32_skinny_exact_toktile_kernel<32u><<<
+                dim3(out_dim, chunks32), kDs4Bf16ToktileThreads>>>(
+            out, weight, x, in_dim, out_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "matmul_bf16 skinny exact tile32 launch")) return 0;
+        first = chunks32 * 32u;
+    }
+#define DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(T) do {                       \
+        if (n_tok - first >= (T)) {                                     \
+            matmul_bf16_f32_skinny_exact_toktile_kernel<(T)><<<         \
+                out_dim, kDs4Bf16ToktileThreads>>>(                     \
+                out + (uint64_t)first * out_dim, weight,                \
+                x + (uint64_t)first * in_dim, in_dim, out_dim);         \
+            if (!cuda_ok(cudaGetLastError(),                            \
+                         "matmul_bf16 skinny exact tail launch"))      \
+                return 0;                                               \
+            first += (T);                                               \
+        }                                                               \
+    } while (0)
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(16u);
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(8u);
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(4u);
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(2u);
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(1u);
+#undef DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL
+    return first == n_tok;
+}
+
 static int matmul_bf16_f32_kslice_toktile_w32_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t full_in_dim, uint32_t k_off, uint32_t k_cnt,
@@ -1779,6 +1813,43 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
     static const int lowrank128_toktile_disabled =
         getenv("DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE") != NULL;
+    static const char *skinny_exact_value =
+        getenv("DS4_ROCM_GLM5_BF16_SKINNY_EXACT_TOKTILE");
+    static const int skinny_exact_enabled =
+        skinny_exact_value != NULL && strcmp(skinny_exact_value, "1") == 0;
+    static const int skinny_exact_valid =
+        skinny_exact_value == NULL || strcmp(skinny_exact_value, "0") == 0 ||
+        skinny_exact_enabled;
+    if (!skinny_exact_valid) {
+        static int invalid_reported;
+        if (!invalid_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "invalid GLM5 BF16 skinny exact token-tile selector\n");
+            invalid_reported = 1;
+        }
+        return 0;
+    }
+    const bool skinny_exact_shape = skinny_exact_enabled &&
+        ((in_dim == 4096u && (out_dim == 32u || out_dim == 128u)) ||
+         (in_dim == 16384u && out_dim == 24u));
+    if (skinny_exact_shape && n_tok >= 16u && in_dim <= UINT32_MAX &&
+        out_dim <= UINT32_MAX && n_tok <= UINT32_MAX && !g_quality_mode &&
+        !cuda_runtime_config()->graph_dump) {
+        static int skinny_exact_reported;
+        if (!skinny_exact_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 skinny exact token-tile engaged: "
+                    "tokens=%llu in=%llu out=%llu\n",
+                    (unsigned long long)n_tok,
+                    (unsigned long long)in_dim,
+                    (unsigned long long)out_dim);
+            skinny_exact_reported = 1;
+        }
+        return matmul_bf16_f32_skinny_exact_toktile_launch(
+            (float *)out->ptr, (const uint16_t *)wptr,
+            (const float *)x->ptr, (uint32_t)in_dim,
+            (uint32_t)out_dim, (uint32_t)n_tok);
+    }
     /* Full KDA expands 128 -> 8192.  True TP computes one contiguous head
      * half at a time, so the same row-major kernel sees 128 -> 4096 after
      * advancing wptr to rank 1's first row. */
