@@ -1779,8 +1779,11 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
     static const int lowrank128_toktile_disabled =
         getenv("DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE") != NULL;
+    /* Full KDA expands 128 -> 8192.  True TP computes one contiguous head
+     * half at a time, so the same row-major kernel sees 128 -> 4096 after
+     * advancing wptr to rank 1's first row. */
     const bool low_rank_128 = !lowrank128_toktile_disabled &&
-        in_dim == 128u && out_dim == 8192u;
+        in_dim == 128u && (out_dim == 8192u || out_dim == 4096u);
     if (!batch_toktile_disabled && n_tok >= 16u &&
         ((in_dim >= 1024u && out_dim >= 1024u) || low_rank_128) &&
         in_dim <= UINT32_MAX && out_dim <= UINT32_MAX &&
@@ -1798,7 +1801,7 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
             verbose_reported = 1;
         }
         static int low_rank_reported = 0;
-        if (!low_rank_reported && in_dim == 128u && out_dim == 8192u &&
+        if (!low_rank_reported && low_rank_128 &&
             getenv("DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE") != NULL) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "BF16 F32 low-rank token-tile path engaged: tokens=%llu "

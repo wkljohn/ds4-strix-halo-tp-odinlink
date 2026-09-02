@@ -417,6 +417,7 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
     float *d_x = nullptr, *d_reference = nullptr;
     float *d_production = nullptr, *d_blas = nullptr;
     float *d_weight_once = nullptr;
+    float *d_lowrank = nullptr;
     uint16_t *d_x_bf16 = nullptr;
     hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
            "allocate M256 F32 input");
@@ -430,6 +431,9 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
            "allocate M256 hipBLAS output");
     hip_ok(hipMalloc(&d_weight_once, out_count * sizeof(float)),
            "allocate M256 weight-once output");
+    if (in_dim == 128u)
+        hip_ok(hipMalloc(&d_lowrank, out_count * sizeof(float)),
+               "allocate M256 low-rank output");
     hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
                      hipMemcpyHostToDevice), "copy M256 input");
     f32_to_bf16_kernel<<<(x_count + 255u) / 256u, 256u>>>(
@@ -444,6 +448,10 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
         weight_once_bf16_f32_m256_kernel<<<out_dim, kThreads>>>(
             d_weight_once, weight, d_x, in_dim, out_dim);
         hip_ok(hipGetLastError(), "M256 weight-once launch");
+    };
+    const auto lowrank = [&] {
+        launch_lowrank128_tiled(d_lowrank, weight, d_x, out_dim,
+                                kPrefillTokens);
     };
     const auto blas = [&] {
         const float alpha = 1.0f;
@@ -463,14 +471,17 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
     hip_ok(hipGetLastError(), "M256 scalar reference launch");
     const float production_ms = time_ms(production);
     const float weight_once_ms = time_ms(weight_once);
+    const float lowrank_ms = in_dim == 128u ? time_ms(lowrank) : 0.0f;
     const float blas_ms = time_ms(blas);
     production();
     weight_once();
+    if (in_dim == 128u) lowrank();
     blas();
     hip_ok(hipDeviceSynchronize(), "M256 output synchronize");
 
     std::vector<float> reference(out_count), production_output(out_count);
     std::vector<float> weight_once_output(out_count), blas_output(out_count);
+    std::vector<float> lowrank_output;
     hip_ok(hipMemcpy(reference.data(), d_reference,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
            "read M256 reference");
@@ -480,6 +491,12 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
     hip_ok(hipMemcpy(weight_once_output.data(), d_weight_once,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
            "read M256 weight-once");
+    if (in_dim == 128u) {
+        lowrank_output.resize(out_count);
+        hip_ok(hipMemcpy(lowrank_output.data(), d_lowrank,
+                         out_count * sizeof(float), hipMemcpyDeviceToHost),
+               "read M256 low-rank");
+    }
     hip_ok(hipMemcpy(blas_output.data(), d_blas,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
            "read M256 hipBLAS");
@@ -500,10 +517,23 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
         "  weight_once_f32 nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
         weight_once_error.nrmse, weight_once_error.cosine,
         weight_once_error.max_abs);
+    if (in_dim == 128u) {
+        const Error lowrank_error = compare(reference, lowrank_output);
+        if (std::memcmp(reference.data(), lowrank_output.data(),
+                        out_count * sizeof(float)) != 0)
+            fail("M256 low-rank token tile must bit-match scalar reduction");
+        std::printf(
+            "  lowrank128_ms=%.4f speedup=%.3fx nrmse=%.9g "
+            "cosine=%.12g max_abs=%.9g bit_exact=1\n",
+            lowrank_ms, production_ms / lowrank_ms, lowrank_error.nrmse,
+            lowrank_error.cosine, lowrank_error.max_abs);
+    }
     std::printf(
         "  bf16_blas nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
         blas_error.nrmse, blas_error.cosine, blas_error.max_abs);
 
+    if (d_lowrank)
+        hip_ok(hipFree(d_lowrank), "free M256 low-rank output");
     hip_ok(hipFree(d_weight_once), "free M256 weight-once output");
     hip_ok(hipFree(d_blas), "free M256 hipBLAS output");
     hip_ok(hipFree(d_production), "free M256 production output");
@@ -675,10 +705,12 @@ int main() {
      * token-tile gate, so keep it in the three-arm diagnostic before changing
      * dispatch. */
     run_shape(handle, device_weight, 128u, 8192u);
+    run_shape(handle, device_weight, 128u, 4096u);
     run_shape(handle, device_weight, 4096u, 8192u);
     run_shape(handle, device_weight, 8192u, 4096u);
     run_prefill_shape(handle, device_weight, 4096u, 8192u);
     run_prefill_shape(handle, device_weight, 8192u, 4096u);
+    run_prefill_shape(handle, device_weight, 128u, 4096u);
     run_prefill_shape(handle, device_weight, 4096u, 64u);
     run_prefill_shape(handle, device_weight, 4096u, 128u);
     run_lowrank128_tail_coverage(device_weight, 63u);
