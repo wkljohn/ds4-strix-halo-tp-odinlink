@@ -1578,6 +1578,12 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
             getenv("DS4_ROCM_GLM5_BF16_QKV_ROWS_PER_BLOCK");
         static const char *decode_qkv_nontemporal_value =
             getenv("DS4_ROCM_GLM5_BF16_QKV_NONTEMPORAL");
+        static const char *decode_output_prefetch_value =
+            getenv("DS4_ROCM_GLM5_BF16_OUTPUT_PREFETCH");
+        static const char *decode_output_rows_value =
+            getenv("DS4_ROCM_GLM5_BF16_OUTPUT_ROWS_PER_BLOCK");
+        static const char *decode_output_nontemporal_value =
+            getenv("DS4_ROCM_GLM5_BF16_OUTPUT_NONTEMPORAL");
         static const uint32_t decode_qkv_prefetch =
             decode_qkv_prefetch_value == NULL ? 0u :
             strcmp(decode_qkv_prefetch_value, "0") == 0 ? 0u :
@@ -1600,62 +1606,102 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
             strcmp(decode_qkv_rows_value, "8") == 0 ? 8u :
             strcmp(decode_qkv_rows_value, "16") == 0 ? 16u :
             strcmp(decode_qkv_rows_value, "32") == 0 ? 32u : 0u;
+        static const uint32_t decode_output_prefetch =
+            decode_output_prefetch_value == NULL ? 0u :
+            strcmp(decode_output_prefetch_value, "0") == 0 ? 0u :
+            strcmp(decode_output_prefetch_value, "4") == 0 ? 4u :
+            strcmp(decode_output_prefetch_value, "8") == 0 ? 8u :
+            strcmp(decode_output_prefetch_value, "16") == 0 ? 16u :
+            strcmp(decode_output_prefetch_value, "32") == 0 ? 32u :
+            strcmp(decode_output_prefetch_value, "64") == 0 ? 64u :
+            UINT32_MAX;
+        static const int decode_output_prefetch_valid =
+            decode_output_prefetch != UINT32_MAX;
+        static const int decode_output_nontemporal =
+            decode_output_nontemporal_value != NULL &&
+            strcmp(decode_output_nontemporal_value, "1") == 0;
+        static const int decode_output_nontemporal_valid =
+            decode_output_nontemporal_value == NULL ||
+            strcmp(decode_output_nontemporal_value, "0") == 0 ||
+            decode_output_nontemporal;
+        static const uint32_t decode_output_rows_per_block =
+            decode_output_rows_value == NULL ? 32u :
+            strcmp(decode_output_rows_value, "8") == 0 ? 8u :
+            strcmp(decode_output_rows_value, "16") == 0 ? 16u :
+            strcmp(decode_output_rows_value, "32") == 0 ? 32u : 0u;
         if (!decode_qkv_prefetch_valid || !decode_qkv_nontemporal_valid ||
             (decode_qkv_nontemporal && decode_qkv_prefetch == 0u) ||
-            decode_qkv_rows_per_block == 0u) {
+            decode_qkv_rows_per_block == 0u ||
+            !decode_output_prefetch_valid ||
+            !decode_output_nontemporal_valid ||
+            (decode_output_nontemporal && decode_output_prefetch == 0u) ||
+            decode_output_rows_per_block == 0u) {
             static int invalid_reported;
             if (!invalid_reported) {
                 fprintf(stderr, DS4_GPU_LOG_PREFIX
-                        "invalid GLM5 BF16 QKV exact-order research selector\n");
+                        "invalid GLM5 BF16 exact-order research selector\n");
                 invalid_reported = 1;
             }
             return 0;
         }
         const int decode_qkv_shape = in_dim == 4096u && out_dim == 4096u;
+        const int decode_output_shape = in_dim == 8192u && out_dim == 2048u;
+        const uint32_t decode_exact_prefetch = decode_qkv_shape
+            ? decode_qkv_prefetch
+            : decode_output_shape ? decode_output_prefetch : 0u;
+        const int decode_exact_nontemporal = decode_qkv_shape
+            ? decode_qkv_nontemporal
+            : decode_output_shape ? decode_output_nontemporal : 0;
         const uint32_t rows_per_block = decode_qkv_shape
-            ? decode_qkv_rows_per_block : 32u;
+            ? decode_qkv_rows_per_block
+            : decode_output_shape ? decode_output_rows_per_block : 32u;
         static const int decode_mlp64_disabled =
             getenv("DS4_ROCM_DISABLE_BF16_DECODE_MLP64") != NULL;
         const dim3 grid(
             ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block);
         const dim3 block(rows_per_block * 32u);
         const size_t shared_bytes = (size_t)in_dim * sizeof(float);
-        if (decode_qkv_shape && decode_qkv_prefetch != 0u) {
+        if ((decode_qkv_shape || decode_output_shape) &&
+            decode_exact_prefetch != 0u) {
 #define DS4_LAUNCH_BF16_QKV_PREFETCH(P, NT) \
             matmul_bf16_f32_sharedx_exact_prefetch_warp_rows_w32_kernel< \
                     P, NT><<<grid, block, shared_bytes>>>( \
                     (float *)out->ptr, (const uint16_t *)wptr, \
                     (const float *)x->ptr, (uint32_t)in_dim, out_dim)
-            if (decode_qkv_prefetch == 4u) {
-                if (decode_qkv_nontemporal)
+            if (decode_exact_prefetch == 4u) {
+                if (decode_exact_nontemporal)
                     DS4_LAUNCH_BF16_QKV_PREFETCH(4u, true);
                 else DS4_LAUNCH_BF16_QKV_PREFETCH(4u, false);
-            } else if (decode_qkv_prefetch == 8u) {
-                if (decode_qkv_nontemporal)
+            } else if (decode_exact_prefetch == 8u) {
+                if (decode_exact_nontemporal)
                     DS4_LAUNCH_BF16_QKV_PREFETCH(8u, true);
                 else DS4_LAUNCH_BF16_QKV_PREFETCH(8u, false);
-            } else if (decode_qkv_prefetch == 16u) {
-                if (decode_qkv_nontemporal)
+            } else if (decode_exact_prefetch == 16u) {
+                if (decode_exact_nontemporal)
                     DS4_LAUNCH_BF16_QKV_PREFETCH(16u, true);
                 else DS4_LAUNCH_BF16_QKV_PREFETCH(16u, false);
-            } else if (decode_qkv_prefetch == 32u) {
-                if (decode_qkv_nontemporal)
+            } else if (decode_exact_prefetch == 32u) {
+                if (decode_exact_nontemporal)
                     DS4_LAUNCH_BF16_QKV_PREFETCH(32u, true);
                 else DS4_LAUNCH_BF16_QKV_PREFETCH(32u, false);
             } else {
-                if (decode_qkv_nontemporal)
+                if (decode_exact_nontemporal)
                     DS4_LAUNCH_BF16_QKV_PREFETCH(64u, true);
                 else DS4_LAUNCH_BF16_QKV_PREFETCH(64u, false);
             }
 #undef DS4_LAUNCH_BF16_QKV_PREFETCH
-            static int prefetch_reported;
-            if (!prefetch_reported) {
+            static int qkv_prefetch_reported;
+            static int output_prefetch_reported;
+            int *prefetch_reported = decode_qkv_shape
+                ? &qkv_prefetch_reported : &output_prefetch_reported;
+            if (!*prefetch_reported) {
                 fprintf(stderr, DS4_GPU_LOG_PREFIX
-                        "GLM5 BF16 QKV exact prefetch engaged "
+                        "GLM5 BF16 %s exact prefetch engaged "
                         "window=%u rows_per_block=%u nontemporal=%d\n",
-                        decode_qkv_prefetch, rows_per_block,
-                        decode_qkv_nontemporal);
-                prefetch_reported = 1;
+                        decode_qkv_shape ? "QKV" : "output",
+                        decode_exact_prefetch, rows_per_block,
+                        decode_exact_nontemporal);
+                *prefetch_reported = 1;
             }
         } else if (!decode_mlp64_disabled && in_dim >= 4096u) {
             static const char *split_order_value =
