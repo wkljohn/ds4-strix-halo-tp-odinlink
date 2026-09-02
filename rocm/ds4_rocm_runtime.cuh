@@ -500,6 +500,8 @@ static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
 static void *g_attention_seq_scratch[DS4_MAX_GPUS];
 static uint64_t g_attention_seq_scratch_bytes[DS4_MAX_GPUS];
+static void *g_glm_causal_scratch[DS4_MAX_GPUS];
+static uint64_t g_glm_causal_scratch_bytes[DS4_MAX_GPUS];
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -843,6 +845,39 @@ static void *cuda_attention_seq_scratch_alloc(uint64_t bytes) {
     }
     g_attention_seq_scratch[device] = ptr;
     g_attention_seq_scratch_bytes[device] = bytes;
+    return ptr;
+}
+
+static void *cuda_glm_causal_scratch_alloc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        device < 0 || device >= DS4_MAX_GPUS) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM causal attention cannot resolve current device\n");
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    if (g_glm_causal_scratch_bytes[device] >= bytes) {
+        return g_glm_causal_scratch[device];
+    }
+    if (g_glm_causal_scratch[device]) {
+        (void)cudaFree(g_glm_causal_scratch[device]);
+        g_glm_causal_scratch[device] = NULL;
+        g_glm_causal_scratch_bytes[device] = 0;
+    }
+    void *ptr = NULL;
+    const cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "GLM causal attention scratch alloc failed (%.2f MiB): %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_glm_causal_scratch[device] = ptr;
+    g_glm_causal_scratch_bytes[device] = bytes;
     return ptr;
 }
 
@@ -8152,6 +8187,14 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
         g_attention_seq_scratch[device] = NULL;
         g_attention_seq_scratch_bytes[device] = 0;
+    }
+    for (int device = 0; device < DS4_MAX_GPUS; device++) {
+        if (!g_glm_causal_scratch[device]) continue;
+        if (cudaSetDevice(device) == cudaSuccess) {
+            (void)cudaFree(g_glm_causal_scratch[device]);
+        }
+        g_glm_causal_scratch[device] = NULL;
+        g_glm_causal_scratch_bytes[device] = 0;
     }
     if (attention_seq_saved_device >= 0) {
         (void)cudaSetDevice(attention_seq_saved_device);

@@ -5,6 +5,26 @@ repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 test_dir=$(mktemp -d)
 trap 'rm -rf -- "$test_dir"' EXIT
 config=$test_dir/bench.env
+model=$test_dir/model.gguf
+
+# Config-only validation still inspects model metadata so provider tests cannot
+# bypass architecture-specific safety checks. Generate the smallest valid GGUF
+# header with a non-GLM architecture instead of relying on /dev/null.
+python3 - "$model" <<'PY'
+import struct
+import sys
+
+key = b"general.architecture"
+value = b"deepseek4"
+with open(sys.argv[1], "wb") as out:
+    out.write(b"GGUF")
+    out.write(struct.pack("<IQQ", 3, 0, 1))
+    out.write(struct.pack("<Q", len(key)))
+    out.write(key)
+    out.write(struct.pack("<I", 8))
+    out.write(struct.pack("<Q", len(value)))
+    out.write(value)
+PY
 
 printf '%s\n' \
   'DS4_BENCH_RDMA_PROFILE=roce-v2' \
@@ -18,7 +38,7 @@ run_validate() {
     DS4_BENCH_DSPARK=1 \
     DS4_BENCH_PROMPT_FILE=/dev/null \
     "$@" \
-    "$repo/run-tp-ds4-bench.sh" env-precedence /dev/null
+    "$repo/run-tp-ds4-bench.sh" env-precedence "$model"
 }
 
 expect_contains() {
@@ -78,7 +98,7 @@ if env -i PATH="$PATH" LANG=C.UTF-8 \
     DS4_BENCH_DSPARK=1 \
     DS4_BENCH_PROMPT_FILE=/dev/null \
     DS4_TP_EXPERT_SPLIT=118 \
-    "$repo/run-tp-ds4-bench.sh" env-precedence /dev/null \
+    "$repo/run-tp-ds4-bench.sh" env-precedence "$model" \
     >"$test_dir/split.out" 2>&1; then
   echo 'FAIL ambient-expert-split-still-rejected: unexpectedly succeeded' >&2
   exit 1

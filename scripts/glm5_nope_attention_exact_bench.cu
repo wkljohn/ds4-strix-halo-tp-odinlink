@@ -32,6 +32,15 @@ constexpr uint32_t kHeadGroup = 8u;
 constexpr uint32_t kRowTile = 32u;
 constexpr uint32_t kColumnTile = 32u;
 constexpr uint32_t kPvRowTile = 16u;
+constexpr uint32_t kPrefillTokens = 256u;
+constexpr uint32_t kPrefillSelected = 2048u;
+constexpr uint32_t kPrefillRowTile = 16u;
+constexpr uint32_t kPrefillScoreHeadGroup = 64u;
+constexpr uint32_t kPrefillScoreThreads =
+    kPrefillScoreHeadGroup * kPrefillRowTile;
+constexpr uint32_t kPrefillPvHeadGroup = 16u;
+constexpr uint32_t kPrefillPvThreads =
+    kPrefillPvHeadGroup * kColumnTile;
 
 #define HIP_CHECK(expr) do {                                                \
     const hipError_t status_ = (expr);                                      \
@@ -321,6 +330,264 @@ __global__ void shared_pv_kernel(
     out[(uint64_t)head * kLatent + channel] = acc / denoms[head];
 }
 
+/* Production-order prefill references.  They deliberately launch once per
+ * head, matching the current live path after its gather step. */
+__global__ void prefill_score_scalar_kernel(
+        float *scores,
+        const float *low,
+        const float *cache,
+        uint32_t head,
+        uint32_t pos0) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t visible = min(kPrefillSelected, pos0 + token + 1u);
+    const float *head_low =
+        low + ((uint64_t)token * kHeads + head) * kLatent;
+    float *score_row = scores +
+        ((uint64_t)head * kPrefillTokens + token) * kPrefillSelected;
+    for (uint32_t s = threadIdx.x; s < kPrefillSelected; s += blockDim.x) {
+        float acc = 0.0f;
+        if (s < visible) {
+            const float *key = cache + (uint64_t)s * kLatent;
+#pragma unroll 1
+            for (uint32_t j = 0u; j < kLatent; ++j) {
+                acc += head_low[j] * key[j];
+            }
+        }
+        score_row[s] = acc;
+    }
+}
+
+/* One launch covers all heads and tokens.  Eight heads share each cache-row
+ * load, while one thread retains each (head,row) ascending-j dot chain. */
+__global__ void prefill_score_shared_kernel(
+        float *scores,
+        const float *low,
+        const float *cache,
+        uint32_t pos0) {
+    const uint32_t token = blockIdx.z;
+    const uint32_t head_lane = threadIdx.x / kPrefillRowTile;
+    const uint32_t row_lane = threadIdx.x % kPrefillRowTile;
+    const uint32_t head =
+        blockIdx.x * kPrefillScoreHeadGroup + head_lane;
+    const uint32_t s = blockIdx.y * kPrefillRowTile + row_lane;
+    const uint32_t visible = min(kPrefillSelected, pos0 + token + 1u);
+    const bool in_range = s < kPrefillSelected;
+    const bool visible_row = s < visible;
+    const float *head_low =
+        low + ((uint64_t)token * kHeads + head) * kLatent;
+    __shared__ float tile[kPrefillRowTile][257u];
+    float dot = 0.0f;
+
+    if (blockIdx.y * kPrefillRowTile >= visible) {
+        if (in_range) {
+            scores[((uint64_t)head * kPrefillTokens + token) *
+                   kPrefillSelected + s] = 0.0f;
+        }
+        return;
+    }
+    for (uint32_t half = 0u; half < 2u; ++half) {
+        for (uint32_t linear = threadIdx.x;
+             linear < kPrefillRowTile * 256u;
+             linear += kPrefillScoreThreads) {
+            const uint32_t tile_row = linear / 256u;
+            const uint32_t column = linear % 256u;
+            const uint32_t tile_s =
+                blockIdx.y * kPrefillRowTile + tile_row;
+            tile[tile_row][column] = tile_s < visible
+                ? cache[(uint64_t)tile_s * kLatent +
+                        half * 256u + column]
+                : 0.0f;
+        }
+        __syncthreads();
+        if (visible_row) {
+#pragma unroll 1
+            for (uint32_t column = 0u; column < 256u; ++column) {
+                dot += head_low[half * 256u + column] *
+                    tile[row_lane][column];
+            }
+        }
+        __syncthreads();
+    }
+    if (in_range) {
+        scores[((uint64_t)head * kPrefillTokens + token) *
+               kPrefillSelected + s] = visible_row ? dot : 0.0f;
+    }
+}
+
+__global__ void prefill_softmax_scalar_kernel(
+        float *normalizers,
+        float *scores,
+        uint32_t head,
+        uint32_t pos0,
+        float scale) {
+    const uint32_t token = blockIdx.x;
+    float *row = scores +
+        ((uint64_t)head * kPrefillTokens + token) * kPrefillSelected;
+    __shared__ float reduce[kThreads];
+    const uint32_t visible = min(kPrefillSelected, pos0 + token + 1u);
+    float vmax = -INFINITY;
+    for (uint32_t s = threadIdx.x; s < kPrefillSelected; s += blockDim.x) {
+        const float v = s < visible ? row[s] * scale : -INFINITY;
+        row[s] = v;
+        vmax = fmaxf(vmax, v);
+    }
+    reduce[threadIdx.x] = vmax;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] =
+                fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float row_max = reduce[0];
+    float sum = 0.0f;
+    for (uint32_t s = threadIdx.x; s < kPrefillSelected; s += blockDim.x) {
+        const float v = expf(row[s] - row_max);
+        row[s] = v;
+        sum += v;
+    }
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        normalizers[(uint64_t)head * kPrefillTokens + token] =
+            fmaxf(reduce[0], 1.0e-20f);
+    }
+}
+
+__global__ void prefill_softmax_heads_kernel(
+        float *normalizers,
+        float *scores,
+        uint32_t pos0,
+        float scale) {
+    const uint32_t head = blockIdx.x / kPrefillTokens;
+    const uint32_t token = blockIdx.x - head * kPrefillTokens;
+    float *row = scores +
+        ((uint64_t)head * kPrefillTokens + token) * kPrefillSelected;
+    __shared__ float reduce[kThreads];
+    const uint32_t visible = min(kPrefillSelected, pos0 + token + 1u);
+    float vmax = -INFINITY;
+    for (uint32_t s = threadIdx.x; s < kPrefillSelected; s += blockDim.x) {
+        const float v = s < visible ? row[s] * scale : -INFINITY;
+        row[s] = v;
+        vmax = fmaxf(vmax, v);
+    }
+    reduce[threadIdx.x] = vmax;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] =
+                fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float row_max = reduce[0];
+    float sum = 0.0f;
+    for (uint32_t s = threadIdx.x; s < kPrefillSelected; s += blockDim.x) {
+        const float v = expf(row[s] - row_max);
+        row[s] = v;
+        sum += v;
+    }
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        normalizers[(uint64_t)head * kPrefillTokens + token] =
+            fmaxf(reduce[0], 1.0e-20f);
+    }
+}
+
+__global__ void prefill_pv_scalar_kernel(
+        float *out,
+        const float *weights,
+        const float *normalizers,
+        const float *cache,
+        uint32_t head,
+        uint32_t pos0) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t visible = min(kPrefillSelected, pos0 + token + 1u);
+    const float *weight_row = weights +
+        ((uint64_t)head * kPrefillTokens + token) * kPrefillSelected;
+    for (uint32_t channel = threadIdx.x;
+         channel < kLatent;
+         channel += blockDim.x) {
+        float acc = 0.0f;
+#pragma unroll 1
+        for (uint32_t s = 0u; s < visible; ++s) {
+            acc += weight_row[s] *
+                cache[(uint64_t)s * kLatent + channel];
+        }
+        out[((uint64_t)token * kHeads + head) * kLatent + channel] =
+            acc / normalizers[(uint64_t)head * kPrefillTokens + token];
+    }
+}
+
+/* Every thread owns one (token,head,channel) accumulator and retains the
+ * scalar path's ascending-s order.  A head group shares each cache tile. */
+__global__ void prefill_pv_shared_kernel(
+        float *out,
+        const float *weights,
+        const float *normalizers,
+        const float *cache,
+        uint32_t pos0) {
+    const uint32_t token = blockIdx.z;
+    const uint32_t head_lane = threadIdx.x / kColumnTile;
+    const uint32_t channel_lane = threadIdx.x % kColumnTile;
+    const uint32_t head =
+        blockIdx.x * kPrefillPvHeadGroup + head_lane;
+    const uint32_t channel = blockIdx.y * kColumnTile + channel_lane;
+    const uint32_t visible = min(kPrefillSelected, pos0 + token + 1u);
+    __shared__ float cache_tile[kPvRowTile][kColumnTile];
+    __shared__ float weight_tile[kPrefillPvHeadGroup][kPvRowTile];
+    float acc = 0.0f;
+
+    for (uint32_t base = 0u; base < visible; base += kPvRowTile) {
+        for (uint32_t linear = threadIdx.x;
+             linear < kPvRowTile * kColumnTile;
+             linear += kPrefillPvThreads) {
+            const uint32_t row_lane = linear / kColumnTile;
+            const uint32_t column_lane = linear % kColumnTile;
+            const uint32_t s = base + row_lane;
+            cache_tile[row_lane][column_lane] = s < visible
+                ? cache[(uint64_t)s * kLatent +
+                        blockIdx.y * kColumnTile + column_lane]
+                : 0.0f;
+        }
+        if (threadIdx.x < kPrefillPvHeadGroup * kPvRowTile) {
+            const uint32_t weight_head = threadIdx.x / kPvRowTile;
+            const uint32_t row_lane = threadIdx.x % kPvRowTile;
+            const uint32_t s = base + row_lane;
+            weight_tile[weight_head][row_lane] = s < visible
+                ? weights[((uint64_t)(blockIdx.x * kPrefillPvHeadGroup +
+                                      weight_head) *
+                           kPrefillTokens + token) * kPrefillSelected + s]
+                : 0.0f;
+        }
+        __syncthreads();
+#pragma unroll 1
+        for (uint32_t row_lane = 0u; row_lane < kPvRowTile; ++row_lane) {
+            if (base + row_lane < visible) {
+                acc += weight_tile[head_lane][row_lane] *
+                    cache_tile[row_lane][channel_lane];
+            }
+        }
+        __syncthreads();
+    }
+    out[((uint64_t)token * kHeads + head) * kLatent + channel] =
+        acc / normalizers[(uint64_t)head * kPrefillTokens + token];
+}
+
 uint64_t fnv1a64(const void *data, size_t bytes) {
     const uint8_t *p = static_cast<const uint8_t *>(data);
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -403,6 +670,102 @@ float benchmark(
     HIP_CHECK(hipEventDestroy(end));
     HIP_CHECK(hipEventDestroy(begin));
     return elapsed_ms / (float)(repeats * kLayers);
+}
+
+void launch_prefill_score(bool shared, float *scores, const float *low,
+                          const float *cache, uint32_t pos0) {
+    if (shared) {
+        const dim3 grid(kHeads / kPrefillScoreHeadGroup,
+                        kPrefillSelected / kPrefillRowTile,
+                        kPrefillTokens);
+        prefill_score_shared_kernel<<<grid, kPrefillScoreThreads>>>(
+            scores, low, cache, pos0);
+    } else {
+        for (uint32_t head = 0u; head < kHeads; ++head) {
+            prefill_score_scalar_kernel<<<kPrefillTokens, kThreads>>>(
+                scores, low, cache, head, pos0);
+        }
+    }
+}
+
+void launch_prefill_softmax(bool shared, float *normalizers, float *scores,
+                            uint32_t pos0) {
+    const float scale = 1.0f / sqrtf(256.0f);
+    if (shared) {
+        prefill_softmax_heads_kernel<<<kHeads * kPrefillTokens, kThreads>>>(
+            normalizers, scores, pos0, scale);
+    } else {
+        for (uint32_t head = 0u; head < kHeads; ++head) {
+            prefill_softmax_scalar_kernel<<<kPrefillTokens, kThreads>>>(
+                normalizers, scores, head, pos0, scale);
+        }
+    }
+}
+
+void launch_prefill_pv(bool shared, float *out, const float *weights,
+                       const float *normalizers, const float *cache,
+                       uint32_t pos0) {
+    if (shared) {
+        const dim3 grid(kHeads / kPrefillPvHeadGroup,
+                        kLatent / kColumnTile,
+                        kPrefillTokens);
+        prefill_pv_shared_kernel<<<grid, kPrefillPvThreads>>>(
+            out, weights, normalizers, cache, pos0);
+    } else {
+        for (uint32_t head = 0u; head < kHeads; ++head) {
+            prefill_pv_scalar_kernel<<<kPrefillTokens, kThreads>>>(
+                out, weights, normalizers, cache, head, pos0);
+        }
+    }
+}
+
+float benchmark_prefill_score(bool shared, float *scores, const float *low,
+                              const float *cache, uint32_t pos0) {
+    constexpr uint32_t warmups = 2u;
+    constexpr uint32_t repeats = 5u;
+    for (uint32_t i = 0u; i < warmups; ++i) {
+        launch_prefill_score(shared, scores, low, cache, pos0);
+    }
+    HIP_CHECK(hipDeviceSynchronize());
+    hipEvent_t begin = nullptr, end = nullptr;
+    HIP_CHECK(hipEventCreate(&begin));
+    HIP_CHECK(hipEventCreate(&end));
+    HIP_CHECK(hipEventRecord(begin));
+    for (uint32_t i = 0u; i < repeats; ++i) {
+        launch_prefill_score(shared, scores, low, cache, pos0);
+    }
+    HIP_CHECK(hipEventRecord(end));
+    HIP_CHECK(hipEventSynchronize(end));
+    float elapsed_ms = 0.0f;
+    HIP_CHECK(hipEventElapsedTime(&elapsed_ms, begin, end));
+    HIP_CHECK(hipEventDestroy(end));
+    HIP_CHECK(hipEventDestroy(begin));
+    return elapsed_ms / repeats;
+}
+
+float benchmark_prefill_pv(bool shared, float *out, const float *weights,
+                           const float *normalizers, const float *cache,
+                           uint32_t pos0) {
+    constexpr uint32_t warmups = 2u;
+    constexpr uint32_t repeats = 5u;
+    for (uint32_t i = 0u; i < warmups; ++i) {
+        launch_prefill_pv(shared, out, weights, normalizers, cache, pos0);
+    }
+    HIP_CHECK(hipDeviceSynchronize());
+    hipEvent_t begin = nullptr, end = nullptr;
+    HIP_CHECK(hipEventCreate(&begin));
+    HIP_CHECK(hipEventCreate(&end));
+    HIP_CHECK(hipEventRecord(begin));
+    for (uint32_t i = 0u; i < repeats; ++i) {
+        launch_prefill_pv(shared, out, weights, normalizers, cache, pos0);
+    }
+    HIP_CHECK(hipEventRecord(end));
+    HIP_CHECK(hipEventSynchronize(end));
+    float elapsed_ms = 0.0f;
+    HIP_CHECK(hipEventElapsedTime(&elapsed_ms, begin, end));
+    HIP_CHECK(hipEventDestroy(end));
+    HIP_CHECK(hipEventDestroy(begin));
+    return elapsed_ms / repeats;
 }
 
 }  // namespace
@@ -549,6 +912,161 @@ int main() {
                 shared_ms, incumbent_ms / shared_ms);
     std::printf("incumbent_qk_shared_pv,%.6f,%.6f\n",
                 hybrid_ms, incumbent_ms / hybrid_ms);
+
+    const uint64_t prefill_low_count =
+        (uint64_t)kPrefillTokens * kHeads * kLatent;
+    const uint64_t prefill_score_count =
+        (uint64_t)kHeads * kPrefillTokens * kPrefillSelected;
+    const uint64_t prefill_output_count = prefill_low_count;
+    const uint64_t prefill_normalizer_count =
+        (uint64_t)kHeads * kPrefillTokens;
+    std::vector<float> prefill_low(prefill_low_count);
+    for (uint64_t i = 0u; i < prefill_low_count; ++i) {
+        prefill_low[i] =
+            (float)((int)((i * 37u + 19u) % 97u) - 48) * 0.000913f;
+    }
+
+    float *d_prefill_low = nullptr;
+    float *d_normalizer_reference = nullptr;
+    float *d_normalizer_shared = nullptr;
+    float *d_score_reference = nullptr;
+    float *d_score_shared = nullptr;
+    float *d_pv_reference = nullptr;
+    float *d_pv_shared = nullptr;
+    HIP_CHECK(hipMalloc(&d_prefill_low,
+                        prefill_low_count * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_normalizer_reference,
+                        prefill_normalizer_count * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_normalizer_shared,
+                        prefill_normalizer_count * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_score_reference,
+                        prefill_score_count * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_score_shared,
+                        prefill_score_count * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_pv_reference,
+                        prefill_output_count * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_pv_shared,
+                        prefill_output_count * sizeof(float)));
+    HIP_CHECK(hipMemcpy(d_prefill_low, prefill_low.data(),
+                        prefill_low_count * sizeof(float),
+                        hipMemcpyHostToDevice));
+
+    std::vector<float> score_reference(prefill_score_count);
+    std::vector<float> score_shared(prefill_score_count);
+    std::vector<float> normalizer_reference(prefill_normalizer_count);
+    std::vector<float> normalizer_shared(prefill_normalizer_count);
+    std::vector<float> pv_reference(prefill_output_count);
+    std::vector<float> pv_shared(prefill_output_count);
+    std::printf("prefill_pos0,score_scalar_ms,score_shared_ms,score_speedup,"
+                "pv_scalar_ms,pv_shared_ms,pv_speedup,combined_speedup\n");
+    for (const uint32_t pos0 : {0u, 1792u}) {
+        launch_prefill_score(false, d_score_reference, d_prefill_low,
+                             device_caches[0], pos0);
+        launch_prefill_score(true, d_score_shared, d_prefill_low,
+                             device_caches[0], pos0);
+        HIP_CHECK(hipDeviceSynchronize());
+        HIP_CHECK(hipMemcpy(score_reference.data(), d_score_reference,
+                            prefill_score_count * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(score_shared.data(), d_score_shared,
+                            prefill_score_count * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        if (std::memcmp(score_reference.data(), score_shared.data(),
+                        prefill_score_count * sizeof(float)) != 0) {
+            size_t first = 0u;
+            while (first < score_reference.size() &&
+                   std::memcmp(&score_reference[first], &score_shared[first],
+                               sizeof(float)) == 0) ++first;
+            std::fprintf(stderr,
+                         "FAIL prefill score pos0=%u first=%zu "
+                         "scalar=%.9g shared=%.9g\n",
+                         pos0, first, score_reference[first],
+                         score_shared[first]);
+            return 4;
+        }
+        launch_prefill_softmax(false, d_normalizer_reference,
+                               d_score_reference, pos0);
+        launch_prefill_softmax(true, d_normalizer_shared,
+                               d_score_shared, pos0);
+        HIP_CHECK(hipDeviceSynchronize());
+        HIP_CHECK(hipMemcpy(score_reference.data(), d_score_reference,
+                            prefill_score_count * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(score_shared.data(), d_score_shared,
+                            prefill_score_count * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(normalizer_reference.data(),
+                            d_normalizer_reference,
+                            prefill_normalizer_count * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(normalizer_shared.data(), d_normalizer_shared,
+                            prefill_normalizer_count * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        if (std::memcmp(score_reference.data(), score_shared.data(),
+                        prefill_score_count * sizeof(float)) != 0 ||
+            std::memcmp(normalizer_reference.data(), normalizer_shared.data(),
+                        prefill_normalizer_count * sizeof(float)) != 0) {
+            std::fprintf(stderr,
+                         "FAIL prefill softmax pos0=%u scale=%.9g\n",
+                         pos0, 1.0f / sqrtf(256.0f));
+            return 5;
+        }
+        launch_prefill_pv(false, d_pv_reference, d_score_reference,
+                          d_normalizer_reference, device_caches[0], pos0);
+        launch_prefill_pv(true, d_pv_shared, d_score_shared,
+                          d_normalizer_shared, device_caches[0], pos0);
+        HIP_CHECK(hipDeviceSynchronize());
+        HIP_CHECK(hipMemcpy(pv_reference.data(), d_pv_reference,
+                            prefill_output_count * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        HIP_CHECK(hipMemcpy(pv_shared.data(), d_pv_shared,
+                            prefill_output_count * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        if (std::memcmp(pv_reference.data(), pv_shared.data(),
+                        prefill_output_count * sizeof(float)) != 0) {
+            size_t first = 0u;
+            while (first < pv_reference.size() &&
+                   std::memcmp(&pv_reference[first], &pv_shared[first],
+                               sizeof(float)) == 0) ++first;
+            std::fprintf(stderr,
+                         "FAIL prefill PV pos0=%u first=%zu "
+                         "scalar=%.9g shared=%.9g\n",
+                         pos0, first, pv_reference[first], pv_shared[first]);
+            return 6;
+        }
+        const float score_scalar_ms = benchmark_prefill_score(
+            false, d_score_reference, d_prefill_low, device_caches[0], pos0);
+        const float score_shared_ms = benchmark_prefill_score(
+            true, d_score_shared, d_prefill_low, device_caches[0], pos0);
+        launch_prefill_softmax(false, d_normalizer_reference,
+                               d_score_reference, pos0);
+        launch_prefill_softmax(true, d_normalizer_shared,
+                               d_score_shared, pos0);
+        const float pv_scalar_ms = benchmark_prefill_pv(
+            false, d_pv_reference, d_score_reference,
+            d_normalizer_reference, device_caches[0], pos0);
+        const float pv_shared_ms = benchmark_prefill_pv(
+            true, d_pv_shared, d_score_shared,
+            d_normalizer_shared, device_caches[0], pos0);
+        std::printf("%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+                    pos0, score_scalar_ms, score_shared_ms,
+                    score_scalar_ms / score_shared_ms,
+                    pv_scalar_ms, pv_shared_ms,
+                    pv_scalar_ms / pv_shared_ms,
+                    (score_scalar_ms + pv_scalar_ms) /
+                        (score_shared_ms + pv_shared_ms));
+    }
+    std::fprintf(stderr, "prefill_bit_identical=1 tokens=%u heads=%u "
+                         "selected=%u\n",
+                 kPrefillTokens, kHeads, kPrefillSelected);
+
+    HIP_CHECK(hipFree(d_pv_shared));
+    HIP_CHECK(hipFree(d_pv_reference));
+    HIP_CHECK(hipFree(d_score_shared));
+    HIP_CHECK(hipFree(d_score_reference));
+    HIP_CHECK(hipFree(d_normalizer_shared));
+    HIP_CHECK(hipFree(d_normalizer_reference));
+    HIP_CHECK(hipFree(d_prefill_low));
 
     HIP_CHECK(hipFree(denoms));
     HIP_CHECK(hipFree(scores));
