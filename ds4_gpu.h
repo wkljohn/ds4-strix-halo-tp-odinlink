@@ -1803,6 +1803,22 @@ int ds4_gpu_glm5_fill_pool_members_tensor(
         uint32_t              first_token,
         uint32_t              n_rows);
 
+/* ROCm batch-prefill fast path for an aligned run of complete pool-4 rows.
+ * It consumes the already contiguous normalized key and pool-gate batches and
+ * publishes keys plus membership directly into the resident pool arrays. */
+int ds4_gpu_glm5_publish_pools_batch_tensor(
+        ds4_gpu_tensor       *pooled_keys,
+        ds4_gpu_tensor       *pool_indices,
+        ds4_gpu_tensor       *pool_valid,
+        const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *gate_scores,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              pool_ape_offset,
+        uint32_t              first_pool,
+        uint32_t              n_tokens,
+        uint32_t              head_dim);
+
 /* Single-sequence GLM-5.3 decode selection helpers. The mask preserves the
  * upstream finite minimum sentinel. Expansion converts selected pool IDs back
  * to raw token IDs and appends the incomplete visible tail (at most 3 rows).

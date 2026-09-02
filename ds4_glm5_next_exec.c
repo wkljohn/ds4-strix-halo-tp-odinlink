@@ -2123,6 +2123,34 @@ static int mla_stage_index_rows(const ds4_glm5_next_exec_ctx *ctx,
     if (!ctx || !offsets || !mla || !w || n_tokens == 0u ||
         mla->token_count != pos0 || mla->complete_pools != pos0 / 4u ||
         mla->tail_count != pos0 % 4u) return 0;
+#ifdef DS4_ROCM_BUILD
+    const char *batch_pool_value =
+        getenv("DS4_ROCM_GLM5_BATCH_POOL_STAGE");
+    const int batch_pool_stage = batch_pool_value != NULL &&
+        strcmp(batch_pool_value, "1") == 0;
+    if (batch_pool_value != NULL &&
+        strcmp(batch_pool_value, "0") != 0 && !batch_pool_stage) {
+        return 0;
+    }
+    if (batch_pool_stage && pos0 <= mla->capacity_tokens &&
+        n_tokens <= mla->capacity_tokens - pos0 &&
+        (pos0 & 3u) == 0u && (n_tokens & 3u) == 0u) {
+        static int logged_batch_pool_stage[2] = {0, 0};
+        const uint32_t rank = ctx->tp_rank < 2u ? ctx->tp_rank : 0u;
+        if (!logged_batch_pool_stage[rank]) {
+            fprintf(stderr,
+                    "ds4: GLM5 aligned batch pool publication engaged "
+                    "rank=%u pos0=%u tokens=%u\n",
+                    ctx->tp_rank, pos0, n_tokens);
+            logged_batch_pool_stage[rank] = 1;
+        }
+        return ds4_gpu_glm5_publish_pools_batch_tensor(
+            mla->index_pool, mla->index_pool_ids, mla->index_pool_valid,
+            w->mla_index_k_norm, w->mla_pool_gate_raw,
+            ctx->model_map, ctx->model_size, offsets->index_pool_ape,
+            pos0 / 4u, n_tokens, GLM5_INDEX_DIM);
+    }
+#endif
     for (uint32_t t = 0u; t < n_tokens; ++t) {
         const uint32_t token = pos0 + t;
         const uint32_t tail_slot = token % 4u;

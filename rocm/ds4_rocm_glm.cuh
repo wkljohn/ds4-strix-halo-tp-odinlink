@@ -2268,6 +2268,50 @@ __global__ static void glm5_fill_pool_members_kernel(
                            n_rows - first_token >= 4u ? 1u : 0u;
 }
 
+__global__ static void glm5_publish_pools_batch_kernel(
+        float *pooled_keys, int32_t *pool_indices, uint32_t *pool_valid,
+        const float *keys, const float *gate_scores,
+        const uint16_t *pool_ape, uint32_t first_pool,
+        uint32_t head_dim) {
+    const uint32_t local_pool = blockIdx.x;
+    const uint32_t pool = first_pool + local_pool;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t start = local_pool * 4u;
+    if (tid == 0u) pool_valid[pool] = 1u;
+    if (tid < 4u)
+        pool_indices[(uint64_t)pool * 4u + tid] =
+            (int32_t)(pool * 4u + tid);
+    for (uint32_t d = tid; d < head_dim; d += blockDim.x) {
+        float logits[4];
+        float maximum = -INFINITY;
+#pragma unroll
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            logits[j] = f32_round_bf16_rne(
+                            gate_scores[(uint64_t)(start + j) * head_dim + d]) +
+                        __uint_as_float(
+                            (uint32_t)pool_ape[(uint64_t)j * head_dim + d] << 16);
+            maximum = fmaxf(maximum, logits[j]);
+        }
+        float denominator = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            logits[j] = expf(logits[j] - maximum);
+            denominator += logits[j];
+        }
+        float result = 0.0f;
+#pragma unroll
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            const float probability =
+                f32_round_bf16_rne(logits[j] / denominator);
+            const float key = f32_round_bf16_rne(
+                keys[(uint64_t)(start + j) * head_dim + d]);
+            result += f32_round_bf16_rne(probability * key);
+        }
+        pooled_keys[(uint64_t)pool * head_dim + d] =
+            f32_round_bf16_rne(result);
+    }
+}
+
 extern "C" int ds4_gpu_glm5_fill_pool_members_tensor(
         ds4_gpu_tensor *pool_indices, ds4_gpu_tensor *pool_valid,
         uint32_t pool, uint32_t first_token, uint32_t n_rows) {
@@ -2280,6 +2324,51 @@ extern "C" int ds4_gpu_glm5_fill_pool_members_tensor(
         (int32_t *)pool_indices->ptr, (uint32_t *)pool_valid->ptr,
         pool, first_token, n_rows);
     return cuda_ok(cudaGetLastError(), "glm5 pool membership launch");
+}
+
+extern "C" int ds4_gpu_glm5_publish_pools_batch_tensor(
+        ds4_gpu_tensor       *pooled_keys,
+        ds4_gpu_tensor       *pool_indices,
+        ds4_gpu_tensor       *pool_valid,
+        const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *gate_scores,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              pool_ape_offset,
+        uint32_t              first_pool,
+        uint32_t              n_tokens,
+        uint32_t              head_dim) {
+    if (!pooled_keys || !pool_indices || !pool_valid || !keys ||
+        !gate_scores || !pooled_keys->ptr || !pool_indices->ptr ||
+        !pool_valid->ptr || !keys->ptr || !gate_scores->ptr || !model_map ||
+        n_tokens == 0u || (n_tokens & 3u) != 0u || head_dim != 128u) {
+        return 0;
+    }
+    const uint32_t n_pools = n_tokens / 4u;
+    const uint64_t end_pool = (uint64_t)first_pool + n_pools;
+    const uint64_t source_bytes =
+        (uint64_t)n_tokens * head_dim * sizeof(float);
+    const uint64_t pooled_bytes = end_pool * head_dim * sizeof(float);
+    const uint64_t indices_bytes = end_pool * 4u * sizeof(int32_t);
+    const uint64_t valid_bytes = end_pool * sizeof(uint32_t);
+    const uint64_t ape_bytes = 4u * (uint64_t)head_dim * sizeof(uint16_t);
+    if (keys->bytes < source_bytes || gate_scores->bytes < source_bytes ||
+        pooled_keys->bytes < pooled_bytes ||
+        pool_indices->bytes < indices_bytes ||
+        pool_valid->bytes < valid_bytes ||
+        pool_ape_offset > model_size ||
+        ape_bytes > model_size - pool_ape_offset) {
+        return 0;
+    }
+    const uint16_t *ape = (const uint16_t *)cuda_model_range_ptr(
+        model_map, pool_ape_offset, ape_bytes,
+        "glm5_index_kpool_batch_ape");
+    if (!ape) return 0;
+    glm5_publish_pools_batch_kernel<<<n_pools, 128>>>(
+        (float *)pooled_keys->ptr, (int32_t *)pool_indices->ptr,
+        (uint32_t *)pool_valid->ptr, (const float *)keys->ptr,
+        (const float *)gate_scores->ptr, ape, first_pool, head_dim);
+    return cuda_ok(cudaGetLastError(), "glm5 batch pool publication launch");
 }
 
 __global__ static void glm5_mask_pool_scores_kernel(
