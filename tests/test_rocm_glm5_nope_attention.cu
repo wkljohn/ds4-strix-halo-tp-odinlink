@@ -367,9 +367,11 @@ bool run_test() {
         (uint64_t)kHeads * kKvLora * sizeof(float));
     ds4_gpu_tensor *d_production_candidate = ds4_gpu_tensor_alloc(
         (uint64_t)kHeads * kKvLora * sizeof(float));
+    ds4_gpu_tensor *d_production_shared = ds4_gpu_tensor_alloc(
+        (uint64_t)kHeads * kKvLora * sizeof(float));
     CHECK(d_production_query && d_production_low && d_production_cache &&
           d_production_selected && d_production_incumbent &&
-          d_production_candidate,
+          d_production_candidate && d_production_shared,
           "allocate production-sized NoPE lora tensors");
     CHECK(ds4_gpu_tensor_write(
               d_production_query, 0u, production_query.data(),
@@ -403,26 +405,122 @@ bool run_test() {
               1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
           ds4_gpu_synchronize(),
           "execute production-sized candidate NoPE lora attention");
+    unsetenv("DS4_ROCM_GLM5_NOPE_ATTN_EXACT");
+    CHECK(setenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV", "1", 1) == 0 &&
+          ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+              d_production_shared, d_production_query, d_production_low,
+              d_production_cache, nullptr, d_production_selected,
+              1u, kProductionSelected, kProductionRows, false,
+              kHeads, kKvLora, kQkNope, 0u, 1u,
+              1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_synchronize(),
+          "execute production-sized shared-PV NoPE lora attention");
     std::vector<float> production_incumbent((uint64_t)kHeads * kKvLora);
     std::vector<float> production_candidate((uint64_t)kHeads * kKvLora);
+    std::vector<float> production_shared((uint64_t)kHeads * kKvLora);
     CHECK(ds4_gpu_tensor_read(
               d_production_incumbent, 0u, production_incumbent.data(),
               (uint64_t)production_incumbent.size() * sizeof(float)) &&
           ds4_gpu_tensor_read(
               d_production_candidate, 0u, production_candidate.data(),
-              (uint64_t)production_candidate.size() * sizeof(float)),
+              (uint64_t)production_candidate.size() * sizeof(float)) &&
+          ds4_gpu_tensor_read(
+              d_production_shared, 0u, production_shared.data(),
+              (uint64_t)production_shared.size() * sizeof(float)),
           "read production-sized NoPE lora outputs");
     CHECK(std::memcmp(production_incumbent.data(), production_candidate.data(),
                       production_incumbent.size() * sizeof(float)) == 0,
           "production-sized NoPE lora output is bit-identical");
+    CHECK(std::memcmp(production_incumbent.data(), production_shared.data(),
+                      production_incumbent.size() * sizeof(float)) == 0,
+          "production-sized shared-PV NoPE lora output is bit-identical");
     const uint64_t production_fnv = fnv1a64_bytes(
         production_candidate.data(), production_candidate.size() * sizeof(float));
     std::fprintf(stderr,
                  "GLM5 NoPE production lora rows=%u selected=%u "
-                 "bit_identical=1 fnv64=%016llx\n",
+                 "exact_bit_identical=1 shared_pv_bit_identical=1 "
+                 "fnv64=%016llx\n",
                  kProductionRows, kProductionSelected,
                  (unsigned long long)production_fnv);
 
+    const uint32_t partial_counts[] = {1u, 7u, 17u, 25u, 2047u};
+    for (uint32_t partial_count : partial_counts) {
+        unsetenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV");
+        CHECK(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+                  d_production_incumbent, d_production_query, d_production_low,
+                  d_production_cache, nullptr, d_production_selected,
+                  1u, partial_count, kProductionRows, false,
+                  kHeads, kKvLora, kQkNope, 0u, 1u,
+                  1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+              ds4_gpu_synchronize(),
+              "execute partial-tile incumbent NoPE lora attention");
+        CHECK(setenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV", "1", 1) == 0 &&
+              ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+                  d_production_shared, d_production_query, d_production_low,
+                  d_production_cache, nullptr, d_production_selected,
+                  1u, partial_count, kProductionRows, false,
+                  kHeads, kKvLora, kQkNope, 0u, 1u,
+                  1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+              ds4_gpu_synchronize() &&
+              ds4_gpu_tensor_read(
+                  d_production_incumbent, 0u, production_incumbent.data(),
+                  (uint64_t)production_incumbent.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  d_production_shared, 0u, production_shared.data(),
+                  (uint64_t)production_shared.size() * sizeof(float)),
+              "execute and read partial-tile shared-PV attention");
+        CHECK(std::memcmp(production_incumbent.data(), production_shared.data(),
+                          production_incumbent.size() * sizeof(float)) == 0,
+              "partial-tile shared-PV output is bit-identical");
+        std::fprintf(stderr,
+                     "GLM5 NoPE partial selected=%u bit_identical=1 "
+                     "fnv64=%016llx\n",
+                     partial_count,
+                     (unsigned long long)fnv1a64_bytes(
+                         production_shared.data(),
+                         production_shared.size() * sizeof(float)));
+    }
+
+    std::vector<int32_t> all_invalid(25u, -1);
+    CHECK(ds4_gpu_tensor_write(d_production_selected, 0u, all_invalid.data(),
+                               all_invalid.size() * sizeof(int32_t)),
+          "upload all-invalid selected rows");
+    unsetenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV");
+    CHECK(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+              d_production_incumbent, d_production_query, d_production_low,
+              d_production_cache, nullptr, d_production_selected,
+              1u, 25u, kProductionRows, false,
+              kHeads, kKvLora, kQkNope, 0u, 1u,
+              1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_synchronize() &&
+          setenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV", "1", 1) == 0 &&
+          ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+              d_production_shared, d_production_query, d_production_low,
+              d_production_cache, nullptr, d_production_selected,
+              1u, 25u, kProductionRows, false,
+              kHeads, kKvLora, kQkNope, 0u, 1u,
+              1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_synchronize() &&
+          ds4_gpu_tensor_read(
+              d_production_incumbent, 0u, production_incumbent.data(),
+              (uint64_t)production_incumbent.size() * sizeof(float)) &&
+          ds4_gpu_tensor_read(
+              d_production_shared, 0u, production_shared.data(),
+              (uint64_t)production_shared.size() * sizeof(float)),
+          "execute all-invalid incumbent and shared-PV attention");
+    CHECK(std::memcmp(production_incumbent.data(), production_shared.data(),
+                      production_incumbent.size() * sizeof(float)) == 0,
+          "all-invalid shared-PV output is bit-identical");
+    for (float value : production_shared) {
+        CHECK(value == 0.0f && !std::signbit(value),
+              "all-invalid shared-PV output is positive zero");
+    }
+    std::fprintf(stderr,
+                 "GLM5 NoPE all-invalid selected=25 bit_identical=1 "
+                 "positive_zero=1\n");
+    unsetenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV");
+
+    ds4_gpu_tensor_free(d_production_shared);
     ds4_gpu_tensor_free(d_production_candidate);
     ds4_gpu_tensor_free(d_production_incumbent);
     ds4_gpu_tensor_free(d_production_selected);

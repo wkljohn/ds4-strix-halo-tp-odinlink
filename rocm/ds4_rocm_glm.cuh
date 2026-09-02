@@ -1038,6 +1038,141 @@ __global__ static void glm_attention_indexed_lora_nope_f32_decode_exact_kernel(
     }
 }
 
+/* Preserve the incumbent QK, max, exp, and sum order while materializing the
+ * per-head weights for the shared-PV stage. */
+__global__ static void glm_attention_indexed_lora_nope_f32_decode_qk_weights_kernel(
+        float *weights,
+        float *denoms,
+        const float *qk_low,
+        const float *kv_lora_cache,
+        const int32_t *selected,
+        uint32_t n_selected,
+        uint32_t cache_cap) {
+    const uint32_t head = blockIdx.x;
+    if (head >= 64u || n_selected == 0u) return;
+    constexpr uint32_t kv_lora_dim = 512u;
+    constexpr float scale = 0.0625f;
+    extern __shared__ float sh[];
+    float *max_red = sh;
+    float *sum_red = sh + 256u;
+    float *scores = sh + 512u;
+    const float *low = qk_low + (uint64_t)head * kv_lora_dim;
+
+    float local_max = -INFINITY;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += 256u) {
+        const int32_t row_i = selected[s];
+        const bool valid = row_i >= 0 && (uint32_t)row_i < cache_cap;
+        float score = -INFINITY;
+        if (valid) {
+            float dotv = 0.0f;
+            const float *kv = kv_lora_cache +
+                (uint64_t)(uint32_t)row_i * kv_lora_dim;
+            for (uint32_t j = 0u; j < kv_lora_dim; ++j) {
+                dotv += low[j] * kv[j];
+            }
+            score = dotv * scale;
+        }
+        scores[s] = score;
+        local_max = fmaxf(local_max, score);
+    }
+    max_red[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            max_red[threadIdx.x] = fmaxf(
+                max_red[threadIdx.x], max_red[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score = max_red[0];
+    const bool valid_max = isfinite(max_score);
+    float local_sum = 0.0f;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += 256u) {
+        const float weight = valid_max ? expf(scores[s] - max_score) : 0.0f;
+        scores[s] = weight;
+        weights[(uint64_t)head * n_selected + s] = weight;
+        local_sum += weight;
+    }
+    sum_red[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            sum_red[threadIdx.x] += sum_red[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        denoms[head] = valid_max ? fmaxf(sum_red[0], 1.0e-20f) : 0.0f;
+    }
+}
+
+/* Eight heads share each selected cache value through LDS.  Every thread owns
+ * one (head,channel) accumulator and still visits selected rows in the exact
+ * incumbent order. */
+__global__ static void glm_attention_indexed_lora_nope_f32_decode_shared_pv_kernel(
+        float *lora_out,
+        const float *weights,
+        const float *denoms,
+        const float *kv_lora_cache,
+        const int32_t *selected,
+        uint32_t n_selected,
+        uint32_t cache_cap) {
+    constexpr uint32_t head_group = 8u;
+    constexpr uint32_t column_tile = 32u;
+    constexpr uint32_t row_tile = 16u;
+    const uint32_t head_lane = threadIdx.x / column_tile;
+    const uint32_t column_lane = threadIdx.x % column_tile;
+    const uint32_t head = blockIdx.x * head_group + head_lane;
+    const uint32_t channel = blockIdx.y * column_tile + column_lane;
+    __shared__ float cache_tile[row_tile][column_tile];
+    __shared__ float weight_tile[head_group][row_tile];
+    __shared__ uint32_t valid_tile[row_tile];
+    float acc = 0.0f;
+
+    for (uint32_t base = 0u; base < n_selected; base += row_tile) {
+        for (uint32_t linear = threadIdx.x;
+             linear < row_tile * column_tile;
+             linear += 256u) {
+            const uint32_t row_lane = linear / column_tile;
+            const uint32_t tile_column = linear % column_tile;
+            const uint32_t s = base + row_lane;
+            const int32_t row_i = s < n_selected ? selected[s] : -1;
+            const bool valid = row_i >= 0 && (uint32_t)row_i < cache_cap;
+            cache_tile[row_lane][tile_column] = kv_lora_cache[
+                (uint64_t)(valid ? (uint32_t)row_i : 0u) * 512u +
+                blockIdx.y * column_tile + tile_column];
+        }
+        if (threadIdx.x < head_group * row_tile) {
+            const uint32_t weight_head = threadIdx.x / row_tile;
+            const uint32_t row_lane = threadIdx.x % row_tile;
+            const uint32_t s = base + row_lane;
+            weight_tile[weight_head][row_lane] =
+                s < n_selected
+                    ? weights[(uint64_t)(blockIdx.x * head_group + weight_head) *
+                              n_selected + s]
+                    : 0.0f;
+        }
+        if (threadIdx.x < row_tile) {
+            const uint32_t s = base + threadIdx.x;
+            const int32_t row_i = s < n_selected ? selected[s] : -1;
+            valid_tile[threadIdx.x] =
+                row_i >= 0 && (uint32_t)row_i < cache_cap;
+        }
+        __syncthreads();
+#pragma unroll 1
+        for (uint32_t row_lane = 0u; row_lane < row_tile; ++row_lane) {
+            if (valid_tile[row_lane]) {
+                acc += weight_tile[head_lane][row_lane] *
+                    cache_tile[row_lane][column_lane];
+            }
+        }
+        __syncthreads();
+    }
+    const float denom = denoms[head];
+    lora_out[(uint64_t)head * 512u + channel] =
+        denom > 0.0f ? acc / denom : 0.0f;
+}
+
 __global__ static void glm_attention_indexed_decode_split_partial_kernel(
         float *partial_lora,
         float *partial_ms,
@@ -4171,6 +4306,70 @@ static int glm_attention_indexed_lora_launch(
         n_tokens == 1u && !causal_range && has_selected &&
         !cache_f16 && n_head == 64u && kv_lora_dim == 512u &&
         qk_nope == 256u && qk_rope == 0u;
+    const char *nope_shared_pv_value =
+        getenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV");
+    const bool nope_shared_pv = nope_shared_pv_value != NULL &&
+        strcmp(nope_shared_pv_value, "1") == 0;
+    if (nope_shared_pv_value != NULL &&
+        strcmp(nope_shared_pv_value, "0") != 0 &&
+        !nope_shared_pv) {
+        static int invalid_reported;
+        if (!invalid_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "invalid DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV selector\n");
+            invalid_reported = 1;
+        }
+        return 0;
+    }
+    if (nope_shared_pv && nope_decode_exact_geometry &&
+        n_selected <= 2048u) {
+        /* Allocate the validated maximum once.  Decode grows its selected
+         * frontier from a few rows to 2048; sizing to the current frontier
+         * would repeatedly cudaFree/cudaMalloc and synchronize the device. */
+        const uint64_t score_floats = (uint64_t)64u * 2048u;
+        if (score_floats > (UINT64_MAX / sizeof(float)) - 64u) return 0;
+        const uint64_t scratch_bytes =
+            (score_floats + 64u) * sizeof(float);
+        float *weights =
+            (float *)cuda_attention_seq_scratch_alloc(scratch_bytes);
+        if (!weights) return 0;
+        float *denoms = weights + score_floats;
+        const size_t qk_shmem =
+            ((size_t)512u + n_selected) * sizeof(float);
+        glm_attention_indexed_lora_nope_f32_decode_qk_weights_kernel<<<
+                64u, 256u, qk_shmem>>>(
+                weights,
+                denoms,
+                (const float *)qk_low->ptr,
+                (const float *)kv_lora_cache->ptr,
+                (const int32_t *)selected->ptr,
+                n_selected,
+                cache_cap);
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm indexed NoPE F32 shared-PV QK launch")) {
+            return 0;
+        }
+        const dim3 pv_grid(8u, 16u, 1u);
+        glm_attention_indexed_lora_nope_f32_decode_shared_pv_kernel<<<
+                pv_grid, 256u>>>(
+                (float *)lora_out->ptr,
+                weights,
+                denoms,
+                (const float *)kv_lora_cache->ptr,
+                (const int32_t *)selected->ptr,
+                n_selected,
+                cache_cap);
+        static int notice_printed;
+        if (!notice_printed) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 NoPE F32 indexed decode exact shared-PV active "
+                    "(selected=%u scratch=%.2f MiB)\n",
+                    n_selected, (double)scratch_bytes / 1048576.0);
+            notice_printed = 1;
+        }
+        return cuda_ok(cudaGetLastError(),
+                       "glm indexed NoPE F32 shared-PV launch");
+    }
     if (nope_decode_exact && nope_decode_exact_geometry) {
         const dim3 exact_grid(64u, 1u, 1u);
         const size_t exact_shmem =
