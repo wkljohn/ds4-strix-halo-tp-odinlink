@@ -122,16 +122,21 @@ static int test_contract(void) {
     CHECK(!ds4_glm5_next_mla_dense_selection_visible_for_topk(
               0u, 16u, 0u, &visible),
           "scaled policy rejects a zero top-k");
-    CHECK(ds4_glm5_next_prefill_chunk(0u, 4096u, 1024u) == 1024u &&
-          ds4_glm5_next_prefill_chunk(1024u, 3072u, 1024u) == 1024u,
+    CHECK(ds4_glm5_next_prefill_chunk(0u, 4096u, 1024u, false) == 1024u &&
+          ds4_glm5_next_prefill_chunk(1024u, 3072u, 1024u, false) == 1024u,
           "prefill planner retains dense 1024-row tiles");
-    CHECK(ds4_glm5_next_prefill_chunk(1536u, 1024u, 1024u) == 512u,
+    CHECK(ds4_glm5_next_prefill_chunk(1536u, 1024u, 1024u, false) == 512u,
           "prefill planner stops a straddling tile at sparse crossover");
-    CHECK(ds4_glm5_next_prefill_chunk(2048u, 512u, 1024u) == 1u &&
-          ds4_glm5_next_prefill_chunk(2347u, 1u, 1024u) == 1u,
+    CHECK(ds4_glm5_next_prefill_chunk(2048u, 512u, 1024u, false) == 1u &&
+          ds4_glm5_next_prefill_chunk(2347u, 1u, 1024u, false) == 1u,
           "prefill planner uses scalar sparse execution after crossover");
-    CHECK(ds4_glm5_next_prefill_chunk(0u, 8u, 1u) == 1u &&
-          ds4_glm5_next_prefill_chunk(0u, 0u, 1024u) == 0u,
+    CHECK(ds4_glm5_next_prefill_chunk(2048u, 512u, 256u, true) == 256u &&
+          ds4_glm5_next_prefill_chunk(2304u, 17u, 256u, true) == 17u &&
+          ds4_glm5_next_prefill_chunk(1900u, 512u, 256u, true) == 148u &&
+          ds4_glm5_next_prefill_chunk(2047u, 512u, 256u, true) == 1u,
+          "prefill sparse bridge preserves exact boundary");
+    CHECK(ds4_glm5_next_prefill_chunk(0u, 8u, 1u, true) == 1u &&
+          ds4_glm5_next_prefill_chunk(0u, 0u, 1024u, true) == 0u,
           "prefill planner preserves scalar and empty contracts");
     uint64_t gate_mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS] = {0};
     uint32_t gate_count = 0;

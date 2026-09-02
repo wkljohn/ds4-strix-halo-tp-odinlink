@@ -19,7 +19,7 @@ fi
 HIPCC=$ROCM_HOME/bin/hipcc
 
 make -j4 ds4 \
-  CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o" \
+  CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o ds4_glm5_kda.o ds4_glm5_next_runtime.o ds4_glm5_next_state.o ds4_glm5_next_exec.o" \
   CFLAGS="-O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -fno-finite-math-only -DDS4_ROCM_BUILD -DDS4_ROCM_TP_READY=1" \
   DS4_LINK="$HIPCC -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=gfx1151 -mno-wavefrontsize64 -DDS4_GFX1151_WAVE32=1" \
   DS4_LINK_LIBS="-lm -pthread -L$ROCM_HOME/lib -Wl,-rpath,$ROCM_HOME/lib -lhipblas -lhipblaslt"

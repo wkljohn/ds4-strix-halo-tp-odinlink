@@ -261,6 +261,8 @@ fi
 }
 ATTN_STATIC_DIRECT_REQUESTED=0
 ATTN_STATIC_DIRECT_T2_REQUESTED=0
+GLM5_SPARSE_BATCH_BRIDGE=0
+GLM5_SPARSE_BATCH_BRIDGE_SEEN=0
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
@@ -280,6 +282,19 @@ for env_kv in "${EXTRA_ENV[@]}"; do
       }
       (( GLM5_PREFILL_BATCH <= 1024 )) || {
         echo "error: DS4_GLM5_NEXT_PREFILL_BATCH must be at most 1024" >&2
+        exit 2
+      }
+      ;;
+    DS4_GLM5_SPARSE_BATCH_BRIDGE=*)
+      (( GLM5_SPARSE_BATCH_BRIDGE_SEEN == 0 )) || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_BATCH_BRIDGE=${env_kv#*=}
+      GLM5_SPARSE_BATCH_BRIDGE_SEEN=1
+      [[ $GLM5_SPARSE_BATCH_BRIDGE == 0 ||
+         $GLM5_SPARSE_BATCH_BRIDGE == 1 ]] || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE must be 0 or 1" >&2
         exit 2
       }
       ;;
@@ -397,6 +412,9 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
     }
     echo "warning: GLM5 batch=1 run is a scalar regression guard, not prefill performance evidence" >&2
   fi
+elif (( GLM5_SPARSE_BATCH_BRIDGE_SEEN == 1 )); then
+  echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE applies only to GLM5 benchmarks" >&2
+  exit 2
 elif (( GLM5_PREFILL_BATCH_SEEN == 1 )); then
   echo "error: DS4_GLM5_NEXT_PREFILL_BATCH applies only to GLM5 benchmarks" >&2
   exit 2
@@ -969,7 +987,8 @@ fi
 "${PEER_SSH[@]}" "cat '$WORKER_STATUSFILE'" > "$OUT/worker-$TAG.status"
 if [[ $MODEL_ARCH == glm5-next ]]; then
   "$REPO/scripts/check-glm5-prefill-proof.sh" \
-    "$COORD_LOG" "$WORKER_LOG" "$GLM5_PREFILL_BATCH" "$FRONTIER"
+    "$COORD_LOG" "$WORKER_LOG" "$GLM5_PREFILL_BATCH" "$FRONTIER" \
+    "$GLM5_SPARSE_BATCH_BRIDGE"
 fi
 if [[ $DECODE_SELF_CHECK == 1 ]]; then
   grep -q 'ds4-bench: decode self-check complete .*argmax_mismatches=0 ' \

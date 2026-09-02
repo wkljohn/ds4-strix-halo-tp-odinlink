@@ -51449,6 +51449,15 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         return 0;
     }
     const uint32_t capacity = (uint32_t)ctx_size;
+    const char *sparse_bridge_env =
+        getenv("DS4_GLM5_SPARSE_BATCH_BRIDGE");
+    if (sparse_bridge_env &&
+        strcmp(sparse_bridge_env, "0") != 0 &&
+        strcmp(sparse_bridge_env, "1") != 0) {
+        fprintf(stderr,
+                "ds4: DS4_GLM5_SPARSE_BATCH_BRIDGE must be 0 or 1\n");
+        return 0;
+    }
     const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint32_t big_capacity = ds4_tp_big_capacity_rows(e->tp.ctx);
     /* The mlx5 provider deliberately caps the registered direct slab at
@@ -51656,9 +51665,16 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
             fflush(stderr);
         }
         const double layer_t0 = layer_profile ? now_sec() : 0.0;
-        ok = ds4_glm5_next_layer_forward_batch(
-            &s->glm5_next_exec, il, &s->glm5_next_state, w,
-            cur, out, n_tokens);
+        const bool sparse_batch_bridge =
+            (ds4_tp_runtime_features(s->engine->tp.ctx) &
+             DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u;
+        ok = sparse_batch_bridge ?
+            ds4_glm5_next_layer_forward_batch_sparse_bridge(
+                &s->glm5_next_exec, il, &s->glm5_next_state, w,
+                s->glm5_next_ws, cur, out, n_tokens) :
+            ds4_glm5_next_layer_forward_batch(
+                &s->glm5_next_exec, il, &s->glm5_next_state, w,
+                cur, out, n_tokens);
         if (layer_profile) {
             fprintf(stderr,
                     "ds4: GLM5 batch layer=%u rows=%u elapsed_ms=%.3f ok=%d\n",
@@ -53615,6 +53631,9 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         getenv("DS4_TP_HOST_CALLBACK"));
     glm5_kda_features |= ds4_tp_glm5_small_gate_direct_send_feature(
         getenv("DS4_GLM5_SMALL_GATE_DIRECT_SEND"), glm5_kda_features);
+    glm5_kda_features |= ds4_tp_glm5_sparse_batch_bridge_feature(
+        getenv("DS4_GLM5_SPARSE_BATCH_BRIDGE"), glm5_next, 1,
+        mtp_or_dspark);
     glm5_kda_features |= ds4_tp_glm5_kda_output_kslice_feature(
         getenv("DS4_GLM5_KDA_OUTPUT_KSLICE"), glm5_kda_features,
         all_kda_outputs_bf16);
@@ -63265,8 +63284,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             const uint32_t remaining = (uint32_t)(prompt->len - i);
+            const bool sparse_batch_bridge =
+                (ds4_tp_runtime_features(e->tp.ctx) &
+                 DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u;
             const uint32_t chunk = ds4_glm5_next_prefill_chunk(
-                (uint32_t)i, remaining, batch);
+                (uint32_t)i, remaining, batch, sparse_batch_bridge);
             if (chunk > 1u) {
                 ++batched_tiles;
                 batched_rows += chunk;

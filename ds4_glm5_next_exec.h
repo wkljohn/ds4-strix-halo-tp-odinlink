@@ -135,6 +135,20 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
                                       ds4_gpu_tensor *hc_out,
                                       uint32_t n_tokens);
 
+/* Exact sparse-boundary bridge. Dense MLA and KDA layers retain the ordinary
+ * batch entry. Sparse MLA attention rows use scalar_workspace in causal order,
+ * then their stateless routed FFN executes in batch_workspace as one tile. The
+ * scalar workspace must have token capacity one and full context capacity. */
+int ds4_glm5_next_layer_forward_batch_sparse_bridge(
+        const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t layer,
+        ds4_glm5_next_state *state,
+        ds4_glm5_next_workspace *batch_workspace,
+        ds4_glm5_next_workspace *scalar_workspace,
+        const ds4_gpu_tensor *hc_in,
+        ds4_gpu_tensor *hc_out,
+        uint32_t n_tokens);
+
 #ifdef DS4_TP_TEST_HOOKS
 /* Test-only decomposition gate for KDA batch recurrence. It commits exactly
  * the KDA attention half and copies the expanded mHC rows to hc_out. */

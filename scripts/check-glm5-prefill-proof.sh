@@ -2,10 +2,11 @@
 # Prove that both TP ranks executed the requested GLM batched-prefill shape.
 set -euo pipefail
 
-COORD_LOG=${1:?usage: check-glm5-prefill-proof.sh COORD_LOG WORKER_LOG BATCH FRONTIER}
+COORD_LOG=${1:?usage: check-glm5-prefill-proof.sh COORD_LOG WORKER_LOG BATCH FRONTIER [SPARSE_BATCH_BRIDGE]}
 WORKER_LOG=${2:?missing worker log}
 BATCH=${3:?missing requested batch}
 FRONTIER=${4:?missing frontier}
+SPARSE_BATCH_BRIDGE=${5:-0}
 
 [[ $BATCH =~ ^[1-9][0-9]*$ && $BATCH -le 1024 ]] || {
   echo "error: invalid GLM prefill batch: $BATCH" >&2
@@ -15,9 +16,18 @@ FRONTIER=${4:?missing frontier}
   echo "error: invalid GLM frontier: $FRONTIER" >&2
   exit 2
 }
+[[ $SPARSE_BATCH_BRIDGE == 0 || $SPARSE_BATCH_BRIDGE == 1 ]] || {
+  echo "error: sparse batch bridge proof selector must be 0 or 1" >&2
+  exit 2
+}
 
-dense_rows=$(( FRONTIER < 2048 ? FRONTIER : 2048 ))
-remaining=$dense_rows
+if (( SPARSE_BATCH_BRIDGE == 1 )); then
+  planned_rows=$FRONTIER
+else
+  planned_rows=$(( FRONTIER < 2048 ? FRONTIER : 2048 ))
+fi
+remaining=$planned_rows
+processed=0
 batched_tiles=0
 batched_rows=0
 scalar_rows=0
@@ -25,6 +35,11 @@ min_tile=0
 max_tile=0
 while (( remaining > 0 )); do
   chunk=$(( remaining < BATCH ? remaining : BATCH ))
+  # The runtime planner must never let one tile straddle the dense-to-sparse
+  # boundary, even when the requested batch does not divide 2048.
+  if (( processed < 2048 && chunk > 2048 - processed )); then
+    chunk=$((2048 - processed))
+  fi
   if (( BATCH < 2 || chunk < 2 )); then
     chunk=1
     scalar_rows=$((scalar_rows + 1))
@@ -34,10 +49,11 @@ while (( remaining > 0 )); do
     if (( min_tile == 0 || chunk < min_tile )); then min_tile=$chunk; fi
     if (( chunk > max_tile )); then max_tile=$chunk; fi
   fi
+  processed=$((processed + chunk))
   remaining=$((remaining - chunk))
 done
-if (( FRONTIER > dense_rows )); then
-  scalar_rows=$((scalar_rows + FRONTIER - dense_rows))
+if (( FRONTIER > planned_rows )); then
+  scalar_rows=$((scalar_rows + FRONTIER - planned_rows))
 fi
 
 for spec in "0:$COORD_LOG" "1:$WORKER_LOG"; do
@@ -56,4 +72,4 @@ for spec in "0:$COORD_LOG" "1:$WORKER_LOG"; do
   }
 done
 
-echo "validated_glm5_prefill_execution=batch:$BATCH,frontier:$FRONTIER,tiles:$batched_tiles,batched_rows:$batched_rows,scalar_rows:$scalar_rows"
+echo "validated_glm5_prefill_execution=batch:$BATCH,frontier:$FRONTIER,bridge:$SPARSE_BATCH_BRIDGE,tiles:$batched_tiles,batched_rows:$batched_rows,scalar_rows:$scalar_rows"

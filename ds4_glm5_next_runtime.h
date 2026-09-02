@@ -146,11 +146,13 @@ int ds4_glm5_next_mla_sparse_selection_plan(
         uint64_t token_count, uint32_t capacity_tokens, uint32_t top_k,
         uint32_t pool_size, uint32_t *visible, uint32_t *n_pools,
         uint32_t *selected_pools, uint32_t *selected_tokens);
-/* Batched MLA prefill is currently dense-only.  Stop a tile exactly at the
- * sparse boundary and use scalar execution thereafter so no earlier layer can
- * commit state for a tile that a later MLA layer must reject. */
+/* Stop a dense tile exactly at the sparse boundary. If the negotiated sparse
+ * bridge is disabled, use scalar execution thereafter. If it is enabled,
+ * later tiles retain their requested size while each sparse MLA attention
+ * stage executes causally through the established scalar implementation. */
 uint32_t ds4_glm5_next_prefill_chunk(
-        uint32_t position, uint32_t remaining, uint32_t requested_batch);
+        uint32_t position, uint32_t remaining, uint32_t requested_batch,
+        bool allow_sparse_batch);
 int ds4_glm5_next_build_tp_gate_mask(
         uint64_t mask[DS4_GLM5_NEXT_TP_GATE_MASK_WORDS],
         uint32_t *gate_count,

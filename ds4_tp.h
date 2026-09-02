@@ -121,6 +121,11 @@ enum {
      * receive slots are unchanged, but both ranks must select the same
      * scheduling path on their independent filesystems. */
     DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND = UINT32_C(1) << 26,
+    /* Preserve layer-major prompt tiles after GLM-5.3 crosses the sparse MLA
+     * selector boundary. KDA layers remain batched; MLA attention retains its
+     * causal row order while its output exchange and routed FFN are tile-wide.
+     * Both independently launched ranks must negotiate the same schedule. */
+    DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE = UINT32_C(1) << 27,
 };
 
 static inline uint32_t ds4_tp_glm5_kda_tp_feature(
@@ -150,6 +155,16 @@ static inline uint32_t ds4_tp_glm5_small_gate_direct_send_feature(
            (runtime_features & DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u &&
            (runtime_features & DS4_TP_FEATURE_GLM5_GPU_ROW_GATE) == 0u
         ? DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_sparse_batch_bridge_feature(
+        const char *env,
+        int glm5_next,
+        int rocm_ready,
+        int mtp_or_dspark) {
+    return env && env[0] == '1' && env[1] == '\0' && glm5_next &&
+           rocm_ready && !mtp_or_dspark
+        ? DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE : 0u;
 }
 
 static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(
