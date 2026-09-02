@@ -29,13 +29,20 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 ### Preliminary GLM-5.3 Flash TP=2 data
 
 These measurements are included for transparency, but are not production
-claims or promotion gates. The GLM path is still staged and opt-in.
+claims or promotion gates. The GLM path is still staged and opt-in. The newer
+Q4_K results require research branch
+[`research/glm5-kb-lds-exact`](https://github.com/wkljohn/ds4-strix-halo-tp-odinlink/tree/aad7ad3eeaa0ccad9d2cf4114769bb0b9e95618b)
+at commit `aad7ad3`; they are not yet enabled by `main`.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | 2,048-token prefill + 300-token decode, batch 256 | **32.09–32.40 t/s** | **2.79–2.98 t/s** | opt-in batched MLA output; cross-run fingerprint is not yet stable |
-| **GLM-5.3 Flash Q4_K over OdinLink** | same workload and staged TP=2 harness | **32.00 t/s** | **7.33 t/s** | single provider-parity run; experimental |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | 2,048-token prefill + 300-token decode, batch 256 | **77.31 t/s** | **9.78 t/s** | research-branch three-run median; exact FNV `e68685daa5f4d385` |
+| **GLM-5.3 Flash Q4_K over OdinLink** | same workload and staged TP=2 harness | **76.54 t/s** | **9.50 t/s** | research-branch provider validation; exact FNV, one successful run after a disconnected attempt |
 | **GLM-5.3 Flash Q2 over RoCE v2** | same workload and staged TP=2 harness | **21.87–21.95 t/s** | **3.48–3.49 t/s** | opt-in mixed IQ2_XXS/Q2_K path; repeated fingerprint matched |
+
+The Q4_K research branch also passed the frozen cross-disciplinary 4,096+300
+screen at 16.74 prefill and 9.34 decode t/s with its established exact
+fingerprint.
 
 Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
 generated tokens over mandatory RDMA. The current Q4_K rows use the Antirez
