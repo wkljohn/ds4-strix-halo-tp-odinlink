@@ -24,7 +24,7 @@ namespace {
 
 constexpr uint32_t kHeads = 64u;
 constexpr uint32_t kLatent = 512u;
-constexpr uint32_t kSelected = 2048u;
+constexpr uint32_t kSelected = 2051u;
 constexpr uint32_t kCacheRows = 2051u;
 constexpr uint32_t kLayers = 11u;
 constexpr uint32_t kThreads = 256u;
@@ -356,7 +356,7 @@ void launch_mode(
         }
     } else {
         const dim3 qk_grid(kHeads / kHeadGroup,
-                           kSelected / kRowTile, 1u);
+                           (kSelected + kRowTile - 1u) / kRowTile, 1u);
         shared_qk_kernel<<<qk_grid, kThreads>>>(
             scores, low, cache, selected, kSelected, kCacheRows);
         exact_softmax_kernel<<<kHeads, kThreads, 512u * sizeof(float)>>>(
@@ -415,11 +415,14 @@ int main() {
                  properties.name, kLayers, kCacheRows, kSelected);
 
     std::vector<int32_t> host_selected(kSelected);
-    for (uint32_t i = 0u; i < kSelected; ++i) {
+    for (uint32_t i = 0u; i < 2048u; ++i) {
         const uint32_t pool = i >> 2u;
         host_selected[i] =
             (int32_t)((((pool * 157u + 17u) & 511u) << 2u) + (i & 3u));
     }
+    host_selected[2048u] = 2048;
+    host_selected[2049u] = 2049;
+    host_selected[2050u] = 2050;
     host_selected[127u] = -1;
     host_selected[1023u] = -1;
     host_selected[2047u] = -1;

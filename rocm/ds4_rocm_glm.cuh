@@ -4322,11 +4322,11 @@ static int glm_attention_indexed_lora_launch(
         return 0;
     }
     if (nope_shared_pv && nope_decode_exact_geometry &&
-        n_selected <= 2048u) {
+        n_selected <= 2051u) {
         /* Allocate the validated maximum once.  Decode grows its selected
          * frontier from a few rows to 2048; sizing to the current frontier
          * would repeatedly cudaFree/cudaMalloc and synchronize the device. */
-        const uint64_t score_floats = (uint64_t)64u * 2048u;
+        const uint64_t score_floats = (uint64_t)64u * 2051u;
         if (score_floats > (UINT64_MAX / sizeof(float)) - 64u) return 0;
         const uint64_t scratch_bytes =
             (score_floats + 64u) * sizeof(float);

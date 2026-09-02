@@ -327,7 +327,7 @@ bool run_test() {
      * sentinels.  Compare the lora output directly so the following Q8 value
      * projection cannot hide an arithmetic difference. */
     constexpr uint32_t kProductionRows = 2051u;
-    constexpr uint32_t kProductionSelected = 2048u;
+    constexpr uint32_t kProductionSelected = 2051u;
     std::vector<float> production_query((uint64_t)kHeads * kQkNope);
     std::vector<float> production_low((uint64_t)kHeads * kKvLora);
     std::vector<float> production_cache((uint64_t)kProductionRows * kKvLora);
@@ -345,12 +345,15 @@ bool run_test() {
             (float)((int)((i * 29u) % 79u) - 39) * 0.001117f +
             (float)((int)(i % 11u) - 5) * 0.000007f;
     }
-    for (uint32_t i = 0u; i < kProductionSelected; ++i) {
+    for (uint32_t i = 0u; i < 2048u; ++i) {
         const uint32_t pool = i >> 2u;
         const uint32_t lane = i & 3u;
         production_selected[i] =
             (int32_t)((((pool * 157u + 17u) & 511u) << 2u) + lane);
     }
+    production_selected[2048u] = 2048;
+    production_selected[2049u] = 2049;
+    production_selected[2050u] = 2050;
     production_selected[127u] = -1;
     production_selected[1023u] = -1;
     production_selected[2047u] = -1;
@@ -443,7 +446,9 @@ bool run_test() {
                  kProductionRows, kProductionSelected,
                  (unsigned long long)production_fnv);
 
-    const uint32_t partial_counts[] = {1u, 7u, 17u, 25u, 2047u};
+    const uint32_t partial_counts[] = {
+        1u, 7u, 17u, 25u, 2047u, 2048u, 2049u, 2050u
+    };
     for (uint32_t partial_count : partial_counts) {
         unsetenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV");
         CHECK(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
