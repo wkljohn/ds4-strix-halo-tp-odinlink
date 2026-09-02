@@ -959,6 +959,85 @@ __global__ static void glm_attention_indexed_lora_kernel(
     }
 }
 
+/* Exact-order GLM-5.3 NoPE decode specialization.  Keep the incumbent
+ * per-row 512-wide QK accumulation, global-max softmax reductions, and
+ * per-channel selected-row PV order.  Only compile away the dead RoPE,
+ * cache-format, causal, token, and shape branches for the production M=1
+ * F32-latent geometry. */
+__global__ static void glm_attention_indexed_lora_nope_f32_decode_exact_kernel(
+        float *lora_out,
+        const float *qk_low,
+        const float *kv_lora_cache,
+        const int32_t *selected,
+        uint32_t n_selected,
+        uint32_t cache_cap) {
+    const uint32_t head = blockIdx.x;
+    if (head >= 64u || n_selected == 0u) return;
+    constexpr uint32_t kv_lora_dim = 512u;
+    constexpr float scale = 0.0625f;
+    extern __shared__ float sh[];
+    float *max_red = sh;
+    float *sum_red = sh + 256u;
+    float *scores = sh + 512u;
+    const float *low = qk_low + (uint64_t)head * kv_lora_dim;
+
+    float local_max = -INFINITY;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += 256u) {
+        const int32_t row_i = selected[s];
+        const bool valid = row_i >= 0 && (uint32_t)row_i < cache_cap;
+        float score = -INFINITY;
+        if (valid) {
+            float dotv = 0.0f;
+            const float *kv = kv_lora_cache +
+                (uint64_t)(uint32_t)row_i * kv_lora_dim;
+            for (uint32_t j = 0u; j < kv_lora_dim; ++j) {
+                dotv += low[j] * kv[j];
+            }
+            score = dotv * scale;
+        }
+        scores[s] = score;
+        local_max = fmaxf(local_max, score);
+    }
+    max_red[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            max_red[threadIdx.x] = fmaxf(
+                max_red[threadIdx.x], max_red[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score = max_red[0];
+    const bool valid_max = isfinite(max_score);
+    float local_sum = 0.0f;
+    for (uint32_t s = threadIdx.x; s < n_selected; s += 256u) {
+        const float weight = valid_max ? expf(scores[s] - max_score) : 0.0f;
+        scores[s] = weight;
+        local_sum += weight;
+    }
+    sum_red[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            sum_red[threadIdx.x] += sum_red[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float denom = fmaxf(sum_red[0], 1.0e-20f);
+    float *out = lora_out + (uint64_t)head * kv_lora_dim;
+    for (uint32_t j = threadIdx.x; j < kv_lora_dim; j += 256u) {
+        float acc = 0.0f;
+        for (uint32_t s = 0u; s < n_selected; ++s) {
+            const int32_t row_i = selected[s];
+            if (row_i >= 0 && (uint32_t)row_i < cache_cap) {
+                acc += scores[s] *
+                    kv_lora_cache[(uint64_t)(uint32_t)row_i * kv_lora_dim + j];
+            }
+        }
+        out[j] = valid_max ? acc / denom : 0.0f;
+    }
+}
+
 __global__ static void glm_attention_indexed_decode_split_partial_kernel(
         float *partial_lora,
         float *partial_ms,
@@ -4073,6 +4152,48 @@ static int glm_attention_indexed_lora_launch(
         }
         return 1;
     }
+    const char *nope_decode_exact_value =
+        getenv("DS4_ROCM_GLM5_NOPE_ATTN_EXACT");
+    const bool nope_decode_exact = nope_decode_exact_value != NULL &&
+        strcmp(nope_decode_exact_value, "1") == 0;
+    if (nope_decode_exact_value != NULL &&
+        strcmp(nope_decode_exact_value, "0") != 0 &&
+        !nope_decode_exact) {
+        static int invalid_reported;
+        if (!invalid_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "invalid DS4_ROCM_GLM5_NOPE_ATTN_EXACT selector\n");
+            invalid_reported = 1;
+        }
+        return 0;
+    }
+    const bool nope_decode_exact_geometry =
+        n_tokens == 1u && !causal_range && has_selected &&
+        !cache_f16 && n_head == 64u && kv_lora_dim == 512u &&
+        qk_nope == 256u && qk_rope == 0u;
+    if (nope_decode_exact && nope_decode_exact_geometry) {
+        const dim3 exact_grid(64u, 1u, 1u);
+        const size_t exact_shmem =
+            ((size_t)512u + n_selected) * sizeof(float);
+        glm_attention_indexed_lora_nope_f32_decode_exact_kernel<<<
+                exact_grid, 256, exact_shmem>>>(
+                (float *)lora_out->ptr,
+                (const float *)qk_low->ptr,
+                (const float *)kv_lora_cache->ptr,
+                (const int32_t *)selected->ptr,
+                n_selected,
+                cache_cap);
+        static int notice_printed;
+        if (!notice_printed) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 NoPE F32 indexed decode exact specialization "
+                    "engaged (heads=64 latent=512 selected=%u)\n",
+                    n_selected);
+            notice_printed = 1;
+        }
+        return cuda_ok(cudaGetLastError(),
+                       "glm indexed NoPE F32 exact decode launch");
+    }
     dim3 grid(n_head, n_tokens, 1);
     const size_t shmem = ((size_t)512u + n_selected) * sizeof(float);
     glm_attention_indexed_lora_kernel<<<grid, 256, shmem>>>((float *)lora_out->ptr,
@@ -4125,7 +4246,6 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
         float attn_factor,
         float beta_fast,
         float beta_slow) {
-    if (qk_rope == 0u) return 0;
     return glm_attention_indexed_lora_launch(lora_out, q, qk_low, kv_lora_cache,
                                              k_rope_cache, selected, n_tokens, 0,
                                              n_selected, cache_cap, cache_f16,
@@ -4188,7 +4308,6 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
         float attn_factor,
         float beta_fast,
         float beta_slow) {
-    if (qk_rope == 0u) return 0;
     return glm_attention_indexed_lora_launch(lora_out, q, qk_low, kv_lora_cache,
                                              k_rope_cache, selected, n_tokens, 0,
                                              n_selected, cache_cap, cache_f16,

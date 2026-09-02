@@ -74,6 +74,16 @@ float q8_dot(const uint8_t *row, const float *x) {
     return total;
 }
 
+uint64_t fnv1a64_bytes(const void *data, size_t size) {
+    const uint8_t *bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 bool run_test() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     CHECK(model && model[0], "GLM5 model environment");
@@ -311,6 +321,114 @@ bool run_test() {
                  "nmse=%.9g\n", got.size(), maximum, nmse);
     CHECK(maximum <= 2.0e-5 && nmse <= 1.0e-10,
           "NoPE attention numerical envelope");
+
+    /* Production-sized Lane-A gate.  The selected rows retain the indexer's
+     * four-row pool geometry while permuting pool order and retaining invalid
+     * sentinels.  Compare the lora output directly so the following Q8 value
+     * projection cannot hide an arithmetic difference. */
+    constexpr uint32_t kProductionRows = 2051u;
+    constexpr uint32_t kProductionSelected = 2048u;
+    std::vector<float> production_query((uint64_t)kHeads * kQkNope);
+    std::vector<float> production_low((uint64_t)kHeads * kKvLora);
+    std::vector<float> production_cache((uint64_t)kProductionRows * kKvLora);
+    std::vector<int32_t> production_selected(kProductionSelected);
+    for (size_t i = 0; i < production_query.size(); ++i) {
+        production_query[i] =
+            (float)((int)((i * 19u) % 67u) - 33) * 0.001271f;
+    }
+    for (size_t i = 0; i < production_low.size(); ++i) {
+        production_low[i] =
+            (float)((int)((i * 23u) % 71u) - 35) * 0.001819f;
+    }
+    for (size_t i = 0; i < production_cache.size(); ++i) {
+        production_cache[i] =
+            (float)((int)((i * 29u) % 79u) - 39) * 0.001117f +
+            (float)((int)(i % 11u) - 5) * 0.000007f;
+    }
+    for (uint32_t i = 0u; i < kProductionSelected; ++i) {
+        const uint32_t pool = i >> 2u;
+        const uint32_t lane = i & 3u;
+        production_selected[i] =
+            (int32_t)((((pool * 157u + 17u) & 511u) << 2u) + lane);
+    }
+    production_selected[127u] = -1;
+    production_selected[1023u] = -1;
+    production_selected[2047u] = -1;
+
+    ds4_gpu_tensor *d_production_query = ds4_gpu_tensor_alloc(
+        (uint64_t)production_query.size() * sizeof(float));
+    ds4_gpu_tensor *d_production_low = ds4_gpu_tensor_alloc(
+        (uint64_t)production_low.size() * sizeof(float));
+    ds4_gpu_tensor *d_production_cache = ds4_gpu_tensor_alloc(
+        (uint64_t)production_cache.size() * sizeof(float));
+    ds4_gpu_tensor *d_production_selected = ds4_gpu_tensor_alloc(
+        (uint64_t)production_selected.size() * sizeof(int32_t));
+    ds4_gpu_tensor *d_production_incumbent = ds4_gpu_tensor_alloc(
+        (uint64_t)kHeads * kKvLora * sizeof(float));
+    ds4_gpu_tensor *d_production_candidate = ds4_gpu_tensor_alloc(
+        (uint64_t)kHeads * kKvLora * sizeof(float));
+    CHECK(d_production_query && d_production_low && d_production_cache &&
+          d_production_selected && d_production_incumbent &&
+          d_production_candidate,
+          "allocate production-sized NoPE lora tensors");
+    CHECK(ds4_gpu_tensor_write(
+              d_production_query, 0u, production_query.data(),
+              (uint64_t)production_query.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(
+              d_production_low, 0u, production_low.data(),
+              (uint64_t)production_low.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(
+              d_production_cache, 0u, production_cache.data(),
+              (uint64_t)production_cache.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(
+              d_production_selected, 0u, production_selected.data(),
+              (uint64_t)production_selected.size() * sizeof(int32_t)),
+          "upload production-sized NoPE lora inputs");
+
+    unsetenv("DS4_ROCM_GLM5_NOPE_ATTN_EXACT");
+    CHECK(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+              d_production_incumbent, d_production_query, d_production_low,
+              d_production_cache, nullptr, d_production_selected,
+              1u, kProductionSelected, kProductionRows, false,
+              kHeads, kKvLora, kQkNope, 0u, 1u,
+              1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_synchronize(),
+          "execute production-sized incumbent NoPE lora attention");
+    CHECK(setenv("DS4_ROCM_GLM5_NOPE_ATTN_EXACT", "1", 1) == 0 &&
+          ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+              d_production_candidate, d_production_query, d_production_low,
+              d_production_cache, nullptr, d_production_selected,
+              1u, kProductionSelected, kProductionRows, false,
+              kHeads, kKvLora, kQkNope, 0u, 1u,
+              1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
+          ds4_gpu_synchronize(),
+          "execute production-sized candidate NoPE lora attention");
+    std::vector<float> production_incumbent((uint64_t)kHeads * kKvLora);
+    std::vector<float> production_candidate((uint64_t)kHeads * kKvLora);
+    CHECK(ds4_gpu_tensor_read(
+              d_production_incumbent, 0u, production_incumbent.data(),
+              (uint64_t)production_incumbent.size() * sizeof(float)) &&
+          ds4_gpu_tensor_read(
+              d_production_candidate, 0u, production_candidate.data(),
+              (uint64_t)production_candidate.size() * sizeof(float)),
+          "read production-sized NoPE lora outputs");
+    CHECK(std::memcmp(production_incumbent.data(), production_candidate.data(),
+                      production_incumbent.size() * sizeof(float)) == 0,
+          "production-sized NoPE lora output is bit-identical");
+    const uint64_t production_fnv = fnv1a64_bytes(
+        production_candidate.data(), production_candidate.size() * sizeof(float));
+    std::fprintf(stderr,
+                 "GLM5 NoPE production lora rows=%u selected=%u "
+                 "bit_identical=1 fnv64=%016llx\n",
+                 kProductionRows, kProductionSelected,
+                 (unsigned long long)production_fnv);
+
+    ds4_gpu_tensor_free(d_production_candidate);
+    ds4_gpu_tensor_free(d_production_incumbent);
+    ds4_gpu_tensor_free(d_production_selected);
+    ds4_gpu_tensor_free(d_production_cache);
+    ds4_gpu_tensor_free(d_production_low);
+    ds4_gpu_tensor_free(d_production_query);
 
     std::vector<uint16_t> cache_f16(cache.size());
     std::vector<float> cache_f16_reference(cache.size());
