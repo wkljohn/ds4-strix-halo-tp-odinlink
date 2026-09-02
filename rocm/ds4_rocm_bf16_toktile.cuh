@@ -8,6 +8,21 @@ static constexpr uint32_t kDs4Bf16ToktileWaves =
 static_assert(kDs4Bf16ToktileThreads % 32u == 0u,
               "BF16 token tile requires complete wave32 groups");
 
+static inline bool ds4_bf16_rowtile2x16_dispatch_allowed(
+        bool selector_enabled,
+        bool batch_toktile_disabled,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        bool quality_mode,
+        bool graph_dump) {
+    const bool supported_shape =
+        (in_dim == 4096u && out_dim == 8192u) ||
+        (in_dim == 8192u && out_dim == 4096u);
+    return selector_enabled && !batch_toktile_disabled && supported_shape &&
+        n_tok >= 16u && (n_tok % 16u) == 0u && !quality_mode && !graph_dump;
+}
+
 static __device__ __forceinline__ float ds4_bf16_ordered_mul(float a,
                                                               float b) {
     float out;

@@ -1840,13 +1840,14 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         }
         return 0;
     }
-    const bool rowtile2x16_shape = rowtile2x16_enabled &&
-        ((in_dim == 4096u && out_dim == 8192u) ||
-         (in_dim == 8192u && out_dim == 4096u));
-    if (rowtile2x16_shape && n_tok >= 16u && (n_tok % 16u) == 0u &&
+    const bool rowtile2x16_shape =
         in_dim <= UINT32_MAX && out_dim <= UINT32_MAX &&
-        n_tok <= UINT32_MAX && !g_quality_mode &&
-        !cuda_runtime_config()->graph_dump) {
+        n_tok <= UINT32_MAX &&
+        ds4_bf16_rowtile2x16_dispatch_allowed(
+            rowtile2x16_enabled, batch_toktile_disabled,
+            (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok,
+            g_quality_mode, cuda_runtime_config()->graph_dump);
+    if (rowtile2x16_shape) {
         static int rowtile2x16_reported;
         if (!rowtile2x16_reported) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX

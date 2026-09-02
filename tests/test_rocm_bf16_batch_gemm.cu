@@ -829,6 +829,27 @@ void run_rowtile_m2048_guard(const uint16_t *weight, uint32_t in_dim,
     hip_ok(hipFree(d_x), "free M2048 rowtile input");
 }
 
+void run_rowtile_dispatch_guard() {
+    if (!ds4_bf16_rowtile2x16_dispatch_allowed(
+            true, false, 8192u, 4096u, 256u, false, false))
+        fail("BF16 rowtile expected dispatch");
+    if (ds4_bf16_rowtile2x16_dispatch_allowed(
+            true, true, 8192u, 4096u, 256u, false, false))
+        fail("BF16 rowtile family rollback must disable dispatch");
+    if (ds4_bf16_rowtile2x16_dispatch_allowed(
+            false, false, 8192u, 4096u, 256u, false, false))
+        fail("BF16 rowtile selector rollback must disable dispatch");
+    if (ds4_bf16_rowtile2x16_dispatch_allowed(
+            true, false, 8192u, 4096u, 255u, false, false))
+        fail("BF16 rowtile partial tile must refuse dispatch");
+    if (ds4_bf16_rowtile2x16_dispatch_allowed(
+            true, false, 8192u, 4096u, 256u, true, false) ||
+        ds4_bf16_rowtile2x16_dispatch_allowed(
+            true, false, 8192u, 4096u, 256u, false, true))
+        fail("BF16 rowtile diagnostic modes must refuse dispatch");
+    std::printf("BF16 rowtile dispatch and rollback guards pass\n");
+}
+
 void run_lowrank128_tail_coverage(const uint16_t *weight, uint32_t tokens) {
     constexpr uint32_t in_dim = 128u;
     constexpr uint32_t out_dim = 8192u;
@@ -1008,6 +1029,7 @@ int main() {
     run_rowtile_shape(device_weight, 8192u, 4096u);
     run_rowtile_m2048_guard(device_weight, 4096u, 8192u);
     run_rowtile_m2048_guard(device_weight, 8192u, 4096u);
+    run_rowtile_dispatch_guard();
     run_lowrank128_tail_coverage(device_weight, 63u);
     for (const uint32_t tokens : {25u, 57u, 121u, 153u}) {
         run_tail25_candidate(device_weight, 4096u, 8192u, tokens);
