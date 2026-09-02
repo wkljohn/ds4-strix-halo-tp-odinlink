@@ -14,6 +14,7 @@
 namespace {
 
 constexpr uint32_t kTokens = 33u;
+constexpr uint32_t kPrefillTokens = 256u;
 constexpr uint32_t kThreads = kDs4Bf16ToktileThreads;
 
 [[noreturn]] void fail(const char *what) {
@@ -87,6 +88,56 @@ __global__ void current_bf16_f32_kernel(float *out, const uint16_t *weight,
     }
     if (threadIdx.x == 0u)
         out[(uint64_t)token * out_dim + row] = partial[0];
+}
+
+/* M=256 diagnostic for the production prefill geometry. One block owns one
+ * output row. It loads each 256-value weight slice once into LDS, then the
+ * eight wave32 groups consume that slice for all 256 activation rows before
+ * advancing K. This deliberately changes the reduction grouping, but retains
+ * BF16 weights and F32 activations so it can distinguish weight rereads from
+ * hipBLAS' additional F32->BF16 activation conversion. */
+__global__ void weight_once_bf16_f32_m256_kernel(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim) {
+    constexpr uint32_t kKTile = 256u;
+    constexpr uint32_t kWaves = kThreads / 32u;
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    if (row >= out_dim) return;
+    __shared__ uint16_t weight_tile[kKTile];
+    __shared__ float token_sums[kPrefillTokens];
+    token_sums[tid] = 0.0f;
+    __syncthreads();
+    const uint16_t *weight_row = weight + (uint64_t)row * in_dim;
+    for (uint32_t k_base = 0u; k_base < in_dim; k_base += kKTile) {
+        const uint32_t k = k_base + tid;
+        weight_tile[tid] = k < in_dim ? weight_row[k] : 0u;
+        __syncthreads();
+#pragma unroll
+        for (uint32_t group = 0u;
+             group < kPrefillTokens / kWaves; ++group) {
+            const uint32_t token = wave + group * kWaves;
+            float partial = 0.0f;
+#pragma unroll
+            for (uint32_t item = 0u; item < kKTile / 32u; ++item) {
+                const uint32_t local_k = lane + item * 32u;
+                if (k_base + local_k < in_dim) {
+                    const float w = __uint_as_float(
+                        (uint32_t)weight_tile[local_k] << 16u);
+                    partial += w * x[(uint64_t)token * in_dim +
+                                     k_base + local_k];
+                }
+            }
+#pragma unroll
+            for (uint32_t offset = 16u; offset > 0u; offset >>= 1u)
+                partial += __shfl_down(partial, offset, 32u);
+            if (lane == 0u) token_sums[token] += partial;
+        }
+        __syncthreads();
+    }
+    out[(uint64_t)tid * out_dim + row] = token_sums[tid];
 }
 
 void launch_segmented_tiled(float *out, const uint16_t *weight,
@@ -354,6 +405,113 @@ void run_shape(hipblasHandle_t handle, const uint16_t *weight,
     hip_ok(hipFree(d_x), "free F32 input");
 }
 
+void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
+                       uint32_t in_dim, uint32_t out_dim) {
+    const uint64_t x_count = (uint64_t)kPrefillTokens * in_dim;
+    const uint64_t out_count = (uint64_t)kPrefillTokens * out_dim;
+    std::vector<float> x(x_count);
+    for (uint64_t i = 0u; i < x_count; ++i)
+        x[i] = 0.7f * std::cos((double)(i % 3571u) * 0.013) +
+               0.03f * std::sin((double)i * 0.001);
+
+    float *d_x = nullptr, *d_reference = nullptr;
+    float *d_production = nullptr, *d_blas = nullptr;
+    float *d_weight_once = nullptr;
+    uint16_t *d_x_bf16 = nullptr;
+    hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
+           "allocate M256 F32 input");
+    hip_ok(hipMalloc(&d_x_bf16, x_count * sizeof(uint16_t)),
+           "allocate M256 BF16 input");
+    hip_ok(hipMalloc(&d_reference, out_count * sizeof(float)),
+           "allocate M256 reference output");
+    hip_ok(hipMalloc(&d_production, out_count * sizeof(float)),
+           "allocate M256 production output");
+    hip_ok(hipMalloc(&d_blas, out_count * sizeof(float)),
+           "allocate M256 hipBLAS output");
+    hip_ok(hipMalloc(&d_weight_once, out_count * sizeof(float)),
+           "allocate M256 weight-once output");
+    hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
+                     hipMemcpyHostToDevice), "copy M256 input");
+    f32_to_bf16_kernel<<<(x_count + 255u) / 256u, 256u>>>(
+        d_x_bf16, d_x, x_count);
+    hip_ok(hipGetLastError(), "M256 BF16 conversion launch");
+
+    const auto production = [&] {
+        launch_segmented_tiled(d_production, weight, d_x, in_dim,
+                               out_dim, kPrefillTokens);
+    };
+    const auto weight_once = [&] {
+        weight_once_bf16_f32_m256_kernel<<<out_dim, kThreads>>>(
+            d_weight_once, weight, d_x, in_dim, out_dim);
+        hip_ok(hipGetLastError(), "M256 weight-once launch");
+    };
+    const auto blas = [&] {
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        blas_ok(hipblasGemmEx(
+                    handle, HIPBLAS_OP_T, HIPBLAS_OP_N,
+                    (int)out_dim, (int)kPrefillTokens, (int)in_dim,
+                    &alpha, weight, HIP_R_16BF, (int)in_dim,
+                    d_x_bf16, HIP_R_16BF, (int)in_dim,
+                    &beta, d_blas, HIP_R_32F, (int)out_dim,
+                    HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
+                "M256 BF16 hipBLAS GEMM");
+    };
+
+    current_bf16_f32_kernel<<<dim3(out_dim, kPrefillTokens), kThreads>>>(
+        d_reference, weight, d_x, in_dim, out_dim, kPrefillTokens);
+    hip_ok(hipGetLastError(), "M256 scalar reference launch");
+    const float production_ms = time_ms(production);
+    const float weight_once_ms = time_ms(weight_once);
+    const float blas_ms = time_ms(blas);
+    production();
+    weight_once();
+    blas();
+    hip_ok(hipDeviceSynchronize(), "M256 output synchronize");
+
+    std::vector<float> reference(out_count), production_output(out_count);
+    std::vector<float> weight_once_output(out_count), blas_output(out_count);
+    hip_ok(hipMemcpy(reference.data(), d_reference,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 reference");
+    hip_ok(hipMemcpy(production_output.data(), d_production,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 production");
+    hip_ok(hipMemcpy(weight_once_output.data(), d_weight_once,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 weight-once");
+    hip_ok(hipMemcpy(blas_output.data(), d_blas,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 hipBLAS");
+    const Error production_error = compare(reference, production_output);
+    const Error weight_once_error = compare(reference, weight_once_output);
+    const Error blas_error = compare(reference, blas_output);
+    std::printf(
+        "BF16 prefill shape=%ux%ux%u residency=host-registered "
+        "production_ms=%.4f weight_once_f32_ms=%.4f bf16_blas_ms=%.4f "
+        "weight_once_speedup=%.3fx blas_speedup=%.3fx\n",
+        kPrefillTokens, out_dim, in_dim, production_ms, weight_once_ms,
+        blas_ms, production_ms / weight_once_ms, production_ms / blas_ms);
+    std::printf(
+        "  production nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+        production_error.nrmse, production_error.cosine,
+        production_error.max_abs);
+    std::printf(
+        "  weight_once_f32 nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+        weight_once_error.nrmse, weight_once_error.cosine,
+        weight_once_error.max_abs);
+    std::printf(
+        "  bf16_blas nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+        blas_error.nrmse, blas_error.cosine, blas_error.max_abs);
+
+    hip_ok(hipFree(d_weight_once), "free M256 weight-once output");
+    hip_ok(hipFree(d_blas), "free M256 hipBLAS output");
+    hip_ok(hipFree(d_production), "free M256 production output");
+    hip_ok(hipFree(d_reference), "free M256 reference output");
+    hip_ok(hipFree(d_x_bf16), "free M256 BF16 input");
+    hip_ok(hipFree(d_x), "free M256 F32 input");
+}
+
 void run_lowrank128_tail_coverage(const uint16_t *weight, uint32_t tokens) {
     constexpr uint32_t in_dim = 128u;
     constexpr uint32_t out_dim = 8192u;
@@ -519,6 +677,10 @@ int main() {
     run_shape(handle, device_weight, 128u, 8192u);
     run_shape(handle, device_weight, 4096u, 8192u);
     run_shape(handle, device_weight, 8192u, 4096u);
+    run_prefill_shape(handle, device_weight, 4096u, 8192u);
+    run_prefill_shape(handle, device_weight, 8192u, 4096u);
+    run_prefill_shape(handle, device_weight, 4096u, 64u);
+    run_prefill_shape(handle, device_weight, 4096u, 128u);
     run_lowrank128_tail_coverage(device_weight, 63u);
     for (const uint32_t tokens : {25u, 57u, 121u, 153u}) {
         run_tail25_candidate(device_weight, 4096u, 8192u, tokens);
