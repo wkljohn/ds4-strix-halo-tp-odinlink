@@ -26,11 +26,10 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **280.58 t/s** | **21.30 t/s** | recorded candidate control; rollback 276.59/21.24, FNV unchanged |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-### Preliminary GLM-5.3 Flash TP=2 data
+### GLM-5.3 Flash TP=2 validated research-branch performance
 
-These measurements are included for transparency, but are not production
-claims or promotion gates. The GLM path is still staged and opt-in. The newer
-Q4_K results require research branch
+These are validated `ds4-bench-tp` results for the opt-in GLM research path.
+The Q4_K results require research branch
 [`research/glm5-kb-lds-exact`](https://github.com/wkljohn/ds4-strix-halo-tp-odinlink/tree/aad7ad3eeaa0ccad9d2cf4114769bb0b9e95618b)
 at commit `aad7ad3`; they are not yet enabled by `main`.
 
