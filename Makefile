@@ -437,6 +437,17 @@ test-rocm-glm5-mla-qkv: tests/test_rocm_glm5_mla_qkv
 	DS4_GLM5_MLA_QKV_ORACLE_PREFIX="$(DS4_RESEARCH_ROOT)/glm5-next-tp2/raw/mla-qkv-layer3" \
 		./tests/test_rocm_glm5_mla_qkv
 
+.PHONY: bench-rocm-glm5-q8-kb-projection
+tests/glm5_q8_kb_projection_bench.o: scripts/glm5_q8_kb_projection_bench.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_glm5_next_runtime.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/glm5_q8_kb_projection_bench: tests/glm5_q8_kb_projection_bench.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+bench-rocm-glm5-q8-kb-projection: tests/glm5_q8_kb_projection_bench
+	@test -n "$(DS4_GLM5_MODEL)" || { echo "DS4_GLM5_MODEL is required" >&2; exit 1; }
+	DS4_GLM5_MODEL="$(DS4_GLM5_MODEL)" ./tests/glm5_q8_kb_projection_bench
+
 .PHONY: test-rocm-glm5-mla-compose
 tests/test_rocm_glm5_mla_compose.o: tests/test_rocm_glm5_mla_compose.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<

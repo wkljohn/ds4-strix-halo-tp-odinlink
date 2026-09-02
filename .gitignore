@@ -57,6 +57,7 @@
 /tests/test_rocm_glm5_nope_score
 /tests/test_rocm_glm5_nope_attention
 /tests/test_rocm_glm5_mla_qkv
+/tests/glm5_q8_kb_projection_bench
 /tests/test_rocm_glm5_mla_compose
 /tests/test_rocm_glm5_prefix_layer3_tp
 /tests/test_rocm_glm5_kda_layer

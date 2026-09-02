@@ -492,6 +492,58 @@ __global__ static void glm_q8_project_head_kernel(
     }
 }
 
+/* Exact-order one-token GLM5 k_b projection.  The GGUF Q8_0 rows are 272
+ * bytes for the production 256-column shape.  Cooperative 32-bit loads make
+ * the global reads contiguous, while one padding word per staged row changes
+ * the LDS stride from 68 to 69 banks.  Each output thread still calls the
+ * incumbent scalar row dot and consumes j=0..255 in exactly the same order. */
+__global__ static void glm_q8_project_head_lds_exact_kernel(
+        float *out,
+        const unsigned char *weight,
+        const float *x,
+        uint32_t n_head,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t x_head_stride,
+        uint32_t row_bytes) {
+    constexpr uint32_t kStagedRowWords = 69u;
+    constexpr uint32_t kTileRows = 192u;
+    const uint32_t head = blockIdx.x;
+    if (head >= n_head) return;
+
+    extern __shared__ uint32_t shared_words[];
+    float *shx = reinterpret_cast<float *>(shared_words);
+    uint32_t *shw = shared_words + in_dim;
+    const float *xr = x + (uint64_t)head * x_head_stride;
+    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        shx[i] = xr[i];
+    }
+    __syncthreads();
+
+    float *dst = out + (uint64_t)head * out_dim;
+    const uint32_t row_words = row_bytes / sizeof(uint32_t);
+    const uint32_t *head_words = reinterpret_cast<const uint32_t *>(
+        weight + (uint64_t)head * out_dim * row_bytes);
+    for (uint32_t tile = 0u; tile < out_dim; tile += kTileRows) {
+        const uint32_t rows = min(kTileRows, out_dim - tile);
+        const uint32_t copy_words = rows * row_words;
+        for (uint32_t i = threadIdx.x; i < copy_words; i += blockDim.x) {
+            const uint32_t row = i / row_words;
+            const uint32_t word = i - row * row_words;
+            shw[row * kStagedRowWords + word] =
+                head_words[(tile + row) * row_words + word];
+        }
+        __syncthreads();
+        if (threadIdx.x < rows) {
+            const unsigned char *row = reinterpret_cast<const unsigned char *>(
+                shw + threadIdx.x * kStagedRowWords);
+            dst[tile + threadIdx.x] =
+                glm_rocm_q8_0_dot_row(row, shx, in_dim);
+        }
+        __syncthreads();
+    }
+}
+
 /* Diagnostic port of the heterogeneous GLM branch's one-token Q8-head
  * projection.  One wave cooperates on each output row instead of assigning a
  * complete serial dot product to one thread.  The reduction changes FP32
@@ -2356,6 +2408,41 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
                                 (uint64_t)n_head * kv_lora_dim, qk_nope,
                                 "glm_qk_lowrank", &w, &row_bytes)) {
         return 0;
+    }
+    const char *lds_exact_value =
+        getenv("DS4_ROCM_GLM5_QK_LOW_LDS_EXACT");
+    const bool lds_exact = lds_exact_value != NULL &&
+        strcmp(lds_exact_value, "1") == 0;
+    if (lds_exact_value != NULL &&
+        strcmp(lds_exact_value, "0") != 0 && !lds_exact) {
+        static int invalid_printed = 0;
+        if (!invalid_printed) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "invalid DS4_ROCM_GLM5_QK_LOW_LDS_EXACT selector\n");
+            invalid_printed = 1;
+        }
+        return 0;
+    }
+    if (lds_exact && n_head == 64u && kv_lora_dim == 512u &&
+        qk_nope == 256u && qk_dim == 256u && row_bytes == 272u) {
+        constexpr size_t shared_bytes =
+            (256u + 192u * 69u) * sizeof(uint32_t);
+        glm_q8_project_head_lds_exact_kernel<<<n_head, 256, shared_bytes>>>(
+            (float *)qk_low->ptr, w, (const float *)q->ptr,
+            n_head, qk_nope, kv_lora_dim, qk_dim, row_bytes);
+        const cudaError_t launch_err = cudaGetLastError();
+        if (launch_err == cudaSuccess) {
+            static int notice_printed = 0;
+            if (!notice_printed) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "GLM5 one-token k_b projection using exact "
+                        "LDS-staged Q8 rows\n");
+                notice_printed = 1;
+            }
+            return 1;
+        }
+        return cuda_ok(launch_err,
+                       "glm exact LDS qk lowrank launch");
     }
     glm_q8_project_head_kernel<<<dim3(n_head, 1, 1), 256, (size_t)qk_nope * sizeof(float)>>>(
             (float *)qk_low->ptr,
