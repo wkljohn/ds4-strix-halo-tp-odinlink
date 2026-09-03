@@ -26,28 +26,28 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **280.58 t/s** | **21.30 t/s** | recorded candidate control; rollback 276.59/21.24, FNV unchanged |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-### GLM-5.3 Flash TP=2 validated research-branch performance
+### GLM-5.3 Flash TP=2 research-branch performance
 
-These are validated `ds4-bench-tp` results for the opt-in GLM research path.
-The Q4_K results require research branch
-[`research/glm5-kb-lds-exact`](https://github.com/wkljohn/ds4-strix-halo-tp-odinlink/tree/aad7ad3eeaa0ccad9d2cf4114769bb0b9e95618b)
-at commit `aad7ad3`; they are not yet enabled by `main`.
+These `ds4-bench-tp` results use the diverse 4,096-token prefill plus
+300-token decode workload at batch 256. They require research branch
+[`research/glm5-kb-lds-exact`](https://github.com/wkljohn/ds4-strix-halo-tp-odinlink/tree/ee9ca905f090a974b56fbfc2b92ed3d821dd0dd6)
+at commit `ee9ca90`; they are not yet enabled by `main`.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | 2,048-token prefill + 300-token decode, batch 256 | **77.31 t/s** | **9.78 t/s** | research-branch three-run median; exact FNV `e68685daa5f4d385` |
-| **GLM-5.3 Flash Q4_K over OdinLink** | same workload and staged TP=2 harness | **76.54 t/s** | **9.50 t/s** | research-branch provider validation; exact FNV, one successful run after a disconnected attempt |
-| **GLM-5.3 Flash Q2 over RoCE v2** | same workload and staged TP=2 harness | **21.87–21.95 t/s** | **3.48–3.49 t/s** | opt-in mixed IQ2_XXS/Q2_K path; repeated fingerprint matched |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | two source-clean runs | **78.19 t/s** | **9.50 t/s** | two-run midpoint; runs were 78.59/9.45 and 77.78/9.54, FNV `9012bd4d7c5ce422` |
+| **GLM-5.3 Flash Q4_K over OdinLink** | one matched provider run | **76.00 t/s** | **9.43 t/s** | zero fallback; FNV `9012bd4d7c5ce422` |
+| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048-token control workload | **21.87–21.95 t/s** | **3.48–3.49 t/s** | opt-in mixed IQ2_XXS/Q2_K path; repeated fingerprint matched |
 
-The Q4_K research branch also passed the frozen cross-disciplinary 4,096+300
-screen at 16.74 prefill and 9.34 decode t/s with its established exact
-fingerprint.
+The Q4_K candidate keeps all 4,096 prompt rows batched, adds no persistent
+weight cache, and uses 45.07 MiB of reusable scratch per rank. It remains
+default-off while its Lane-B quality and three-run provider medians complete.
 
-Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
-generated tokens over mandatory RDMA. The current Q4_K rows use the Antirez
-reference model listed below. It does not fit one node's current 96 GiB ROCm
-aperture; TP=2 keeps one expert shard on each node. Q2_K and Q4_K run without a
-persistent expanded-weight cache.
+The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
+followed by 300 generated tokens over mandatory RDMA. Its current Q4_K rows
+use the Antirez reference model listed below. It does not fit one node's
+current 96 GiB ROCm aperture; TP=2 keeps one expert shard on each node. Q2_K
+and Q4_K run without a persistent expanded-weight cache.
 
 The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
 release results.
