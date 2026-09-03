@@ -5,6 +5,7 @@
 #include <hip/hip_fp16.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -12,6 +13,24 @@
 #include <cstring>
 #include <limits>
 #include <vector>
+
+extern "C" int ds4_rocm_glm5_sparse_attention_exact_rows(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t selected_stride,
+        uint32_t cache_cap);
+
+extern "C" int ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t selected_stride,
+        uint32_t cache_cap);
 
 #define CHECK(expr, message) do {                                           \
     if (!(expr)) {                                                          \
@@ -446,10 +465,320 @@ bool run_test() {
                  kProductionRows, kProductionSelected,
                  (unsigned long long)production_fnv);
 
+    /* The sparse-prefill executor stores one fixed-width, -1-padded selected
+     * list per query.  Compare the multi-row launch against the established
+     * exact shared-PV one-row path to catch row-stride or batch-indexing drift
+     * before exercising the full TP graph. */
+    constexpr uint32_t kBatchRows = 16u;
+    std::vector<float> batch_query(
+        (uint64_t)kBatchRows * production_query.size());
+    std::vector<float> batch_low(
+        (uint64_t)kBatchRows * production_low.size());
+    std::vector<int32_t> batch_selected(
+        (uint64_t)kBatchRows * kProductionSelected);
+    uint32_t batch_live[kBatchRows] = {};
+    for (uint32_t row = 0u; row < kBatchRows; ++row) {
+        batch_live[row] = 2048u + ((row + 1u) & 3u);
+    }
+    for (uint32_t row = 0u; row < kBatchRows; ++row) {
+        std::memcpy(batch_query.data() +
+                        (uint64_t)row * production_query.size(),
+                    production_query.data(),
+                    production_query.size() * sizeof(float));
+        std::memcpy(batch_low.data() +
+                        (uint64_t)row * production_low.size(),
+                    production_low.data(),
+                    production_low.size() * sizeof(float));
+        std::memcpy(batch_selected.data() +
+                        (uint64_t)row * kProductionSelected,
+                    production_selected.data(),
+                    production_selected.size() * sizeof(int32_t));
+        for (size_t i = 0; i < production_low.size(); ++i) {
+            batch_low[(uint64_t)row * production_low.size() + i] +=
+                (float)row * (float)((int)(i % 7u) - 3) * 0.00000037f;
+        }
+        const uint32_t live = batch_live[row];
+        for (uint32_t s = live; s < kProductionSelected; ++s) {
+            batch_selected[(uint64_t)row * kProductionSelected + s] = -1;
+        }
+    }
+    const uint64_t batch_lora_floats =
+        (uint64_t)kBatchRows * kHeads * kKvLora;
+    ds4_gpu_tensor *d_batch_query = ds4_gpu_tensor_alloc(
+        (uint64_t)batch_query.size() * sizeof(float));
+    ds4_gpu_tensor *d_batch_low = ds4_gpu_tensor_alloc(
+        (uint64_t)batch_low.size() * sizeof(float));
+    ds4_gpu_tensor *d_batch_selected = ds4_gpu_tensor_alloc(
+        (uint64_t)batch_selected.size() * sizeof(int32_t));
+    ds4_gpu_tensor *d_batch_lora = ds4_gpu_tensor_alloc(
+        batch_lora_floats * sizeof(float));
+    ds4_gpu_tensor *d_head_shared_lora = ds4_gpu_tensor_alloc(
+        batch_lora_floats * sizeof(float));
+    ds4_gpu_tensor *d_f16_gemm_lora = ds4_gpu_tensor_alloc(
+        batch_lora_floats * sizeof(float));
+    ds4_gpu_tensor *d_scalar_lora = ds4_gpu_tensor_alloc(
+        batch_lora_floats * sizeof(float));
+    CHECK(d_batch_query && d_batch_low && d_batch_selected &&
+          d_batch_lora && d_head_shared_lora && d_f16_gemm_lora &&
+          d_scalar_lora &&
+          ds4_gpu_tensor_write(
+              d_batch_query, 0u, batch_query.data(),
+              (uint64_t)batch_query.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(
+              d_batch_low, 0u, batch_low.data(),
+              (uint64_t)batch_low.size() * sizeof(float)) &&
+          ds4_gpu_tensor_write(
+              d_batch_selected, 0u, batch_selected.data(),
+              (uint64_t)batch_selected.size() * sizeof(int32_t)),
+          "allocate and upload fixed-width NoPE batch oracle");
+    unsetenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV");
+    CHECK(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+              d_batch_lora, d_batch_query, d_batch_low,
+              d_production_cache, nullptr, d_batch_selected,
+              kBatchRows, kProductionSelected, kProductionRows, false,
+              kHeads, kKvLora, kQkNope, 0u, 1u,
+              1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+          "execute fixed-width NoPE batch oracle");
+    CHECK(ds4_rocm_glm5_sparse_attention_exact_rows(
+              d_head_shared_lora, d_batch_low, d_production_cache,
+              d_batch_selected, kBatchRows, kProductionSelected,
+              kProductionRows),
+          "execute fixed-stride head-shared NoPE batch oracle");
+    CHECK(ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+              d_f16_gemm_lora, d_batch_low, d_production_cache,
+              d_batch_selected, kBatchRows, kProductionSelected,
+              kProductionRows),
+          "execute fixed-stride F16 GEMM NoPE batch oracle");
+    CHECK(setenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV", "1", 1) == 0,
+          "enable exact shared-PV scalar oracle");
+    const uint64_t query_row_bytes =
+        (uint64_t)kHeads * kQkNope * sizeof(float);
+    const uint64_t low_row_bytes =
+        (uint64_t)kHeads * kKvLora * sizeof(float);
+    const uint64_t selected_row_bytes =
+        (uint64_t)kProductionSelected * sizeof(int32_t);
+    for (uint32_t row = 0u; row < kBatchRows; ++row) {
+        ds4_gpu_tensor *q_view = ds4_gpu_tensor_view(
+            d_batch_query, (uint64_t)row * query_row_bytes,
+            query_row_bytes);
+        ds4_gpu_tensor *low_view = ds4_gpu_tensor_view(
+            d_batch_low, (uint64_t)row * low_row_bytes,
+            low_row_bytes);
+        ds4_gpu_tensor *selected_view = ds4_gpu_tensor_view(
+            d_batch_selected, (uint64_t)row * selected_row_bytes,
+            selected_row_bytes);
+        ds4_gpu_tensor *out_view = ds4_gpu_tensor_view(
+            d_scalar_lora, (uint64_t)row * low_row_bytes,
+            low_row_bytes);
+        const int row_ok = q_view && low_view && selected_view && out_view &&
+            ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+                out_view, q_view, low_view, d_production_cache, nullptr,
+                selected_view, 1u, batch_live[row], kProductionRows,
+                false, kHeads, kKvLora, kQkNope, 0u, 1u,
+                1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        ds4_gpu_tensor_free(out_view);
+        ds4_gpu_tensor_free(selected_view);
+        ds4_gpu_tensor_free(low_view);
+        ds4_gpu_tensor_free(q_view);
+        CHECK(row_ok, "execute exact shared-PV scalar batch row");
+    }
+    std::vector<float> batch_lora(batch_lora_floats);
+    std::vector<float> head_shared_lora(batch_lora_floats);
+    std::vector<float> f16_gemm_lora(batch_lora_floats);
+    std::vector<float> scalar_lora(batch_lora_floats);
+    CHECK(ds4_gpu_synchronize() &&
+          ds4_gpu_tensor_read(d_batch_lora, 0u, batch_lora.data(),
+                              batch_lora_floats * sizeof(float)) &&
+          ds4_gpu_tensor_read(d_head_shared_lora, 0u,
+                              head_shared_lora.data(),
+                              batch_lora_floats * sizeof(float)) &&
+          ds4_gpu_tensor_read(d_f16_gemm_lora, 0u,
+                              f16_gemm_lora.data(),
+                              batch_lora_floats * sizeof(float)) &&
+          ds4_gpu_tensor_read(d_scalar_lora, 0u, scalar_lora.data(),
+                              batch_lora_floats * sizeof(float)),
+          "read fixed-width NoPE batch oracle outputs");
+    CHECK(std::memcmp(batch_lora.data(), scalar_lora.data(),
+                      batch_lora_floats * sizeof(float)) == 0,
+          "boundary NoPE batch is bit-identical to live-count scalar path");
+    CHECK(std::memcmp(head_shared_lora.data(), scalar_lora.data(),
+                      batch_lora_floats * sizeof(float)) == 0,
+          "boundary head-shared NoPE batch is bit-identical to scalar path");
+    long double f16_error2 = 0.0L;
+    long double f16_reference2 = 0.0L;
+    long double f16_candidate2 = 0.0L;
+    long double f16_dot = 0.0L;
+    double f16_max_abs = 0.0;
+    uint64_t f16_nonfinite = 0u;
+    for (uint64_t i = 0u; i < batch_lora_floats; ++i) {
+        const double reference = scalar_lora[i];
+        const double candidate = f16_gemm_lora[i];
+        if (!std::isfinite(candidate)) {
+            ++f16_nonfinite;
+            continue;
+        }
+        const double difference = candidate - reference;
+        f16_error2 += (long double)difference * difference;
+        f16_reference2 += (long double)reference * reference;
+        f16_candidate2 += (long double)candidate * candidate;
+        f16_dot += (long double)reference * candidate;
+        f16_max_abs = std::max(f16_max_abs, std::fabs(difference));
+    }
+    const double f16_gemm_nmse = (double)(
+        f16_error2 / std::max(f16_reference2, 1.0e-30L));
+    const double f16_gemm_cosine =
+        f16_reference2 > 0.0L && f16_candidate2 > 0.0L ?
+        (double)(f16_dot /
+            std::sqrt(f16_reference2 * f16_candidate2)) : 0.0;
+    const double f16_reference_rms = std::sqrt((double)(
+        f16_reference2 / std::max<uint64_t>(batch_lora_floats, 1u)));
+    std::fprintf(stderr,
+                 "GLM5 NoPE F16 GEMM boundary rows=%u selected=%u "
+                 "live_pattern=2049,2050,2051,2048 max_abs=%.9g nmse=%.9g "
+                 "cosine=%.12g "
+                 "nonfinite=%llu\n",
+                 kBatchRows, kProductionSelected, f16_max_abs, f16_gemm_nmse,
+                 f16_gemm_cosine, (unsigned long long)f16_nonfinite);
+    CHECK(f16_nonfinite == 0u && f16_gemm_nmse <= 2.0e-4 &&
+          f16_max_abs <= 0.05 * f16_reference_rms &&
+          f16_gemm_cosine >= 0.9999,
+          "boundary F16 GEMM NoPE batch remains numerically coherent");
+    constexpr uint32_t kWarmIterations = 3u;
+    constexpr uint32_t kTimedIterations = 21u;
+    for (uint32_t i = 0u; i < kWarmIterations; ++i) {
+        CHECK(ds4_rocm_glm5_sparse_attention_exact_rows(
+                  d_head_shared_lora, d_batch_low, d_production_cache,
+                  d_batch_selected, kBatchRows, kProductionSelected,
+                  kProductionRows) &&
+              ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+                  d_f16_gemm_lora, d_batch_low, d_production_cache,
+                  d_batch_selected, kBatchRows, kProductionSelected,
+                  kProductionRows) && ds4_gpu_synchronize(),
+              "warm sparse NoPE boundary implementations");
+    }
+    std::vector<double> exact_wall_us;
+    std::vector<double> f16_wall_us;
+    exact_wall_us.reserve(kTimedIterations);
+    f16_wall_us.reserve(kTimedIterations);
+    auto time_call = [&](bool f16) {
+        const auto begin = std::chrono::steady_clock::now();
+        const int launched = f16 ?
+            ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+                d_f16_gemm_lora, d_batch_low, d_production_cache,
+                d_batch_selected, kBatchRows, kProductionSelected,
+                kProductionRows) :
+            ds4_rocm_glm5_sparse_attention_exact_rows(
+                d_head_shared_lora, d_batch_low, d_production_cache,
+                d_batch_selected, kBatchRows, kProductionSelected,
+                kProductionRows);
+        if (!launched || !ds4_gpu_synchronize()) return -1.0;
+        const auto end = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::micro>(end - begin).count();
+    };
+    for (uint32_t i = 0u; i < kTimedIterations; ++i) {
+        const bool f16_first = (i & 1u) != 0u;
+        const double first = time_call(f16_first);
+        const double second = time_call(!f16_first);
+        CHECK(first > 0.0 && second > 0.0,
+              "time sparse NoPE boundary implementations");
+        (f16_first ? f16_wall_us : exact_wall_us).push_back(first);
+        (f16_first ? exact_wall_us : f16_wall_us).push_back(second);
+    }
+    std::sort(exact_wall_us.begin(), exact_wall_us.end());
+    std::sort(f16_wall_us.begin(), f16_wall_us.end());
+    const double exact_median_us = exact_wall_us[kTimedIterations / 2u];
+    const double f16_median_us = f16_wall_us[kTimedIterations / 2u];
+    std::fprintf(stderr,
+                 "GLM5 NoPE boundary warm wall rows=%u exact_us=%.3f "
+                 "f16_gemm_us=%.3f change=%.1f%% samples=%u\n",
+                 kBatchRows, exact_median_us, f16_median_us,
+                 100.0 * (f16_median_us / exact_median_us - 1.0),
+                 kTimedIterations);
+    std::fprintf(stderr,
+                 "GLM5 NoPE fixed-width batch rows=%u selected=%u "
+                 "live_pattern=2049,2050,2051,2048 scalar_bit_identical=1 "
+                 "head_shared_bit_identical=1 fnv64=%016llx\n",
+                 kBatchRows, kProductionSelected,
+                 (unsigned long long)fnv1a64_bytes(
+                     batch_lora.data(),
+                     batch_lora_floats * sizeof(float)));
+    const uint32_t tail_rows[] = {1u, 3u, 15u};
+    for (uint32_t rows : tail_rows) {
+        CHECK(ds4_rocm_glm5_sparse_attention_exact_rows(
+                  d_head_shared_lora, d_batch_low, d_production_cache,
+                  d_batch_selected, rows, kProductionSelected,
+                  kProductionRows) > 0 &&
+              ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+                  d_f16_gemm_lora, d_batch_low, d_production_cache,
+                  d_batch_selected, rows, kProductionSelected,
+                  kProductionRows) > 0 && ds4_gpu_synchronize(),
+              "execute sparse NoPE F16 tail geometry");
+        const uint64_t count = (uint64_t)rows * kHeads * kKvLora;
+        CHECK(ds4_gpu_tensor_read(
+                  d_head_shared_lora, 0u, head_shared_lora.data(),
+                  count * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  d_f16_gemm_lora, 0u, f16_gemm_lora.data(),
+                  count * sizeof(float)),
+              "read sparse NoPE F16 tail geometry");
+        long double error2 = 0.0L, reference2 = 0.0L;
+        double maximum = 0.0;
+        uint64_t nonfinite = 0u;
+        for (uint64_t i = 0u; i < count; ++i) {
+            if (!std::isfinite(f16_gemm_lora[i])) {
+                ++nonfinite;
+                continue;
+            }
+            const double error =
+                (double)f16_gemm_lora[i] - head_shared_lora[i];
+            error2 += (long double)error * error;
+            reference2 += (long double)head_shared_lora[i] *
+                          head_shared_lora[i];
+            maximum = std::max(maximum, std::fabs(error));
+        }
+        const double tail_nmse = (double)(
+            error2 / std::max(reference2, 1.0e-30L));
+        const double tail_rms = std::sqrt((double)(
+            reference2 / std::max<uint64_t>(count, 1u)));
+        std::fprintf(stderr,
+                     "GLM5 NoPE F16 GEMM tail rows=%u max_abs=%.9g "
+                     "nmse=%.9g ref_rms=%.9g nonfinite=%llu\n",
+                     rows, maximum, tail_nmse, tail_rms,
+                     (unsigned long long)nonfinite);
+        CHECK(nonfinite == 0u && tail_nmse <= 2.0e-4 &&
+              maximum <= 0.05 * tail_rms,
+              "sparse NoPE F16 tail remains inside Lane-B envelope");
+    }
+    CHECK(ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+              d_f16_gemm_lora, d_batch_low, d_production_cache,
+              d_batch_selected, 17u, kProductionSelected,
+              kProductionRows) == -1,
+          "sparse NoPE F16 rejects rows above the bounded tile");
+    CHECK(ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+              d_f16_gemm_lora, d_batch_low, d_production_cache,
+              d_batch_selected, 16u, kProductionSelected - 1u,
+              kProductionRows) == -1,
+          "sparse NoPE F16 rejects a noncanonical selected stride");
+    unsetenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV");
+    ds4_gpu_tensor_free(d_scalar_lora);
+    ds4_gpu_tensor_free(d_f16_gemm_lora);
+    ds4_gpu_tensor_free(d_head_shared_lora);
+    ds4_gpu_tensor_free(d_batch_lora);
+    ds4_gpu_tensor_free(d_batch_selected);
+    ds4_gpu_tensor_free(d_batch_low);
+    ds4_gpu_tensor_free(d_batch_query);
+
     const uint32_t partial_counts[] = {
         1u, 7u, 17u, 25u, 2047u, 2048u, 2049u, 2050u
     };
     for (uint32_t partial_count : partial_counts) {
+        std::vector<int32_t> padded_selected = production_selected;
+        for (uint32_t i = partial_count; i < kProductionSelected; ++i)
+            padded_selected[i] = -1;
+        CHECK(ds4_gpu_tensor_write(
+                  d_production_selected, 0u, padded_selected.data(),
+                  (uint64_t)padded_selected.size() * sizeof(int32_t)),
+              "upload padded partial selected row");
         unsetenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV");
         CHECK(ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
                   d_production_incumbent, d_production_query, d_production_low,
@@ -477,16 +806,54 @@ bool run_test() {
         CHECK(std::memcmp(production_incumbent.data(), production_shared.data(),
                           production_incumbent.size() * sizeof(float)) == 0,
               "partial-tile shared-PV output is bit-identical");
+        CHECK(ds4_rocm_glm5_sparse_attention_exact_rows(
+                  d_production_shared, d_production_low, d_production_cache,
+                  d_production_selected, 1u, kProductionSelected,
+                  kProductionRows) > 0 &&
+              ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+                  d_production_candidate, d_production_low,
+                  d_production_cache, d_production_selected, 1u,
+                  kProductionSelected, kProductionRows) > 0 &&
+              ds4_gpu_synchronize() &&
+              ds4_gpu_tensor_read(
+                  d_production_shared, 0u, production_shared.data(),
+                  (uint64_t)production_shared.size() * sizeof(float)) &&
+              ds4_gpu_tensor_read(
+                  d_production_candidate, 0u, production_candidate.data(),
+                  (uint64_t)production_candidate.size() * sizeof(float)),
+              "execute and read padded partial F16 attention");
+        long double partial_error2 = 0.0L, partial_reference2 = 0.0L;
+        double partial_maximum = 0.0;
+        uint64_t partial_nonfinite = 0u;
+        for (size_t i = 0u; i < production_shared.size(); ++i) {
+            if (!std::isfinite(production_candidate[i])) {
+                ++partial_nonfinite;
+                continue;
+            }
+            const double error =
+                (double)production_candidate[i] - production_shared[i];
+            partial_error2 += (long double)error * error;
+            partial_reference2 += (long double)production_shared[i] *
+                                  production_shared[i];
+            partial_maximum = std::max(partial_maximum, std::fabs(error));
+        }
+        const double partial_nmse = (double)(partial_error2 /
+            std::max(partial_reference2, 1.0e-30L));
+        const double partial_rms = std::sqrt((double)(partial_reference2 /
+            std::max<size_t>(production_shared.size(), 1u)));
+        CHECK(partial_nonfinite == 0u && partial_nmse <= 2.0e-4 &&
+              partial_maximum <= 0.05 * partial_rms,
+              "padded partial F16 attention remains inside Lane-B envelope");
         std::fprintf(stderr,
                      "GLM5 NoPE partial selected=%u bit_identical=1 "
-                     "fnv64=%016llx\n",
-                     partial_count,
+                     "f16_max_abs=%.9g f16_nmse=%.9g fnv64=%016llx\n",
+                     partial_count, partial_maximum, partial_nmse,
                      (unsigned long long)fnv1a64_bytes(
                          production_shared.data(),
                          production_shared.size() * sizeof(float)));
     }
 
-    std::vector<int32_t> all_invalid(25u, -1);
+    std::vector<int32_t> all_invalid(kProductionSelected, -1);
     CHECK(ds4_gpu_tensor_write(d_production_selected, 0u, all_invalid.data(),
                                all_invalid.size() * sizeof(int32_t)),
           "upload all-invalid selected rows");
@@ -519,6 +886,18 @@ bool run_test() {
     for (float value : production_shared) {
         CHECK(value == 0.0f && !std::signbit(value),
               "all-invalid shared-PV output is positive zero");
+    }
+    CHECK(ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+              d_production_candidate, d_production_low, d_production_cache,
+              d_production_selected, 1u, kProductionSelected,
+              kProductionRows) > 0 && ds4_gpu_synchronize() &&
+          ds4_gpu_tensor_read(
+              d_production_candidate, 0u, production_candidate.data(),
+              (uint64_t)production_candidate.size() * sizeof(float)),
+          "execute and read all-invalid F16 attention");
+    for (float value : production_candidate) {
+        CHECK(value == 0.0f && !std::signbit(value),
+              "all-invalid F16 output is positive zero");
     }
     std::fprintf(stderr,
                  "GLM5 NoPE all-invalid selected=25 bit_identical=1 "

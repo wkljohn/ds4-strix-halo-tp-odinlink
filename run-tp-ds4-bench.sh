@@ -267,6 +267,12 @@ GLM5_SPARSE_BATCH_OUTPUT=0
 GLM5_SPARSE_BATCH_OUTPUT_SEEN=0
 GLM5_SPARSE_BATCH_PRELUDE=0
 GLM5_SPARSE_BATCH_PRELUDE_SEEN=0
+GLM5_SPARSE_BATCH_VALUE=0
+GLM5_SPARSE_BATCH_VALUE_SEEN=0
+GLM5_SPARSE_ATTN_HEAD_SHARED=0
+GLM5_SPARSE_ATTN_HEAD_SHARED_SEEN=0
+GLM5_SPARSE_ATTN_F16_GEMM=0
+GLM5_SPARSE_ATTN_F16_GEMM_SEEN=0
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
@@ -328,6 +334,45 @@ for env_kv in "${EXTRA_ENV[@]}"; do
         exit 2
       }
       ;;
+    DS4_GLM5_SPARSE_BATCH_VALUE=*)
+      (( GLM5_SPARSE_BATCH_VALUE_SEEN == 0 )) || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_VALUE was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_BATCH_VALUE=${env_kv#*=}
+      GLM5_SPARSE_BATCH_VALUE_SEEN=1
+      [[ $GLM5_SPARSE_BATCH_VALUE == 0 ||
+         $GLM5_SPARSE_BATCH_VALUE == 1 ]] || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_VALUE must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=*)
+      (( GLM5_SPARSE_ATTN_HEAD_SHARED_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_HEAD_SHARED=${env_kv#*=}
+      GLM5_SPARSE_ATTN_HEAD_SHARED_SEEN=1
+      [[ $GLM5_SPARSE_ATTN_HEAD_SHARED == 0 ||
+         $GLM5_SPARSE_ATTN_HEAD_SHARED == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=*)
+      (( GLM5_SPARSE_ATTN_F16_GEMM_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_F16_GEMM=${env_kv#*=}
+      GLM5_SPARSE_ATTN_F16_GEMM_SEEN=1
+      [[ $GLM5_SPARSE_ATTN_F16_GEMM == 0 ||
+         $GLM5_SPARSE_ATTN_F16_GEMM == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
     DS4_ROCM_ENABLE_Q8_F16_CACHE=*|DS4_ROCM_STREAM_Q8_F16_CACHE_GB=*)
       echo "error: ds4-bench-tp results must not use the memory-heavy Q8-to-FP16 cache" >&2
       exit 2
@@ -355,7 +400,7 @@ for env_kv in "${EXTRA_ENV[@]}"; do
   esac
   if [[ $CANDIDATE == 1 ]]; then
     case $env_kv in
-      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*|DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE=*)
+      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*|DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE=*|DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16=*)
         echo "error: candidate timing cannot enable graph dumps, profilers, or reference oracles: ${env_kv%%=*}" >&2
         exit 2
         ;;
@@ -452,6 +497,31 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
     echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE=1 requires DS4_GLM5_SPARSE_BATCH_OUTPUT=1" >&2
     exit 2
   fi
+  if (( GLM5_SPARSE_BATCH_VALUE == 1 &&
+        GLM5_SPARSE_BATCH_PRELUDE != 1 )); then
+    echo "error: DS4_GLM5_SPARSE_BATCH_VALUE=1 requires DS4_GLM5_SPARSE_BATCH_PRELUDE=1" >&2
+    exit 2
+  fi
+  if (( GLM5_SPARSE_BATCH_VALUE == 1 )); then
+    shared_pv=0
+    for env_kv in "${EXTRA_ENV[@]}"; do
+      [[ $env_kv == DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV=1 ]] && shared_pv=1
+    done
+    (( shared_pv == 1 )) || {
+      echo "error: DS4_GLM5_SPARSE_BATCH_VALUE=1 requires DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV=1" >&2
+      exit 2
+    }
+  fi
+  if (( GLM5_SPARSE_ATTN_HEAD_SHARED == 1 &&
+        GLM5_SPARSE_BATCH_VALUE != 1 )); then
+    echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1 requires DS4_GLM5_SPARSE_BATCH_VALUE=1" >&2
+    exit 2
+  fi
+  if (( GLM5_SPARSE_ATTN_F16_GEMM == 1 &&
+        GLM5_SPARSE_ATTN_HEAD_SHARED != 1 )); then
+    echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=1 requires DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1" >&2
+    exit 2
+  fi
 elif (( GLM5_SPARSE_BATCH_BRIDGE_SEEN == 1 )); then
   echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE applies only to GLM5 benchmarks" >&2
   exit 2
@@ -460,6 +530,15 @@ elif (( GLM5_SPARSE_BATCH_OUTPUT_SEEN == 1 )); then
   exit 2
 elif (( GLM5_SPARSE_BATCH_PRELUDE_SEEN == 1 )); then
   echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_BATCH_VALUE_SEEN == 1 )); then
+  echo "error: DS4_GLM5_SPARSE_BATCH_VALUE applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_ATTN_HEAD_SHARED_SEEN == 1 )); then
+  echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_ATTN_F16_GEMM_SEEN == 1 )); then
+  echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM applies only to GLM5 benchmarks" >&2
   exit 2
 elif (( GLM5_PREFILL_BATCH_SEEN == 1 )); then
   echo "error: DS4_GLM5_NEXT_PREFILL_BATCH applies only to GLM5 benchmarks" >&2
@@ -1034,7 +1113,8 @@ fi
 if [[ $MODEL_ARCH == glm5-next ]]; then
   "$REPO/scripts/check-glm5-prefill-proof.sh" \
     "$COORD_LOG" "$WORKER_LOG" "$GLM5_PREFILL_BATCH" "$FRONTIER" \
-    "$GLM5_SPARSE_BATCH_BRIDGE"
+    "$GLM5_SPARSE_BATCH_BRIDGE" "$GLM5_SPARSE_BATCH_VALUE" \
+    "$GLM5_SPARSE_ATTN_HEAD_SHARED" "$GLM5_SPARSE_ATTN_F16_GEMM"
 fi
 if [[ $DECODE_SELF_CHECK == 1 ]]; then
   grep -q 'ds4-bench: decode self-check complete .*argmax_mismatches=0 ' \

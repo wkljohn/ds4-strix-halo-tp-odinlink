@@ -156,3 +156,83 @@ fi
 grep -q 'DS4_GLM5_SPARSE_BATCH_PRELUDE=1 requires DS4_GLM5_SPARSE_BATCH_OUTPUT=1' \
   "$test_dir/sparse-prelude-parent.out"
 echo 'PASS sparse-prelude-requires-output'
+
+if env -i PATH="$PATH" LANG=C.UTF-8 \
+    DS4_BENCH_CONFIG="$config" \
+    DS4_BENCH_VALIDATE_CONFIG_ONLY=1 \
+    DS4_BENCH_PROMPT_FILE=/dev/null \
+    "$repo/run-tp-ds4-bench.sh" sparse-attn-parent "$glm_model" \
+    DS4_GLM5_NEXT_PREFILL_BATCH=256 \
+    DS4_GLM5_SPARSE_BATCH_BRIDGE=1 \
+    DS4_GLM5_SPARSE_BATCH_OUTPUT=1 \
+    DS4_GLM5_SPARSE_BATCH_VALUE=1 \
+    >"$test_dir/sparse-attn-parent.out" 2>&1; then
+  echo 'FAIL sparse-attn-requires-prelude: unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -q 'DS4_GLM5_SPARSE_BATCH_VALUE=1 requires DS4_GLM5_SPARSE_BATCH_PRELUDE=1' \
+  "$test_dir/sparse-attn-parent.out"
+echo 'PASS sparse-attn-requires-prelude'
+
+if env -i PATH="$PATH" LANG=C.UTF-8 \
+    DS4_BENCH_CONFIG="$config" \
+    DS4_BENCH_VALIDATE_CONFIG_ONLY=1 \
+    DS4_BENCH_PROMPT_FILE=/dev/null \
+    "$repo/run-tp-ds4-bench.sh" sparse-head-shared-parent "$glm_model" \
+    DS4_GLM5_NEXT_PREFILL_BATCH=256 \
+    DS4_GLM5_SPARSE_BATCH_BRIDGE=1 \
+    DS4_GLM5_SPARSE_BATCH_OUTPUT=1 \
+    DS4_GLM5_SPARSE_BATCH_PRELUDE=1 \
+    DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1 \
+    >"$test_dir/sparse-head-shared-parent.out" 2>&1; then
+  echo 'FAIL sparse-head-shared-requires-value: unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -q 'DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1 requires DS4_GLM5_SPARSE_BATCH_VALUE=1' \
+  "$test_dir/sparse-head-shared-parent.out"
+echo 'PASS sparse-head-shared-requires-value'
+
+if env -i PATH="$PATH" LANG=C.UTF-8 \
+    DS4_BENCH_CONFIG="$config" \
+    DS4_BENCH_VALIDATE_CONFIG_ONLY=1 \
+    DS4_BENCH_PROMPT_FILE=/dev/null \
+    "$repo/run-tp-ds4-bench.sh" sparse-f16-parent "$glm_model" \
+    DS4_GLM5_NEXT_PREFILL_BATCH=256 \
+    DS4_GLM5_SPARSE_BATCH_BRIDGE=1 \
+    DS4_GLM5_SPARSE_BATCH_OUTPUT=1 \
+    DS4_GLM5_SPARSE_BATCH_PRELUDE=1 \
+    DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV=1 \
+    DS4_GLM5_SPARSE_BATCH_VALUE=1 \
+    DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=1 \
+    >"$test_dir/sparse-f16-parent.out" 2>&1; then
+  echo 'FAIL sparse-f16-requires-head-shared: unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -q 'DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=1 requires DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1' \
+  "$test_dir/sparse-f16-parent.out"
+echo 'PASS sparse-f16-requires-head-shared'
+
+if env -i PATH="$PATH" LANG=C.UTF-8 \
+    DS4_BENCH_CONFIG="$config" \
+    DS4_BENCH_VALIDATE_CONFIG_ONLY=1 \
+    DS4_BENCH_PROMPT_FILE=/dev/null \
+    "$repo/run-tp-ds4-bench.sh" sparse-attn-valid "$glm_model" \
+    DS4_GLM5_NEXT_PREFILL_BATCH=256 \
+    DS4_GLM5_SPARSE_BATCH_BRIDGE=1 \
+    DS4_GLM5_SPARSE_BATCH_OUTPUT=1 \
+    DS4_GLM5_SPARSE_BATCH_PRELUDE=1 \
+    DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV=1 \
+    DS4_GLM5_SPARSE_BATCH_VALUE=1 \
+    DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1 \
+    DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=1 \
+    >"$test_dir/sparse-attn-valid.out" 2>&1; then
+  echo 'FAIL sparse-attn-valid-chain: incomplete fake model unexpectedly succeeded' >&2
+  exit 1
+fi
+! grep -q 'requires DS4_GLM5_SPARSE_BATCH_PRELUDE=1' \
+  "$test_dir/sparse-attn-valid.out"
+! grep -q 'requires DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1' \
+  "$test_dir/sparse-attn-valid.out"
+grep -q 'unsupported routed-expert quantization' \
+  "$test_dir/sparse-attn-valid.out"
+echo 'PASS sparse-attn-valid-chain'

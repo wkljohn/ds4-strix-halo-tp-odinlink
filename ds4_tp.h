@@ -132,6 +132,13 @@ enum {
     /* Batch the stateless sparse MLA HC/Q/KV/index projections while keeping
      * pool publication, selection, and gathered attention query ordered. */
     DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE = UINT32_C(1) << 29,
+    /* Retain causal/query-ordered sparse attention, but defer its compact
+     * latent outputs and batch the Q8 value projection for the prompt tile. */
+    DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE = UINT32_C(1) << 30,
+    /* Replace the exact sparse-prefill NoPE reduction with the bounded
+     * F16-input/F32-accumulate GEMM path.  This changes floating-point
+     * arithmetic, so independent ranks must agree before inference. */
+    DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM = UINT32_C(1) << 31,
 };
 
 static inline uint32_t ds4_tp_glm5_kda_tp_feature(
@@ -187,6 +194,25 @@ static inline uint32_t ds4_tp_glm5_sparse_batch_prelude_feature(
     return env && env[0] == '1' && env[1] == '\0' &&
            (runtime_features & DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT) != 0u
         ? DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_sparse_batch_value_feature(
+        const char *env,
+        uint32_t runtime_features) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE) != 0u
+        ? DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_sparse_attn_f16_gemm_feature(
+        const char *env,
+        const char *head_shared_env,
+        uint32_t runtime_features) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           head_shared_env && head_shared_env[0] == '1' &&
+           head_shared_env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE) != 0u
+        ? DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM : 0u;
 }
 
 static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(

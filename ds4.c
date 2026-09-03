@@ -51493,6 +51493,69 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
                 "DS4_GLM5_SPARSE_BATCH_OUTPUT=1\n");
         return 0;
     }
+    const char *sparse_batch_value_env =
+        getenv("DS4_GLM5_SPARSE_BATCH_VALUE");
+    if (sparse_batch_value_env &&
+        strcmp(sparse_batch_value_env, "0") != 0 &&
+        strcmp(sparse_batch_value_env, "1") != 0) {
+        fprintf(stderr,
+                "ds4: DS4_GLM5_SPARSE_BATCH_VALUE must be 0 or 1\n");
+        return 0;
+    }
+    if (sparse_batch_value_env &&
+        strcmp(sparse_batch_value_env, "1") == 0 &&
+        (!sparse_batch_prelude_env ||
+         strcmp(sparse_batch_prelude_env, "1") != 0)) {
+        fprintf(stderr,
+                "ds4: DS4_GLM5_SPARSE_BATCH_VALUE=1 requires "
+                "DS4_GLM5_SPARSE_BATCH_PRELUDE=1\n");
+        return 0;
+    }
+    if (sparse_batch_value_env &&
+        strcmp(sparse_batch_value_env, "1") == 0 &&
+        (!getenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV") ||
+         strcmp(getenv("DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV"), "1") != 0)) {
+        fprintf(stderr,
+                "ds4: DS4_GLM5_SPARSE_BATCH_VALUE=1 requires "
+                "DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV=1\n");
+        return 0;
+    }
+    const char *sparse_attn_head_shared_env =
+        getenv("DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED");
+    if (sparse_attn_head_shared_env &&
+        strcmp(sparse_attn_head_shared_env, "0") != 0 &&
+        strcmp(sparse_attn_head_shared_env, "1") != 0) {
+        fprintf(stderr,
+                "ds4: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED must be 0 or 1\n");
+        return 0;
+    }
+    if (sparse_attn_head_shared_env &&
+        strcmp(sparse_attn_head_shared_env, "1") == 0 &&
+        (!sparse_batch_value_env ||
+         strcmp(sparse_batch_value_env, "1") != 0)) {
+        fprintf(stderr,
+                "ds4: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1 requires "
+                "DS4_GLM5_SPARSE_BATCH_VALUE=1\n");
+        return 0;
+    }
+    const char *sparse_attn_f16_gemm_env =
+        getenv("DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM");
+    if (sparse_attn_f16_gemm_env &&
+        strcmp(sparse_attn_f16_gemm_env, "0") != 0 &&
+        strcmp(sparse_attn_f16_gemm_env, "1") != 0) {
+        fprintf(stderr,
+                "ds4: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM must be 0 or 1\n");
+        return 0;
+    }
+    if (sparse_attn_f16_gemm_env &&
+        strcmp(sparse_attn_f16_gemm_env, "1") == 0 &&
+        (!sparse_attn_head_shared_env ||
+         strcmp(sparse_attn_head_shared_env, "1") != 0)) {
+        fprintf(stderr,
+                "ds4: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=1 requires "
+                "DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1\n");
+        return 0;
+    }
     const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint32_t big_capacity = ds4_tp_big_capacity_rows(e->tp.ctx);
     /* The mlx5 provider deliberately caps the registered direct slab at
@@ -51568,6 +51631,17 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
                                    row_bytes)) {
         fprintf(stderr, "ds4: GLM5 ordinary executor direct RDMA views failed\n");
         return 0;
+    }
+    if ((ds4_tp_runtime_features(e->tp.ctx) &
+         DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM) != 0u) {
+        const int reserve_rc =
+            ds4_rocm_glm5_sparse_attention_f16_gemm_reserve();
+        if (reserve_rc <= 0) {
+            fprintf(stderr,
+                    "ds4: GLM5 sparse F16 GEMM scratch reservation failed "
+                    "after feature negotiation (rc=%d)\n", reserve_rc);
+            return 0;
+        }
     }
     s->glm5_next_ready = true;
     fprintf(stderr, "ds4: GLM5 ordinary executor enabled (experimental, TP/RDMA)\n");
@@ -53673,6 +53747,12 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         getenv("DS4_GLM5_SPARSE_BATCH_OUTPUT"), glm5_kda_features);
     glm5_kda_features |= ds4_tp_glm5_sparse_batch_prelude_feature(
         getenv("DS4_GLM5_SPARSE_BATCH_PRELUDE"), glm5_kda_features);
+    glm5_kda_features |= ds4_tp_glm5_sparse_batch_value_feature(
+        getenv("DS4_GLM5_SPARSE_BATCH_VALUE"), glm5_kda_features);
+    glm5_kda_features |= ds4_tp_glm5_sparse_attn_f16_gemm_feature(
+        getenv("DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM"),
+        getenv("DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED"),
+        glm5_kda_features);
     glm5_kda_features |= ds4_tp_glm5_kda_output_kslice_feature(
         getenv("DS4_GLM5_KDA_OUTPUT_KSLICE"), glm5_kda_features,
         all_kda_outputs_bf16);

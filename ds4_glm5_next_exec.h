@@ -12,6 +12,11 @@ extern "C" {
 struct ds4_tp;
 typedef struct ds4_glm5_next_workspace ds4_glm5_next_workspace;
 
+/* Reserve the bounded sparse-attention Lane-B tile workspace before timed
+ * prefill. A positive return means reserved, zero is a hard backend failure,
+ * and -1 means the backend does not provide the specialization. */
+int ds4_rocm_glm5_sparse_attention_f16_gemm_reserve(void);
+
 typedef struct {
     const void *model_map;
     uint64_t model_size;

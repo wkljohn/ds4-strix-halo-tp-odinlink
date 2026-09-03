@@ -1225,6 +1225,254 @@ __global__ static void glm_attention_indexed_lora_nope_f32_decode_shared_pv_kern
         denom > 0.0f ? acc / denom : 0.0f;
 }
 
+/* Sparse-prefill form of the exact NoPE path.  A 16-row gathered KV tile is
+ * loaded once into LDS and reused by all 64 query heads.  The selected-list
+ * storage stride is fixed and independent of each query's live count; unused
+ * entries must be -1.  Each dot still visits channels 0..511 in incumbent
+ * order. */
+__global__ __launch_bounds__(1024, 1) static void
+glm_attention_indexed_lora_nope_f32_rows_head_shared_score_kernel(
+        float *scores,
+        const float *qk_low,
+        const float *kv_lora_cache,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t selected_stride,
+        uint32_t cache_cap) {
+    const uint32_t token = blockIdx.z;
+    const uint32_t head = threadIdx.x / 16u;
+    const uint32_t row_lane = threadIdx.x & 15u;
+    const float *low = qk_low +
+        ((uint64_t)token * 64u + head) * 512u;
+    __shared__ float tile[16u][257u];
+    constexpr uint32_t tiles_per_block = 8u;
+
+    for (uint32_t tile_iter = 0u; tile_iter < tiles_per_block;
+         ++tile_iter) {
+        const uint32_t tile_base =
+            (blockIdx.y * tiles_per_block + tile_iter) * 16u;
+        const uint32_t s = tile_base + row_lane;
+        const bool in_range = token < n_tokens && head < 64u &&
+            s < selected_stride;
+        const int32_t row_i = in_range ?
+            selected[(uint64_t)token * selected_stride + s] : -1;
+        const bool valid = row_i >= 0 && (uint32_t)row_i < cache_cap;
+        float dot = 0.0f;
+        for (uint32_t half = 0u; half < 2u; ++half) {
+            for (uint32_t linear = threadIdx.x;
+                 linear < 16u * 256u;
+                 linear += blockDim.x) {
+                const uint32_t tile_row = linear / 256u;
+                const uint32_t column = linear % 256u;
+                const uint32_t tile_s = tile_base + tile_row;
+                const int32_t tile_row_i = tile_s < selected_stride ?
+                    selected[(uint64_t)token * selected_stride + tile_s] : -1;
+                const bool tile_valid = tile_row_i >= 0 &&
+                    (uint32_t)tile_row_i < cache_cap;
+                tile[tile_row][column] = tile_valid ?
+                    kv_lora_cache[(uint64_t)(uint32_t)tile_row_i * 512u +
+                                  half * 256u + column] : 0.0f;
+            }
+            __syncthreads();
+            if (valid) {
+#pragma unroll 1
+                for (uint32_t column = 0u; column < 256u; ++column) {
+                    dot += low[half * 256u + column] *
+                        tile[row_lane][column];
+                }
+            }
+            __syncthreads();
+        }
+        if (in_range) {
+            scores[((uint64_t)token * 64u + head) * selected_stride + s] =
+                valid ? dot : -INFINITY;
+        }
+    }
+}
+
+__global__ static void
+glm_attention_indexed_lora_nope_f32_rows_exact_softmax_kernel(
+        float *weights,
+        float *denoms,
+        uint32_t n_tokens,
+        uint32_t selected_stride) {
+    const uint32_t token_head = blockIdx.x;
+    if (token_head >= n_tokens * 64u) return;
+    float *row = weights + (uint64_t)token_head * selected_stride;
+    __shared__ float reduce[256u];
+    float vmax = -INFINITY;
+    for (uint32_t s = threadIdx.x; s < selected_stride; s += 256u) {
+        const float value = row[s] * 0.0625f;
+        row[s] = value;
+        vmax = fmaxf(vmax, value);
+    }
+    reduce[threadIdx.x] = vmax;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] =
+                fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float row_max = reduce[0];
+    const bool valid_max = isfinite(row_max);
+    float sum = 0.0f;
+    for (uint32_t s = threadIdx.x; s < selected_stride; s += 256u) {
+        const float weight = valid_max ? expf(row[s] - row_max) : 0.0f;
+        row[s] = weight;
+        sum += weight;
+    }
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        denoms[token_head] = valid_max ?
+            fmaxf(reduce[0], 1.0e-20f) : 0.0f;
+    }
+}
+
+__global__ static void
+glm_attention_indexed_lora_nope_f32_rows_exact_shared_pv_kernel(
+        float *lora_out,
+        const float *weights,
+        const float *denoms,
+        const float *kv_lora_cache,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t selected_stride,
+        uint32_t cache_cap) {
+    constexpr uint32_t head_group = 16u;
+    constexpr uint32_t column_tile = 32u;
+    constexpr uint32_t row_tile = 16u;
+    const uint32_t token = blockIdx.z;
+    const uint32_t head_lane = threadIdx.x / column_tile;
+    const uint32_t column_lane = threadIdx.x % column_tile;
+    const uint32_t head = blockIdx.x * head_group + head_lane;
+    const uint32_t channel = blockIdx.y * column_tile + column_lane;
+    if (token >= n_tokens) return;
+    const int32_t *token_selected = selected +
+        (uint64_t)token * selected_stride;
+    const float *token_weights = weights +
+        (uint64_t)token * 64u * selected_stride;
+    __shared__ float cache_tile[row_tile][column_tile];
+    __shared__ float weight_tile[head_group][row_tile];
+    __shared__ uint32_t valid_tile[row_tile];
+    float acc = 0.0f;
+
+    for (uint32_t base = 0u; base < selected_stride; base += row_tile) {
+        for (uint32_t linear = threadIdx.x;
+             linear < row_tile * column_tile;
+             linear += 256u) {
+            const uint32_t row_lane = linear / column_tile;
+            const uint32_t tile_column = linear % column_tile;
+            const uint32_t s = base + row_lane;
+            const int32_t row_i = s < selected_stride ?
+                token_selected[s] : -1;
+            const bool valid = row_i >= 0 && (uint32_t)row_i < cache_cap;
+            cache_tile[row_lane][tile_column] = kv_lora_cache[
+                (uint64_t)(valid ? (uint32_t)row_i : 0u) * 512u +
+                blockIdx.y * column_tile + tile_column];
+        }
+        if (threadIdx.x < head_group * row_tile) {
+            const uint32_t weight_head = threadIdx.x / row_tile;
+            const uint32_t row_lane = threadIdx.x % row_tile;
+            const uint32_t s = base + row_lane;
+            weight_tile[weight_head][row_lane] = s < selected_stride ?
+                token_weights[
+                    (uint64_t)(blockIdx.x * head_group + weight_head) *
+                        selected_stride + s] : 0.0f;
+        }
+        if (threadIdx.x < row_tile) {
+            const uint32_t s = base + threadIdx.x;
+            const int32_t row_i = s < selected_stride ?
+                token_selected[s] : -1;
+            valid_tile[threadIdx.x] =
+                row_i >= 0 && (uint32_t)row_i < cache_cap;
+        }
+        __syncthreads();
+#pragma unroll 1
+        for (uint32_t row_lane = 0u; row_lane < row_tile; ++row_lane) {
+            if (valid_tile[row_lane]) {
+                acc += weight_tile[head_lane][row_lane] *
+                    cache_tile[row_lane][column_lane];
+            }
+        }
+        __syncthreads();
+    }
+    const float denom = denoms[(uint64_t)token * 64u + head];
+    lora_out[((uint64_t)token * 64u + head) * 512u + channel] =
+        denom > 0.0f ? acc / denom : 0.0f;
+}
+
+extern "C" int ds4_rocm_glm5_sparse_attention_exact_rows(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t selected_stride,
+        uint32_t cache_cap) {
+    if (!lora_out || !qk_low || !kv_lora_cache || !selected ||
+        n_tokens == 0u || n_tokens > 16u || selected_stride != 2051u ||
+        cache_cap < selected_stride ||
+        !cuda_tensor_has_elems3(
+            lora_out, n_tokens, 64u, 512u, sizeof(float)) ||
+        !cuda_tensor_has_elems3(
+            qk_low, n_tokens, 64u, 512u, sizeof(float)) ||
+        !cuda_tensor_has_elems2(
+            selected, n_tokens, selected_stride, sizeof(int32_t)) ||
+        !glm_rocm_tensor_has_cache2(
+            kv_lora_cache, cache_cap, 512u, sizeof(float))) {
+        return 0;
+    }
+    uint64_t score_count = 0u, denom_count = 0u;
+    uint64_t total_count = 0u, scratch_bytes = 0u;
+    if (!cuda_u64_mul3_checked(
+            n_tokens, 64u, selected_stride, &score_count) ||
+        !cuda_u64_mul_checked(n_tokens, 64u, &denom_count) ||
+        !cuda_u64_add_checked(score_count, denom_count, &total_count) ||
+        !cuda_u64_mul_checked(total_count, sizeof(float), &scratch_bytes)) {
+        return 0;
+    }
+    float *weights =
+        (float *)cuda_attention_seq_scratch_alloc(scratch_bytes);
+    if (!weights) return 0;
+    float *denoms = weights + score_count;
+    const dim3 score_grid(1u, (selected_stride + 127u) / 128u, n_tokens);
+    glm_attention_indexed_lora_nope_f32_rows_head_shared_score_kernel<<<
+        score_grid, 1024u>>>(
+            weights, (const float *)qk_low->ptr,
+            (const float *)kv_lora_cache->ptr,
+            (const int32_t *)selected->ptr, n_tokens, selected_stride,
+            cache_cap);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm sparse NoPE rows head-shared score launch")) {
+        return 0;
+    }
+    glm_attention_indexed_lora_nope_f32_rows_exact_softmax_kernel<<<
+        n_tokens * 64u, 256u>>>(
+            weights, denoms, n_tokens, selected_stride);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm sparse NoPE rows exact softmax launch")) {
+        return 0;
+    }
+    const dim3 pv_grid(4u, 16u, n_tokens);
+    glm_attention_indexed_lora_nope_f32_rows_exact_shared_pv_kernel<<<
+        pv_grid, 512u>>>(
+            (float *)lora_out->ptr, weights, denoms,
+            (const float *)kv_lora_cache->ptr,
+            (const int32_t *)selected->ptr, n_tokens, selected_stride,
+            cache_cap);
+    return cuda_ok(cudaGetLastError(),
+                   "glm sparse NoPE rows exact shared-PV launch");
+}
+
 __global__ static void glm_attention_indexed_decode_split_partial_kernel(
         float *partial_lora,
         float *partial_ms,
@@ -3380,6 +3628,84 @@ __global__ static void glm_selected_gemm_softmax_heads_f16_kernel(
     }
 }
 
+/* Fixed-stride GLM-5.3 NoPE sparse softmax.  Invalid padding slots are
+ * explicitly masked even though their gathered KV rows are zero, so a
+ * 2051-wide batch can safely contain live counts 2048..2051. */
+__global__ static void glm5_sparse_nope_gemm_softmax_f16_kernel(
+        __half *probs,
+        float *denoms,
+        float *scores,
+        const int32_t *selected,
+        uint32_t n_tokens,
+        uint32_t selected_stride,
+        uint32_t cache_cap) {
+    const uint32_t token_head = blockIdx.x;
+    if (token_head >= n_tokens * 64u) return;
+    const uint32_t token = token_head / 64u;
+    float *row = scores + (uint64_t)token_head * selected_stride;
+    __half *prob_row = probs + (uint64_t)token_head * selected_stride;
+    const int32_t *selected_row = selected +
+        (uint64_t)token * selected_stride;
+    __shared__ float reduce[256u];
+    float vmax = -INFINITY;
+    for (uint32_t s = threadIdx.x; s < selected_stride; s += 256u) {
+        const int32_t row_i = selected_row[s];
+        const bool valid = row_i >= 0 && (uint32_t)row_i < cache_cap;
+        const float value = valid ? row[s] * 0.0625f : -INFINITY;
+        row[s] = value;
+        vmax = fmaxf(vmax, value);
+    }
+    reduce[threadIdx.x] = vmax;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] =
+                fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float row_max = reduce[0];
+    const bool valid_max = isfinite(row_max);
+    float sum = 0.0f;
+    for (uint32_t s = threadIdx.x; s < selected_stride; s += 256u) {
+        const int32_t row_i = selected_row[s];
+        const bool valid = row_i >= 0 && (uint32_t)row_i < cache_cap;
+        const float value = valid_max && valid ?
+            expf(row[s] - row_max) : 0.0f;
+        row[s] = value;
+        sum += value;
+    }
+    reduce[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = 128u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        denoms[token_head] = valid_max ?
+            fmaxf(reduce[0], 1.0e-20f) : 0.0f;
+    }
+    for (uint32_t s = threadIdx.x; s < selected_stride; s += 256u) {
+        /* Retain exp(score - max) near unit scale through the F16 GEMM.
+         * Normalizing first makes common 1/2048 tail weights subnormal. */
+        prob_row[s] = __float2half(row[s]);
+    }
+}
+
+__global__ static void glm5_sparse_nope_gemm_postdivide_kernel(
+        float *lora_out,
+        const float *denoms,
+        uint64_t count) {
+    const uint64_t i =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint64_t token_head = i / 512u;
+    const float denom = denoms[token_head];
+    lora_out[i] = denom > 0.0f ? lora_out[i] / denom : 0.0f;
+}
+
 __global__ static void glm_selected_gemm_scatter_heads_kernel(
         float *out,
         const float *head_out,
@@ -4523,6 +4849,181 @@ static int glm_attention_indexed_lora_selected_gemm(
     }
     glm_selected_gemm_profile_report(
         &profile, n_tokens, n_selected, n_head, head_tile);
+    return 1;
+}
+
+typedef struct {
+    uint64_t kv_count;
+    uint64_t low_count;
+    uint64_t score_count;
+    uint64_t kv_offset;
+    uint64_t low_offset;
+    uint64_t score_offset;
+    uint64_t prob_offset;
+    uint64_t denom_offset;
+    uint64_t scratch_bytes;
+} glm5_sparse_f16_gemm_layout;
+
+static int glm5_sparse_f16_gemm_layout_make(
+        uint32_t n_tokens, uint32_t selected_stride,
+        glm5_sparse_f16_gemm_layout *layout) {
+    if (!layout || n_tokens == 0u || n_tokens > 16u ||
+        selected_stride != 2051u) return 0;
+    memset(layout, 0, sizeof(*layout));
+    uint64_t selected_rows = 0u;
+    uint64_t kv_bytes = 0u, low_bytes = 0u, score_bytes = 0u;
+    uint64_t prob_bytes = 0u, denom_bytes = 0u;
+    if (!cuda_u64_mul_checked(n_tokens, selected_stride, &selected_rows) ||
+        !cuda_u64_mul_checked(selected_rows, 512u, &layout->kv_count) ||
+        !cuda_u64_mul3_checked(n_tokens, 64u, 512u, &layout->low_count) ||
+        !cuda_u64_mul3_checked(
+            n_tokens, 64u, selected_stride, &layout->score_count) ||
+        !cuda_u64_mul_checked(
+            layout->kv_count, sizeof(__half), &kv_bytes) ||
+        !cuda_u64_mul_checked(
+            layout->low_count, sizeof(__half), &low_bytes) ||
+        !cuda_u64_mul_checked(
+            layout->score_count, sizeof(float), &score_bytes) ||
+        !cuda_u64_mul_checked(
+            layout->score_count, sizeof(__half), &prob_bytes) ||
+        !cuda_u64_mul3_checked(
+            n_tokens, 64u, sizeof(float), &denom_bytes) ||
+        !glm_causal_gemm_scratch_part(
+            &layout->scratch_bytes, kv_bytes, &layout->kv_offset) ||
+        !glm_causal_gemm_scratch_part(
+            &layout->scratch_bytes, low_bytes, &layout->low_offset) ||
+        !glm_causal_gemm_scratch_part(
+            &layout->scratch_bytes, score_bytes, &layout->score_offset) ||
+        !glm_causal_gemm_scratch_part(
+            &layout->scratch_bytes, prob_bytes, &layout->prob_offset) ||
+        !glm_causal_gemm_scratch_part(
+            &layout->scratch_bytes, denom_bytes, &layout->denom_offset)) {
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_rocm_glm5_sparse_attention_f16_gemm_reserve(void) {
+    glm5_sparse_f16_gemm_layout layout;
+    if (!g_cublas_ready ||
+        !glm5_sparse_f16_gemm_layout_make(16u, 2051u, &layout)) return -1;
+    if (!cuda_attention_seq_scratch_alloc(layout.scratch_bytes)) return 0;
+    static int notice_printed;
+    if (!notice_printed) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM5 sparse NoPE F16 GEMM scratch reserved "
+                "before prefill (%.2f MiB)\n",
+                (double)layout.scratch_bytes / 1048576.0);
+        notice_printed = 1;
+    }
+    return 1;
+}
+
+extern "C" int ds4_rocm_glm5_sparse_attention_f16_gemm_rows(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_tokens,
+        uint32_t selected_stride,
+        uint32_t cache_cap) {
+    if (!g_cublas_ready || !lora_out || !qk_low || !kv_lora_cache ||
+        !selected || n_tokens == 0u || n_tokens > 16u ||
+        selected_stride != 2051u || cache_cap < selected_stride ||
+        !cuda_tensor_has_elems3(
+            lora_out, n_tokens, 64u, 512u, sizeof(float)) ||
+        !cuda_tensor_has_elems3(
+            qk_low, n_tokens, 64u, 512u, sizeof(float)) ||
+        !cuda_tensor_has_elems2(
+            selected, n_tokens, selected_stride, sizeof(int32_t)) ||
+        !glm_rocm_tensor_has_cache2(
+            kv_lora_cache, cache_cap, 512u, sizeof(float))) {
+        return -1;
+    }
+
+    glm5_sparse_f16_gemm_layout layout;
+    if (!glm5_sparse_f16_gemm_layout_make(
+            n_tokens, selected_stride, &layout)) return -1;
+    char *scratch =
+        (char *)cuda_attention_seq_scratch_alloc(layout.scratch_bytes);
+    if (!scratch) return -1;
+    __half *kv_h = (__half *)(scratch + layout.kv_offset);
+    __half *low_h = (__half *)(scratch + layout.low_offset);
+    float *scores = (float *)(scratch + layout.score_offset);
+    __half *probs = (__half *)(scratch + layout.prob_offset);
+    float *denoms = (float *)(scratch + layout.denom_offset);
+
+    const uint32_t kv_blocks =
+        (uint32_t)min((layout.kv_count + 255u) / 256u, 4096ull);
+    glm_selected_gemm_kv_to_f16_kernel<<<kv_blocks, 256u>>>(
+        kv_h, (const char *)kv_lora_cache->ptr,
+        (const int32_t *)selected->ptr, n_tokens, selected_stride,
+        512u, cache_cap, false);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm sparse NoPE GEMM KV gather launch")) {
+        return 0;
+    }
+    const uint32_t low_blocks =
+        (uint32_t)min((layout.low_count + 255u) / 256u, 4096ull);
+    glm_selected_gemm_gather_heads_f16_kernel<<<low_blocks, 256u>>>(
+        low_h, NULL, (const float *)qk_low->ptr, NULL,
+        n_tokens, 0u, 64u, 64u, 64u, 512u, 256u, 0u);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm sparse NoPE GEMM query gather launch")) {
+        return 0;
+    }
+
+    const float one = 1.0f;
+    const float zero = 0.0f;
+    cublasStatus_t st = cublasGemmStridedBatchedEx(
+        g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        (int)selected_stride, 64, 512, &one,
+        kv_h, CUDA_R_16F, 512, (long long)selected_stride * 512ll,
+        low_h, CUDA_R_16F, 512, 64ll * 512ll,
+        &zero, scores, CUDA_R_32F, (int)selected_stride,
+        (long long)selected_stride * 64ll, (int)n_tokens,
+        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (!cublas_ok(st, "glm sparse NoPE score strided GEMM")) return 0;
+
+    glm5_sparse_nope_gemm_softmax_f16_kernel<<<
+        n_tokens * 64u, 256u>>>(
+            probs, denoms, scores, (const int32_t *)selected->ptr,
+            n_tokens, selected_stride, cache_cap);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm sparse NoPE GEMM softmax launch")) {
+        return 0;
+    }
+
+    st = cublasGemmStridedBatchedEx(
+        g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+        512, 64, (int)selected_stride, &one,
+        kv_h, CUDA_R_16F, 512, (long long)selected_stride * 512ll,
+        probs, CUDA_R_16F, (int)selected_stride,
+        (long long)selected_stride * 64ll,
+        &zero, lora_out->ptr, CUDA_R_32F, 512, 64ll * 512ll,
+        (int)n_tokens, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (!cublas_ok(st, "glm sparse NoPE value strided GEMM")) return 0;
+
+    const uint64_t output_count =
+        (uint64_t)n_tokens * 64u * 512u;
+    glm5_sparse_nope_gemm_postdivide_kernel<<<
+        (output_count + 255u) / 256u, 256u>>>(
+            (float *)lora_out->ptr, denoms, output_count);
+    if (!cuda_ok(cudaGetLastError(),
+                 "glm sparse NoPE GEMM postdivide launch")) {
+        return 0;
+    }
+
+    static int notice_printed;
+    if (!notice_printed) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM5 sparse NoPE F16 strided GEMM rows active "
+                "(rows=%u stride=%u probs=F16-exp/F32-sum "
+                "scratch=%.2f MiB)\n",
+                n_tokens, selected_stride,
+                (double)layout.scratch_bytes / 1048576.0);
+        notice_printed = 1;
+    }
     return 1;
 }
 
