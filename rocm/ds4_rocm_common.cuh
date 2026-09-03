@@ -303,6 +303,7 @@ __global__ static void matmul_bf16_f32_sharedx_warp_rows_w32_kernel(
  * independent projection (24 wave32 rows total), stages the shared activation
  * vector once, and then applies the incumbent lane-major BF16->F32 reduction
  * to each output.  The GGUF matrices are never concatenated. */
+template <uint32_t PREFETCH>
 __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
         float *out_q, float *out_k, float *out_v,
         const uint16_t *weight_q, const uint16_t *weight_k,
@@ -328,7 +329,22 @@ __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
                  projection == 1u ? out_k : out_v;
     const uint16_t *wr = weight + row * (uint64_t)in_dim;
     float acc = 0.0f;
-    for (uint32_t i = lane; i < in_dim; i += 32u)
+    uint32_t i = lane;
+    for (; i + (PREFETCH - 1u) * 32u < in_dim;
+         i += PREFETCH * 32u) {
+        uint16_t packed_w[PREFETCH];
+        float packed_x[PREFETCH];
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u) {
+            const uint32_t index = i + u * 32u;
+            packed_w[u] = wr[index];
+            packed_x[u] = shx[index];
+        }
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u)
+            acc += __uint_as_float((uint32_t)packed_w[u] << 16u) * packed_x[u];
+    }
+    for (; i < in_dim; i += 32u)
         acc += __uint_as_float((uint32_t)wr[i] << 16u) * shx[i];
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
