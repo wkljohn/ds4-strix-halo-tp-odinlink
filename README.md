@@ -21,11 +21,11 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **209.60 t/s** | **20.09 t/s** | recorded candidate control; rollback 213.50/20.07, FNV unchanged |
+| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | current branch probe; exact FNV `2a44e523bf2d7947` |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **233.04 t/s** | **19.17 t/s** | three-run median, exact fingerprint |
-| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **280.58 t/s** | **21.30 t/s** | recorded candidate control; rollback 276.59/21.24, FNV unchanged |
+| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **255.49 t/s** | **21.01 t/s** | current GLM-branch probe; exact FNV `2a44e523bf2d7947` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
-| **GLM-5.3 Flash Q4_K over RoCE v2** | staged TP=2, 2,048 prefill + 300 decode, batch 256 | **55.80 t/s** | **9.35 t/s** | three-run research median; exact FNV `e68685daa5f4d385` |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | staged TP=2, diverse 4,096 prefill + 300 decode, batch 256 | **89.32 t/s** | **10.20 t/s** | decode-multipointer median; exact FNV `9012bd4d7c5ce422`; branch `968d0b9` |
 
 Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
 generated tokens over mandatory RDMA. The current Q4_K rows use the Antirez
