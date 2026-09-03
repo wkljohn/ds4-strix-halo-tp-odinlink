@@ -45,6 +45,7 @@ TP_TIMEOUT_SEC=${TP_TIMEOUT_SEC:-60}
 DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0}
 DSPARK=${DSPARK:-0}
 GLM5_ENABLE_ORDINARY=${GLM5_ENABLE_ORDINARY:-0}
+GLM5_FULL_LOGITS=${GLM5_FULL_LOGITS:-0}
 PREFILL_FFN_WAVEFRONT=${PREFILL_FFN_WAVEFRONT:-1}
 Q8_M256_K128=${Q8_M256_K128:-1}
 HC_STAGE_EXACT_COOP=${HC_STAGE_EXACT_COOP:-1}
@@ -82,6 +83,9 @@ is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$EXPERT_SPLIT" &&
 [[ $DSPARK == 0 || $DSPARK == 1 ]] || { echo "error: DSPARK must be 0 or 1" >&2; exit 2; }
 [[ $GLM5_ENABLE_ORDINARY == 0 || $GLM5_ENABLE_ORDINARY == 1 ]] || {
   echo "error: GLM5_ENABLE_ORDINARY must be 0 or 1" >&2; exit 2;
+}
+[[ $GLM5_FULL_LOGITS == 0 || $GLM5_FULL_LOGITS == 1 ]] || {
+  echo "error: GLM5_FULL_LOGITS must be 0 or 1" >&2; exit 2;
 }
 [[ $PREFILL_FFN_WAVEFRONT == 0 || $PREFILL_FFN_WAVEFRONT == 1 ]] || {
   echo "error: PREFILL_FFN_WAVEFRONT must be 0 or 1" >&2; exit 2;
@@ -268,6 +272,10 @@ start() {
   if [[ $GLM5_ENABLE_ORDINARY == 1 ]]; then
     echo "warning: GLM-5.3 ordinary session integration is explicitly enabled; this is an experimental deployment" >&2
     common+=(DS4_GLM5_NEXT_ENABLE_ORDINARY=1)
+  fi
+  if [[ $GLM5_FULL_LOGITS == 1 ]]; then
+    echo "warning: GLM full-logits TP mode is explicitly enabled; transport and memory cost may increase" >&2
+    common+=(DS4_TP_RANK0_FULL_LOGITS=1 DS4_TP_GREEDY_TOP2=0)
   fi
   if [[ $DSPARK == 1 ]]; then
     echo "warning: DSpark is experimental and is not target-fingerprint exact" >&2
