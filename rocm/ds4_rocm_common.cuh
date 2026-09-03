@@ -299,6 +299,41 @@ __global__ static void matmul_bf16_f32_sharedx_warp_rows_w32_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+/* Decode-only Q/K/V experiment.  A 768-thread block owns eight rows of each
+ * independent projection (24 wave32 rows total), stages the shared activation
+ * vector once, and then applies the incumbent lane-major BF16->F32 reduction
+ * to each output.  The GGUF matrices are never concatenated. */
+__global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
+        float *out_q, float *out_k, float *out_v,
+        const uint16_t *weight_q, const uint16_t *weight_k,
+        const uint16_t *weight_v, const float *x,
+        uint32_t in_dim, uint32_t out_dim) {
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    constexpr uint32_t rows_per_projection = 8u;
+    constexpr uint32_t projections = 3u;
+    const uint32_t projection = wave / rows_per_projection;
+    const uint32_t row_in_block = wave % rows_per_projection;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+    if (projection >= projections) return;
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_projection +
+                         row_in_block;
+    if (row >= out_dim) return;
+    const uint16_t *weight = projection == 0u ? weight_q :
+                             projection == 1u ? weight_k : weight_v;
+    float *out = projection == 0u ? out_q :
+                 projection == 1u ? out_k : out_v;
+    const uint16_t *wr = weight + row * (uint64_t)in_dim;
+    float acc = 0.0f;
+    for (uint32_t i = lane; i < in_dim; i += 32u)
+        acc += __uint_as_float((uint32_t)wr[i] << 16u) * shx[i];
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
 /* Exact-order gfx1151 decode matvec.  Each lane retains the original
  * lane,lane+32,... accumulation sequence, but batches 64 independent weight
  * and LDS loads before consuming them.  This raises memory-level parallelism

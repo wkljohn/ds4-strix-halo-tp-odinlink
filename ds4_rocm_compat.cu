@@ -394,6 +394,14 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
         if (bases[i] > UINT64_MAX - row_offset) return 0;
         offsets[i] = bases[i] + row_offset;
     }
+    if (args->n_tokens == 1u) {
+        const int decode_multiptr =
+            ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
+                out_q, out_k, out_v, args->model_map, args->model_size,
+                offsets[0], offsets[1], offsets[2], in_dim, out_dim,
+                input, args->n_tokens);
+        if (decode_multiptr >= 0) return decode_multiptr;
+    }
     rocm_glm5_bf16_wmma_hilo_register_report();
     const int candidate = ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
         out_q, out_k, out_v, args->model_map, args->model_size,

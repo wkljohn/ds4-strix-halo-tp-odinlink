@@ -1658,6 +1658,47 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
                    "matmul_bf16 WMMA hi/lo QKV multiptr launch");
 }
 
+extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
+        ds4_gpu_tensor *out_q, ds4_gpu_tensor *out_k,
+        ds4_gpu_tensor *out_v, const void *model_map, uint64_t model_size,
+        uint64_t weight_q_offset, uint64_t weight_k_offset,
+        uint64_t weight_v_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    static const char *selector =
+        getenv("DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR");
+    if (!selector || strcmp(selector, "1") != 0) return -1;
+    if (!out_q || !out_k || !out_v || !x || !model_map || !out_q->ptr ||
+        !out_k->ptr || !out_v->ptr || !x->ptr || n_tok != 1u ||
+        in_dim != 4096u || out_dim == 0u || out_dim > 4096u ||
+        (out_dim & 7u) != 0u) return -1;
+    const uint64_t weight_elems = in_dim * out_dim;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    const uint64_t out_bytes = out_dim * sizeof(float);
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t) ||
+        out_q->bytes < out_bytes || out_k->bytes < out_bytes ||
+        out_v->bytes < out_bytes || x->bytes < in_dim * sizeof(float))
+        return 0;
+    const uint64_t offsets[] = {weight_q_offset, weight_k_offset,
+                                weight_v_offset};
+    const char *weights[3] = {};
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        if (offsets[i] > model_size || weight_bytes > model_size - offsets[i])
+            return 0;
+        weights[i] = cuda_model_range_ptr(model_map, offsets[i], weight_bytes,
+                                          "glm5_bf16_qkv_decode_multiptr");
+        if (!weights[i]) return 0;
+    }
+    matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel<<<
+        (unsigned)((out_dim + 7u) / 8u), 24u * 32u,
+        (size_t)in_dim * sizeof(float)>>>(
+        (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+        (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+        (const uint16_t *)weights[2], (const float *)x->ptr,
+        (uint32_t)in_dim, (uint32_t)out_dim);
+    return cuda_ok(cudaGetLastError(),
+                   "BF16 decode QKV multiptr launch");
+}
+
 static int matmul_bf16_f32_rowtile2x16_w32_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
