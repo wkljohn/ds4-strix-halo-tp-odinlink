@@ -273,10 +273,6 @@ start() {
     echo "warning: GLM-5.3 ordinary session integration is explicitly enabled; this is an experimental deployment" >&2
     common+=(DS4_GLM5_NEXT_ENABLE_ORDINARY=1)
   fi
-  if [[ $GLM5_FULL_LOGITS == 1 ]]; then
-    echo "warning: GLM full-logits TP mode is explicitly enabled; transport and memory cost may increase" >&2
-    common+=(DS4_TP_RANK0_FULL_LOGITS=1 DS4_TP_GREEDY_TOP2=0)
-  fi
   if [[ $DSPARK == 1 ]]; then
     echo "warning: DSpark is experimental and is not target-fingerprint exact" >&2
     decode_env=(
@@ -322,6 +318,11 @@ start() {
     support_args=()
   fi
   common+=("${decode_env[@]}")
+  if [[ $GLM5_FULL_LOGITS == 1 ]]; then
+    echo "warning: GLM full-logits TP mode is explicitly enabled; transport and memory cost may increase" >&2
+    # Append after ordinary decode defaults so the explicit server mode wins.
+    common+=(DS4_TP_RANK0_FULL_LOGITS=1 DS4_TP_GREEDY_TOP2=0)
+  fi
   worker=("${common[@]}" ./ds4 --role worker --tensor-parallel
     --coordinator "$COORDINATOR_RDMA_ADDR" "$TP_PORT" --transport rdma --rocm
     -m "$MODEL" -c "$CONTEXT" "${prefill_args[@]}"
