@@ -7339,6 +7339,23 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
     }
     if (unique.size() > cache->slots) return 0;
     cache->prepares++;
+    if (getenv("DS4_ROCM_GLM5_WINDOW_SET_PROFILE")) {
+        std::vector<int32_t> ordered = unique;
+        std::sort(ordered.begin(), ordered.end());
+        uint64_t set_hash = UINT64_C(1469598103934665603);
+        for (int32_t expert : ordered) {
+            const uint32_t bits = (uint32_t)expert;
+            for (unsigned b = 0; b < 4u; ++b) {
+                set_hash ^= (uint8_t)(bits >> (8u * b));
+                set_hash *= UINT64_C(1099511628211);
+            }
+        }
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM5 window set prepares=%llu pairs=%u unique=%zu "
+                "set_fnv64=%016llx\n",
+                (unsigned long long)cache->prepares, count, unique.size(),
+                (unsigned long long)set_hash);
+    }
 
     bool needs_fill = false;
     for (int32_t expert : unique) {
