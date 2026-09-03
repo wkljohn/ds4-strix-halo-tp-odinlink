@@ -337,7 +337,7 @@ __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
 #pragma unroll
         for (uint32_t u = 0u; u < PREFETCH; ++u) {
             const uint32_t index = i + u * 32u;
-            packed_w[u] = wr[index];
+            packed_w[u] = __builtin_nontemporal_load(&wr[index]);
             packed_x[u] = shx[index];
         }
 #pragma unroll
@@ -345,7 +345,7 @@ __global__ static void matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel(
             acc += __uint_as_float((uint32_t)packed_w[u] << 16u) * packed_x[u];
     }
     for (; i < in_dim; i += 32u)
-        acc += __uint_as_float((uint32_t)wr[i] << 16u) * shx[i];
+        acc += __uint_as_float((uint32_t)__builtin_nontemporal_load(&wr[i]) << 16u) * shx[i];
     acc = warp_sum_f32(acc);
     if (lane == 0u) out[row] = acc;
 }
