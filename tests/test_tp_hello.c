@@ -284,6 +284,12 @@ int main(void) {
     ok &= check("hello mismatched-glm5-sparse-batch-bridge",
                 DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x08000000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-sparse-batch-output",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT,
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT, 1, NULL);
+    ok &= check("hello mismatched-glm5-sparse-batch-output",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x10000000 peer=0x00000000)");
     ok &= check("hello q4k-wmma-kshard mismatch",
                 DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD,
                 DS4_TP_FEATURE_Q4K_WMMA, 0,
@@ -343,6 +349,16 @@ int main(void) {
     } else {
         fprintf(stderr,
                 "PASS GLM5 sparse-batch bridge feature is disjoint\n");
+    }
+    if ((DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT &
+         (prior_features | DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE)) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch output feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch output feature is disjoint\n");
     }
     if ((DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND & prior_features) != 0u) {
         fprintf(stderr,
@@ -440,6 +456,23 @@ int main(void) {
     } else {
         fprintf(stderr,
                 "PASS GLM5 sparse-batch bridge advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_sparse_batch_output_feature(
+            "1", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) !=
+            DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT ||
+        ds4_tp_glm5_sparse_batch_output_feature(
+            NULL, DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u ||
+        ds4_tp_glm5_sparse_batch_output_feature(
+            "0", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u ||
+        ds4_tp_glm5_sparse_batch_output_feature(
+            "true", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u ||
+        ds4_tp_glm5_sparse_batch_output_feature("1", 0u) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch output advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch output advertisement predicate\n");
     }
     if (ds4_tp_glm5_gpu_row_gate_feature(
             "1", DS4_TP_FEATURE_GLM5_SMALL_GATE, NULL) !=

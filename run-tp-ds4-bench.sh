@@ -263,6 +263,8 @@ ATTN_STATIC_DIRECT_REQUESTED=0
 ATTN_STATIC_DIRECT_T2_REQUESTED=0
 GLM5_SPARSE_BATCH_BRIDGE=0
 GLM5_SPARSE_BATCH_BRIDGE_SEEN=0
+GLM5_SPARSE_BATCH_OUTPUT=0
+GLM5_SPARSE_BATCH_OUTPUT_SEEN=0
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
@@ -295,6 +297,19 @@ for env_kv in "${EXTRA_ENV[@]}"; do
       [[ $GLM5_SPARSE_BATCH_BRIDGE == 0 ||
          $GLM5_SPARSE_BATCH_BRIDGE == 1 ]] || {
         echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_GLM5_SPARSE_BATCH_OUTPUT=*)
+      (( GLM5_SPARSE_BATCH_OUTPUT_SEEN == 0 )) || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_BATCH_OUTPUT=${env_kv#*=}
+      GLM5_SPARSE_BATCH_OUTPUT_SEEN=1
+      [[ $GLM5_SPARSE_BATCH_OUTPUT == 0 ||
+         $GLM5_SPARSE_BATCH_OUTPUT == 1 ]] || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT must be 0 or 1" >&2
         exit 2
       }
       ;;
@@ -412,8 +427,16 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
     }
     echo "warning: GLM5 batch=1 run is a scalar regression guard, not prefill performance evidence" >&2
   fi
+  if (( GLM5_SPARSE_BATCH_OUTPUT == 1 &&
+        GLM5_SPARSE_BATCH_BRIDGE != 1 )); then
+    echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT=1 requires DS4_GLM5_SPARSE_BATCH_BRIDGE=1" >&2
+    exit 2
+  fi
 elif (( GLM5_SPARSE_BATCH_BRIDGE_SEEN == 1 )); then
   echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_BATCH_OUTPUT_SEEN == 1 )); then
+  echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT applies only to GLM5 benchmarks" >&2
   exit 2
 elif (( GLM5_PREFILL_BATCH_SEEN == 1 )); then
   echo "error: DS4_GLM5_NEXT_PREFILL_BATCH applies only to GLM5 benchmarks" >&2

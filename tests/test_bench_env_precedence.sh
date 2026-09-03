@@ -6,24 +6,26 @@ test_dir=$(mktemp -d)
 trap 'rm -rf -- "$test_dir"' EXIT
 config=$test_dir/bench.env
 model=$test_dir/model.gguf
+glm_model=$test_dir/glm-model.gguf
 
 # Config-only validation still inspects model metadata so provider tests cannot
 # bypass architecture-specific safety checks. Generate the smallest valid GGUF
 # header with a non-GLM architecture instead of relying on /dev/null.
-python3 - "$model" <<'PY'
+python3 - "$model" "$glm_model" <<'PY'
 import struct
 import sys
 
 key = b"general.architecture"
-value = b"deepseek4"
-with open(sys.argv[1], "wb") as out:
-    out.write(b"GGUF")
-    out.write(struct.pack("<IQQ", 3, 0, 1))
-    out.write(struct.pack("<Q", len(key)))
-    out.write(key)
-    out.write(struct.pack("<I", 8))
-    out.write(struct.pack("<Q", len(value)))
-    out.write(value)
+for path, value in ((sys.argv[1], b"deepseek4"),
+                    (sys.argv[2], b"glm5-next")):
+    with open(path, "wb") as out:
+        out.write(b"GGUF")
+        out.write(struct.pack("<IQQ", 3, 0, 1))
+        out.write(struct.pack("<Q", len(key)))
+        out.write(key)
+        out.write(struct.pack("<I", 8))
+        out.write(struct.pack("<Q", len(value)))
+        out.write(value)
 PY
 
 printf '%s\n' \
@@ -105,3 +107,36 @@ if env -i PATH="$PATH" LANG=C.UTF-8 \
 fi
 grep -q 'ambient DS4_TP_EXPERT_SPLIT is not accepted' "$test_dir/split.out"
 echo 'PASS ambient-expert-split-still-rejected'
+
+if env -i PATH="$PATH" LANG=C.UTF-8 \
+    DS4_BENCH_CONFIG="$config" \
+    DS4_BENCH_VALIDATE_CONFIG_ONLY=1 \
+    DS4_BENCH_PROMPT_FILE=/dev/null \
+    "$repo/run-tp-ds4-bench.sh" sparse-output-parent "$glm_model" \
+    DS4_GLM5_NEXT_PREFILL_BATCH=256 \
+    DS4_GLM5_SPARSE_BATCH_OUTPUT=1 \
+    >"$test_dir/sparse-output-parent.out" 2>&1; then
+  echo 'FAIL sparse-output-requires-bridge: unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -q 'DS4_GLM5_SPARSE_BATCH_OUTPUT=1 requires DS4_GLM5_SPARSE_BATCH_BRIDGE=1' \
+  "$test_dir/sparse-output-parent.out"
+echo 'PASS sparse-output-requires-bridge'
+
+if env -i PATH="$PATH" LANG=C.UTF-8 \
+    DS4_BENCH_CONFIG="$config" \
+    DS4_BENCH_VALIDATE_CONFIG_ONLY=1 \
+    DS4_BENCH_PROMPT_FILE=/dev/null \
+    "$repo/run-tp-ds4-bench.sh" sparse-output-valid "$glm_model" \
+    DS4_GLM5_NEXT_PREFILL_BATCH=256 \
+    DS4_GLM5_SPARSE_BATCH_BRIDGE=1 \
+    DS4_GLM5_SPARSE_BATCH_OUTPUT=1 \
+    >"$test_dir/sparse-output-valid.out" 2>&1; then
+  echo 'FAIL sparse-output-with-bridge: incomplete fake model unexpectedly succeeded' >&2
+  exit 1
+fi
+! grep -q 'requires DS4_GLM5_SPARSE_BATCH_BRIDGE=1' \
+  "$test_dir/sparse-output-valid.out"
+grep -q 'unsupported routed-expert quantization' \
+  "$test_dir/sparse-output-valid.out"
+echo 'PASS sparse-output-with-bridge'

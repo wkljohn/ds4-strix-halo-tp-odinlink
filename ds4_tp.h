@@ -126,6 +126,9 @@ enum {
      * causal row order while its output exchange and routed FFN are tile-wide.
      * Both independently launched ranks must negotiate the same schedule. */
     DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE = UINT32_C(1) << 27,
+    /* Batch only the Q8 attention-output projection after sparse indexed MLA
+     * rows have completed in their established causal order. */
+    DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT = UINT32_C(1) << 28,
 };
 
 static inline uint32_t ds4_tp_glm5_kda_tp_feature(
@@ -165,6 +168,14 @@ static inline uint32_t ds4_tp_glm5_sparse_batch_bridge_feature(
     return env && env[0] == '1' && env[1] == '\0' && glm5_next &&
            rocm_ready && !mtp_or_dspark
         ? DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_sparse_batch_output_feature(
+        const char *env,
+        uint32_t runtime_features) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u
+        ? DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT : 0u;
 }
 
 static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(
