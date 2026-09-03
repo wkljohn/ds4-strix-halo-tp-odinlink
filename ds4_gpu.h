@@ -1007,6 +1007,25 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Research microbenchmark entry point. It is not selected by production
+ * inference and exists to compare exact-order Q8 decode schedules on real
+ * mapped GGUF tensor slices. */
+int ds4_gpu_rocm_q8_sharedx_prefetch_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              full_in_dim,
+        uint64_t              full_out_dim,
+        uint64_t              in_start,
+        uint64_t              in_count,
+        uint64_t              out_start,
+        uint64_t              out_count,
+        const ds4_gpu_tensor *x,
+        uint32_t              prefetch,
+        int                   nontemporal,
+        uint32_t              rows_per_block);
+
 int ds4_gpu_attention_q_b_qnorm_rope_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,

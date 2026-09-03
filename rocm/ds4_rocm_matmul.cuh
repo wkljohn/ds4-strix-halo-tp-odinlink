@@ -752,19 +752,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             cuda_runtime_config()->q8_decode_sharedx_64k;
         if ((in_dim & 31u) == 0u &&
             (in_dim <= 8192u || extended_sharedx)) {
-            const unsigned rows_per_block = 32u;
-            const unsigned threads = rows_per_block * 32u;
-            matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
-                    (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
-                    threads,
-                    (size_t)in_dim * sizeof(float)>>>(
+            const cudaError_t launch_err =
+                cuda_launch_q8_sharedx_glm5_candidate(
                     (float *)out->ptr,
                     reinterpret_cast<const unsigned char *>(wptr),
-                    (const float *)x->ptr,
-                    (uint32_t)blocks,
-                    out_dim,
+                    (const float *)x->ptr, (uint32_t)blocks, out_dim,
                     blocks * 34u);
-            const cudaError_t launch_err = cudaGetLastError();
             if (launch_err == cudaSuccess) {
                 if (extended_sharedx) {
                     static int notice_printed = 0;
@@ -995,6 +988,71 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
+}
+
+extern "C" int ds4_gpu_rocm_q8_sharedx_prefetch_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t full_out_dim,
+        uint64_t in_start, uint64_t in_count, uint64_t out_start,
+        uint64_t out_count, const ds4_gpu_tensor *x, uint32_t prefetch,
+        int nontemporal, uint32_t rows_per_block) {
+    if (!out || !x || !model_map || full_in_dim == 0u || full_out_dim == 0u ||
+        in_count == 0u || out_count == 0u || (full_in_dim & 31u) != 0u ||
+        (in_start & 31u) != 0u || (in_count & 31u) != 0u ||
+        in_start > full_in_dim || in_count > full_in_dim - in_start ||
+        out_start > full_out_dim || out_count > full_out_dim - out_start ||
+        in_count > 16384u || rows_per_block == 0u || rows_per_block > 32u ||
+        (rows_per_block & (rows_per_block - 1u)) != 0u ||
+        x->bytes < in_count * sizeof(float) ||
+        out->bytes < out_count * sizeof(float)) return 0;
+    if (prefetch != 0u && prefetch != 4u && prefetch != 8u &&
+        prefetch != 16u && prefetch != 32u) return 0;
+    const uint64_t full_blocks = full_in_dim / 32u;
+    const uint64_t slice_blocks = in_count / 32u;
+    const uint64_t row_bytes = full_blocks * 34u;
+    uint64_t weight_bytes = 0u;
+    if (!cuda_u64_mul_checked(full_out_dim, row_bytes, &weight_bytes) ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset)
+        return 0;
+    const char *base = cuda_model_range_ptr(model_map, weight_offset,
+                                             weight_bytes,
+                                             "q8 sharedx prefetch bench");
+    if (!base) return 0;
+    const unsigned char *weight =
+        reinterpret_cast<const unsigned char *>(base) +
+        out_start * row_bytes + (in_start / 32u) * 34u;
+    const dim3 grid((unsigned)((out_count + rows_per_block - 1u) /
+                               rows_per_block));
+    const dim3 block(rows_per_block * 32u);
+    const size_t shared_bytes = (size_t)in_count * sizeof(float);
+    if (prefetch == 0u) {
+        matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
+            grid, block, shared_bytes>>>((float *)out->ptr, weight,
+                                         (const float *)x->ptr,
+                                         (uint32_t)slice_blocks, out_count,
+                                         row_bytes);
+    } else {
+#define DS4_LAUNCH_Q8_PREFETCH(P, NT) \
+        matmul_q8_0_f32_sharedx_exact_prefetch_warp_rows_w32_kernel< \
+            P, NT><<<grid, block, shared_bytes>>>( \
+                (float *)out->ptr, weight, (const float *)x->ptr, \
+                (uint32_t)slice_blocks, out_count, row_bytes)
+        if (prefetch == 4u) {
+            if (nontemporal) DS4_LAUNCH_Q8_PREFETCH(4u, true);
+            else DS4_LAUNCH_Q8_PREFETCH(4u, false);
+        } else if (prefetch == 8u) {
+            if (nontemporal) DS4_LAUNCH_Q8_PREFETCH(8u, true);
+            else DS4_LAUNCH_Q8_PREFETCH(8u, false);
+        } else if (prefetch == 16u) {
+            if (nontemporal) DS4_LAUNCH_Q8_PREFETCH(16u, true);
+            else DS4_LAUNCH_Q8_PREFETCH(16u, false);
+        } else {
+            if (nontemporal) DS4_LAUNCH_Q8_PREFETCH(32u, true);
+            else DS4_LAUNCH_Q8_PREFETCH(32u, false);
+        }
+#undef DS4_LAUNCH_Q8_PREFETCH
+    }
+    return cuda_ok(cudaGetLastError(), "Q8 sharedx prefetch bench launch");
 }
 
 extern "C" int ds4_gpu_attention_q_b_qnorm_rope_q8_0_tensor(
@@ -2521,17 +2579,13 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
                 row_bytes);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 kslice rows pack4 launch");
     }
-    matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
-            (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
-            threads,
-            (size_t)in_count * sizeof(float)>>>(
-            (float *)out->ptr,
-            reinterpret_cast<const unsigned char *>(wptr) + block_start * 34u,
-            (const float *)x->ptr,
-            (uint32_t)slice_blocks,
-            out_dim,
-            row_bytes);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0 kslice rows launch");
+    return cuda_ok(cuda_launch_q8_sharedx_glm5_candidate(
+                       (float *)out->ptr,
+                       reinterpret_cast<const unsigned char *>(wptr) +
+                           block_start * 34u,
+                       (const float *)x->ptr, (uint32_t)slice_blocks,
+                       out_dim, row_bytes),
+                   "matmul_q8_0 kslice rows launch");
 }
 
 /* GLM-5.3 MLA produces full-width head rows but each TP rank owns one
