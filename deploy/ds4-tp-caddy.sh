@@ -44,6 +44,7 @@ fi
 TP_TIMEOUT_SEC=${TP_TIMEOUT_SEC:-60}
 DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0}
 DSPARK=${DSPARK:-0}
+GLM5_ENABLE_ORDINARY=${GLM5_ENABLE_ORDINARY:-0}
 PREFILL_FFN_WAVEFRONT=${PREFILL_FFN_WAVEFRONT:-1}
 Q8_M256_K128=${Q8_M256_K128:-1}
 HC_STAGE_EXACT_COOP=${HC_STAGE_EXACT_COOP:-1}
@@ -79,6 +80,9 @@ is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$EXPERT_SPLIT" &&
   }
 (( EXPERT_SPLIT < 256 )) || { echo "error: expert split must be in 1..255" >&2; exit 2; }
 [[ $DSPARK == 0 || $DSPARK == 1 ]] || { echo "error: DSPARK must be 0 or 1" >&2; exit 2; }
+[[ $GLM5_ENABLE_ORDINARY == 0 || $GLM5_ENABLE_ORDINARY == 1 ]] || {
+  echo "error: GLM5_ENABLE_ORDINARY must be 0 or 1" >&2; exit 2;
+}
 [[ $PREFILL_FFN_WAVEFRONT == 0 || $PREFILL_FFN_WAVEFRONT == 1 ]] || {
   echo "error: PREFILL_FFN_WAVEFRONT must be 0 or 1" >&2; exit 2;
 }
@@ -255,6 +259,10 @@ start() {
     DS4_ROCM_STREAM_Q8_F16_CACHE_GB=0
     DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
     DS4_ROCM_Q4K_DECODE_STAGE_XQ=1)
+  if [[ $GLM5_ENABLE_ORDINARY == 1 ]]; then
+    echo "warning: GLM-5.3 ordinary session integration is explicitly enabled; this is an experimental deployment" >&2
+    common+=(DS4_GLM5_NEXT_ENABLE_ORDINARY=1)
+  fi
   if [[ $DSPARK == 1 ]]; then
     echo "warning: DSpark is experimental and is not target-fingerprint exact" >&2
     decode_env=(
