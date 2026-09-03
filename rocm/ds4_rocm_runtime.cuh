@@ -7343,18 +7343,26 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
         std::vector<int32_t> ordered = unique;
         std::sort(ordered.begin(), ordered.end());
         uint64_t set_hash = UINT64_C(1469598103934665603);
+        uint64_t set_bits[5] = {};
         for (int32_t expert : ordered) {
             const uint32_t bits = (uint32_t)expert;
             for (unsigned b = 0; b < 4u; ++b) {
                 set_hash ^= (uint8_t)(bits >> (8u * b));
                 set_hash *= UINT64_C(1099511628211);
             }
+            set_bits[(uint32_t)expert >> 6u] |=
+                UINT64_C(1) << ((uint32_t)expert & 63u);
         }
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "GLM5 window set prepares=%llu pairs=%u unique=%zu "
-                "set_fnv64=%016llx\n",
+                "set_fnv64=%016llx bits=%016llx:%016llx:%016llx:%016llx:%016llx\n",
                 (unsigned long long)cache->prepares, count, unique.size(),
-                (unsigned long long)set_hash);
+                (unsigned long long)set_hash,
+                (unsigned long long)set_bits[0],
+                (unsigned long long)set_bits[1],
+                (unsigned long long)set_bits[2],
+                (unsigned long long)set_bits[3],
+                (unsigned long long)set_bits[4]);
     }
 
     bool needs_fill = false;
