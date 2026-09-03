@@ -1193,14 +1193,24 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
     "$GLM5_SPARSE_ATTN_HEAD_SHARED" "$GLM5_SPARSE_ATTN_F16_GEMM"
 fi
 if [[ $GLM5_BF16_WMMA_HILO == 1 ]]; then
-  wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
-  for wmma_log in "$COORD_LOG" "$WORKER_LOG"; do
-    grep -Eq "$wmma_summary_re" "$wmma_log" || {
-      echo "error: GLM5 BF16 WMMA hi/lo engagement proof failed in $wmma_log" >&2
-      exit 1
-    }
-  done
-  echo "validated_glm5_bf16_wmma_hilo=both-ranks,qkv-output-engaged,hard-failure:0"
+  if [[ $MODEL_ARCH == glm5-next ]]; then
+    wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+    for wmma_log in "$COORD_LOG" "$WORKER_LOG"; do
+      grep -Eq "$wmma_summary_re" "$wmma_log" || {
+        echo "error: GLM5 BF16 WMMA hi/lo engagement proof failed in $wmma_log" >&2
+        exit 1
+      }
+    done
+    echo "validated_glm5_bf16_wmma_hilo=both-ranks,qkv-output-engaged,hard-failure:0"
+  else
+    for wmma_log in "$COORD_LOG" "$WORKER_LOG"; do
+      ! grep -q 'GLM5 BF16 WMMA hi/lo summary' "$wmma_log" || {
+        echo "error: GLM5-only BF16 WMMA path engaged for $MODEL_ARCH in $wmma_log" >&2
+        exit 1
+      }
+    done
+    echo "validated_glm5_bf16_wmma_hilo=non-glm-refusal,model-arch:$MODEL_ARCH"
+  fi
 fi
 if [[ $DECODE_SELF_CHECK == 1 ]]; then
   grep -q 'ds4-bench: decode self-check complete .*argmax_mismatches=0 ' \
