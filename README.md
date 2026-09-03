@@ -25,7 +25,9 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **233.04 t/s** | **19.17 t/s** | three-run median, exact fingerprint |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **255.49 t/s** | **21.01 t/s** | current GLM-branch probe; exact FNV `2a44e523bf2d7947` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
-| **GLM-5.3 Flash Q4_K over RoCE v2** | staged TP=2, diverse 4,096 prefill + 300 decode, batch 256 | **89.32 t/s** | **10.20 t/s** | decode-multipointer median; exact FNV `9012bd4d7c5ce422`; branch `968d0b9` |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | three source-clean runs, diverse 4,096 prefill + 300 decode, batch 256 | **78.59 t/s** | **9.45 t/s** | median of 78.59/9.45, 77.78/9.54, 79.05/9.42; FNV `9012bd4d7c5ce422`; branch `ee9ca90` |
+| **GLM-5.3 Flash Q4_K over OdinLink** | one matched provider run, diverse 4,096 prefill + 300 decode, batch 256 | **76.00 t/s** | **9.43 t/s** | zero fallback; FNV `9012bd4d7c5ce422`; branch `ee9ca90` |
+| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048-token control workload | **21.87–21.95 t/s** | **3.48–3.49 t/s** | opt-in mixed IQ2_XXS/Q2_K path; repeated fingerprint matched the main control |
 
 Current rows use `ds4-bench-tp`: a fixed 2,048-token prefill followed by 300
 generated tokens over mandatory RDMA. The current Q4_K rows use the Antirez
@@ -38,9 +40,12 @@ release results.
 
 GLM-5.3 Flash support is an experimental TP=2 staged path in this branch; it
 keeps the model's KDA state sharded by attention head and does not change the
-validated DeepSeek production path. Its row uses the opt-in exact aligned pool
-publication path (`DS4_ROCM_GLM5_BATCH_POOL_STAGE=1`). Full GLM session
-integration remains fail-closed until promoted.
+validated DeepSeek production path. The branch launcher applies the validated
+cache-free GLM staged environment and the full-logits sampling contract. The
+sampling-mode correction is documented in
+`research-results/glm5-next-tp2/deployment-debug-20260903.md`; the full staged
+optimization record is in
+`research-results/glm5-next-tp2/staged-optimization-plan-20260901.md`.
 
 The ordinary benchmark and deployment launchers enable the validated ordered
 ROCm TP callback, temporal-compressor schedule, shape-gated M256/K128 Q8
