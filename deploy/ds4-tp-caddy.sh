@@ -46,6 +46,7 @@ DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0}
 DSPARK=${DSPARK:-0}
 GLM5_ENABLE_ORDINARY=${GLM5_ENABLE_ORDINARY:-0}
 GLM5_FULL_LOGITS=${GLM5_FULL_LOGITS:-0}
+GLM5_PREFILL_BATCH=${GLM5_PREFILL_BATCH:-256}
 PREFILL_FFN_WAVEFRONT=${PREFILL_FFN_WAVEFRONT:-1}
 Q8_M256_K128=${Q8_M256_K128:-1}
 HC_STAGE_EXACT_COOP=${HC_STAGE_EXACT_COOP:-1}
@@ -86,6 +87,9 @@ is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$EXPERT_SPLIT" &&
 }
 [[ $GLM5_FULL_LOGITS == 0 || $GLM5_FULL_LOGITS == 1 ]] || {
   echo "error: GLM5_FULL_LOGITS must be 0 or 1" >&2; exit 2;
+}
+is_uint "$GLM5_PREFILL_BATCH" || {
+  echo "error: GLM5_PREFILL_BATCH must be a positive integer" >&2; exit 2;
 }
 [[ $PREFILL_FFN_WAVEFRONT == 0 || $PREFILL_FFN_WAVEFRONT == 1 ]] || {
   echo "error: PREFILL_FFN_WAVEFRONT must be 0 or 1" >&2; exit 2;
@@ -271,7 +275,8 @@ start() {
     DS4_ROCM_Q4K_DECODE_STAGE_XQ=1)
   if [[ $GLM5_ENABLE_ORDINARY == 1 ]]; then
     echo "warning: GLM-5.3 ordinary session integration is explicitly enabled; this is an experimental deployment" >&2
-    common+=(DS4_GLM5_NEXT_ENABLE_ORDINARY=1)
+    common+=(DS4_GLM5_NEXT_ENABLE_ORDINARY=1
+             DS4_GLM5_NEXT_PREFILL_BATCH="$GLM5_PREFILL_BATCH")
   fi
   if [[ $DSPARK == 1 ]]; then
     echo "warning: DSpark is experimental and is not target-fingerprint exact" >&2
