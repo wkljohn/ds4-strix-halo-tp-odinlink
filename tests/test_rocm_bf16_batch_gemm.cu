@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
+#include <rocwmma/rocwmma.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -138,6 +139,275 @@ __global__ void weight_once_bf16_f32_m256_kernel(
         __syncthreads();
     }
     out[(uint64_t)tid * out_dim + row] = token_sums[tid];
+}
+
+/* Benchmark-only native gfx11 BF16 WMMA ceiling.  Each wave owns one 16x16
+ * C tile, so every weight element is fetched once per 16-token M tile instead
+ * of once per 32-token production chunk.  Eight waves share a workgroup and
+ * cover adjacent N tiles without staging or retaining a second weight copy.
+ * This deliberately consumes BF16 activations and is therefore a Lane-B
+ * numerical ceiling, not a production candidate. */
+template <uint32_t NWaves>
+__global__ __launch_bounds__(NWaves * 32u, 1)
+void bf16_wmma_m256_ceiling_kernel(
+        float *out, const uint16_t *weight, const uint16_t *x,
+        uint32_t in_dim, uint32_t out_dim) {
+    constexpr uint32_t BM = 16u;
+    constexpr uint32_t BN = 16u;
+    constexpr uint32_t BK = 16u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    const uint32_t m0 = blockIdx.y * BM;
+    const uint32_t n0 = (blockIdx.x * NWaves + wave) * BN;
+    if (wave >= NWaves || m0 >= kPrefillTokens || n0 >= out_dim) return;
+
+    using Bf16 = rocwmma::bfloat16_t;
+    using FragA = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK,
+                                     Bf16, rocwmma::col_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK,
+                                     float>;
+    FragA a;
+    FragB b;
+    FragC acc;
+    rocwmma::fill_fragment(acc, 0.0f);
+    const Bf16 *xb = reinterpret_cast<const Bf16 *>(x);
+    const Bf16 *wb = reinterpret_cast<const Bf16 *>(weight);
+    for (uint32_t k0 = 0u; k0 < in_dim; k0 += BK) {
+        rocwmma::load_matrix_sync(a, xb + (uint64_t)m0 * in_dim + k0,
+                                  in_dim);
+        rocwmma::load_matrix_sync(b, wb + (uint64_t)n0 * in_dim + k0,
+                                  in_dim);
+        rocwmma::mma_sync(acc, a, b, acc);
+    }
+    rocwmma::store_matrix_sync(out + (uint64_t)m0 * out_dim + n0,
+                               acc, out_dim, rocwmma::mem_row_major);
+}
+
+/* Weight-once cooperative WMMA geometry.  Sixteen M waves consume the same
+ * staged B tile, covering all 256 prompt rows before it is discarded.  An
+ * optional second N tile shares the same 256x16 A panel; testing 16 and 32
+ * waves makes the occupancy/extra-reuse tradeoff explicit on gfx1151. */
+template <uint32_t NTilesN>
+__global__ __launch_bounds__(16u * NTilesN * 32u, 1)
+void bf16_wmma_m256_weight_once_kernel(
+        float *out, const uint16_t *weight, const uint16_t *x,
+        uint32_t in_dim, uint32_t out_dim) {
+    constexpr uint32_t BM = 16u;
+    constexpr uint32_t BN = 16u;
+    constexpr uint32_t BK = 16u;
+    constexpr uint32_t MTiles = kPrefillTokens / BM;
+    constexpr uint32_t NWaves = MTiles * NTilesN;
+    __shared__ uint16_t sh_a[kPrefillTokens * BK];
+    __shared__ uint16_t sh_b[NTilesN * BK * BN];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t mt = wave % MTiles;
+    const uint32_t nt = wave / MTiles;
+    const uint32_t n0 = (blockIdx.x * NTilesN + nt) * BN;
+
+    using Bf16 = rocwmma::bfloat16_t;
+    using FragA = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK,
+                                     float>;
+    FragA a;
+    FragB b;
+    FragC acc;
+    rocwmma::fill_fragment(acc, 0.0f);
+    const uint16_t *xb = x;
+    for (uint32_t k0 = 0u; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < kPrefillTokens * BK; j += NWaves * 32u) {
+            const uint32_t m = j / BK;
+            const uint32_t kk = j % BK;
+            sh_a[j] = xb[(uint64_t)m * in_dim + k0 + kk];
+        }
+        for (uint32_t j = tid; j < NTilesN * BK * BN; j += NWaves * 32u) {
+            const uint32_t tile_n = j / (BK * BN);
+            const uint32_t rem = j % (BK * BN);
+            const uint32_t kk = rem / BN;
+            const uint32_t nn = rem % BN;
+            const uint32_t n = (blockIdx.x * NTilesN + tile_n) * BN + nn;
+            sh_b[j] = n < out_dim
+                ? weight[(uint64_t)n * in_dim + k0 + kk]
+                : 0u;
+        }
+        __syncthreads();
+        rocwmma::load_matrix_sync(
+            a, reinterpret_cast<const Bf16 *>(sh_a + mt * BM * BK), BK);
+        rocwmma::load_matrix_sync(
+            b, reinterpret_cast<const Bf16 *>(sh_b + nt * BK * BN), BN);
+        rocwmma::mma_sync(acc, a, b, acc);
+        __syncthreads();
+    }
+    if (n0 < out_dim) {
+        rocwmma::store_matrix_sync(
+            out + (uint64_t)(mt * BM) * out_dim + n0,
+            acc, out_dim, rocwmma::mem_row_major);
+    }
+}
+
+/* Same 16-wave M coverage, with each wave retaining multiple adjacent N
+ * accumulators.  This shares A across N without forcing a 1,024-thread block;
+ * N=2 and N=4 expose the VGPR-versus-input-traffic knee. */
+template <uint32_t NTilesN>
+__global__ __launch_bounds__(16u * 32u, 1)
+void bf16_wmma_m256_multin_kernel(
+        float *out, const uint16_t *weight, const uint16_t *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t tokens) {
+    constexpr uint32_t BM = 16u;
+    constexpr uint32_t BN = 16u;
+    constexpr uint32_t BK = 16u;
+    constexpr uint32_t MTiles = kPrefillTokens / BM;
+    constexpr uint32_t NThreads = MTiles * 32u;
+    __shared__ uint16_t sh_a[kPrefillTokens * BK];
+    __shared__ uint16_t sh_b[NTilesN * BK * BN];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t mt = tid >> 5u;
+    const uint32_t nbase = blockIdx.x * NTilesN * BN;
+    const uint32_t mbase = blockIdx.y * kPrefillTokens;
+    if (mbase >= tokens) return;
+
+    using Bf16 = rocwmma::bfloat16_t;
+    using FragA = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK,
+                                     float>;
+    FragA a;
+    FragB b;
+    FragC acc[NTilesN];
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt)
+        rocwmma::fill_fragment(acc[nt], 0.0f);
+    for (uint32_t k0 = 0u; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < kPrefillTokens * BK; j += NThreads) {
+            const uint32_t m = j / BK;
+            const uint32_t kk = j % BK;
+            const uint32_t global_m = mbase + m;
+            sh_a[j] = global_m < tokens
+                ? x[(uint64_t)global_m * in_dim + k0 + kk]
+                : 0u;
+        }
+        for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
+            const uint32_t nt = j / (BK * BN);
+            const uint32_t rem = j % (BK * BN);
+            const uint32_t kk = rem / BN;
+            const uint32_t nn = rem % BN;
+            const uint32_t n = nbase + nt * BN + nn;
+            sh_b[j] = n < out_dim
+                ? weight[(uint64_t)n * in_dim + k0 + kk]
+                : 0u;
+        }
+        __syncthreads();
+        rocwmma::load_matrix_sync(
+            a, reinterpret_cast<const Bf16 *>(sh_a + mt * BM * BK), BK);
+#pragma unroll
+        for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+            rocwmma::load_matrix_sync(
+                b, reinterpret_cast<const Bf16 *>(sh_b + nt * BK * BN), BN);
+            rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+        const uint32_t n0 = nbase + nt * BN;
+        if (n0 < out_dim && mbase + mt * BM < tokens)
+            rocwmma::store_matrix_sync(
+                out + (uint64_t)(mbase + mt * BM) * out_dim + n0,
+                acc[nt], out_dim, rocwmma::mem_row_major);
+    }
+}
+
+/* Precision-repaired WMMA ceiling: x = bf16_hi(x) + bf16_lo(x-hi).
+ * BF16 weights are exact model storage, so two WMMA products recover most of
+ * the F32-activation path's precision while retaining weight-once execution.
+ * Both activation fragments are tile-local; there is no expanded persistent
+ * activation or weight allocation. */
+template <uint32_t NTilesN>
+__global__ __launch_bounds__(16u * 32u, 1)
+void bf16_wmma_m256_multin_hilo_kernel(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t tokens) {
+    constexpr uint32_t BM = 16u;
+    constexpr uint32_t BN = 16u;
+    constexpr uint32_t BK = 16u;
+    constexpr uint32_t MTiles = kPrefillTokens / BM;
+    constexpr uint32_t NThreads = MTiles * 32u;
+    __shared__ uint16_t sh_a_hi[kPrefillTokens * BK];
+    __shared__ uint16_t sh_a_lo[kPrefillTokens * BK];
+    __shared__ uint16_t sh_b[NTilesN * BK * BN];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t mt = tid >> 5u;
+    const uint32_t nbase = blockIdx.x * NTilesN * BN;
+    const uint32_t mbase = blockIdx.y * kPrefillTokens;
+    if (mbase >= tokens) return;
+
+    using Bf16 = rocwmma::bfloat16_t;
+    using FragA = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK,
+                                     float>;
+    FragA a;
+    FragB b;
+    FragC acc[NTilesN];
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt)
+        rocwmma::fill_fragment(acc[nt], 0.0f);
+    for (uint32_t k0 = 0u; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < kPrefillTokens * BK; j += NThreads) {
+            const uint32_t m = j / BK;
+            const uint32_t kk = j % BK;
+            const uint32_t global_m = mbase + m;
+            if (global_m < tokens) {
+                const float xv = x[(uint64_t)global_m * in_dim + k0 + kk];
+                const uint16_t hi = bf16_rne_device(xv);
+                const float hi_f = __uint_as_float((uint32_t)hi << 16u);
+                sh_a_hi[j] = hi;
+                sh_a_lo[j] = bf16_rne_device(xv - hi_f);
+            } else {
+                sh_a_hi[j] = 0u;
+                sh_a_lo[j] = 0u;
+            }
+        }
+        for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
+            const uint32_t nt = j / (BK * BN);
+            const uint32_t rem = j % (BK * BN);
+            const uint32_t kk = rem / BN;
+            const uint32_t nn = rem % BN;
+            const uint32_t n = nbase + nt * BN + nn;
+            sh_b[j] = n < out_dim
+                ? weight[(uint64_t)n * in_dim + k0 + kk]
+                : 0u;
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+            rocwmma::load_matrix_sync(
+                b, reinterpret_cast<const Bf16 *>(sh_b + nt * BK * BN), BN);
+            rocwmma::load_matrix_sync(
+                a, reinterpret_cast<const Bf16 *>(sh_a_hi + mt * BM * BK), BK);
+            rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+            rocwmma::load_matrix_sync(
+                a, reinterpret_cast<const Bf16 *>(sh_a_lo + mt * BM * BK), BK);
+            rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+        const uint32_t n0 = nbase + nt * BN;
+        if (n0 < out_dim && mbase + mt * BM < tokens)
+            rocwmma::store_matrix_sync(
+                out + (uint64_t)(mbase + mt * BM) * out_dim + n0,
+                acc[nt], out_dim, rocwmma::mem_row_major);
+    }
 }
 
 void launch_segmented_tiled(float *out, const uint16_t *weight,
@@ -417,6 +687,10 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
     float *d_x = nullptr, *d_reference = nullptr;
     float *d_production = nullptr, *d_blas = nullptr;
     float *d_weight_once = nullptr;
+    float *d_wmma = nullptr, *d_wmma_weight_once_1 = nullptr;
+    float *d_wmma_weight_once_2 = nullptr;
+    float *d_wmma_multin_2 = nullptr, *d_wmma_multin_4 = nullptr;
+    float *d_wmma_hilo_2 = nullptr;
     float *d_lowrank = nullptr;
     uint16_t *d_x_bf16 = nullptr;
     hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
@@ -431,6 +705,18 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
            "allocate M256 hipBLAS output");
     hip_ok(hipMalloc(&d_weight_once, out_count * sizeof(float)),
            "allocate M256 weight-once output");
+    hip_ok(hipMalloc(&d_wmma, out_count * sizeof(float)),
+           "allocate M256 WMMA output");
+    hip_ok(hipMalloc(&d_wmma_weight_once_1, out_count * sizeof(float)),
+           "allocate M256 cooperative WMMA N1 output");
+    hip_ok(hipMalloc(&d_wmma_weight_once_2, out_count * sizeof(float)),
+           "allocate M256 cooperative WMMA N2 output");
+    hip_ok(hipMalloc(&d_wmma_multin_2, out_count * sizeof(float)),
+           "allocate M256 multi-N WMMA N2 output");
+    hip_ok(hipMalloc(&d_wmma_multin_4, out_count * sizeof(float)),
+           "allocate M256 multi-N WMMA N4 output");
+    hip_ok(hipMalloc(&d_wmma_hilo_2, out_count * sizeof(float)),
+           "allocate M256 hi/lo WMMA N2 output");
     if (in_dim == 128u)
         hip_ok(hipMalloc(&d_lowrank, out_count * sizeof(float)),
                "allocate M256 low-rank output");
@@ -465,6 +751,51 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
                     HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT),
                 "M256 BF16 hipBLAS GEMM");
     };
+    const auto wmma = [&] {
+        constexpr uint32_t kWmmaWaves = 8u;
+        bf16_wmma_m256_ceiling_kernel<kWmmaWaves><<<
+            dim3((out_dim + kWmmaWaves * 16u - 1u) /
+                     (kWmmaWaves * 16u),
+                 (kPrefillTokens + 15u) / 16u),
+            kWmmaWaves * 32u>>>(d_wmma, weight, d_x_bf16,
+                                in_dim, out_dim);
+        hip_ok(hipGetLastError(), "M256 BF16 WMMA launch");
+    };
+    const auto wmma_weight_once_1 = [&] {
+        bf16_wmma_m256_weight_once_kernel<1u><<<
+            (out_dim + 15u) / 16u, 16u * 32u>>>(
+                d_wmma_weight_once_1, weight, d_x_bf16,
+                in_dim, out_dim);
+        hip_ok(hipGetLastError(), "M256 cooperative WMMA N1 launch");
+    };
+    const auto wmma_weight_once_2 = [&] {
+        bf16_wmma_m256_weight_once_kernel<2u><<<
+            (out_dim + 31u) / 32u, 32u * 32u>>>(
+                d_wmma_weight_once_2, weight, d_x_bf16,
+                in_dim, out_dim);
+        hip_ok(hipGetLastError(), "M256 cooperative WMMA N2 launch");
+    };
+    const auto wmma_multin_2 = [&] {
+        bf16_wmma_m256_multin_kernel<2u><<<
+            dim3((out_dim + 31u) / 32u, 1u), 16u * 32u>>>(
+                d_wmma_multin_2, weight, d_x_bf16, in_dim, out_dim,
+                kPrefillTokens);
+        hip_ok(hipGetLastError(), "M256 multi-N WMMA N2 launch");
+    };
+    const auto wmma_multin_4 = [&] {
+        bf16_wmma_m256_multin_kernel<4u><<<
+            dim3((out_dim + 63u) / 64u, 1u), 16u * 32u>>>(
+                d_wmma_multin_4, weight, d_x_bf16, in_dim, out_dim,
+                kPrefillTokens);
+        hip_ok(hipGetLastError(), "M256 multi-N WMMA N4 launch");
+    };
+    const auto wmma_hilo_2 = [&] {
+        bf16_wmma_m256_multin_hilo_kernel<2u><<<
+            dim3((out_dim + 31u) / 32u, 1u), 16u * 32u>>>(
+                d_wmma_hilo_2, weight, d_x, in_dim, out_dim,
+                kPrefillTokens);
+        hip_ok(hipGetLastError(), "M256 hi/lo WMMA N2 launch");
+    };
 
     current_bf16_f32_kernel<<<dim3(out_dim, kPrefillTokens), kThreads>>>(
         d_reference, weight, d_x, in_dim, out_dim, kPrefillTokens);
@@ -473,14 +804,32 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
     const float weight_once_ms = time_ms(weight_once);
     const float lowrank_ms = in_dim == 128u ? time_ms(lowrank) : 0.0f;
     const float blas_ms = time_ms(blas);
+    const float wmma_ms = time_ms(wmma);
+    const float wmma_weight_once_1_ms = time_ms(wmma_weight_once_1);
+    const float wmma_weight_once_2_ms = time_ms(wmma_weight_once_2);
+    const float wmma_multin_2_ms = time_ms(wmma_multin_2);
+    const float wmma_multin_4_ms = time_ms(wmma_multin_4);
+    const float wmma_hilo_2_ms = time_ms(wmma_hilo_2);
     production();
     weight_once();
     if (in_dim == 128u) lowrank();
     blas();
+    wmma();
+    wmma_weight_once_1();
+    wmma_weight_once_2();
+    wmma_multin_2();
+    wmma_multin_4();
+    wmma_hilo_2();
     hip_ok(hipDeviceSynchronize(), "M256 output synchronize");
 
     std::vector<float> reference(out_count), production_output(out_count);
     std::vector<float> weight_once_output(out_count), blas_output(out_count);
+    std::vector<float> wmma_output(out_count);
+    std::vector<float> wmma_weight_once_1_output(out_count);
+    std::vector<float> wmma_weight_once_2_output(out_count);
+    std::vector<float> wmma_multin_2_output(out_count);
+    std::vector<float> wmma_multin_4_output(out_count);
+    std::vector<float> wmma_hilo_2_output(out_count);
     std::vector<float> lowrank_output;
     hip_ok(hipMemcpy(reference.data(), d_reference,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
@@ -500,15 +849,55 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
     hip_ok(hipMemcpy(blas_output.data(), d_blas,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
            "read M256 hipBLAS");
+    hip_ok(hipMemcpy(wmma_output.data(), d_wmma,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 WMMA");
+    hip_ok(hipMemcpy(wmma_weight_once_1_output.data(), d_wmma_weight_once_1,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 cooperative WMMA N1");
+    hip_ok(hipMemcpy(wmma_weight_once_2_output.data(), d_wmma_weight_once_2,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 cooperative WMMA N2");
+    hip_ok(hipMemcpy(wmma_multin_2_output.data(), d_wmma_multin_2,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 multi-N WMMA N2");
+    hip_ok(hipMemcpy(wmma_multin_4_output.data(), d_wmma_multin_4,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 multi-N WMMA N4");
+    hip_ok(hipMemcpy(wmma_hilo_2_output.data(), d_wmma_hilo_2,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M256 hi/lo WMMA N2");
     const Error production_error = compare(reference, production_output);
     const Error weight_once_error = compare(reference, weight_once_output);
     const Error blas_error = compare(reference, blas_output);
+    const Error wmma_error = compare(reference, wmma_output);
+    const Error wmma_weight_once_1_error =
+        compare(reference, wmma_weight_once_1_output);
+    const Error wmma_weight_once_2_error =
+        compare(reference, wmma_weight_once_2_output);
+    const Error wmma_multin_2_error = compare(reference, wmma_multin_2_output);
+    const Error wmma_multin_4_error = compare(reference, wmma_multin_4_output);
+    const Error wmma_hilo_2_error = compare(reference, wmma_hilo_2_output);
     std::printf(
         "BF16 prefill shape=%ux%ux%u residency=host-registered "
         "production_ms=%.4f weight_once_f32_ms=%.4f bf16_blas_ms=%.4f "
-        "weight_once_speedup=%.3fx blas_speedup=%.3fx\n",
+        "wmma_bf16_ms=%.4f wmma_weight_once_n1_ms=%.4f "
+        "wmma_weight_once_n2_ms=%.4f weight_once_speedup=%.3fx "
+        "blas_speedup=%.3fx wmma_speedup=%.3fx "
+        "wmma_weight_once_n1_speedup=%.3fx "
+        "wmma_weight_once_n2_speedup=%.3fx\n",
         kPrefillTokens, out_dim, in_dim, production_ms, weight_once_ms,
-        blas_ms, production_ms / weight_once_ms, production_ms / blas_ms);
+        blas_ms, wmma_ms, wmma_weight_once_1_ms, wmma_weight_once_2_ms,
+        production_ms / weight_once_ms, production_ms / blas_ms,
+        production_ms / wmma_ms, production_ms / wmma_weight_once_1_ms,
+        production_ms / wmma_weight_once_2_ms);
+    std::printf(
+        "  wmma_multin_n2_ms=%.4f speedup=%.3fx "
+        "wmma_multin_n4_ms=%.4f speedup=%.3fx "
+        "wmma_hilo_n2_ms=%.4f speedup=%.3fx\n",
+        wmma_multin_2_ms, production_ms / wmma_multin_2_ms,
+        wmma_multin_4_ms, production_ms / wmma_multin_4_ms,
+        wmma_hilo_2_ms, production_ms / wmma_hilo_2_ms);
     std::printf(
         "  production nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
         production_error.nrmse, production_error.cosine,
@@ -531,9 +920,42 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
     std::printf(
         "  bf16_blas nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
         blas_error.nrmse, blas_error.cosine, blas_error.max_abs);
+    std::printf(
+        "  wmma_bf16 nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+        wmma_error.nrmse, wmma_error.cosine, wmma_error.max_abs);
+    std::printf(
+        "  wmma_weight_once_n1 nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+        wmma_weight_once_1_error.nrmse,
+        wmma_weight_once_1_error.cosine,
+        wmma_weight_once_1_error.max_abs);
+    std::printf(
+        "  wmma_weight_once_n2 nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+        wmma_weight_once_2_error.nrmse,
+        wmma_weight_once_2_error.cosine,
+        wmma_weight_once_2_error.max_abs);
+    std::printf(
+        "  wmma_multin_n2 nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+        wmma_multin_2_error.nrmse, wmma_multin_2_error.cosine,
+        wmma_multin_2_error.max_abs);
+    std::printf(
+        "  wmma_multin_n4 nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+        wmma_multin_4_error.nrmse, wmma_multin_4_error.cosine,
+        wmma_multin_4_error.max_abs);
+    std::printf(
+        "  wmma_hilo_n2 nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+        wmma_hilo_2_error.nrmse, wmma_hilo_2_error.cosine,
+        wmma_hilo_2_error.max_abs);
 
     if (d_lowrank)
         hip_ok(hipFree(d_lowrank), "free M256 low-rank output");
+    hip_ok(hipFree(d_wmma), "free M256 WMMA output");
+    hip_ok(hipFree(d_wmma_weight_once_1),
+           "free M256 cooperative WMMA N1 output");
+    hip_ok(hipFree(d_wmma_weight_once_2),
+           "free M256 cooperative WMMA N2 output");
+    hip_ok(hipFree(d_wmma_multin_2), "free M256 multi-N WMMA N2 output");
+    hip_ok(hipFree(d_wmma_multin_4), "free M256 multi-N WMMA N4 output");
+    hip_ok(hipFree(d_wmma_hilo_2), "free M256 hi/lo WMMA N2 output");
     hip_ok(hipFree(d_weight_once), "free M256 weight-once output");
     hip_ok(hipFree(d_blas), "free M256 hipBLAS output");
     hip_ok(hipFree(d_production), "free M256 production output");
@@ -783,14 +1205,26 @@ void run_rowtile_m2048_guard(const uint16_t *weight, uint32_t in_dim,
         x[i] = 0.17f * std::cos((double)(i % 12289u) * 0.003) -
                0.13f * std::sin((double)i * 0.002);
     float *d_x = nullptr, *d_reference = nullptr, *d_candidate = nullptr;
+    float *d_wmma = nullptr;
+    float *d_wmma_hilo = nullptr;
+    uint16_t *d_x_bf16 = nullptr;
     hip_ok(hipMalloc(&d_x, x_count * sizeof(float)),
            "allocate M2048 rowtile input");
     hip_ok(hipMalloc(&d_reference, out_count * sizeof(float)),
            "allocate M2048 rowtile reference");
     hip_ok(hipMalloc(&d_candidate, out_count * sizeof(float)),
            "allocate M2048 rowtile candidate");
+    hip_ok(hipMalloc(&d_wmma, out_count * sizeof(float)),
+           "allocate M2048 multi-N WMMA output");
+    hip_ok(hipMalloc(&d_wmma_hilo, out_count * sizeof(float)),
+           "allocate M2048 hi/lo WMMA output");
+    hip_ok(hipMalloc(&d_x_bf16, x_count * sizeof(uint16_t)),
+           "allocate M2048 BF16 input");
     hip_ok(hipMemcpy(d_x, x.data(), x_count * sizeof(float),
                      hipMemcpyHostToDevice), "copy M2048 rowtile input");
+    f32_to_bf16_kernel<<<(x_count + 255u) / 256u, 256u>>>(
+        d_x_bf16, d_x, x_count);
+    hip_ok(hipGetLastError(), "M2048 BF16 conversion launch");
     const auto reference = [&] {
         launch_segmented_tiled(d_reference, weight, d_x, in_dim,
                                out_dim, tokens);
@@ -801,29 +1235,68 @@ void run_rowtile_m2048_guard(const uint16_t *weight, uint32_t in_dim,
             d_candidate, weight, d_x, in_dim, out_dim);
         hip_ok(hipGetLastError(), "M2048 rowtile 2x16 launch");
     };
+    const auto wmma = [&] {
+        bf16_wmma_m256_multin_kernel<2u><<<
+            dim3((out_dim + 31u) / 32u,
+                 (tokens + kPrefillTokens - 1u) / kPrefillTokens),
+            16u * 32u>>>(d_wmma, weight, d_x_bf16,
+                          in_dim, out_dim, tokens);
+        hip_ok(hipGetLastError(), "M2048 multi-N WMMA launch");
+    };
+    const auto wmma_hilo = [&] {
+        bf16_wmma_m256_multin_hilo_kernel<2u><<<
+            dim3((out_dim + 31u) / 32u,
+                 (tokens + kPrefillTokens - 1u) / kPrefillTokens),
+            16u * 32u>>>(d_wmma_hilo, weight, d_x,
+                          in_dim, out_dim, tokens);
+        hip_ok(hipGetLastError(), "M2048 hi/lo WMMA launch");
+    };
     const float reference_ms = time_ms(reference);
     const float candidate_ms = time_ms(candidate);
+    const float wmma_ms = time_ms(wmma);
+    const float wmma_hilo_ms = time_ms(wmma_hilo);
     reference();
     candidate();
+    wmma();
+    wmma_hilo();
     hip_ok(hipDeviceSynchronize(), "M2048 rowtile synchronize");
     std::vector<float> host_reference(out_count), host_candidate(out_count);
+    std::vector<float> host_wmma(out_count);
+    std::vector<float> host_wmma_hilo(out_count);
     hip_ok(hipMemcpy(host_reference.data(), d_reference,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
            "read M2048 rowtile reference");
     hip_ok(hipMemcpy(host_candidate.data(), d_candidate,
                      out_count * sizeof(float), hipMemcpyDeviceToHost),
            "read M2048 rowtile candidate");
+    hip_ok(hipMemcpy(host_wmma.data(), d_wmma,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M2048 multi-N WMMA output");
+    hip_ok(hipMemcpy(host_wmma_hilo.data(), d_wmma_hilo,
+                     out_count * sizeof(float), hipMemcpyDeviceToHost),
+           "read M2048 hi/lo WMMA output");
     const bool exact = std::memcmp(host_reference.data(),
                                    host_candidate.data(),
                                    out_count * sizeof(float)) == 0;
     const Error error = compare(host_reference, host_candidate);
+    const Error wmma_error = compare(host_reference, host_wmma);
+    const Error wmma_hilo_error = compare(host_reference, host_wmma_hilo);
     std::printf(
         "BF16 rowtile guard shape=%ux%ux%u residency=host-registered "
         "reference_ms=%.4f row2x16_ms=%.4f speedup=%.3fx exact=%d "
-        "nrmse=%.9g\n",
+        "nrmse=%.9g wmma_multin_n2_ms=%.4f wmma_speedup=%.3fx "
+        "wmma_nrmse=%.9g wmma_max_abs=%.9g "
+        "wmma_hilo_ms=%.4f wmma_hilo_speedup=%.3fx "
+        "wmma_hilo_nrmse=%.9g wmma_hilo_max_abs=%.9g\n",
         tokens, out_dim, in_dim, reference_ms, candidate_ms,
-        reference_ms / candidate_ms, exact ? 1 : 0, error.nrmse);
+        reference_ms / candidate_ms, exact ? 1 : 0, error.nrmse,
+        wmma_ms, reference_ms / wmma_ms, wmma_error.nrmse,
+        wmma_error.max_abs, wmma_hilo_ms, reference_ms / wmma_hilo_ms,
+        wmma_hilo_error.nrmse, wmma_hilo_error.max_abs);
     if (!exact) fail("BF16 M2048 adjacent-row token tile bit identity");
+    hip_ok(hipFree(d_x_bf16), "free M2048 BF16 input");
+    hip_ok(hipFree(d_wmma), "free M2048 multi-N WMMA output");
+    hip_ok(hipFree(d_wmma_hilo), "free M2048 hi/lo WMMA output");
     hip_ok(hipFree(d_candidate), "free M2048 rowtile candidate");
     hip_ok(hipFree(d_reference), "free M2048 rowtile reference");
     hip_ok(hipFree(d_x), "free M2048 rowtile input");
