@@ -633,6 +633,83 @@ bool benchmark_decode_qkv_half(const Glm5TestGGUF &gguf,
     return ms[0] > 0.0 && ms[1] > 0.0;
 }
 
+bool benchmark_decode_qkv_multiptr(const Glm5TestGGUF &gguf,
+                                   uint64_t q_offset, uint64_t k_offset,
+                                   uint64_t v_offset) {
+    constexpr uint32_t kIn = 4096u;
+    constexpr uint32_t kOut = 4096u;
+    const uint64_t weight_bytes = (uint64_t)kIn * kOut * sizeof(uint16_t);
+    std::vector<float> host_input(kIn);
+    for (uint32_t i = 0u; i < kIn; ++i)
+        host_input[i] = 0.03125f * std::sin((double)i * 0.013) +
+                        0.0078125f * std::cos((double)i * 0.031);
+    Tensors tensors;
+    ds4_gpu_tensor *input = tensors.f32(kIn);
+    ds4_gpu_tensor *seq[3] = {tensors.f32(kOut), tensors.f32(kOut),
+                              tensors.f32(kOut)};
+    ds4_gpu_tensor *fused[3] = {tensors.f32(kOut), tensors.f32(kOut),
+                                tensors.f32(kOut)};
+    CHECK(input && seq[0] && seq[1] && seq[2] && fused[0] && fused[1] &&
+          fused[2] && ds4_gpu_tensor_write(input, 0u, host_input.data(),
+                                           (uint64_t)kIn * sizeof(float)),
+          "allocate decode QKV multiptr A/B tensors");
+    const uint64_t offsets[3] = {q_offset, k_offset, v_offset};
+    const auto sequential = [&] {
+        for (uint32_t i = 0u; i < 3u; ++i)
+            CHECK(ds4_gpu_matmul_bf16_tensor(
+                      seq[i], gguf.map, gguf.size, offsets[i], kIn, kOut,
+                      input, 1u), "launch sequential decode QKV");
+        return true;
+    };
+    const auto multiptr = [&] {
+        return ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
+            fused[0], fused[1], fused[2], gguf.map, gguf.size,
+            q_offset, k_offset, v_offset, kIn, kOut, input, 1u) != 0;
+    };
+    CHECK(sequential() && multiptr() && ds4_gpu_synchronize(),
+          "warm decode QKV multiptr A/B");
+    std::vector<float> a(kOut), b(kOut);
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        CHECK(ds4_gpu_tensor_read(seq[i], 0u, a.data(),
+                                  (uint64_t)kOut * sizeof(float)) &&
+              ds4_gpu_tensor_read(fused[i], 0u, b.data(),
+                                  (uint64_t)kOut * sizeof(float)),
+              "read decode QKV multiptr A/B");
+        CHECK(std::memcmp(a.data(), b.data(), (size_t)kOut * sizeof(float)) == 0,
+              "decode QKV multiptr bit exact");
+    }
+    constexpr uint32_t warmup = 8u, repeats = 64u;
+    const auto timed = [&](bool use_fused) -> double {
+        for (uint32_t i = 0u; i < warmup; ++i)
+            CHECK(use_fused ? multiptr() : sequential(),
+                  "warm decode QKV multiptr arm");
+        hipEvent_t begin = nullptr, end = nullptr;
+        CHECK(hipEventCreate(&begin) == hipSuccess &&
+              hipEventCreate(&end) == hipSuccess && hipEventRecord(begin) == hipSuccess,
+              "create decode QKV multiptr events");
+        for (uint32_t i = 0u; i < repeats; ++i)
+            CHECK(use_fused ? multiptr() : sequential(),
+                  "time decode QKV multiptr arm");
+        CHECK(hipEventRecord(end) == hipSuccess && hipEventSynchronize(end) == hipSuccess,
+              "complete decode QKV multiptr events");
+        float elapsed = 0.0f;
+        CHECK(hipEventElapsedTime(&elapsed, begin, end) == hipSuccess &&
+              hipEventDestroy(end) == hipSuccess && hipEventDestroy(begin) == hipSuccess,
+              "read decode QKV multiptr events");
+        return (double)elapsed / repeats;
+    };
+    const double seq_ms = timed(false);
+    const double fused_ms = timed(true);
+    std::fprintf(stderr,
+                 "MEASURE GLM5 BF16 decode-QKV multiptr shape=3x1x%ux%u "
+                 "sequential_ms=%.6f fused_ms=%.6f speedup=%.3fx "
+                 "weight_gib=%.6f exact=1 repeats=%u\n",
+                 kOut, kIn, seq_ms, fused_ms, seq_ms / fused_ms,
+                 (double)(3u * weight_bytes) / (1024.0 * 1024.0 * 1024.0),
+                 repeats);
+    return fused_ms > 0.0;
+}
+
 bool benchmark_decode_qkv_stream(const Glm5TestGGUF &gguf,
                                  const std::vector<uint64_t> &offsets) {
     constexpr uint32_t kIn = 4096u;
@@ -891,6 +968,7 @@ bool run_test() {
         CHECK(benchmark_decode_qkv_half(gguf, "kda_q", q) &&
               benchmark_decode_qkv_half(gguf, "kda_k", k) &&
               benchmark_decode_qkv_half(gguf, "kda_v", v) &&
+              benchmark_decode_qkv_multiptr(gguf, q, k, v) &&
               benchmark_decode_qkv_stream(gguf, qkv_stream) &&
               benchmark_decode_output_stream(gguf, output_stream),
               "GLM5 BF16 decode projection geometry benchmark");
