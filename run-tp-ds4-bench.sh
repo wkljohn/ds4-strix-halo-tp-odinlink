@@ -281,12 +281,26 @@ GLM5_BF16_WMMA_HILO=0
 GLM5_BF16_WMMA_HILO_SEEN=0
 GLM5_BF16_WMMA_QKV_FUSED=0
 GLM5_BF16_WMMA_QKV_FUSED_SEEN=0
+GLM5_BF16_QKV_DECODE_MULTIPTR=0
+GLM5_BF16_QKV_DECODE_MULTIPTR_SEEN=0
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
     exit 2
   }
   case $env_kv in
+    DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR=*)
+      (( GLM5_BF16_QKV_DECODE_MULTIPTR_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_BF16_QKV_DECODE_MULTIPTR=${env_kv#*=}
+      GLM5_BF16_QKV_DECODE_MULTIPTR_SEEN=1
+      [[ $GLM5_BF16_QKV_DECODE_MULTIPTR == 0 || $GLM5_BF16_QKV_DECODE_MULTIPTR == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
     DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED=*)
       (( GLM5_BF16_WMMA_QKV_FUSED_SEEN == 0 )) || {
         echo "error: DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED was supplied more than once" >&2
@@ -1000,6 +1014,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'prefill_batch=%s\n' "${GLM5_PREFILL_BATCH:-n/a}"
   printf 'glm5_bf16_wmma_hilo=%s\n' "$GLM5_BF16_WMMA_HILO"
   printf 'glm5_bf16_wmma_qkv_fused=%s\n' "$GLM5_BF16_WMMA_QKV_FUSED"
+  printf 'glm5_bf16_qkv_decode_multiptr=%s\n' "$GLM5_BF16_QKV_DECODE_MULTIPTR"
   printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
   printf 'coordinator_addr=%s\n' "$COORDINATOR_ADDR"
   printf 'coordinator_rdma_device=%s\n' "$LOCAL_RDMA_DEVICE"
@@ -1214,17 +1229,37 @@ fi
 if [[ $GLM5_BF16_WMMA_HILO == 1 ]]; then
   if [[ $MODEL_ARCH == glm5-next ]]; then
     if [[ $GLM5_BF16_WMMA_QKV_FUSED == 1 ]]; then
-      wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=0 k=0 v=0 qkv_fused=[1-9][0-9]* output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+      if [[ $GLM5_BF16_QKV_DECODE_MULTIPTR == 1 ]]; then
+        # The one-token multipointer kernel intentionally bypasses the
+        # batched WMMA-QKV counter. Prove both its engagement and the regular
+        # hi/lo output path instead of falsely requiring qkv_fused>0.
+        wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* qkv_fused=0 output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+        wmma_decode_re='GLM5 BF16 decode QKV multiptr engaged out_dim=[0-9]+'
+      else
+        wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=0 k=0 v=0 qkv_fused=[1-9][0-9]* output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+        wmma_decode_re=
+      fi
     else
       wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* qkv_fused=0 output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+      wmma_decode_re=
     fi
     for wmma_log in "$COORD_LOG" "$WORKER_LOG"; do
       grep -Eq "$wmma_summary_re" "$wmma_log" || {
         echo "error: GLM5 BF16 WMMA hi/lo engagement proof failed in $wmma_log" >&2
         exit 1
       }
+      if [[ -n $wmma_decode_re ]]; then
+        grep -Eq "$wmma_decode_re" "$wmma_log" || {
+          echo "error: GLM5 BF16 decode QKV multiptr engagement proof failed in $wmma_log" >&2
+          exit 1
+        }
+      fi
     done
-    echo "validated_glm5_bf16_wmma_hilo=both-ranks,qkv-output-engaged,hard-failure:0"
+    if [[ -n $wmma_decode_re ]]; then
+      echo "validated_glm5_bf16_wmma_hilo=both-ranks,qkv-decode-multiptr-engaged,hard-failure:0"
+    else
+      echo "validated_glm5_bf16_wmma_hilo=both-ranks,qkv-output-engaged,hard-failure:0"
+    fi
   else
     for wmma_log in "$COORD_LOG" "$WORKER_LOG"; do
       ! grep -q 'GLM5 BF16 WMMA hi/lo summary' "$wmma_log" || {
