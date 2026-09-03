@@ -35,13 +35,13 @@ at commit `ee9ca90`; they are not yet enabled by `main`.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | two source-clean runs | **78.19 t/s** | **9.50 t/s** | two-run midpoint; runs were 78.59/9.45 and 77.78/9.54, FNV `9012bd4d7c5ce422` |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | three source-clean runs | **78.59 t/s** | **9.45 t/s** | three-run median; runs were 78.59/9.45, 77.78/9.54, and 79.05/9.42, FNV `9012bd4d7c5ce422` |
 | **GLM-5.3 Flash Q4_K over OdinLink** | one matched provider run | **76.00 t/s** | **9.43 t/s** | zero fallback; FNV `9012bd4d7c5ce422` |
 | **GLM-5.3 Flash Q2 over RoCE v2** | 2,048-token control workload | **21.87–21.95 t/s** | **3.48–3.49 t/s** | opt-in mixed IQ2_XXS/Q2_K path; repeated fingerprint matched |
 
 The Q4_K candidate keeps all 4,096 prompt rows batched, adds no persistent
 weight cache, and uses 45.07 MiB of reusable scratch per rank. It remains
-default-off while its Lane-B quality and three-run provider medians complete.
+default-off pending its Lane-B quality review and three-run OdinLink median.
 
 The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
 followed by 300 generated tokens over mandatory RDMA. Its current Q4_K rows
