@@ -276,7 +276,10 @@ start() {
   if [[ $GLM5_ENABLE_ORDINARY == 1 ]]; then
     echo "warning: GLM-5.3 ordinary session integration is explicitly enabled; this is an experimental deployment" >&2
     common+=(DS4_GLM5_NEXT_ENABLE_ORDINARY=1
-             DS4_GLM5_NEXT_PREFILL_BATCH="$GLM5_PREFILL_BATCH")
+             DS4_GLM5_NEXT_PREFILL_BATCH="$GLM5_PREFILL_BATCH"
+             # GLM ordinary TP publishes the full sampling logits contract;
+             # DeepSeek's two-candidate greedy mode is incompatible with it.
+             DS4_TP_GREEDY_TOP2=0)
   fi
   if [[ $DSPARK == 1 ]]; then
     echo "warning: DSpark is experimental and is not target-fingerprint exact" >&2
@@ -323,6 +326,12 @@ start() {
     support_args=()
   fi
   common+=("${decode_env[@]}")
+  # decode_env carries DeepSeek's two-candidate default.  GLM ordinary TP
+  # requires the full logits sampling contract, so override it after the
+  # generic block has been appended.
+  if [[ $GLM5_ENABLE_ORDINARY == 1 ]]; then
+    common+=(DS4_TP_GREEDY_TOP2=0)
+  fi
   if [[ $GLM5_FULL_LOGITS == 1 ]]; then
     echo "warning: GLM full-logits TP mode is explicitly enabled; transport and memory cost may increase" >&2
     # Append after ordinary decode defaults so the explicit server mode wins.
