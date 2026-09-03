@@ -265,6 +265,8 @@ GLM5_SPARSE_BATCH_BRIDGE=0
 GLM5_SPARSE_BATCH_BRIDGE_SEEN=0
 GLM5_SPARSE_BATCH_OUTPUT=0
 GLM5_SPARSE_BATCH_OUTPUT_SEEN=0
+GLM5_SPARSE_BATCH_PRELUDE=0
+GLM5_SPARSE_BATCH_PRELUDE_SEEN=0
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
@@ -310,6 +312,19 @@ for env_kv in "${EXTRA_ENV[@]}"; do
       [[ $GLM5_SPARSE_BATCH_OUTPUT == 0 ||
          $GLM5_SPARSE_BATCH_OUTPUT == 1 ]] || {
         echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_GLM5_SPARSE_BATCH_PRELUDE=*)
+      (( GLM5_SPARSE_BATCH_PRELUDE_SEEN == 0 )) || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_BATCH_PRELUDE=${env_kv#*=}
+      GLM5_SPARSE_BATCH_PRELUDE_SEEN=1
+      [[ $GLM5_SPARSE_BATCH_PRELUDE == 0 ||
+         $GLM5_SPARSE_BATCH_PRELUDE == 1 ]] || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE must be 0 or 1" >&2
         exit 2
       }
       ;;
@@ -432,11 +447,19 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
     echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT=1 requires DS4_GLM5_SPARSE_BATCH_BRIDGE=1" >&2
     exit 2
   fi
+  if (( GLM5_SPARSE_BATCH_PRELUDE == 1 &&
+        GLM5_SPARSE_BATCH_OUTPUT != 1 )); then
+    echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE=1 requires DS4_GLM5_SPARSE_BATCH_OUTPUT=1" >&2
+    exit 2
+  fi
 elif (( GLM5_SPARSE_BATCH_BRIDGE_SEEN == 1 )); then
   echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE applies only to GLM5 benchmarks" >&2
   exit 2
 elif (( GLM5_SPARSE_BATCH_OUTPUT_SEEN == 1 )); then
   echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_BATCH_PRELUDE_SEEN == 1 )); then
+  echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE applies only to GLM5 benchmarks" >&2
   exit 2
 elif (( GLM5_PREFILL_BATCH_SEEN == 1 )); then
   echo "error: DS4_GLM5_NEXT_PREFILL_BATCH applies only to GLM5 benchmarks" >&2

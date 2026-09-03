@@ -51475,6 +51475,24 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
                 "DS4_GLM5_SPARSE_BATCH_BRIDGE=1\n");
         return 0;
     }
+    const char *sparse_batch_prelude_env =
+        getenv("DS4_GLM5_SPARSE_BATCH_PRELUDE");
+    if (sparse_batch_prelude_env &&
+        strcmp(sparse_batch_prelude_env, "0") != 0 &&
+        strcmp(sparse_batch_prelude_env, "1") != 0) {
+        fprintf(stderr,
+                "ds4: DS4_GLM5_SPARSE_BATCH_PRELUDE must be 0 or 1\n");
+        return 0;
+    }
+    if (sparse_batch_prelude_env &&
+        strcmp(sparse_batch_prelude_env, "1") == 0 &&
+        (!sparse_batch_output_env ||
+         strcmp(sparse_batch_output_env, "1") != 0)) {
+        fprintf(stderr,
+                "ds4: DS4_GLM5_SPARSE_BATCH_PRELUDE=1 requires "
+                "DS4_GLM5_SPARSE_BATCH_OUTPUT=1\n");
+        return 0;
+    }
     const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint32_t big_capacity = ds4_tp_big_capacity_rows(e->tp.ctx);
     /* The mlx5 provider deliberately caps the registered direct slab at
@@ -53653,6 +53671,8 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
         mtp_or_dspark);
     glm5_kda_features |= ds4_tp_glm5_sparse_batch_output_feature(
         getenv("DS4_GLM5_SPARSE_BATCH_OUTPUT"), glm5_kda_features);
+    glm5_kda_features |= ds4_tp_glm5_sparse_batch_prelude_feature(
+        getenv("DS4_GLM5_SPARSE_BATCH_PRELUDE"), glm5_kda_features);
     glm5_kda_features |= ds4_tp_glm5_kda_output_kslice_feature(
         getenv("DS4_GLM5_KDA_OUTPUT_KSLICE"), glm5_kda_features,
         all_kda_outputs_bf16);
