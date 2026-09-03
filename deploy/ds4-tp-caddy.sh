@@ -280,6 +280,37 @@ start() {
              # GLM ordinary TP publishes the full sampling logits contract;
              # DeepSeek's two-candidate greedy mode is incompatible with it.
              DS4_TP_GREEDY_TOP2=0)
+    # Match the source-clean GLM 4096+300 TP benchmark.  These are all
+    # cache-free, GLM-scoped kernels/features; do not leak them into DS4.
+    common+=(DS4_GLM5_KDA_TP=1
+             DS4_GLM5_SMALL_GATE=1
+             DS4_GLM5_KDA_OUTPUT_ROWSLICE=1
+             DS4_ROCM_GLM5_Q4K_WMMA=1
+             DS4_ROCM_GLM5_Q4K_KSHARD=1
+             DS4_GLM5_ALLOW_Q4_BATCH_MLA_OUTPUT=1
+             DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=1
+             DS4_ROCM_GLM5_BF16_QKV_PREFETCH=64
+             DS4_ROCM_GLM5_BF16_QKV_NONTEMPORAL=1
+             DS4_ROCM_GLM5_BF16_OUTPUT_PREFETCH=64
+             DS4_ROCM_GLM5_BF16_OUTPUT_NONTEMPORAL=1
+             DS4_ROCM_GLM5_BF16_OUTPUT_ROWS_PER_BLOCK=8
+             DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV=1
+             DS4_ROCM_GLM5_QK_LOW_LDS_EXACT=1
+             DS4_ROCM_GLM5_BATCH_POOL_STAGE=1
+             DS4_ROCM_GLM_CAUSAL_ATTN_HEAD_SHARED=1
+             DS4_GLM5_SMALL_GATE_DIRECT_SEND=1
+             DS4_ROCM_GLM5_BF16_ROWTILE2X16=1
+             DS4_GLM5_SPARSE_BATCH_BRIDGE=1
+             DS4_GLM5_SPARSE_BATCH_OUTPUT=1
+             DS4_GLM5_SPARSE_BATCH_PRELUDE=1
+             DS4_GLM5_SPARSE_BATCH_VALUE=1
+             DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1
+             DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=1
+             DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH=8
+             DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL=1
+             DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK=32
+             DS4_ROCM_GLM5_BF16_WMMA_HILO=1
+             DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED=1)
   fi
   if [[ $DSPARK == 1 ]]; then
     echo "warning: DSpark is experimental and is not target-fingerprint exact" >&2
