@@ -2994,6 +2994,12 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
         ok = declare_local_q4k_half_only(ctx, layer);
         const char *persist_windows =
             getenv("DS4_ROCM_GLM5_WINDOW_PERSIST");
+        const char *persist_prefill =
+            getenv("DS4_ROCM_GLM5_WINDOW_PERSIST_PREFILL");
+        const bool persist_this_call =
+            (persist_windows && strcmp(persist_windows, "1") == 0) ||
+            (!w->decode_phase && persist_prefill &&
+             strcmp(persist_prefill, "1") == 0);
         if (ok && use_scratch && il < DS4_GLM5_NEXT_LAYER_COUNT) {
             if (!w->q4_window_scratch)
                 w->q4_window_scratch =
@@ -3002,7 +3008,7 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
                 ok = ds4_gpu_q4k_window_cache_rebind(
                     w->q4_window_scratch, &config);
             cache = w->q4_window_scratch;
-        } else if (ok && persist_windows && strcmp(persist_windows, "1") == 0 &&
+        } else if (ok && persist_this_call &&
             il < DS4_GLM5_NEXT_LAYER_COUNT) {
             cache = w->q4_window[il];
             if (!cache) {
@@ -3084,11 +3090,17 @@ static int routed_ffn_one(const ds4_glm5_next_exec_ctx *ctx,
 routed_one_done:
     if (!ok) ds4_gpu_synchronize();
     const char *persist_windows = getenv("DS4_ROCM_GLM5_WINDOW_PERSIST");
+    const char *persist_prefill =
+        getenv("DS4_ROCM_GLM5_WINDOW_PERSIST_PREFILL");
+    const bool persist_this_call =
+        (persist_windows && strcmp(persist_windows, "1") == 0) ||
+        (!w->decode_phase && persist_prefill &&
+         strcmp(persist_prefill, "1") == 0);
     const char *scratch_windows = getenv("DS4_ROCM_GLM5_WINDOW_SCRATCH");
     const bool use_scratch = w->decode_phase && scratch_windows &&
         strcmp(scratch_windows, "1") == 0;
     if (!mixed_q2 && q4_residency == 0 &&
-        !(persist_windows && strcmp(persist_windows, "1") == 0) &&
+        !persist_this_call &&
         !use_scratch)
         ds4_gpu_q4k_packed_slice_release_all();
     (void)q8_down_row_bytes;
