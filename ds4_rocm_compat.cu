@@ -228,6 +228,40 @@ static int rocm_glm5_workspace_fits(
 #define DS4_GLM5_KDA_INJECTED(stage) 0
 #endif
 
+typedef struct {
+    uint64_t q;
+    uint64_t k;
+    uint64_t v;
+    uint64_t output;
+    uint64_t other;
+    uint64_t not_applicable;
+    uint64_t hard_failure;
+} ds4_glm5_bf16_wmma_hilo_stats;
+
+static ds4_glm5_bf16_wmma_hilo_stats g_glm5_bf16_wmma_hilo_stats;
+static int g_glm5_bf16_wmma_hilo_stats_registered;
+
+static void rocm_glm5_bf16_wmma_hilo_report(void) {
+    const ds4_glm5_bf16_wmma_hilo_stats *s =
+        &g_glm5_bf16_wmma_hilo_stats;
+    fprintf(stderr,
+            "ds4: GLM5 BF16 WMMA hi/lo summary "
+            "q=%llu k=%llu v=%llu output=%llu other=%llu "
+            "not_applicable=%llu hard_failure=%llu\n",
+            (unsigned long long)s->q, (unsigned long long)s->k,
+            (unsigned long long)s->v, (unsigned long long)s->output,
+            (unsigned long long)s->other,
+            (unsigned long long)s->not_applicable,
+            (unsigned long long)s->hard_failure);
+}
+
+static void rocm_glm5_bf16_wmma_hilo_register_report(void) {
+    if (!g_glm5_bf16_wmma_hilo_stats_registered) {
+        atexit(rocm_glm5_bf16_wmma_hilo_report);
+        g_glm5_bf16_wmma_hilo_stats_registered = 1;
+    }
+}
+
 static int rocm_glm5_kda_matmul_typed(
         ds4_gpu_tensor *out, const ds4_glm5_kda_device_args *args,
         uint64_t base_offset, uint32_t type, uint64_t in_dim,
@@ -260,6 +294,45 @@ static int rocm_glm5_kda_matmul_typed(
         return ds4_gpu_matmul_q4_k_tensor(
             out, args->model_map, args->model_size, offset,
             in_dim, out_dim, input, args->n_tokens);
+    }
+    static const char *wmma_hilo_value =
+        getenv("DS4_ROCM_GLM5_BF16_WMMA_HILO");
+    static const int wmma_hilo_enabled = wmma_hilo_value != NULL &&
+        strcmp(wmma_hilo_value, "1") == 0;
+    static const int wmma_hilo_valid = wmma_hilo_value == NULL ||
+        strcmp(wmma_hilo_value, "0") == 0 || wmma_hilo_enabled;
+    if (!wmma_hilo_valid) {
+        static int invalid_reported;
+        if (!invalid_reported) {
+            fprintf(stderr,
+                    "ds4: invalid GLM5 BF16 WMMA hi/lo selector\n");
+            invalid_reported = 1;
+        }
+        return 0;
+    }
+    if (wmma_hilo_enabled) {
+        rocm_glm5_bf16_wmma_hilo_register_report();
+        const int candidate = ds4_gpu_matmul_bf16_wmma_hilo_tensor(
+            out, args->model_map, args->model_size, offset,
+            in_dim, out_dim, input, args->n_tokens);
+        if (candidate >= 0) {
+            if (candidate) {
+                if (base_offset == args->weights->q)
+                    g_glm5_bf16_wmma_hilo_stats.q++;
+                else if (base_offset == args->weights->k)
+                    g_glm5_bf16_wmma_hilo_stats.k++;
+                else if (base_offset == args->weights->v)
+                    g_glm5_bf16_wmma_hilo_stats.v++;
+                else if (base_offset == args->weights->output)
+                    g_glm5_bf16_wmma_hilo_stats.output++;
+                else
+                    g_glm5_bf16_wmma_hilo_stats.other++;
+            } else {
+                g_glm5_bf16_wmma_hilo_stats.hard_failure++;
+            }
+            return candidate;
+        }
+        g_glm5_bf16_wmma_hilo_stats.not_applicable++;
     }
     return ds4_gpu_matmul_bf16_tensor(
         out, args->model_map, args->model_size, offset,

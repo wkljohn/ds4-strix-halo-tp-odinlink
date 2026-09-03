@@ -1484,6 +1484,55 @@ static int matmul_bf16_f32_toktile_w32_launch(
     return first == n_tok;
 }
 
+static int matmul_bf16_f32_wmma_hilo_m256_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    matmul_bf16_f32_wmma_hilo_m256_kernel<2u><<<
+            dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
+            16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_bf16 WMMA hi/lo M256 launch");
+}
+
+/* GLM-KDA-only optional dispatch.  Return -1 when the guarded candidate is
+ * not applicable, 0 on a hard validation/launch failure, and 1 on launch. */
+extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    static const int batch_toktile_disabled =
+        getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
+        !ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, batch_toktile_disabled, (uint32_t)in_dim,
+            (uint32_t)out_dim, (uint32_t)n_tok, g_quality_mode,
+            cuda_runtime_config()->graph_dump)) return -1;
+    if (!out || !x || !out->ptr || !x->ptr || !model_map ||
+        out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_elems = out_dim * in_dim;
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t) ||
+        n_tok > UINT64_MAX / in_dim || n_tok > UINT64_MAX / out_dim)
+        return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    const uint64_t x_elems = n_tok * in_dim;
+    const uint64_t out_elems = n_tok * out_dim;
+    if (x_elems > UINT64_MAX / sizeof(float) ||
+        out_elems > UINT64_MAX / sizeof(float) ||
+        weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        x->bytes < x_elems * sizeof(float) ||
+        out->bytes < out_elems * sizeof(float) ||
+        cuda_u64_ranges_overlap(
+            (uint64_t)(uintptr_t)out->ptr, out_elems * sizeof(float),
+            (uint64_t)(uintptr_t)x->ptr, x_elems * sizeof(float))) return 0;
+    const char *wptr = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "glm5_bf16_wmma_hilo");
+    if (!wptr) return 0;
+    return matmul_bf16_f32_wmma_hilo_m256_launch(
+        (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
+        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+}
+
 static int matmul_bf16_f32_rowtile2x16_w32_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {

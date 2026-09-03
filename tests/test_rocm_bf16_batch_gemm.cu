@@ -790,7 +790,7 @@ void run_prefill_shape(hipblasHandle_t handle, const uint16_t *weight,
         hip_ok(hipGetLastError(), "M256 multi-N WMMA N4 launch");
     };
     const auto wmma_hilo_2 = [&] {
-        bf16_wmma_m256_multin_hilo_kernel<2u><<<
+        matmul_bf16_f32_wmma_hilo_m256_kernel<2u><<<
             dim3((out_dim + 31u) / 32u, 1u), 16u * 32u>>>(
                 d_wmma_hilo_2, weight, d_x, in_dim, out_dim,
                 kPrefillTokens);
@@ -1244,7 +1244,7 @@ void run_rowtile_m2048_guard(const uint16_t *weight, uint32_t in_dim,
         hip_ok(hipGetLastError(), "M2048 multi-N WMMA launch");
     };
     const auto wmma_hilo = [&] {
-        bf16_wmma_m256_multin_hilo_kernel<2u><<<
+        matmul_bf16_f32_wmma_hilo_m256_kernel<2u><<<
             dim3((out_dim + 31u) / 32u,
                  (tokens + kPrefillTokens - 1u) / kPrefillTokens),
             16u * 32u>>>(d_wmma_hilo, weight, d_x,
@@ -1327,6 +1327,37 @@ void run_rowtile_dispatch_guard() {
             true, false, 4096u, 12288u, 256u, false, false))
         fail("BF16 rowtile unknown projection must refuse dispatch");
     std::printf("BF16 rowtile dispatch and rollback guards pass\n");
+}
+
+void run_wmma_hilo_dispatch_guard() {
+    if (!ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 256u, false, false) ||
+        !ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 8192u, 4096u, 2048u, false, false))
+        fail("BF16 WMMA hi/lo expected dispatch");
+    if (ds4_bf16_wmma_hilo_dispatch_allowed(
+            false, false, 4096u, 8192u, 256u, false, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, true, 4096u, 8192u, 256u, false, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 255u, false, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 257u, false, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 300u, false, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 2051u, false, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 256u, true, false) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 256u, false, true) ||
+        ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 2048u, 256u, false, false))
+        fail("BF16 WMMA hi/lo rollback/shape guard");
+    if (!ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, false, 4096u, 8192u, 4096u, false, false))
+        fail("BF16 WMMA hi/lo 4096-row dispatch");
+    std::printf("BF16 WMMA hi/lo dispatch and rollback guards pass\n");
 }
 
 void run_lowrank128_tail_coverage(const uint16_t *weight, uint32_t tokens) {
@@ -1514,6 +1545,7 @@ int main() {
     run_rowtile_m2048_guard(device_weight, 8192u, 4096u);
     run_rowtile_m2048_guard(device_weight, 4096u, 4096u);
     run_rowtile_dispatch_guard();
+    run_wmma_hilo_dispatch_guard();
     run_lowrank128_tail_coverage(device_weight, 63u);
     for (const uint32_t tokens : {25u, 57u, 121u, 153u}) {
         run_tail25_candidate(device_weight, 4096u, 8192u, tokens);
