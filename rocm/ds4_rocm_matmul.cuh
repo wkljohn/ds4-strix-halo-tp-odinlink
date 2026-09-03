@@ -1695,6 +1695,13 @@ extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
         (const uint16_t *)weights[0], (const uint16_t *)weights[1],
         (const uint16_t *)weights[2], (const float *)x->ptr,
         (uint32_t)in_dim, (uint32_t)out_dim);
+    static int reported = 0;
+    if (!reported) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM5 BF16 decode QKV multiptr engaged out_dim=%llu\n",
+                (unsigned long long)out_dim);
+        reported = 1;
+    }
     return cuda_ok(cudaGetLastError(),
                    "BF16 decode QKV multiptr launch");
 }

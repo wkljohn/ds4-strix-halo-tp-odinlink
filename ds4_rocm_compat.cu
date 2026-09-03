@@ -350,6 +350,21 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
         ds4_gpu_tensor *out_v, const ds4_glm5_kda_device_args *args,
         uint64_t row_start, uint64_t out_dim,
         const ds4_gpu_tensor *input) {
+    const char *decode_selector =
+        getenv("DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR");
+    const int decode_enabled = decode_selector != NULL &&
+        strcmp(decode_selector, "1") == 0;
+    const int decode_valid = decode_selector == NULL || decode_enabled ||
+        strcmp(decode_selector, "0") == 0;
+    if (!decode_valid) {
+        static int invalid_decode_reported;
+        if (!invalid_decode_reported) {
+            fprintf(stderr,
+                    "ds4: invalid GLM5 BF16 decode QKV multiptr selector\n");
+            invalid_decode_reported = 1;
+        }
+        return 0;
+    }
     static const char *selector_value =
         getenv("DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED");
     static const int selector_enabled = selector_value != NULL &&
@@ -365,9 +380,9 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
         }
         return 0;
     }
-    if (!selector_enabled) return -1;
+    if (!selector_enabled && !decode_enabled) return -1;
     const char *hilo = getenv("DS4_ROCM_GLM5_BF16_WMMA_HILO");
-    if (!hilo || strcmp(hilo, "1") != 0) {
+    if (!decode_enabled && (!hilo || strcmp(hilo, "1") != 0)) {
         static int dependency_reported;
         if (!dependency_reported) {
             fprintf(stderr,
@@ -377,7 +392,10 @@ static int rocm_glm5_kda_qkv_wmma_multiptr(
         return 0;
     }
     if (!out_q || !out_k || !out_v || !args || !args->weights || !input ||
-        out_dim != 4096u || args->n_tokens == 0u ||
+        ((!decode_enabled && out_dim != 4096u) ||
+         (decode_enabled && (args->n_tokens != 1u || out_dim == 0u ||
+                             out_dim > 4096u || (out_dim & 7u) != 0u))) ||
+        (!decode_enabled && args->n_tokens == 0u) ||
         !((args->weights->q_type == 0u || args->weights->q_type == 30u) &&
           (args->weights->k_type == 0u || args->weights->k_type == 30u) &&
           (args->weights->v_type == 0u || args->weights->v_type == 30u)))
