@@ -58742,6 +58742,50 @@ static void model_warm_weights_sharded(const ds4_model *m,
             now_sec() - t0, (unsigned long long)checksum);
 }
 
+/* GLM5 TP already computes an exact, rank-local list of registered model
+ * spans.  Warm those spans rather than reconstructing ownership from the
+ * generic routed-expert layout: GLM5's mixed routed tensor types do not match
+ * that legacy layout and the reconstruction otherwise degenerates into a
+ * whole-file 177+ GiB walk.  This only faults the existing mmap pages; it
+ * allocates no persistent weight copy. */
+static bool model_warm_mapped_spans(const ds4_model *m,
+                                    const uint64_t *offsets,
+                                    const uint64_t *sizes,
+                                    uint32_t count,
+                                    int rank) {
+    if (!m || !m->map || !offsets || !sizes || count == 0u) return false;
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    if (page == 0u) return false;
+    uint64_t total = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        if (offsets[i] > m->size || sizes[i] > m->size - offsets[i] ||
+            total > UINT64_MAX - sizes[i]) {
+            return false;
+        }
+        total += sizes[i];
+    }
+    fprintf(stderr,
+            "ds4: warming mapped tensor spans (rank %d): %u spans, %.2f GiB\n",
+            rank, count, (double)total / 1073741824.0);
+    const double t0 = now_sec();
+    const uint8_t *base = m->map;
+    volatile uint64_t checksum = 0u;
+    for (uint32_t i = 0u; i < count; ++i) {
+        const uint64_t start = offsets[i];
+        const uint64_t end = start + sizes[i];
+#if defined(POSIX_MADV_WILLNEED)
+        (void)posix_madvise((void *)(base + start), (size_t)sizes[i],
+                            POSIX_MADV_WILLNEED);
+#endif
+        for (uint64_t off = start; off < end; off += page) checksum += base[off];
+        if (end > start && (end - start - 1u) % page != 0u) checksum += base[end - 1u];
+    }
+    fprintf(stderr,
+            "ds4: mapped-span warm done in %.1fs (checksum=%llu)\n",
+            now_sec() - t0, (unsigned long long)checksum);
+    return true;
+}
+
 /* =========================================================================
  * Wave-2 multi-GPU placement scaffolding: engine placement helpers.
  * =========================================================================
@@ -60810,8 +60854,19 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else if (glm5_tp_warm) {
             fprintf(stderr,
                     "ds4: GLM5.3 TP warming owned mapped tensor pages (opt-in)\n");
-            model_warm_weights_sharded(&e->model, &e->weights,
-                                       tp_shard_rank);
+            if (!model_warm_mapped_spans(&e->model,
+                                         load_offsets,
+                                         load_sizes,
+                                         load_span_count,
+                                         tp_shard_rank)) {
+                fprintf(stderr,
+                        "ds4: GLM5.3 TP mapped-span warm failed\n");
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         } else if (tp_shard && DS4_MODEL_VARIANT == DS4_VARIANT_GLM53) {
             fprintf(stderr,
                     "ds4: GLM5.3 TP leaves the mapped GGUF lazy; "
