@@ -273,6 +273,10 @@ GLM5_SPARSE_ATTN_HEAD_SHARED=0
 GLM5_SPARSE_ATTN_HEAD_SHARED_SEEN=0
 GLM5_SPARSE_ATTN_F16_GEMM=0
 GLM5_SPARSE_ATTN_F16_GEMM_SEEN=0
+GLM5_SPARSE_ATTN_COMPARE_F16=0
+GLM5_SPARSE_ATTN_COMPARE_F16_SEEN=0
+GLM5_SPARSE_ATTN_COMPARE_F16_LAYER=
+GLM5_SPARSE_ATTN_COMPARE_F16_POS=
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
@@ -373,6 +377,41 @@ for env_kv in "${EXTRA_ENV[@]}"; do
         exit 2
       }
       ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16=*)
+      (( GLM5_SPARSE_ATTN_COMPARE_F16_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16 was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_COMPARE_F16=${env_kv#*=}
+      GLM5_SPARSE_ATTN_COMPARE_F16_SEEN=1
+      [[ $GLM5_SPARSE_ATTN_COMPARE_F16 == 0 ||
+         $GLM5_SPARSE_ATTN_COMPARE_F16 == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16 must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_LAYER=*)
+      [[ -z $GLM5_SPARSE_ATTN_COMPARE_F16_LAYER ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_LAYER was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_COMPARE_F16_LAYER=${env_kv#*=}
+      [[ $GLM5_SPARSE_ATTN_COMPARE_F16_LAYER =~ ^[0-9]+$ ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_LAYER must be an unsigned integer" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_POS=*)
+      [[ -z $GLM5_SPARSE_ATTN_COMPARE_F16_POS ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_POS was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_COMPARE_F16_POS=${env_kv#*=}
+      [[ $GLM5_SPARSE_ATTN_COMPARE_F16_POS =~ ^[0-9]+$ ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_POS must be an unsigned integer" >&2
+        exit 2
+      }
+      ;;
     DS4_ROCM_ENABLE_Q8_F16_CACHE=*|DS4_ROCM_STREAM_Q8_F16_CACHE_GB=*)
       echo "error: ds4-bench-tp results must not use the memory-heavy Q8-to-FP16 cache" >&2
       exit 2
@@ -400,13 +439,19 @@ for env_kv in "${EXTRA_ENV[@]}"; do
   esac
   if [[ $CANDIDATE == 1 ]]; then
     case $env_kv in
-      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*|DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE=*|DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16=*)
+      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*|DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE=*|DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16=*|DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_*=*)
         echo "error: candidate timing cannot enable graph dumps, profilers, or reference oracles: ${env_kv%%=*}" >&2
         exit 2
         ;;
     esac
   fi
 done
+if [[ (-n $GLM5_SPARSE_ATTN_COMPARE_F16_LAYER ||
+       -n $GLM5_SPARSE_ATTN_COMPARE_F16_POS) &&
+      $GLM5_SPARSE_ATTN_COMPARE_F16 != 1 ]]; then
+  echo "error: sparse F16 comparison selectors require DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16=1" >&2
+  exit 2
+fi
 if [[ $ATTN_STATIC_DIRECT_T2_REQUESTED == 1 &&
       $ATTN_STATIC_DIRECT_REQUESTED != 1 ]]; then
   echo "error: paired-query static attention requires DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT=1" >&2
@@ -1110,6 +1155,22 @@ if ! "${PEER_SSH[@]}" "test -r '$WORKER_STATUSFILE'"; then
   exit 1
 fi
 "${PEER_SSH[@]}" "cat '$WORKER_STATUSFILE'" > "$OUT/worker-$TAG.status"
+if [[ $GLM5_SPARSE_ATTN_COMPARE_F16 == 1 ]]; then
+  compare_layer_re=${GLM5_SPARSE_ATTN_COMPARE_F16_LAYER:-'[0-9]+'}
+  compare_pos_re=${GLM5_SPARSE_ATTN_COMPARE_F16_POS:-'[0-9]+'}
+  compare_re="GLM5 sparse F16 real-row compare layer=${compare_layer_re} pos0=${compare_pos_re} rows=[0-9]+ max_abs=.* nonfinite=0"
+  for compare_log in "$COORD_LOG" "$WORKER_LOG"; do
+    grep -Eq "$compare_re" "$compare_log" || {
+      echo "error: requested sparse F16 real-row comparison did not complete in $compare_log" >&2
+      exit 1
+    }
+    ! grep -q 'GLM5 sparse F16 real-row compare failed' "$compare_log" || {
+      echo "error: sparse F16 real-row comparison failed in $compare_log" >&2
+      exit 1
+    }
+  done
+  echo "validated_glm5_sparse_f16_compare=layer:${GLM5_SPARSE_ATTN_COMPARE_F16_LAYER:-first},pos:${GLM5_SPARSE_ATTN_COMPARE_F16_POS:-first}"
+fi
 if [[ $MODEL_ARCH == glm5-next ]]; then
   "$REPO/scripts/check-glm5-prefill-proof.sh" \
     "$COORD_LOG" "$WORKER_LOG" "$GLM5_PREFILL_BATCH" "$FRONTIER" \

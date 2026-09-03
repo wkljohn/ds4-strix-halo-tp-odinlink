@@ -1,5 +1,6 @@
 #include "ds4_glm5_next_exec.h"
 
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2453,11 +2454,13 @@ static int mla_sparse_attention_compare_f16(
         const ds4_gpu_tensor *qk_low,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *reference,
+        uint32_t layer,
         uint32_t pos0,
         uint32_t n_tokens) {
     fprintf(stderr,
-            "ds4: GLM5 sparse F16 real-row compare begin pos0=%u rows=%u\n",
-            pos0, n_tokens);
+            "ds4: GLM5 sparse F16 real-row compare begin layer=%u "
+            "pos0=%u rows=%u\n",
+            layer, pos0, n_tokens);
     const uint64_t out_count =
         (uint64_t)n_tokens * GLM5_HEADS * GLM5_KV_LORA;
     const uint64_t qk_count = out_count;
@@ -2545,11 +2548,12 @@ static int mla_sparse_attention_compare_f16(
         const double kv_rms = kv_samples ?
             sqrt((double)(kv2 / kv_samples)) : 0.0;
         fprintf(stderr,
-                "ds4: GLM5 sparse F16 real-row compare pos0=%u rows=%u "
+                "ds4: GLM5 sparse F16 real-row compare layer=%u "
+                "pos0=%u rows=%u "
                 "max_abs=%.9g nmse=%.9g cosine=%.12g ref_rms=%.9g "
                 "qk_max=%.9g qk_rms=%.9g kv_max=%.9g kv_rms=%.9g "
                 "nonfinite=%llu\n",
-                pos0, n_tokens, max_abs, nmse, cosine, ref_rms,
+                layer, pos0, n_tokens, max_abs, nmse, cosine, ref_rms,
                 qk_max, qk_rms, kv_max, kv_rms,
                 (unsigned long long)nonfinite);
         ok = nonfinite == 0u && nmse <= 1.0e-6 &&
@@ -2564,7 +2568,7 @@ static int mla_sparse_attention_compare_f16(
     if (!ok) {
         fprintf(stderr,
                 "ds4: GLM5 sparse F16 real-row compare failed "
-                "pos0=%u rows=%u\n", pos0, n_tokens);
+                "layer=%u pos0=%u rows=%u\n", layer, pos0, n_tokens);
     }
     return ok;
 }
@@ -2573,6 +2577,7 @@ static int mla_sparse_attention_rows_deferred(
         const ds4_glm5_next_exec_ctx *ctx,
         const ds4_glm5_next_mla_state *mla,
         ds4_glm5_next_workspace *w,
+        uint32_t layer,
         uint32_t pos0,
         uint32_t n_tokens,
         uint32_t *selected_min_out,
@@ -2605,6 +2610,29 @@ static int mla_sparse_attention_rows_deferred(
         !f16_compare_claimed &&
         getenv("DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16") != NULL &&
         strcmp(getenv("DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16"), "1") == 0;
+    uint32_t compare_layer = UINT32_MAX;
+    uint32_t compare_pos = UINT32_MAX;
+    if (compare_f16) {
+        const char *layer_env = getenv(
+            "DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_LAYER");
+        const char *pos_env = getenv(
+            "DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_POS");
+        char *end = NULL;
+        if (layer_env && layer_env[0]) {
+            errno = 0;
+            const unsigned long parsed = strtoul(layer_env, &end, 10);
+            if (errno != 0 || !end || *end != '\0' || parsed > UINT32_MAX)
+                return 0;
+            compare_layer = (uint32_t)parsed;
+        }
+        if (pos_env && pos_env[0]) {
+            errno = 0;
+            const unsigned long parsed = strtoul(pos_env, &end, 10);
+            if (errno != 0 || !end || *end != '\0' || parsed > UINT32_MAX)
+                return 0;
+            compare_pos = (uint32_t)parsed;
+        }
+    }
     for (uint32_t row0 = 0u; row0 < n_tokens; ++row0) {
         uint32_t visible = 0u, n_pools = 0u, selected_pools = 0u;
         uint32_t selected_tokens = 0u;
@@ -2665,10 +2693,15 @@ static int mla_sparse_attention_rows_deferred(
                     ds4_rocm_glm5_sparse_attention_exact_rows(
                         lora, qk_low, mla->compact_kv, selected, rows,
                         GLM5_SELECTED_STRIDE, mla->capacity_tokens)) : 0;
-            const int compare_ok = rc > 0 && compare_f16 && row0 == 0u ?
+            const uint32_t tile_pos = pos0 + row0;
+            const bool compare_tile = compare_f16 &&
+                (compare_layer == UINT32_MAX || compare_layer == layer) &&
+                (compare_pos == UINT32_MAX ? row0 == 0u :
+                 compare_pos == tile_pos);
+            const int compare_ok = rc > 0 && compare_tile ?
                 mla_sparse_attention_compare_f16(
-                    mla, qk_low, selected, lora, pos0 + row0, rows) : 1;
-            if (compare_ok && compare_f16 && row0 == 0u) {
+                    mla, qk_low, selected, lora, layer, tile_pos, rows) : 1;
+            if (compare_ok && compare_tile) {
                 f16_compare_claimed = 1;
             }
             ds4_gpu_tensor_free(selected);
@@ -3964,7 +3997,7 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
     if (batch_value) {
         uint32_t selected_min = 0u, selected_max = 0u;
         if (!(mla_sparse_attention_rows_deferred(
-                  ctx, mla, batch_w, token_ordinal, n_tokens,
+                  ctx, mla, batch_w, il, token_ordinal, n_tokens,
                   &selected_min, &selected_max) &&
           mla_value_project_rows_batch(
               ctx, &layer->mla, batch_w, n_tokens))) {

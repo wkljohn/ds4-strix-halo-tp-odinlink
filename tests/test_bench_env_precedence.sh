@@ -216,6 +216,21 @@ if env -i PATH="$PATH" LANG=C.UTF-8 \
     DS4_BENCH_CONFIG="$config" \
     DS4_BENCH_VALIDATE_CONFIG_ONLY=1 \
     DS4_BENCH_PROMPT_FILE=/dev/null \
+    "$repo/run-tp-ds4-bench.sh" sparse-f16-selector-parent "$glm_model" \
+    DS4_GLM5_NEXT_PREFILL_BATCH=256 \
+    DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_LAYER=43 \
+    >"$test_dir/sparse-f16-selector-parent.out" 2>&1; then
+  echo 'FAIL sparse-f16-selector-requires-compare: unexpectedly succeeded' >&2
+  exit 1
+fi
+grep -q 'comparison selectors require DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16=1' \
+  "$test_dir/sparse-f16-selector-parent.out"
+echo 'PASS sparse-f16-selector-requires-compare'
+
+if env -i PATH="$PATH" LANG=C.UTF-8 \
+    DS4_BENCH_CONFIG="$config" \
+    DS4_BENCH_VALIDATE_CONFIG_ONLY=1 \
+    DS4_BENCH_PROMPT_FILE=/dev/null \
     "$repo/run-tp-ds4-bench.sh" sparse-attn-valid "$glm_model" \
     DS4_GLM5_NEXT_PREFILL_BATCH=256 \
     DS4_GLM5_SPARSE_BATCH_BRIDGE=1 \
