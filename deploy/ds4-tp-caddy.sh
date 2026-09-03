@@ -234,9 +234,15 @@ start() {
     rc=$?; [[ $rc == 7 ]] && echo "error: owned worker is already running" >&2; exit "$rc";
   }
 
-  local -a common worker coordinator decode_env support_args
+  local -a common worker coordinator decode_env support_args prefill_args
   local -a worker_rdma_args coordinator_rdma_args
-  local routed_family tp_prefill_skip_unowned
+  local routed_family tp_prefill_skip_unowned model_is_glm5=0
+  if python3 "$REPO/scripts/check-glm5-next-gguf.py" "$MODEL" >/dev/null 2>&1; then
+    model_is_glm5=1
+  fi
+  if (( model_is_glm5 == 0 )); then
+    prefill_args=(--prefill-chunk "$PREFILL_CHUNK")
+  fi
   if [[ $RDMA_PROFILE == odinlink ]]; then
     common=(env
       DS4_TP_ODINLINK_BATCH_ASYNC=1
@@ -310,7 +316,7 @@ start() {
   common+=("${decode_env[@]}")
   worker=("${common[@]}" ./ds4 --role worker --tensor-parallel
     --coordinator "$COORDINATOR_RDMA_ADDR" "$TP_PORT" --transport rdma --rocm
-    -m "$MODEL" -c "$CONTEXT" --prefill-chunk "$PREFILL_CHUNK"
+    -m "$MODEL" -c "$CONTEXT" "${prefill_args[@]}"
     "${worker_rdma_args[@]}"
     "${support_args[@]}")
   coordinator=("${common[@]}")
@@ -319,7 +325,7 @@ start() {
     --role coordinator --tensor-parallel --listen 0.0.0.0 "$TP_PORT"
     --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
     "${coordinator_rdma_args[@]}"
-    --prefill-chunk "$PREFILL_CHUNK" "${support_args[@]}"
+    "${prefill_args[@]}" "${support_args[@]}"
     --default-temperature "$DEFAULT_TEMPERATURE"
     --host "$API_HOST" --port "$API_PORT")
 
