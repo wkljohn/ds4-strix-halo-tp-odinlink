@@ -1688,7 +1688,7 @@ extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
                                           "glm5_bf16_qkv_decode_multiptr");
         if (!weights[i]) return 0;
     }
-    matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel<16u><<<
+    matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel<32u><<<
         (unsigned)((out_dim + 7u) / 8u), 24u * 32u,
         (size_t)in_dim * sizeof(float)>>>(
         (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
