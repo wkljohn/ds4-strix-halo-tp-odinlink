@@ -18,8 +18,8 @@ static uint64_t ds4_slab_bytes(uint32_t layers, uint32_t embd,
 
 static void usage(const char *argv0) {
     std::fprintf(stderr,
-                 "usage: %s <mlx5-device> [layers=61] [embd=4096] "
-                 "[big-rows=2048]\n",
+                  "usage: %s <rdma-device> [layers=61] [embd=4096] "
+                  "[big-rows=2048]\n",
                  argv0);
 }
 
@@ -97,15 +97,28 @@ int main(int argc, char **argv) {
         const uint64_t big_bytes = (uint64_t)big_rows * embd * sizeof(float);
         const uint64_t core_bytes = bytes - 2 * big_bytes;
         ibv_mr *segments[3] = {};
+        ibv_mr *single = nullptr;
         if (hip_rc == hipSuccess) {
-            segments[0] = ibv_reg_mr(pd, host_slab, (size_t)core_bytes, access);
-            segments[1] = ibv_reg_mr(pd, (char *)host_slab + core_bytes,
-                                     (size_t)big_bytes, access);
-            segments[2] = ibv_reg_mr(pd,
-                                     (char *)host_slab + core_bytes + big_bytes,
-                                     (size_t)big_bytes, access);
+            single = ibv_reg_mr(pd, host_slab, (size_t)bytes, access);
+            if (!single) {
+                segments[0] =
+                    ibv_reg_mr(pd, host_slab, (size_t)core_bytes, access);
+                segments[1] = ibv_reg_mr(pd, (char *)host_slab + core_bytes,
+                                         (size_t)big_bytes, access);
+                segments[2] = ibv_reg_mr(
+                    pd, (char *)host_slab + core_bytes + big_bytes,
+                    (size_t)big_bytes, access);
+            }
         }
-        if (segments[0] && segments[1] && segments[2]) {
+        if (single) {
+            std::printf("PASS device=%s allocator=hipHostMallocMapped "
+                        "bytes=%" PRIu64 " lkey=0x%x rkey=0x%x mr_layout=1 "
+                        "memlock_soft=%" PRIu64 " memlock_hard=%" PRIu64 "\n",
+                        argv[1], bytes, single->lkey, single->rkey,
+                        (uint64_t)lim.rlim_cur, (uint64_t)lim.rlim_max);
+            ibv_dereg_mr(single);
+            mr = (ibv_mr *)(uintptr_t)1;
+        } else if (segments[0] && segments[1] && segments[2]) {
             std::printf("PASS device=%s allocator=hipHostMallocMapped "
                         "bytes=%" PRIu64 " mr_layout=3 core=%" PRIu64
                         " big=%" PRIu64 " memlock_soft=%" PRIu64

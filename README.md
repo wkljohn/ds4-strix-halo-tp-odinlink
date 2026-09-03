@@ -1,8 +1,9 @@
-# DS4 Strix Halo TP over OdinLink or RoCE v2
+# DS4 Strix Halo TP over OdinLink, RoCE v2, or InfiniBand
 
 Tensor-parallel **DeepSeek V4 Flash 0731** inference across two AMD Strix Halo
 APUs. This fork runs the 153.32 GiB Q4_K model over consumer USB4/TB5 with
-OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
+OdinLink GPU RDMA, over a Mellanox RoCE v2 link, or over a directly connected
+native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 
 - **2 × Ryzen AI MAX+ 395 / Radeon 8060S**
 - **2 × 128 GB installed RAM; 96 GiB ROCm aperture per node**
@@ -13,7 +14,7 @@ OdinLink GPU RDMA, or over a standard Mellanox RoCE v2 link.
 ```text
  Ryzen AI MAX+ 395          RDMA link          Ryzen AI MAX+ 395
    Radeon 8060S       <================>          Radeon 8060S
-     TP rank 0       OdinLink or RoCE v2           TP rank 1
+      TP rank 0    OdinLink, RoCE v2, or IB          TP rank 1
 ```
 
 ## Performance (DeepSeek V4 Flash 0731)
@@ -128,7 +129,8 @@ Run one fixed Q4_K benchmark:
   /absolute/path/DeepSeek-V4-Flash-Q4_K-0731.gguf
 ```
 
-Select `DS4_BENCH_RDMA_PROFILE=roce-v2` in `bench.env.local` for Mellanox.
+Select `DS4_BENCH_RDMA_PROFILE=roce-v2` in `bench.env.local` for Mellanox
+RoCE v2, or `ib-mlx4` for native Mellanox InfiniBand.
 Use distinct tags (`q4-r1`, `q4-r2`, `q4-r3`) and report the median. Candidate
 fingerprints and the combined pre-main test belong to the
 local validation archive at
@@ -203,6 +205,47 @@ in `bench.env.local`, set `DS4_BENCH_RDMA_PROFILE=roce-v2`, and run the same
 benchmark command. Reference hardware details and the registration pitfall are
 documented locally under `$DS4_RESEARCH_ROOT/reports/roce-v2-2026-08-14/`.
 
+## Mellanox InfiniBand (ConnectX-3, mlx4)
+
+A directly connected native InfiniBand cable (no RoCE GID-type or 9,000-byte
+MTU configuration) uses the generic verbs path: RC queue pairs, 16 KiB decode
+framing, and a single full-slab MR. RC is required because the exchanges are
+full-duplex post-recv/post-send: a UC SEND that reaches the peer before its
+RECV WR is armed is dropped silently (no RNR retry) and hangs the round,
+while RC retransmits on RNR. Install the same system verbs on both nodes and
+keep the OdinLink provider variables unset:
+
+```sh
+sudo apt install rdma-core ibverbs-utils opensm
+unset DS4_TP_VERBS_LIB ODL_VERBS_WC_STREAM_COPY DS4_TP_ODINLINK_BATCH_ASYNC
+```
+
+Run a subnet manager on one node so both directly connected ports receive
+LIDs, and give the InfiniBand network devices addresses on one subnet for the
+TCP control plane:
+
+```sh
+sudo opensm
+sudo ip addr replace <node-address>/24 dev <ib-netdev>
+rdma link show    # both ports must be ACTIVE with LIDs 1 and 2
+```
+
+Prove that the device can register DS4's mapped communication slab. GID 0 is
+the canonical native-IB GID and is also selected automatically when no
+IPv4-mapped GID exists:
+
+```sh
+ibv_devinfo -d <ib-device>
+make tests/roce_v2_mr_probe
+./tests/roce_v2_mr_probe <ib-device>
+```
+
+In `bench.env.local`, set `DS4_BENCH_RDMA_PROFILE=ib-mlx4`, the coordinator's
+InfiniBand interface address, both device names from `ibv_devinfo -l`
+(udev may name them like `ibp195s0`), and `DS4_RDMA_GID_INDEX=0`; then run the
+same benchmark command. For a manual two-node run, pass
+`--transport rdma --rdma-device <ib-device> --rdma-gid-index 0` on both ranks.
+
 ## Production server
 
 The included 256K profile starts both independent model loads together, keeps
@@ -252,7 +295,8 @@ git pull --ff-only origin main
 
 ## When to use upstream DS4
 
-This fork is for **dual-Strix-Halo TP=2 over OdinLink or RoCE v2**. For general
+This fork is for **dual-Strix-Halo TP=2 over OdinLink, RoCE v2, or
+InfiniBand**. For general
 DS4 usage—including model downloads, single-node inference, Metal, CUDA,
 multi-GPU CUDA, SSD streaming, pipeline parallelism, the server, and the coding
 agent—use the canonical [antirez/ds4](https://github.com/antirez/ds4) README and
