@@ -279,12 +279,26 @@ GLM5_SPARSE_ATTN_COMPARE_F16_LAYER=
 GLM5_SPARSE_ATTN_COMPARE_F16_POS=
 GLM5_BF16_WMMA_HILO=0
 GLM5_BF16_WMMA_HILO_SEEN=0
+GLM5_BF16_WMMA_QKV_FUSED=0
+GLM5_BF16_WMMA_QKV_FUSED_SEEN=0
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
     exit 2
   }
   case $env_kv in
+    DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED=*)
+      (( GLM5_BF16_WMMA_QKV_FUSED_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_BF16_WMMA_QKV_FUSED=${env_kv#*=}
+      GLM5_BF16_WMMA_QKV_FUSED_SEEN=1
+      [[ $GLM5_BF16_WMMA_QKV_FUSED == 0 || $GLM5_BF16_WMMA_QKV_FUSED == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
     DS4_ROCM_GLM5_BF16_WMMA_HILO=*)
       (( GLM5_BF16_WMMA_HILO_SEEN == 0 )) || {
         echo "error: DS4_ROCM_GLM5_BF16_WMMA_HILO was supplied more than once" >&2
@@ -460,6 +474,10 @@ for env_kv in "${EXTRA_ENV[@]}"; do
     esac
   fi
 done
+if [[ $GLM5_BF16_WMMA_QKV_FUSED == 1 && $GLM5_BF16_WMMA_HILO != 1 ]]; then
+  echo "error: DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED=1 requires DS4_ROCM_GLM5_BF16_WMMA_HILO=1" >&2
+  exit 2
+fi
 if [[ (-n $GLM5_SPARSE_ATTN_COMPARE_F16_LAYER ||
        -n $GLM5_SPARSE_ATTN_COMPARE_F16_POS) &&
       $GLM5_SPARSE_ATTN_COMPARE_F16 != 1 ]]; then
@@ -981,6 +999,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'prefill_chunk=%s\n' "$PREFILL_CHUNK"
   printf 'prefill_batch=%s\n' "${GLM5_PREFILL_BATCH:-n/a}"
   printf 'glm5_bf16_wmma_hilo=%s\n' "$GLM5_BF16_WMMA_HILO"
+  printf 'glm5_bf16_wmma_qkv_fused=%s\n' "$GLM5_BF16_WMMA_QKV_FUSED"
   printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
   printf 'coordinator_addr=%s\n' "$COORDINATOR_ADDR"
   printf 'coordinator_rdma_device=%s\n' "$LOCAL_RDMA_DEVICE"
@@ -1194,7 +1213,11 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
 fi
 if [[ $GLM5_BF16_WMMA_HILO == 1 ]]; then
   if [[ $MODEL_ARCH == glm5-next ]]; then
-    wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+    if [[ $GLM5_BF16_WMMA_QKV_FUSED == 1 ]]; then
+      wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=0 k=0 v=0 qkv_fused=[1-9][0-9]* output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+    else
+      wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* qkv_fused=0 output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+    fi
     for wmma_log in "$COORD_LOG" "$WORKER_LOG"; do
       grep -Eq "$wmma_summary_re" "$wmma_log" || {
         echo "error: GLM5 BF16 WMMA hi/lo engagement proof failed in $wmma_log" >&2

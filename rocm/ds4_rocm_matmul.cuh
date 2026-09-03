@@ -1533,6 +1533,73 @@ extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
 }
 
+extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
+        ds4_gpu_tensor *out_q, ds4_gpu_tensor *out_k,
+        ds4_gpu_tensor *out_v, const void *model_map, uint64_t model_size,
+        uint64_t weight_q_offset, uint64_t weight_k_offset,
+        uint64_t weight_v_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    static const int batch_toktile_disabled =
+        getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
+        in_dim != 4096u || out_dim != 4096u ||
+        !ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, batch_toktile_disabled, (uint32_t)in_dim,
+            (uint32_t)out_dim, (uint32_t)n_tok, g_quality_mode,
+            cuda_runtime_config()->graph_dump)) return -1;
+    if (!out_q || !out_k || !out_v || !x || !out_q->ptr || !out_k->ptr ||
+        !out_v->ptr || !x->ptr || !model_map ||
+        out_dim > UINT64_MAX / in_dim || n_tok > UINT64_MAX / in_dim ||
+        n_tok > UINT64_MAX / out_dim) return 0;
+    const uint64_t weight_elems = out_dim * in_dim;
+    const uint64_t x_elems = n_tok * in_dim;
+    const uint64_t out_elems = n_tok * out_dim;
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t) ||
+        x_elems > UINT64_MAX / sizeof(float) ||
+        out_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    const uint64_t x_bytes = x_elems * sizeof(float);
+    const uint64_t out_bytes = out_elems * sizeof(float);
+    const uint64_t output_ptrs[] = {
+        (uint64_t)(uintptr_t)out_q->ptr,
+        (uint64_t)(uintptr_t)out_k->ptr,
+        (uint64_t)(uintptr_t)out_v->ptr,
+    };
+    if (out_q->bytes < out_bytes || out_k->bytes < out_bytes ||
+        out_v->bytes < out_bytes || x->bytes < x_bytes) return 0;
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        if (cuda_u64_ranges_overlap(
+                output_ptrs[i], out_bytes,
+                (uint64_t)(uintptr_t)x->ptr, x_bytes)) return 0;
+        for (uint32_t j = i + 1u; j < 3u; ++j)
+            if (cuda_u64_ranges_overlap(
+                    output_ptrs[i], out_bytes, output_ptrs[j], out_bytes))
+                return 0;
+    }
+    const uint64_t offsets[] = {
+        weight_q_offset, weight_k_offset, weight_v_offset,
+    };
+    const char *weights[3] = {};
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        if (offsets[i] > model_size ||
+            weight_bytes > model_size - offsets[i]) return 0;
+        weights[i] = cuda_model_range_ptr(
+            model_map, offsets[i], weight_bytes,
+            "glm5_bf16_wmma_hilo_qkv");
+        if (!weights[i]) return 0;
+    }
+    matmul_bf16_f32_wmma_hilo_qkv_multiptr_kernel<<<
+        dim3(3u * ((uint32_t)out_dim + 31u) / 32u,
+             ((uint32_t)n_tok + 255u) / 256u),
+        16u * 32u>>>(
+            (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+            (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+            (const uint16_t *)weights[2], (const float *)x->ptr,
+            (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_bf16 WMMA hi/lo QKV multiptr launch");
+}
+
 static int matmul_bf16_f32_rowtile2x16_w32_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {

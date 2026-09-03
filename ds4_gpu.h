@@ -1266,6 +1266,22 @@ int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
         const ds4_gpu_tensor *x,
         uint64_t              n_tok);
 
+/* Optional GLM-KDA Q/K/V launch collapse over three independent BF16 weight
+ * pointers. Return semantics match the single-projection WMMA entry. */
+int ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
 /* BF16 K-slice over physical row stride full_in_dim.  Each input row is a
  * compact k_cnt-element slice; partial outputs from ranks are summed in fixed
  * rank order.  This is a different contract from output-row slicing. */

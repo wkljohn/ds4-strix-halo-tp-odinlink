@@ -232,6 +232,7 @@ typedef struct {
     uint64_t q;
     uint64_t k;
     uint64_t v;
+    uint64_t qkv_fused;
     uint64_t output;
     uint64_t other;
     uint64_t not_applicable;
@@ -246,10 +247,12 @@ static void rocm_glm5_bf16_wmma_hilo_report(void) {
         &g_glm5_bf16_wmma_hilo_stats;
     fprintf(stderr,
             "ds4: GLM5 BF16 WMMA hi/lo summary "
-            "q=%llu k=%llu v=%llu output=%llu other=%llu "
+            "q=%llu k=%llu v=%llu qkv_fused=%llu output=%llu other=%llu "
             "not_applicable=%llu hard_failure=%llu\n",
             (unsigned long long)s->q, (unsigned long long)s->k,
-            (unsigned long long)s->v, (unsigned long long)s->output,
+            (unsigned long long)s->v,
+            (unsigned long long)s->qkv_fused,
+            (unsigned long long)s->output,
             (unsigned long long)s->other,
             (unsigned long long)s->not_applicable,
             (unsigned long long)s->hard_failure);
@@ -339,6 +342,69 @@ static int rocm_glm5_kda_matmul_typed(
         in_dim, out_dim, input, args->n_tokens);
 }
 
+/* One-launch Q/K/V candidate. Return -1 for selector/shape/type rollback,
+ * 0 for a hard validation or launch failure, and 1 after a successful launch.
+ * The three physical GGUF tensors remain independent. */
+static int rocm_glm5_kda_qkv_wmma_multiptr(
+        ds4_gpu_tensor *out_q, ds4_gpu_tensor *out_k,
+        ds4_gpu_tensor *out_v, const ds4_glm5_kda_device_args *args,
+        uint64_t row_start, uint64_t out_dim,
+        const ds4_gpu_tensor *input) {
+    static const char *selector_value =
+        getenv("DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED");
+    static const int selector_enabled = selector_value != NULL &&
+        strcmp(selector_value, "1") == 0;
+    static const int selector_valid = selector_value == NULL ||
+        strcmp(selector_value, "0") == 0 || selector_enabled;
+    if (!selector_valid) {
+        static int invalid_reported;
+        if (!invalid_reported) {
+            fprintf(stderr,
+                    "ds4: invalid GLM5 BF16 WMMA QKV fused selector\n");
+            invalid_reported = 1;
+        }
+        return 0;
+    }
+    if (!selector_enabled) return -1;
+    const char *hilo = getenv("DS4_ROCM_GLM5_BF16_WMMA_HILO");
+    if (!hilo || strcmp(hilo, "1") != 0) {
+        static int dependency_reported;
+        if (!dependency_reported) {
+            fprintf(stderr,
+                    "ds4: GLM5 QKV fused WMMA requires hi/lo WMMA selector\n");
+            dependency_reported = 1;
+        }
+        return 0;
+    }
+    if (!out_q || !out_k || !out_v || !args || !args->weights || !input ||
+        out_dim != 4096u || args->n_tokens == 0u ||
+        !((args->weights->q_type == 0u || args->weights->q_type == 30u) &&
+          (args->weights->k_type == 0u || args->weights->k_type == 30u) &&
+          (args->weights->v_type == 0u || args->weights->v_type == 30u)))
+        return -1;
+    constexpr uint64_t in_dim = 4096u;
+    constexpr uint64_t row_bytes = in_dim * sizeof(uint16_t);
+    if (row_start > UINT64_MAX / row_bytes) return 0;
+    const uint64_t row_offset = row_start * row_bytes;
+    const uint64_t bases[] = {
+        args->weights->q, args->weights->k, args->weights->v,
+    };
+    uint64_t offsets[3];
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        if (bases[i] > UINT64_MAX - row_offset) return 0;
+        offsets[i] = bases[i] + row_offset;
+    }
+    rocm_glm5_bf16_wmma_hilo_register_report();
+    const int candidate = ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
+        out_q, out_k, out_v, args->model_map, args->model_size,
+        offsets[0], offsets[1], offsets[2], in_dim, out_dim,
+        input, args->n_tokens);
+    if (candidate > 0) g_glm5_bf16_wmma_hilo_stats.qkv_fused++;
+    else if (candidate == 0) g_glm5_bf16_wmma_hilo_stats.hard_failure++;
+    else g_glm5_bf16_wmma_hilo_stats.not_applicable++;
+    return candidate;
+}
+
 extern "C" int ds4_rocm_glm5_kda_layer_begin(
         const ds4_glm5_kda_device_args *args) {
 #if !defined(DS4_GFX1151_WAVE32) || !DS4_GFX1151_WAVE32
@@ -366,18 +432,27 @@ extern "C" int ds4_rocm_glm5_kda_layer_begin(
             w->norm, args->input, args->model_map, args->model_size,
             weights->attn_norm, 4096u, tokens, 1.0e-5f) ||
         DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_INPUT_NORM)) return 0;
-    if (!rocm_glm5_kda_matmul_typed(
-            w->q, args, weights->q, weights->q_type,
-            4096u, channel_start, channels, w->norm) ||
-        DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_Q_PROJECTION)) return 0;
-    if (!rocm_glm5_kda_matmul_typed(
-            w->k, args, weights->k, weights->k_type,
-            4096u, channel_start, channels, w->norm) ||
-        DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_K_PROJECTION)) return 0;
-    if (!rocm_glm5_kda_matmul_typed(
-            w->v, args, weights->v, weights->v_type,
-            4096u, channel_start, channels, w->norm) ||
-        DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_V_PROJECTION)) return 0;
+    const int qkv_fused = rocm_glm5_kda_qkv_wmma_multiptr(
+        w->q, w->k, w->v, args, channel_start, channels, w->norm);
+    if (qkv_fused == 0) return 0;
+    if (qkv_fused < 0) {
+        if (!rocm_glm5_kda_matmul_typed(
+                w->q, args, weights->q, weights->q_type,
+                4096u, channel_start, channels, w->norm) ||
+            DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_Q_PROJECTION)) return 0;
+        if (!rocm_glm5_kda_matmul_typed(
+                w->k, args, weights->k, weights->k_type,
+                4096u, channel_start, channels, w->norm) ||
+            DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_K_PROJECTION)) return 0;
+        if (!rocm_glm5_kda_matmul_typed(
+                w->v, args, weights->v, weights->v_type,
+                4096u, channel_start, channels, w->norm) ||
+            DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_V_PROJECTION)) return 0;
+    } else if (DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_Q_PROJECTION) ||
+               DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_K_PROJECTION) ||
+               DS4_GLM5_KDA_INJECTED(DS4_GLM5_KDA_FAIL_V_PROJECTION)) {
+        return 0;
+    }
 
     const uint64_t conv_offset =
         (uint64_t)head_start * DS4_GLM5_KDA_HEAD_DIM * 4u * sizeof(float);
