@@ -27,15 +27,17 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **310.65 t/s** | **21.21 t/s** | two-run midpoint; exact FNV `0163c44015591445` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-### Q4_K throughput through 10K context
+### TP=2 throughput through 10K context
 
-![Antirez DeepSeek V4 Flash Q4_K TP=2 throughput through 10K context](speed-bench/strix_halo_tp2_q4_roce_10k_ts.svg)
+![DeepSeek V4 Flash Q4_K context sweep with GLM-5.3 Q4_K and Q2 comparison points](speed-bench/strix_halo_tp2_q4_roce_10k_ts.svg)
 
 This RoCE v2 sweep follows the upstream `ds4-bench` convention: each point
 adds 2,048 prompt tokens at the stated context frontier, then measures 300
 generated tokens. It uses the same diverse prompt corpus throughout. The
 separate full 10,240-token prefill has a three-run median of **289.23 t/s**;
-its decode median is **18.76 t/s**.
+its decode median is **18.76 t/s**. The isolated GLM markers reuse the validated
+results below: Q4_K uses 4,096+300 and Q2 uses 2,048+300, so they are reference
+points rather than a GLM context sweep.
 
 ```sh
 DS4_BENCH_RDMA_PROFILE=roce-v2 \

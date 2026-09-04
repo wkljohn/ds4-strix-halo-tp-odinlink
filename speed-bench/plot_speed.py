@@ -20,6 +20,7 @@ TEXT_COLOR = "#1f2933"
 MUTED_COLOR = "#64748b"
 GRID_COLOR = "#e2e8f0"
 AXIS_COLOR = "#334155"
+COMPARISON_COLORS = ("#16a34a", "#9333ea", "#d97706", "#0891b2")
 
 
 def nice_ceil(value):
@@ -81,6 +82,28 @@ def read_points(path):
     return rows
 
 
+def read_comparison_points(path):
+    rows = []
+    with path.open("r", encoding="utf-8-sig", newline="") as fp:
+        reader = csv.DictReader(fp)
+        required = {"label", "ctx_tokens", "prefill_tps", "gen_tps"}
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            missing_list = ", ".join(sorted(missing))
+            raise SystemExit(f"{path}: missing comparison CSV column(s): {missing_list}")
+
+        for row in reader:
+            rows.append(
+                (
+                    row["label"],
+                    int(row["ctx_tokens"]),
+                    float(row["prefill_tps"]),
+                    float(row["gen_tps"]),
+                )
+            )
+    return rows
+
+
 def derive_title(csv_path):
     words = csv_path.stem.replace("_", " ").replace("-", " ").split()
     return " ".join(word.upper() if word[0:1].lower() == "m" and word[1:].isdigit() else word.capitalize() for word in words) + " t/s"
@@ -98,7 +121,7 @@ def points_to_polyline(points, x_min, x_max, y_max, plot):
     return " ".join(project(point) for point in points)
 
 
-def render_svg(rows, title, width, height):
+def render_svg(rows, title, width, height, comparison_rows=()):
     margin_left = 82
     margin_right = 82
     margin_top = 66
@@ -113,9 +136,9 @@ def render_svg(rows, title, width, height):
     right = left + plot_width
     bottom = top + plot_height
 
-    ctx_values = [row[0] for row in rows]
-    prefill_values = [row[1] for row in rows]
-    gen_values = [row[2] for row in rows]
+    ctx_values = [row[0] for row in rows] + [row[1] for row in comparison_rows]
+    prefill_values = [row[1] for row in rows] + [row[2] for row in comparison_rows]
+    gen_values = [row[2] for row in rows] + [row[3] for row in comparison_rows]
     x_min = 0
     x_max = max(ctx_values)
     prefill_max = nice_ceil(max(prefill_values) * 1.05)
@@ -181,17 +204,43 @@ def render_svg(rows, title, width, height):
         ]
     )
 
-    legend_x = right - 170
+    # Comparison workloads are isolated markers, not connecting lines: they may
+    # use a different model or prompt span from the primary context sweep.
+    for index, (label, ctx_tokens, prefill_tps, gen_tps) in enumerate(comparison_rows):
+        color = COMPARISON_COLORS[index % len(COMPARISON_COLORS)]
+        x = left + (ctx_tokens - x_min) / (x_max - x_min) * plot_width
+        prefill_y = bottom - prefill_tps / prefill_max * plot_height
+        gen_y = bottom - gen_tps / gen_max * plot_height
+        parts.append(
+            f'<circle cx="{x:.2f}" cy="{prefill_y:.2f}" r="6" fill="{color}" stroke="#ffffff" stroke-width="2"/>'
+        )
+        parts.append(
+            f'<path d="M {x - 6:.2f} {gen_y:.2f} L {x + 6:.2f} {gen_y:.2f} M {x:.2f} {gen_y - 6:.2f} L {x:.2f} {gen_y + 6:.2f}" stroke="{color}" stroke-width="3"/>'
+        )
+
+    legend_width = 250 if comparison_rows else 176
+    legend_height = 62 + 24 * len(comparison_rows)
+    legend_x = right - legend_width + 14
     legend_y = top + 18
     parts.extend(
         [
-            f'<rect x="{legend_x - 14}" y="{legend_y - 18}" width="176" height="62" rx="6" fill="#ffffff" stroke="#cbd5e1"/>',
+            f'<rect x="{legend_x - 14}" y="{legend_y - 18}" width="{legend_width}" height="{legend_height}" rx="6" fill="#ffffff" stroke="#cbd5e1"/>',
             f'<rect x="{legend_x}" y="{legend_y - 6}" width="12" height="12" fill="{PREFILL_COLOR}"/>',
-            f'<text class="legend" x="{legend_x + 22}" y="{legend_y + 5}">prefill</text>',
+            f'<text class="legend" x="{legend_x + 22}" y="{legend_y + 5}">DeepSeek prefill</text>',
             f'<rect x="{legend_x}" y="{legend_y + 20}" width="12" height="12" fill="{GEN_COLOR}"/>',
-            f'<text class="legend" x="{legend_x + 22}" y="{legend_y + 31}">generation</text>',
+            f'<text class="legend" x="{legend_x + 22}" y="{legend_y + 31}">DeepSeek decode</text>',
         ]
     )
+    for index, (label, _ctx_tokens, _prefill_tps, _gen_tps) in enumerate(comparison_rows):
+        color = COMPARISON_COLORS[index % len(COMPARISON_COLORS)]
+        y = legend_y + 55 + index * 24
+        parts.append(f'<circle cx="{legend_x + 6}" cy="{y - 4}" r="6" fill="{color}"/>')
+        parts.append(
+            f'<path d="M {legend_x + 16} {y - 4} L {legend_x + 28} {y - 4} M {legend_x + 22} {y - 10} L {legend_x + 22} {y + 2}" stroke="{color}" stroke-width="3"/>'
+        )
+        parts.append(
+            f'<text class="legend" x="{legend_x + 36}" y="{y}">{html.escape(label)}</text>'
+        )
 
     parts.append("</svg>")
     return "\n".join(parts) + "\n"
@@ -212,6 +261,11 @@ def main():
     parser.add_argument("--title", help="graph title; defaults to a title derived from the CSV name")
     parser.add_argument("--width", type=int, default=960, help="SVG width in pixels")
     parser.add_argument("--height", type=int, default=540, help="SVG height in pixels")
+    parser.add_argument(
+        "--comparison-csv",
+        type=Path,
+        help="optional labeled comparison points with label, ctx_tokens, prefill_tps, and gen_tps",
+    )
     args = parser.parse_args()
 
     output = args.output
@@ -220,7 +274,8 @@ def main():
 
     rows = read_points(args.csv)
     title = args.title or derive_title(args.csv)
-    output.write_text(render_svg(rows, title, args.width, args.height), encoding="utf-8")
+    comparison_rows = read_comparison_points(args.comparison_csv) if args.comparison_csv else ()
+    output.write_text(render_svg(rows, title, args.width, args.height, comparison_rows), encoding="utf-8")
 
 
 if __name__ == "__main__":

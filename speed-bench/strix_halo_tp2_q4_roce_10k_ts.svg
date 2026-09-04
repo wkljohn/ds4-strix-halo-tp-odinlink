@@ -8,7 +8,7 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
 </style>
 <rect width="960" height="540" fill="#ffffff"/>
-<text class="title" x="480.0" y="34" text-anchor="middle">DeepSeek V4 Flash Q4_K · 2× Strix Halo · RoCE v2</text>
+<text class="title" x="480.0" y="34" text-anchor="middle">TP=2 throughput · RoCE v2 · 2× Strix Halo</text>
 <line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
 <text class="tick" x="70" y="472.00" text-anchor="end">0</text>
 <line x1="82" y1="367.50" x2="878" y2="367.50" stroke="#e2e8f0" stroke-width="1"/>
@@ -45,9 +45,19 @@ text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 <text class="axis-label" x="938" y="267.0" text-anchor="middle" transform="rotate(90 938 267.0)">generation t/s</text>
 <polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="241.20,140.35 400.40,176.80 559.60,179.50 718.80,184.66 878.00,189.85"/>
 <polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="241.20,129.36 400.40,159.42 559.60,160.55 718.80,164.73 878.00,166.98"/>
-<rect x="694" y="66" width="176" height="62" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
-<rect x="708" y="78" width="12" height="12" fill="#2563eb"/>
-<text class="legend" x="730" y="89">prefill</text>
-<rect x="708" y="104" width="12" height="12" fill="#dc2626"/>
-<text class="legend" x="730" y="115">generation</text>
+<circle cx="400.40" cy="372.10" r="6" fill="#16a34a" stroke="#ffffff" stroke-width="2"/>
+<path d="M 394.40 308.00 L 406.40 308.00 M 400.40 302.00 L 400.40 314.00" stroke="#16a34a" stroke-width="3"/>
+<circle cx="241.20" cy="415.00" r="6" fill="#9333ea" stroke="#ffffff" stroke-width="2"/>
+<path d="M 235.20 301.57 L 247.20 301.57 M 241.20 295.57 L 241.20 307.57" stroke="#9333ea" stroke-width="3"/>
+<rect x="628" y="66" width="250" height="110" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
+<rect x="642" y="78" width="12" height="12" fill="#2563eb"/>
+<text class="legend" x="664" y="89">DeepSeek prefill</text>
+<rect x="642" y="104" width="12" height="12" fill="#dc2626"/>
+<text class="legend" x="664" y="115">DeepSeek decode</text>
+<circle cx="648" cy="135" r="6" fill="#16a34a"/>
+<path d="M 658 135 L 670 135 M 664 129 L 664 141" stroke="#16a34a" stroke-width="3"/>
+<text class="legend" x="678" y="139">GLM Q4_K</text>
+<circle cx="648" cy="159" r="6" fill="#9333ea"/>
+<path d="M 658 159 L 670 159 M 664 153 L 664 165" stroke="#9333ea" stroke-width="3"/>
+<text class="legend" x="678" y="163">GLM Q2</text>
 </svg>
