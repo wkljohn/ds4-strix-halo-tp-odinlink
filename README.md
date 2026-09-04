@@ -51,9 +51,9 @@ included in this fork and remains isolated from DeepSeek's graph executor.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | three source-clean runs | **78.59 t/s** | **9.45 t/s** | three-run median; current-source control 79.57/9.36, same FNV `9012bd4d7c5ce422` |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256 | **95.42 t/s** | **9.95 t/s** | current source-clean run; exact FNV `9012bd4d7c5ce422` |
 | **GLM-5.3 Flash Q4_K over OdinLink** | one matched provider run | **76.00 t/s** | **9.43 t/s** | zero fallback; FNV `9012bd4d7c5ce422` |
-| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048-token control workload | **21.87–21.95 t/s** | **3.48–3.49 t/s** | opt-in mixed IQ2_XXS/Q2_K path; repeated fingerprint matched |
+| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256 | **52.74 t/s** | **10.35 t/s** | current source-clean mixed IQ2_XXS/Q2_K run; exact FNV `4dabfb16bc99c81b` |
 
 The Q4_K path keeps all 4,096 prompt rows batched, adds no persistent weight
 cache, and uses 45.07 MiB of reusable scratch per rank.
