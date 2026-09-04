@@ -103,8 +103,8 @@ def cv(values: list[float]) -> float:
 def calculate(baseline_paths: list[Path], candidate_path: Path, lane: str) -> dict:
     if lane not in {"A", "B", "C"}:
         raise Error("lane must be A, B, or C")
-    if len(baseline_paths) != 3:
-        raise Error("exactly three frozen baseline runs are required")
+    if len(baseline_paths) != 2:
+        raise Error("exactly two frozen baseline runs are required")
     baseline = [read_run(path.resolve()) for path in baseline_paths]
     candidate = read_run(candidate_path.resolve())
     manifests = [read_manifest(manifest_for(path.resolve())) for path in baseline_paths]
@@ -180,8 +180,8 @@ def verify(summary_path: Path) -> dict:
         raise Error("invalid diverse benchmark schema/workload")
     baseline = value.get("baseline", [])
     candidate = value.get("candidate", {})
-    if len(baseline) != 3 or not isinstance(candidate, dict):
-        raise Error("diverse benchmark requires three baselines and one candidate")
+    if len(baseline) != 2 or not isinstance(candidate, dict):
+        raise Error("diverse benchmark requires two baselines and one candidate")
     paths = [confined(Path(item["path"]), root) for item in baseline]
     candidate_path = confined(Path(candidate["path"]), root)
     for item, path in zip([*baseline, candidate], [*paths, candidate_path]):

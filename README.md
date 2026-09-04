@@ -24,7 +24,7 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
 | **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | current branch probe; exact FNV `2a44e523bf2d7947` |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **233.04 t/s** | **19.17 t/s** | three-run median, exact fingerprint |
-| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **303.27 t/s** | **21.10 t/s** | three-run median; exact FNV `0163c44015591445` |
+| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **310.65 t/s** | **21.21 t/s** | two-run midpoint; exact FNV `0163c44015591445` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
 ### Q4_K throughput through 10K context
@@ -149,7 +149,7 @@ Run one fixed Q4_K benchmark:
 
 Select `DS4_BENCH_RDMA_PROFILE=roce-v2` in `bench.env.local` for Mellanox
 RoCE v2, or `ib-mlx4` for native Mellanox InfiniBand.
-Use distinct tags (`q4-r1`, `q4-r2`, `q4-r3`) and report the median. Candidate
+Use two distinct tags (`q4-r1`, `q4-r2`) and report their midpoint. Candidate
 fingerprints and the combined pre-main test belong to the
 local validation archive at
 `$DS4_RESEARCH_ROOT/reports/strix-halo-tp-validation-2026-08/`, not

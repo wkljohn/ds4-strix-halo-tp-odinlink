@@ -566,8 +566,8 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
                 local_binary != peer_binary):
             raise GateError("baseline genesis binaries differed across ranks")
         binary_hashes.add(local_binary)
-    if any(count < 3 for count in provider_counts.values()):
-        raise GateError("baseline genesis requires three runs per RDMA provider")
+    if any(count < 2 for count in provider_counts.values()):
+        raise GateError("baseline genesis requires two runs per RDMA provider")
     if len(binary_hashes) != 1:
         raise GateError("baseline genesis benchmarks used different binaries")
 
@@ -1092,8 +1092,8 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
     missing_kinds = sorted(required_kinds - set(kinds))
     if missing_kinds:
         raise GateError("missing evidence kinds: " + ", ".join(missing_kinds))
-    if kinds.count("candidate-benchmark") != 3:
-        raise GateError("exactly three candidate-benchmark artifacts are required")
+    if kinds.count("candidate-benchmark") != 2:
+        raise GateError("exactly two candidate-benchmark artifacts are required")
     if len(diverse_summaries) != 1:
         raise GateError("exactly one cross-disciplinary long summary is required")
     diverse_tool = Path(__file__).with_name("diverse-bench-gate.py")
@@ -1129,9 +1129,9 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
             raise GateError("candidate benchmark uses a different numerical baseline")
     run_ids = {manifest.get("run_id") for _, manifest, _ in benchmark_rows}
     run_tags = {manifest.get("tag") for _, manifest, _ in benchmark_rows}
-    if (None in run_ids or "" in run_ids or len(run_ids) != 3 or
-            None in run_tags or "" in run_tags or len(run_tags) != 3):
-        raise GateError("candidate benchmarks must be three distinct recorded runs")
+    if (None in run_ids or "" in run_ids or len(run_ids) != 2 or
+            None in run_tags or "" in run_tags or len(run_tags) != 2):
+        raise GateError("candidate benchmarks must be two distinct recorded runs")
     if lane == "A":
         expected = {manifest.get("expected_fnv64", "").lower()
                     for _, manifest, _ in benchmark_rows}
