@@ -71,10 +71,10 @@ GLM-5.3 Flash support uses a staged TP=2 path that keeps the model's KDA state
 sharded by attention head and does not change the validated DeepSeek production
 path. The launcher applies the validated cache-free GLM staged environment and
 the full-logits sampling contract. The
-sampling-mode correction is documented in
-`research-results/glm5-next-tp2/deployment-debug-20260903.md`; the full staged
-optimization record is in
-`research-results/glm5-next-tp2/staged-optimization-plan-20260901.md`.
+sampling-mode correction is documented at
+`$DS4_RESEARCH_ROOT/glm5-next-tp2/deployment-debug-20260903.md`; the full staged
+optimization record is at
+`$DS4_RESEARCH_ROOT/glm5-next-tp2/staged-optimization-plan-20260901.md`.
 
 The ordinary benchmark and deployment launchers enable the validated ordered
 ROCm TP callback, temporal-compressor schedule, shape-gated M256/K128 Q8
