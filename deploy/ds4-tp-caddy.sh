@@ -73,6 +73,11 @@ CONTAINER=${DS4_TP_CONTAINER:-0}
 if [[ $CONTAINER == 1 ]]; then
   : "${DS4_TP_CONTAINER_IMAGE:?DS4_TP_CONTAINER_IMAGE is required when DS4_TP_CONTAINER=1}"
   : "${DS4_TP_CONTAINER_VOLUME:?DS4_TP_CONTAINER_VOLUME is required when DS4_TP_CONTAINER=1}"
+  : "${DS4_TP_CONTAINER_IMAGE_ID:?DS4_TP_CONTAINER_IMAGE_ID is required when DS4_TP_CONTAINER=1}"
+  : "${DS4_TP_CONTAINER_WRITABLE_VOLUME:?DS4_TP_CONTAINER_WRITABLE_VOLUME is required when DS4_TP_CONTAINER=1}"
+  [[ $DS4_TP_CONTAINER_IMAGE_ID =~ ^[0-9a-fA-F]{64}$ ]] || {
+    echo "error: DS4_TP_CONTAINER_IMAGE_ID must be the 64-hex content ID" >&2; exit 2;
+  }
   CONTAINER_VOLUME=$DS4_TP_CONTAINER_VOLUME
   [[ $RDMA_PROFILE != odinlink ]] || {
     echo "error: DS4_TP_CONTAINER=1 supports only the Mellanox profiles" >&2
@@ -80,19 +85,63 @@ if [[ $CONTAINER == 1 ]]; then
   }
   CONTAINER_INIT=${DS4_TP_CONTAINER_INIT:-}
   CONTAINER_WORKER=ds4-tp-worker
+  # A container volume must be a dedicated directory, not a home directory
+  # or a broad host tree. It may contain only the deployment artifacts.
+  CONTAINER_VOLUME=$(realpath -e -- "$CONTAINER_VOLUME" 2>/dev/null) || {
+    echo "error: DS4_TP_CONTAINER_VOLUME must already exist" >&2; exit 2;
+  }
+  [[ $CONTAINER_VOLUME != / && $CONTAINER_VOLUME != /home &&
+     $CONTAINER_VOLUME != /root && $CONTAINER_VOLUME != /etc &&
+     $CONTAINER_VOLUME != /var && $CONTAINER_VOLUME != /tmp ]] || {
+    echo "error: DS4_TP_CONTAINER_VOLUME is too broad" >&2; exit 2;
+  }
+  while IFS=: read -r _ _ _ _ _ container_home _; do
+    [[ -n $container_home && $CONTAINER_VOLUME != "$container_home" ]] || {
+      echo "error: container volume must not be a user home directory" >&2; exit 2;
+    }
+  done < <(getent passwd)
+  [[ ! -e $CONTAINER_VOLUME/.ssh && ! -e $CONTAINER_VOLUME/.aws &&
+     ! -e $CONTAINER_VOLUME/.config ]] || {
+    echo "error: container volume contains a credentials directory" >&2; exit 2;
+  }
   # Shared podman spec for both ranks. Host networking carries the TCP
   # control plane and the RDMA verbs; the container's memlock ulimit
   # replaces the system unit's LimitMEMLOCK, so this mode needs no sudo.
   PODMAN_RUN=(podman run --rm
+    --entrypoint /bin/bash
     --network host --ipc host
-    --security-opt label=disable --security-opt unmask=all
+    --cap-drop=all --security-opt no-new-privileges
     --ulimit memlock=-1
-    --device /dev/dri --device /dev/kfd --device /dev/infiniband
-    -v "$CONTAINER_VOLUME:$CONTAINER_VOLUME")
+    --group-add keep-groups
+    --device /dev/kfd)
+  for device in /dev/dri/renderD* /dev/infiniband/uverbs* /dev/infiniband/rdma_cm; do
+    [[ -e $device ]] && PODMAN_RUN+=(--device "$device")
+  done
+  # Kernel verbs devices are not sufficient by themselves: userspace provider
+  # packages must be installed in the image with the image's own ABI. Never
+  # mount host provider libraries into the container. Only discovery sysfs is
+  # supplied by the host, read-only.
+  [[ -d /sys/class/infiniband ]] &&
+    PODMAN_RUN+=(--mount type=bind,src=/sys/class/infiniband,dst=/sys/class/infiniband,ro)
+  PODMAN_RUN+=(-v "$CONTAINER_VOLUME:$CONTAINER_VOLUME:ro")
+  WRITABLE_VOLUME=$(realpath -e -- "$DS4_TP_CONTAINER_WRITABLE_VOLUME" 2>/dev/null) || {
+    echo "error: writable container volume must already exist" >&2; exit 2;
+  }
+  [[ $WRITABLE_VOLUME != "$CONTAINER_VOLUME" ]] || {
+    echo "error: writable volume must be separate from the read-only volume" >&2; exit 2;
+  }
+  PODMAN_RUN+=(-v "$WRITABLE_VOLUME:$WRITABLE_VOLUME:rw")
 fi
 WORKER_PIDFILE=$DS4_PEER_RESEARCH_ROOT/deployment/worker.pid
 LOCAL_LOG=$DS4_RESEARCH_ROOT/deployment/coordinator.log
 WORKER_LOG=$DS4_PEER_RESEARCH_ROOT/deployment/worker.log
+if [[ $CONTAINER == 1 ]]; then
+  # Logs and PID state must remain writable without making model/repository
+  # artifacts writable inside the container.
+  LOCAL_LOG=$WRITABLE_VOLUME/deployment/coordinator.log
+  WORKER_LOG=$WRITABLE_VOLUME/deployment/worker.log
+  WORKER_PIDFILE=$WRITABLE_VOLUME/deployment/worker.pid
+fi
 if [[ $RDMA_PROFILE == odinlink ]]; then
   VERBS_LIB=$ODINLINK_ROOT/build/verbs/libodl_tb5_verbs.so.0.1.0
   ODL_LD_PATH=$ODINLINK_ROOT/build/lib:$ODINLINK_ROOT/build/verbs
@@ -205,31 +254,59 @@ preflight() {
     }
   else
     if [[ $CONTAINER == 1 ]]; then
-      podman image inspect "$DS4_TP_CONTAINER_IMAGE" >/dev/null 2>&1 || {
+      local image_meta expected_image_id
+      image_meta=$(podman image inspect --format '{{.Id}} {{.Digest}} {{join .RepoDigests " "}}' "$DS4_TP_CONTAINER_IMAGE") || {
         echo "error: local container image $DS4_TP_CONTAINER_IMAGE is missing" >&2
         exit 1
       }
-      if ! "${PODMAN_RUN[@]}" "$DS4_TP_CONTAINER_IMAGE" bash -c \
-          '[[ $(ulimit -l) == unlimited ]] && [[ -c /dev/kfd && -d /dev/dri && -e /dev/infiniband/uverbs0 ]]'; then
-        echo "error: local container cannot see GPU/InfiniBand devices with unlimited memlock" >&2
+      expected_image_id=${image_meta%% *}
+      [[ ${expected_image_id,,} == ${DS4_TP_CONTAINER_IMAGE_ID,,} ]] || {
+        echo "error: local container image ID does not match DS4_TP_CONTAINER_IMAGE_ID" >&2
+        exit 1
+      }
+      if ! "${PODMAN_RUN[@]}" "$DS4_TP_CONTAINER_IMAGE" -c \
+          '[[ $(ulimit -l) == unlimited ]] && [[ -c /dev/kfd && -d /dev/dri && -e /dev/infiniband/uverbs0 ]] && command -v ibv_devinfo >/dev/null && ibv_devinfo -d "$1" -l >/dev/null && "$2/ds4" --help >/dev/null' \
+          _ "$LOCAL_RDMA_DEVICE" "$REPO"; then
+        echo "error: local container cannot execute DS4 or discover GPU/InfiniBand with unlimited memlock" >&2
         exit 1
       fi
       if [[ -n $CONTAINER_INIT ]]; then
-        "${PODMAN_RUN[@]}" "$DS4_TP_CONTAINER_IMAGE" bash -c "set -e; $CONTAINER_INIT; true" || {
+        "${PODMAN_RUN[@]}" "$DS4_TP_CONTAINER_IMAGE" -c "set -e; $CONTAINER_INIT; true" || {
           echo "error: DS4_TP_CONTAINER_INIT failed in a fresh local container" >&2
           exit 1
         }
       fi
       local podman_q
       printf -v podman_q '%q ' "${PODMAN_RUN[@]}"
-      "${SSH[@]}" "$podman_q '$DS4_TP_CONTAINER_IMAGE' bash -c '[[ \$(ulimit -l) == unlimited ]] && [[ -c /dev/kfd && -d /dev/dri && -e /dev/infiniband/uverbs0 ]]'" || {
-        echo "error: peer container image or GPU/InfiniBand access with unlimited memlock is unavailable" >&2
+      local peer_device_q peer_repo_q
+      printf -v peer_device_q '%q' "$PEER_RDMA_DEVICE"
+      printf -v peer_repo_q '%q' "$PEER_REPO"
+      "${SSH[@]}" "$podman_q '$DS4_TP_CONTAINER_IMAGE' -c '[[ \$(ulimit -l) == unlimited ]] && [[ -c /dev/kfd && -d /dev/dri && -e /dev/infiniband/uverbs0 ]] && command -v ibv_devinfo >/dev/null && ibv_devinfo -d \"\$1\" -l >/dev/null && \"\$2/ds4\" --help >/dev/null' _ $peer_device_q $peer_repo_q" || {
+        echo "error: peer container cannot execute DS4 or discover GPU/InfiniBand with unlimited memlock" >&2
+        exit 1
+      }
+      local peer_image_id
+      peer_image_id=$("${SSH[@]}" "podman image inspect --format '{{.Id}}' '$DS4_TP_CONTAINER_IMAGE'") || {
+        echo "error: peer container image cannot be inspected" >&2; exit 1;
+      }
+      [[ ${peer_image_id,,} == ${DS4_TP_CONTAINER_IMAGE_ID,,} ]] || {
+        echo "error: peer container image ID differs from local pinned image" >&2
+        exit 1
+      }
+      "${SSH[@]}" "test -d '$DS4_TP_CONTAINER_VOLUME' -a -d '$DS4_TP_CONTAINER_WRITABLE_VOLUME'" || {
+        echo "error: peer container volumes are missing" >&2; exit 1;
+      }
+      local peer_volume_q peer_writable_q
+      printf -v peer_volume_q '%q' "$DS4_TP_CONTAINER_VOLUME"
+      printf -v peer_writable_q '%q' "$DS4_TP_CONTAINER_WRITABLE_VOLUME"
+      "${SSH[@]}" "v=\$(realpath -e -- $peer_volume_q) && w=\$(realpath -e -- $peer_writable_q) && [[ \$v != / && \$v != /home && \$v != /root && \$v != /etc && \$v != /var && \$v != /tmp && \$v != \$w ]] && (getent passwd | awk -F: -v p=\"\$v\" '\$6 == p { bad=1 } END { exit bad }') && [[ ! -e \"\$v/.ssh\" && ! -e \"\$v/.aws\" && ! -e \"\$v/.config\" ]]" || {
+        echo "error: peer container volumes are broad, credential-bearing, or identical" >&2
         exit 1
       }
       if [[ -n $CONTAINER_INIT ]]; then
         local peer_init_q
         printf -v peer_init_q '%q' "set -e; $CONTAINER_INIT; true"
-        "${SSH[@]}" "$podman_q '$DS4_TP_CONTAINER_IMAGE' bash -c $peer_init_q" || {
+        "${SSH[@]}" "$podman_q '$DS4_TP_CONTAINER_IMAGE' -c $peer_init_q" || {
           echo "error: DS4_TP_CONTAINER_INIT failed in a fresh peer container" >&2
           exit 1
         }
@@ -276,6 +353,11 @@ preflight() {
   local_bin=$(sha256sum "$REPO/ds4" | awk '{print $1}')
   peer_bin=$("${SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}')
   [[ $local_bin == "$peer_bin" ]] || { echo "error: node binaries differ" >&2; exit 1; }
+  local peer_server_hash
+  peer_server_hash=$("${SSH[@]}" "sha256sum '$PEER_REPO/ds4-server'" | awk '{print $1}')
+  [[ ${peer_server_hash,,} == ${DS4_SERVER_SHA256,,} ]] || {
+    echo "error: peer ds4-server does not match DS4_SERVER_SHA256" >&2; exit 1;
+  }
   [[ $(sample_fingerprint "$MODEL") == "$(remote_fingerprint "$MODEL")" ]] || {
     echo "error: target-model fingerprints differ" >&2; exit 1;
   }
@@ -292,6 +374,10 @@ preflight() {
   mkdir -p "$RUNTIME" "$(dirname -- "$LOCAL_LOG")"
   printf -v peer_research_deploy_q '%q' "$DS4_PEER_RESEARCH_ROOT/deployment"
   "${SSH[@]}" "mkdir -p $peer_research_deploy_q"
+  if [[ $CONTAINER == 1 ]]; then
+    printf -v writable_deploy_q '%q' "$WRITABLE_VOLUME/deployment"
+    "${SSH[@]}" "mkdir -p $writable_deploy_q"
+  fi
 }
 
 start() {
@@ -416,7 +502,7 @@ start() {
     printf -v inner_q '%q' "$worker_inner"
     # Detached worker container; the pid file stores the container id and
     # stdout lands in the same host log file as in host mode.
-    "${SSH[@]}" "$podman_q -d --name $CONTAINER_WORKER -w $repo_q '$DS4_TP_CONTAINER_IMAGE' bash -c $inner_q >$pid_q"
+    "${SSH[@]}" "$podman_q -d --name $CONTAINER_WORKER -w $repo_q '$DS4_TP_CONTAINER_IMAGE' -c $inner_q >$pid_q"
   else
     # Keep the background operator scoped to ds4 itself. With `cd && cmd &`,
     # POSIX shells background the whole AND-list and `$!` names a wrapper shell.
@@ -441,7 +527,7 @@ start() {
       --property="StandardError=append:$LOCAL_LOG" \
       "${PODMAN_RUN[@]}" --name "$COORD_UNIT" -w "$REPO" \
         "$DS4_TP_CONTAINER_IMAGE" \
-        bash -c "$coordinator_inner" >/dev/null
+        -c "$coordinator_inner" >/dev/null
   elif [[ $RDMA_PROFILE != odinlink ]]; then
     # Mellanox RDMA registration needs more than the user manager's inherited
     # 8 MiB hard memlock limit. A system transient unit can genuinely raise
@@ -465,19 +551,21 @@ start() {
   coord_pid=$(coord_main_pid)
   [[ $coord_pid =~ ^[1-9][0-9]*$ ]] || {
     echo "error: coordinator service failed to start" >&2
+    "${SSH[@]}" "podman stop -t 10 '$CONTAINER_WORKER' >/dev/null 2>&1 || true"
     return 1
   }
   if [[ $CONTAINER == 1 ]]; then
     local container_memlock
     container_memlock=
     for _ in $(seq 1 50); do
-      container_memlock=$(podman exec "$COORD_UNIT" ulimit -l 2>/dev/null || true)
+      container_memlock=$(podman exec "$COORD_UNIT" /bin/bash -c 'ulimit -l' 2>/dev/null || true)
       [[ $container_memlock == unlimited ]] && break
       sleep 0.2
     done
     [[ $container_memlock == unlimited ]] || {
       echo "error: coordinator container memlock is ${container_memlock:-unavailable}, expected unlimited" >&2
       coord_stop_service
+      "${SSH[@]}" "podman stop -t 10 '$CONTAINER_WORKER' >/dev/null 2>&1 || true"
       return 1
     }
   elif [[ $RDMA_PROFILE != odinlink ]]; then
@@ -550,10 +638,11 @@ logs() {
 }
 
 case ${1:-status} in
+  preflight) preflight ;;
   start) start ;;
   stop) stop ;;
   restart) stop; start ;;
   status) status ;;
   logs) logs ;;
-  *) echo "usage: $0 {start|stop|restart|status|logs}" >&2; exit 2 ;;
+  *) echo "usage: $0 {preflight|start|stop|restart|status|logs}" >&2; exit 2 ;;
 esac

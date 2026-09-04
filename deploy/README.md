@@ -82,14 +82,43 @@ The launcher verifies that effective process limit and checks the peer's
 SSH-session limit before model loading. OdinLink retains its transient user
 service and does not acquire this requirement.
 
-Set `DS4_TP_CONTAINER=1` (plus the image, volume, and optional init command)
+Set `DS4_TP_CONTAINER=1` (plus the image reference, content-addressed image ID, dedicated
+read-only artifact volume, separate writable runtime volume, and optional init command)
 to run both ranks in podman containers instead, for hosts where ROCm exists
 only inside a container image. The memlock requirement then moves into the
 container (`--ulimit memlock=-1`), the coordinator runs as a `systemd --user`
 transient unit supervising a foreground `podman run`, the peer worker is a
 detached `--rm` container, and passwordless `sudo` is not required. The
 launcher probes the image, GPU/InfiniBand device access, and the memlock
-limit inside a throwaway container on both nodes before model loading.
+limit inside a throwaway container on both nodes before model loading. It
+refuses mutable tags, mismatched image IDs, broad/home/credential directories,
+and missing peer volumes. Container mode is a dedicated-host, administrator-
+only trust boundary: host networking/IPC and `/dev/kfd` remain necessary for
+this TP/RDMA design.
+
+Before enabling it, install the exact same image on both nodes and record its
+content identity:
+
+```sh
+podman build --pull=never -f deploy/Containerfile.rocm714-rdma \
+  -t localhost/ds4-rocm714-rdma:local .
+podman image inspect --format '{{.Id}} {{.Digest}} {{join .RepoDigests " "}}' \
+  localhost/ds4-rocm714-rdma:local
+```
+
+The supplied Containerfile pins the ROCm 7.14/gfx1151 base-image digest and
+installs matching, version-pinned Ubuntu `libibverbs` providers and inspection
+utilities. Do not bind-mount provider libraries from the host: a host/container
+ABI mismatch makes verbs discovery fail and may not be caught until after the
+large model has loaded.
+
+Set `DS4_TP_CONTAINER_IMAGE` to that local tag (or a registry digest) and
+`DS4_TP_CONTAINER_IMAGE_ID` to the 64-hex `.Id` returned on both nodes. Do not
+use a tag that was built independently on each machine. When an image is
+transferred with `podman save|load`, the manifest digest may be rewritten; the
+content-addressed image ID is therefore the mandatory parity pin. Use a dedicated pair
+of directories such as `/srv/ds4-container` and `/srv/ds4-container-runtime`;
+the launcher mounts artifacts read-only and runtime state separately.
 
 Useful commands:
 
