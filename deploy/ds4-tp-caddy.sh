@@ -43,12 +43,13 @@ case $RDMA_PROFILE in
     ;;
 esac
 CONTEXT=${CONTEXT:-262144}
-if [[ -z ${PREFILL_CHUNK:-} ]]; then
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then PREFILL_CHUNK=2048; else PREFILL_CHUNK=4096; fi
-fi
+PREFILL_CHUNK=${PREFILL_CHUNK:-2048}
 TP_TIMEOUT_SEC=${TP_TIMEOUT_SEC:-60}
 DEFAULT_TEMPERATURE=${DEFAULT_TEMPERATURE:-0}
 DSPARK=${DSPARK:-0}
+GLM5_ENABLE_ORDINARY=${GLM5_ENABLE_ORDINARY:-0}
+GLM5_FULL_LOGITS=${GLM5_FULL_LOGITS:-0}
+GLM5_PREFILL_BATCH=${GLM5_PREFILL_BATCH:-256}
 PREFILL_FFN_WAVEFRONT=${PREFILL_FFN_WAVEFRONT:-1}
 Q8_M256_K128=${Q8_M256_K128:-1}
 HC_STAGE_EXACT_COOP=${HC_STAGE_EXACT_COOP:-1}
@@ -158,6 +159,15 @@ is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$EXPERT_SPLIT" &&
 }
 (( EXPERT_SPLIT < 256 )) || { echo "error: expert split must be in 1..255" >&2; exit 2; }
 [[ $DSPARK == 0 || $DSPARK == 1 ]] || { echo "error: DSPARK must be 0 or 1" >&2; exit 2; }
+[[ $GLM5_ENABLE_ORDINARY == 0 || $GLM5_ENABLE_ORDINARY == 1 ]] || {
+  echo "error: GLM5_ENABLE_ORDINARY must be 0 or 1" >&2; exit 2;
+}
+[[ $GLM5_FULL_LOGITS == 0 || $GLM5_FULL_LOGITS == 1 ]] || {
+  echo "error: GLM5_FULL_LOGITS must be 0 or 1" >&2; exit 2;
+}
+is_uint "$GLM5_PREFILL_BATCH" || {
+  echo "error: GLM5_PREFILL_BATCH must be a positive integer" >&2; exit 2;
+}
 [[ $PREFILL_FFN_WAVEFRONT == 0 || $PREFILL_FFN_WAVEFRONT == 1 ]] || {
   echo "error: PREFILL_FFN_WAVEFRONT must be 0 or 1" >&2; exit 2;
 }
@@ -434,9 +444,15 @@ start() {
     }
   fi
 
-  local -a common worker coordinator decode_env support_args
+  local -a common worker coordinator decode_env support_args prefill_args
   local -a worker_rdma_args coordinator_rdma_args
-  local routed_family tp_prefill_skip_unowned
+  local routed_family tp_prefill_skip_unowned model_is_glm5=0
+  if python3 "$REPO/scripts/check-glm5-next-gguf.py" "$MODEL" >/dev/null 2>&1; then
+    model_is_glm5=1
+  fi
+  if (( model_is_glm5 == 0 )); then
+    prefill_args=(--prefill-chunk "$PREFILL_CHUNK")
+  fi
   if [[ $RDMA_PROFILE == odinlink ]]; then
     common=(env
       DS4_TP_ODINLINK_BATCH_ASYNC=1
@@ -459,6 +475,45 @@ start() {
     DS4_ROCM_STREAM_Q8_F16_CACHE_GB=0
     DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
     DS4_ROCM_Q4K_DECODE_STAGE_XQ=1)
+  if [[ $GLM5_ENABLE_ORDINARY == 1 ]]; then
+    echo "warning: GLM-5.3 ordinary session integration is explicitly enabled; this is an experimental deployment" >&2
+    common+=(DS4_GLM5_NEXT_ENABLE_ORDINARY=1
+             DS4_GLM5_NEXT_PREFILL_BATCH="$GLM5_PREFILL_BATCH"
+             # GLM ordinary TP publishes the full sampling logits contract;
+             # DeepSeek's two-candidate greedy mode is incompatible with it.
+             DS4_TP_GREEDY_TOP2=0)
+    # Match the source-clean GLM 4096+300 TP benchmark.  These are all
+    # cache-free, GLM-scoped kernels/features; do not leak them into DS4.
+    common+=(DS4_GLM5_KDA_TP=1
+             DS4_GLM5_SMALL_GATE=1
+             DS4_GLM5_KDA_OUTPUT_ROWSLICE=1
+             DS4_ROCM_GLM5_Q4K_WMMA=1
+             DS4_ROCM_GLM5_Q4K_KSHARD=1
+             DS4_GLM5_ALLOW_Q4_BATCH_MLA_OUTPUT=1
+             DS4_ROCM_TP_PREFILL_SKIP_UNOWNED=1
+             DS4_ROCM_GLM5_BF16_QKV_PREFETCH=64
+             DS4_ROCM_GLM5_BF16_QKV_NONTEMPORAL=1
+             DS4_ROCM_GLM5_BF16_OUTPUT_PREFETCH=64
+             DS4_ROCM_GLM5_BF16_OUTPUT_NONTEMPORAL=1
+             DS4_ROCM_GLM5_BF16_OUTPUT_ROWS_PER_BLOCK=8
+             DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV=1
+             DS4_ROCM_GLM5_QK_LOW_LDS_EXACT=1
+             DS4_ROCM_GLM5_BATCH_POOL_STAGE=1
+             DS4_ROCM_GLM_CAUSAL_ATTN_HEAD_SHARED=1
+             DS4_GLM5_SMALL_GATE_DIRECT_SEND=1
+             DS4_ROCM_GLM5_BF16_ROWTILE2X16=1
+             DS4_GLM5_SPARSE_BATCH_BRIDGE=1
+             DS4_GLM5_SPARSE_BATCH_OUTPUT=1
+             DS4_GLM5_SPARSE_BATCH_PRELUDE=1
+             DS4_GLM5_SPARSE_BATCH_VALUE=1
+             DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1
+             DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=1
+             DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH=8
+             DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL=1
+             DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK=32
+             DS4_ROCM_GLM5_BF16_WMMA_HILO=1
+             DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED=1)
+  fi
   if [[ $DSPARK == 1 ]]; then
     echo "warning: DSpark is experimental and is not target-fingerprint exact" >&2
     decode_env=(
@@ -504,9 +559,20 @@ start() {
     support_args=()
   fi
   common+=("${decode_env[@]}")
+  # decode_env carries DeepSeek's two-candidate default.  GLM ordinary TP
+  # requires the full logits sampling contract, so override it after the
+  # generic block has been appended.
+  if [[ $GLM5_ENABLE_ORDINARY == 1 ]]; then
+    common+=(DS4_TP_GREEDY_TOP2=0)
+  fi
+  if [[ $GLM5_FULL_LOGITS == 1 ]]; then
+    echo "warning: GLM full-logits TP mode is explicitly enabled; transport and memory cost may increase" >&2
+    # Append after ordinary decode defaults so the explicit server mode wins.
+    common+=(DS4_TP_RANK0_FULL_LOGITS=1 DS4_TP_GREEDY_TOP2=0)
+  fi
   worker=("${common[@]}" ./ds4 --role worker --tensor-parallel
     --coordinator "$COORDINATOR_RDMA_ADDR" "$TP_PORT" --transport rdma --rocm
-    -m "$MODEL" -c "$CONTEXT" --prefill-chunk "$PREFILL_CHUNK"
+    -m "$MODEL" -c "$CONTEXT" "${prefill_args[@]}"
     "${worker_rdma_args[@]}"
     "${support_args[@]}")
   coordinator=("${common[@]}")
@@ -515,7 +581,7 @@ start() {
     --role coordinator --tensor-parallel --listen 0.0.0.0 "$TP_PORT"
     --transport rdma --rocm -m "$MODEL" -c "$CONTEXT"
     "${coordinator_rdma_args[@]}"
-    --prefill-chunk "$PREFILL_CHUNK" "${support_args[@]}"
+    "${prefill_args[@]}" "${support_args[@]}"
     --default-temperature "$DEFAULT_TEMPERATURE"
     --host "$API_HOST" --port "$API_PORT")
 

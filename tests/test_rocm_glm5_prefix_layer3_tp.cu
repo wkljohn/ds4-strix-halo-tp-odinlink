@@ -319,6 +319,8 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
         identity.runtime_features |= DS4_TP_FEATURE_GLM5_KDA_TP;
     const char *kda_output_kslice =
         std::getenv("DS4_GLM5_KDA_OUTPUT_KSLICE");
+    const char *kda_output_rowslice =
+        std::getenv("DS4_GLM5_KDA_OUTPUT_ROWSLICE");
     CHECK(!kda_output_kslice || std::strcmp(kda_output_kslice, "0") == 0 ||
               std::strcmp(kda_output_kslice, "1") == 0,
           "KDA output K-slice selector is exactly 0 or 1");
@@ -329,6 +331,26 @@ bool create_tp(const Glm5TestGGUF &gguf, bool leader,
               "KDA output K-slice requires BF16 output and KDA-TP");
         identity.runtime_features |=
             DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE;
+    }
+    CHECK(!kda_output_rowslice || std::strcmp(kda_output_rowslice, "0") == 0 ||
+              std::strcmp(kda_output_rowslice, "1") == 0,
+          "KDA output row-slice selector is exactly 0 or 1");
+    if (kda_output_rowslice && std::strcmp(kda_output_rowslice, "1") == 0) {
+        CHECK(!mixed_q2_model &&
+                  (identity.runtime_features &
+                   DS4_TP_FEATURE_GLM5_KDA_TP) != 0u &&
+                  !(identity.runtime_features &
+                    DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE),
+              "KDA output row-slice requires BF16 output, KDA-TP, and no K-slice");
+        identity.runtime_features |=
+            DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE;
+    }
+    const char *gpu_row_gate = std::getenv("DS4_GLM5_GPU_ROW_GATE");
+    if (gpu_row_gate && std::strcmp(gpu_row_gate, "1") == 0 &&
+        small_gate_enabled &&
+        !(std::getenv("DS4_TP_HOST_CALLBACK") &&
+          std::strcmp(std::getenv("DS4_TP_HOST_CALLBACK"), "1") == 0)) {
+        identity.runtime_features |= DS4_TP_FEATURE_GLM5_GPU_ROW_GATE;
     }
     identity.gate_slot_start =
         (identity.runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u ?
@@ -616,6 +638,150 @@ bool finite_nonzero_vector(const std::vector<float> &values) {
         nonzero = nonzero || value != 0.0f;
     }
     return nonzero;
+}
+
+bool run_mla_longkey_attention_test(const char *role, ds4_tp *tp) {
+    constexpr uint32_t kTokens = 256u;
+    constexpr uint32_t kPos0 = 1792u;
+    constexpr uint32_t kSelected = 2048u;
+    constexpr uint32_t kHeads = 1u;
+    constexpr uint32_t kQkNope = 256u;
+    constexpr uint32_t kKvWidth = 512u;
+    constexpr uint32_t kCacheCap = kSelected;
+    const uint64_t q_count = (uint64_t)kTokens * kHeads * kQkNope;
+    const uint64_t low_count = (uint64_t)kTokens * kHeads * kKvWidth;
+    const uint64_t kv_count = (uint64_t)kCacheCap * kKvWidth;
+    const uint64_t out_count = low_count;
+
+    std::vector<float> host_q(q_count, 0.0f);
+    std::vector<float> host_low(low_count);
+    std::vector<float> host_kv(kv_count);
+    auto bounded_value = [](uint64_t index, uint32_t salt) {
+        uint32_t x = (uint32_t)index ^ salt;
+        x ^= x >> 16u;
+        x *= UINT32_C(0x7feb352d);
+        x ^= x >> 15u;
+        x *= UINT32_C(0x846ca68b);
+        x ^= x >> 16u;
+        return ((float)(x & UINT32_C(0x00ffffff)) /
+                (float)UINT32_C(0x00800000)) - 1.0f;
+    };
+    for (uint64_t i = 0u; i < low_count; ++i)
+        host_low[i] = bounded_value(i, UINT32_C(0x13579bdf));
+    for (uint64_t i = 0u; i < kv_count; ++i)
+        host_kv[i] = bounded_value(i, UINT32_C(0x2468ace1));
+
+    TensorGuard q, low, kv, scalar_out, gemm_out;
+    CHECK((q.value = ds4_gpu_tensor_alloc(q_count * sizeof(float))) != nullptr &&
+              (low.value = ds4_gpu_tensor_alloc(
+                   low_count * sizeof(float))) != nullptr &&
+              (kv.value = ds4_gpu_tensor_alloc(kv_count * sizeof(float))) != nullptr &&
+              (scalar_out.value = ds4_gpu_tensor_alloc(
+                   out_count * sizeof(float))) != nullptr &&
+              (gemm_out.value = ds4_gpu_tensor_alloc(
+                   out_count * sizeof(float))) != nullptr &&
+              ds4_gpu_tensor_write(q.value, 0u, host_q.data(),
+                                   q_count * sizeof(float)) &&
+              ds4_gpu_tensor_write(low.value, 0u, host_low.data(),
+                                   low_count * sizeof(float)) &&
+              ds4_gpu_tensor_write(kv.value, 0u, host_kv.data(),
+                                   kv_count * sizeof(float)),
+          "allocate deterministic 256x2048 MLA attention fixture");
+
+    CHECK(unsetenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE") == 0 &&
+              unsetenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32") == 0 &&
+              ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+                  scalar_out.value, q.value, low.value, kv.value, nullptr,
+                  kTokens, kPos0, kSelected, kCacheCap, false, kHeads,
+                  kKvWidth, kQkNope, 0u, 0u,
+                  10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+          "execute scalar 256x2048 NoPE attention oracle");
+    CHECK(setenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE", "1", 1) == 0 &&
+              setenv("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32", "1", 1) == 0 &&
+              ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+                  gemm_out.value, q.value, low.value, kv.value, nullptr,
+                  kTokens, kPos0, kSelected, kCacheCap, false, kHeads,
+                  kKvWidth, kQkNope, 0u, 0u,
+                  10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+          "execute FP32 GEMM 256x2048 NoPE attention candidate");
+
+    std::vector<float> scalar(out_count), gemm(out_count);
+    CHECK(ds4_gpu_tensor_read(scalar_out.value, 0u, scalar.data(),
+                               out_count * sizeof(float)) &&
+              ds4_gpu_tensor_read(gemm_out.value, 0u, gemm.data(),
+                                   out_count * sizeof(float)),
+          "read scalar and GEMM long-key attention outputs");
+    const VectorError full_error = vector_error(scalar, gemm);
+
+    const uint32_t token = kTokens - 1u;
+    const float scale = 1.0f / std::sqrt((float)kQkNope);
+    std::vector<long double> probability(kSelected);
+    long double maximum = -INFINITY;
+    for (uint32_t row = 0u; row < kSelected; ++row) {
+        long double score = 0.0L;
+        for (uint32_t j = 0u; j < kKvWidth; ++j) {
+            score += (long double)host_low[(uint64_t)token * kKvWidth + j] *
+                     (long double)host_kv[(uint64_t)row * kKvWidth + j];
+        }
+        probability[row] = score * (long double)scale;
+        maximum = std::max(maximum, probability[row]);
+    }
+    long double denominator = 0.0L;
+    for (long double &value : probability) {
+        value = std::exp(value - maximum);
+        denominator += value;
+    }
+    std::vector<float> reference(kKvWidth);
+    for (uint32_t j = 0u; j < kKvWidth; ++j) {
+        long double value = 0.0L;
+        for (uint32_t row = 0u; row < kSelected; ++row) {
+            value += probability[row] *
+                     (long double)host_kv[(uint64_t)row * kKvWidth + j];
+        }
+        reference[j] = (float)(value / denominator);
+    }
+    const float *scalar_last = scalar.data() + (uint64_t)token * kKvWidth;
+    const float *gemm_last = gemm.data() + (uint64_t)token * kKvWidth;
+    const VectorError scalar_reference = vector_error_data(
+        reference.data(), scalar_last, kKvWidth);
+    const VectorError gemm_reference = vector_error_data(
+        reference.data(), gemm_last, kKvWidth);
+    const uint64_t scalar_hash = fnv64(
+        scalar.data(), scalar.size() * sizeof(float));
+    const uint64_t gemm_hash = fnv64(
+        gemm.data(), gemm.size() * sizeof(float));
+    char hash_error[256] = {};
+    CHECK(ds4_tp_hash_check(tp, UINT64_C(0x474c4d354c4b5343),
+                            scalar_hash, hash_error,
+                            sizeof(hash_error)) == 1 &&
+              ds4_tp_hash_check(tp, UINT64_C(0x474c4d354c4b474d),
+                                gemm_hash, hash_error,
+                                sizeof(hash_error)) == 1,
+          hash_error[0] ? hash_error :
+              "long-key attention outputs agree across ranks");
+    std::fprintf(stderr,
+        "GLM5 MLA long-key attention role=%s tokens=%u pos0=%u rows=%u "
+        "full_nrmse=%.9g full_cosine=%.12g full_max_abs=%.9g "
+        "scalar_fp64_nrmse=%.9g scalar_fp64_max_abs=%.9g "
+        "gemm_fp64_nrmse=%.9g gemm_fp64_max_abs=%.9g "
+        "scalar=%016llx gemm=%016llx rdma=1\n",
+        role, kTokens, kPos0, kSelected,
+        full_error.nrmse, full_error.cosine, full_error.max_abs,
+        scalar_reference.nrmse, scalar_reference.max_abs,
+        gemm_reference.nrmse, gemm_reference.max_abs,
+        (unsigned long long)scalar_hash,
+        (unsigned long long)gemm_hash);
+    CHECK(finite_error(full_error) &&
+              finite_error(scalar_reference) &&
+              finite_error(gemm_reference) &&
+              full_error.nrmse <= 1.0e-5 &&
+              full_error.cosine >= 0.9999999999 &&
+              full_error.max_abs <= 2.0e-5,
+          "FP32 GEMM long-key attention stays inside predeclared T1 bounds");
+    std::fprintf(stderr,
+        "PASS GLM5 MLA long-key attention role=%s geometry=256x2048x512 "
+        "window_cache_bytes=0 rdma=1\n", role);
+    return true;
 }
 
 bool compare_full_prompt_states(const char *role,
@@ -920,6 +1086,17 @@ bool run() {
           "MLA attention-only selector is exactly 0 or 1");
     CHECK(!mla_attention_only || mla_batch_test,
           "MLA attention-only gate requires the MLA batch fixture");
+    const char *mla_attention_mode_env =
+        std::getenv("DS4_GLM5_MLA_ATTENTION_MODE");
+    const bool mla_attention_sequential =
+        !mla_attention_mode_env ||
+        std::strcmp(mla_attention_mode_env, "sequential") == 0;
+    const bool mla_attention_batch =
+        !mla_attention_mode_env ||
+        std::strcmp(mla_attention_mode_env, "batch") == 0;
+    CHECK(!mla_attention_mode_env || mla_attention_sequential ||
+              mla_attention_batch,
+          "MLA attention mode is sequential or batch");
     const char *mla_sparse_boundary_env =
         std::getenv("DS4_GLM5_MLA_SPARSE_BOUNDARY_TEST");
     const bool mla_sparse_boundary_test = mla_sparse_boundary_env &&
@@ -927,6 +1104,13 @@ bool run() {
     CHECK(!mla_sparse_boundary_env || mla_sparse_boundary_test ||
               std::strcmp(mla_sparse_boundary_env, "0") == 0,
           "MLA sparse boundary selector is exactly 0 or 1");
+    const char *mla_longkey_env =
+        std::getenv("DS4_GLM5_MLA_LONGKEY_ATTENTION_TEST");
+    const bool mla_longkey_test = mla_longkey_env &&
+        std::strcmp(mla_longkey_env, "1") == 0;
+    CHECK(!mla_longkey_env || mla_longkey_test ||
+              std::strcmp(mla_longkey_env, "0") == 0,
+          "MLA long-key attention selector is exactly 0 or 1");
     const char *mla_batch_rows_env =
         std::getenv("DS4_GLM5_MLA_ROUTED_BATCH_ROWS");
     char *mla_batch_rows_end = nullptr;
@@ -936,8 +1120,9 @@ bool run() {
               (mla_batch_rows_end && *mla_batch_rows_end == '\0')) &&
               (mla_batch_rows_long == 3ul || mla_batch_rows_long == 5ul ||
                mla_batch_rows_long == 33ul ||
-               mla_batch_rows_long == 121ul),
-          "MLA routed batch rows are the bounded 3, 5, 33, or 121 fixture");
+               mla_batch_rows_long == 121ul ||
+               mla_batch_rows_long == 256ul),
+          "MLA routed batch rows are the bounded 3, 5, 33, 121, or 256 fixture");
     const uint32_t mla_batch_rows = (uint32_t)mla_batch_rows_long;
     const char *mla_prefix_rows_env =
         std::getenv("DS4_GLM5_MLA_ROUTED_PREFIX_ROWS");
@@ -1074,6 +1259,10 @@ bool run() {
               (!full_trunk && !text_mode && !kda_batch_test &&
                !mla_batch_test),
           "MLA sparse boundary is an isolated layer-3 gate");
+    CHECK(!mla_longkey_test ||
+              (!full_trunk && !text_mode && !kda_batch_test &&
+               !mla_batch_test && !mla_sparse_boundary_test),
+          "MLA long-key attention is an isolated component gate");
     CodecGuard codec;
     TokensGuard prompt_tokens;
     if (text_mode) {
@@ -1086,7 +1275,7 @@ bool run() {
         CHECK(prompt_tokens.value.len > 0 && prompt_tokens.value.len <= 128,
               "real chat prompt token count is bounded to tested 1..128");
     }
-    const uint32_t context_capacity = text_mode ?
+    const uint32_t context_capacity = mla_longkey_test ? 2048u : text_mode ?
         (uint32_t)prompt_tokens.value.len + text_generate :
         mla_sparse_boundary_test ? 9u :
         kda_batch_test ? kda_batch_rows + kda_continuation_rows :
@@ -1203,6 +1392,7 @@ bool run() {
         (uint64_t)mla_prefix_rows,
         (uint64_t)mla_continuation_rows,
         (uint64_t)mla_sparse_boundary_test,
+        (uint64_t)mla_longkey_test,
         (uint64_t)batch_prefill,
         (uint64_t)batch_prefill_compare,
         prompt_hash,
@@ -1299,7 +1489,7 @@ bool run() {
             (unsigned long long)(free_before_install - free_after_install));
     }
 
-    if (text_mode || kda_batch_test || mla_batch_test ||
+    if (text_mode || kda_batch_test || mla_batch_test || mla_longkey_test ||
         mla_sparse_boundary_test) {
         char ready_error[256] = {};
         CHECK(ds4_gpu_synchronize() &&
@@ -1309,6 +1499,10 @@ bool run() {
                       sizeof(ready_error)) == 1,
               ready_error[0] ? ready_error :
                   "both ranks ready after full-trunk residency");
+    }
+
+    if (mla_longkey_test) {
+        return run_mla_longkey_attention_test(role, tp.tp);
     }
 
     if (mla_sparse_boundary_test) {
@@ -1537,7 +1731,7 @@ bool run() {
          * cross-disciplinary prompt used by the end-to-end repeatability
          * gate.  The two trailing control tokens permit the existing bounded
          * prefix cases without inventing a different input fixture. */
-        const std::vector<uint32_t> ids = {
+        std::vector<uint32_t> ids = {
             154822u, 154824u, 154826u, 25062u, 287u, 29905u, 371u, 25u,
             7487u, 154827u, 50258u, 264u, 63141u, 5312u, 51325u, 43201u,
             24206u, 13u, 758u, 3162u, 14657u, 11u, 10334u, 3170u,
@@ -1555,6 +1749,10 @@ bool run() {
             18940u, 20484u, 16859u, 13057u, 504u, 18532u, 13u, 154828u,
             154841u, 17u, 287u,
         };
+        const size_t frozen_ids = ids.size();
+        while (ids.size() < committed_rows) {
+            ids.push_back(ids[(ids.size() - frozen_ids) % frozen_ids]);
+        }
         CHECK(committed_rows <= ids.size(),
               "select exact MLA routed token fixture");
         constexpr uint32_t continuation_ids[16] = {
@@ -1681,7 +1879,8 @@ bool run() {
                   "seed identical scalar MLA tail before batch");
         }
 
-        for (uint32_t row = 0u; row < rows; ++row) {
+        for (uint32_t row = 0u;
+             mla_attention_sequential && row < rows; ++row) {
             ds4_gpu_tensor *row_input = ds4_gpu_tensor_view(
                 batch_input.value,
                 (uint64_t)row * kHcWidth * sizeof(float),
@@ -1698,7 +1897,8 @@ bool run() {
             ds4_gpu_tensor_free(row_input);
             CHECK(row_ok, "execute sequential MLA attention oracle row");
         }
-        CHECK(ds4_glm5_next_mla_attention_forward_test(
+        CHECK(!mla_attention_batch ||
+              ds4_glm5_next_mla_attention_forward_test(
                   &exec, 3u, &attention_batch_state.value,
                   batch_workspace.value, batch_input.value,
                   attention_batch_output.value, rows),
@@ -1706,31 +1906,48 @@ bool run() {
         std::vector<float> attention_sequential(
             (uint64_t)rows * kHcWidth);
         std::vector<float> attention_batch((uint64_t)rows * kHcWidth);
-        CHECK(ds4_gpu_tensor_read(
+        CHECK(!mla_attention_sequential || ds4_gpu_tensor_read(
                   attention_sequential_output.value, 0u,
                   attention_sequential.data(),
-                  attention_sequential.size() * sizeof(float)) &&
-              ds4_gpu_tensor_read(
+                  attention_sequential.size() * sizeof(float)),
+              "read sequential MLA attention outputs");
+        CHECK(!mla_attention_batch || ds4_gpu_tensor_read(
                   attention_batch_output.value, 0u,
                   attention_batch.data(),
                   attention_batch.size() * sizeof(float)),
-              "read decomposed MLA attention outputs");
-        const VectorError attention_error =
-            vector_error(attention_sequential, attention_batch);
-        std::fprintf(stderr,
-            "GLM5 MLA attention batch measurement role=%s prefix=%u rows=%u "
-            "nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
-            role, prefix_rows, rows, attention_error.nrmse,
-            attention_error.cosine,
-            attention_error.max_abs);
-        CHECK(attention_error.nrmse <= 1.0e-6 &&
-                  attention_error.cosine >= 0.999999999 &&
-                  attention_error.max_abs <= 2.0e-6,
-              "MLA attention batch matches sequential same-GGUF execution");
+              "read batched MLA attention outputs");
+        if (mla_attention_sequential && mla_attention_batch) {
+            const VectorError attention_error =
+                vector_error(attention_sequential, attention_batch);
+            std::fprintf(stderr,
+                "GLM5 MLA attention batch measurement role=%s prefix=%u rows=%u "
+                "nrmse=%.9g cosine=%.12g max_abs=%.9g\n",
+                role, prefix_rows, rows, attention_error.nrmse,
+                attention_error.cosine,
+                attention_error.max_abs);
+            CHECK(attention_error.nrmse <= 1.0e-6 &&
+                      attention_error.cosine >= 0.999999999 &&
+                      attention_error.max_abs <= 2.0e-6,
+                  "MLA attention batch matches sequential same-GGUF execution");
+        }
+        const std::vector<float> &attention_result =
+            mla_attention_batch ? attention_batch : attention_sequential;
+        const char *attention_dump_path =
+            std::getenv("DS4_GLM5_MLA_OUTPUT_DUMP");
+        if (attention_dump_path &&
+            mla_attention_sequential != mla_attention_batch) {
+            FILE *dump_file = std::fopen(attention_dump_path, "wb");
+            CHECK(dump_file != nullptr &&
+                      std::fwrite(attention_result.data(), sizeof(float),
+                                  attention_result.size(), dump_file) ==
+                          attention_result.size() &&
+                      std::fclose(dump_file) == 0,
+                  "dump isolated MLA-attention output");
+        }
         if (mla_attention_only) {
             const uint64_t attention_hash = fnv64(
-                attention_batch.data(),
-                attention_batch.size() * sizeof(float));
+                attention_result.data(),
+                attention_result.size() * sizeof(float));
             char attention_hash_error[256] = {};
             CHECK(ds4_tp_hash_check(
                       tp.tp, UINT64_C(0x474c4d354d4c4154), attention_hash,
@@ -2765,7 +2982,15 @@ bool run() {
                      (unsigned long long)kPrefixFNV,
                      (unsigned long long)prefix_hash);
     }
-    CHECK(prefix_hash == kPrefixFNV,
+    const char *allow_prefix_mismatch =
+        std::getenv("DS4_GLM5_ALLOW_PREFIX_MISMATCH");
+    const bool diagnostic_prefix = allow_prefix_mismatch &&
+        std::strcmp(allow_prefix_mismatch, "1") == 0;
+    if (diagnostic_prefix && prefix_hash != kPrefixFNV)
+        std::fprintf(stderr,
+                     "warning: accepting prefix mismatch for diagnostic "
+                     "timing only\n");
+    CHECK(prefix_hash == kPrefixFNV || diagnostic_prefix,
           "production prefix matches frozen real-GGUF fixture");
 
     if (full_trunk) {

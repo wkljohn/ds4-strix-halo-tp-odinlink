@@ -76,12 +76,27 @@ case $RDMA_PROFILE in
     COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
     LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-odl_tb5_0}
     PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-odl_tb5_0}
+    # A RoCE-oriented bench.env.local may leave mlx5 names exported.  Never
+    # let those stale values reach an OdinLink run: the provider would be
+    # loaded explicitly while DS4 probes the wrong device and fails with an
+    # opaque "no active port" error.  Require the provider namespace here so
+    # profile switches are fail-closed and explicit.
+    [[ $LOCAL_RDMA_DEVICE == odl_tb5_* && $PEER_RDMA_DEVICE == odl_tb5_* ]] || {
+      echo "error: odinlink profile requires odl_tb5_* devices (got $LOCAL_RDMA_DEVICE / $PEER_RDMA_DEVICE)" >&2
+      echo "error: set DS4_LOCAL_RDMA_DEVICE=odl_tb5_0 and DS4_PEER_RDMA_DEVICE=odl_tb5_0" >&2
+      exit 2
+    }
     ;;
   roce-v2)
     COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
     LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-mlx5_0}
     PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-mlx5_1}
     RDMA_GID_INDEX=${DS4_RDMA_GID_INDEX:-3}
+    [[ $LOCAL_RDMA_DEVICE == mlx5_* && $PEER_RDMA_DEVICE == mlx5_* ]] || {
+      echo "error: roce-v2 profile requires mlx5_* devices (got $LOCAL_RDMA_DEVICE / $PEER_RDMA_DEVICE)" >&2
+      echo "error: set DS4_LOCAL_RDMA_DEVICE and DS4_PEER_RDMA_DEVICE to the ConnectX devices" >&2
+      exit 2
+    }
     ;;
   ib-mlx4)
     COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
@@ -101,12 +116,9 @@ STEP_INCR=${DS4_BENCH_STEP_INCR:-2048}
 STEP_MUL=${DS4_BENCH_STEP_MUL:-1}
 TOKENS=${DS4_BENCH_TOKENS:-300}
 CONTEXT=${DS4_BENCH_CONTEXT:-4096}
-PREFILL_CHUNK=${DS4_BENCH_PREFILL_CHUNK:-4096}
-if [[ $RDMA_PROFILE == roce-v2 && -z $PREFILL_CHUNK_EXPLICIT ]]; then
-  # ConnectX-4 Lx registers the 2048-row mapped slab but exhausts its
-  # pin/translation resources with the 4096-row direct layout.
-  PREFILL_CHUNK=2048
-fi
+# Both validated RDMA providers use the same 2,048-row production shape.
+# ConnectX-4 Lx also exhausts its pin/translation budget at 4,096 rows.
+PREFILL_CHUNK=${DS4_BENCH_PREFILL_CHUNK:-2048}
 DSPARK=${DS4_BENCH_DSPARK:-0}
 MTP=${DS4_BENCH_MTP:-}
 if [[ ${DS4_BENCH_OUT+x} ]]; then
@@ -117,6 +129,7 @@ else
   PEER_OUT=$DS4_PEER_RESEARCH_ROOT/bench-runs
 fi
 ROCPROF=${DS4_BENCH_ROCPROF:-0}
+ROCPROF_BIN=${DS4_BENCH_ROCPROF_BIN:-rocprofv3}
 # 1 captures the complete runtime domain, including asynchronous memory-copy
 # records.  2 captures HIP runtime calls plus kernels and markers, avoiding a
 # rocprofiler-sdk 1.3.x shutdown hang when an HSA copy completion callback is
@@ -141,6 +154,7 @@ ALLOW_NONSTANDARD_SPLIT=${DS4_BENCH_ALLOW_NONSTANDARD_SPLIT:-0}
 ALLOW_GLM_BATCH1=${DS4_BENCH_ALLOW_GLM_BATCH1:-0}
 VALIDATE_CONFIG_ONLY=${DS4_BENCH_VALIDATE_CONFIG_ONLY:-0}
 DUMP_FRONTIER_LOGITS_DIR=${DS4_BENCH_DUMP_FRONTIER_LOGITS_DIR:-}
+DUMP_GENERATED_TOKEN_FILE=${DS4_BENCH_DUMP_GENERATED_TOKEN_FILE:-}
 FROZEN_TOKEN_FILE=${DS4_BENCH_FROZEN_TOKEN_FILE:-}
 FROZEN_LOGITS_DIR=${DS4_BENCH_FROZEN_LOGITS_DIR:-}
 DECLARED_TOOLCHAIN_ID=${DS4_BENCH_TOOLCHAIN_ID:-}
@@ -180,6 +194,24 @@ if [[ $ROCPROF == 1 && $ROCPROF_RUNTIME != 1 && $ROCPROF_RUNTIME != 2 &&
       $ROCPROF_RUNTIME != 3 ]]; then
   echo "error: DS4_BENCH_ROCPROF_RUNTIME must be 1 (full runtime), 2 (HIP API + kernel), or 3 (kernel only)" >&2
   exit 2
+fi
+if [[ $ROCPROF == 1 ]]; then
+  if [[ $ROCPROF_BIN == */* ]]; then
+    [[ -x $ROCPROF_BIN ]] || {
+      echo "error: profiler is not executable: $ROCPROF_BIN" >&2
+      exit 2
+    }
+    ROCPROF_RESOLVED=$ROCPROF_BIN
+  else
+    ROCPROF_RESOLVED=$(command -v "$ROCPROF_BIN") || {
+      echo "error: profiler is not on PATH: $ROCPROF_BIN" >&2
+      exit 2
+    }
+  fi
+  ROCPROF_SHA256=$(sha256sum "$ROCPROF_RESOLVED" | awk '{print $1}')
+else
+  ROCPROF_RESOLVED=
+  ROCPROF_SHA256=
 fi
 if [[ $ROCPROF == 1 && $ROCPROF_RUNTIME == 3 && $TP_TIMEOUT_SEC -lt 600 ]]; then
   echo "error: asymmetric kernel tracing requires DS4_BENCH_TP_TIMEOUT_SEC >= 600" >&2
@@ -232,12 +264,70 @@ fi
 }
 ATTN_STATIC_DIRECT_REQUESTED=0
 ATTN_STATIC_DIRECT_T2_REQUESTED=0
+GLM5_SPARSE_BATCH_BRIDGE=0
+GLM5_SPARSE_BATCH_BRIDGE_SEEN=0
+GLM5_SPARSE_BATCH_OUTPUT=0
+GLM5_SPARSE_BATCH_OUTPUT_SEEN=0
+GLM5_SPARSE_BATCH_PRELUDE=0
+GLM5_SPARSE_BATCH_PRELUDE_SEEN=0
+GLM5_SPARSE_BATCH_VALUE=0
+GLM5_SPARSE_BATCH_VALUE_SEEN=0
+GLM5_SPARSE_ATTN_HEAD_SHARED=0
+GLM5_SPARSE_ATTN_HEAD_SHARED_SEEN=0
+GLM5_SPARSE_ATTN_F16_GEMM=0
+GLM5_SPARSE_ATTN_F16_GEMM_SEEN=0
+GLM5_SPARSE_ATTN_COMPARE_F16=0
+GLM5_SPARSE_ATTN_COMPARE_F16_SEEN=0
+GLM5_SPARSE_ATTN_COMPARE_F16_LAYER=
+GLM5_SPARSE_ATTN_COMPARE_F16_POS=
+GLM5_BF16_WMMA_HILO=0
+GLM5_BF16_WMMA_HILO_SEEN=0
+GLM5_BF16_WMMA_QKV_FUSED=0
+GLM5_BF16_WMMA_QKV_FUSED_SEEN=0
+GLM5_BF16_QKV_DECODE_MULTIPTR=0
+GLM5_BF16_QKV_DECODE_MULTIPTR_SEEN=0
 for env_kv in "${EXTRA_ENV[@]}"; do
   [[ $env_kv =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || {
     echo "error: experiment settings must be NAME=VALUE pairs: $env_kv" >&2
     exit 2
   }
   case $env_kv in
+    DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR=*)
+      (( GLM5_BF16_QKV_DECODE_MULTIPTR_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_BF16_QKV_DECODE_MULTIPTR=${env_kv#*=}
+      GLM5_BF16_QKV_DECODE_MULTIPTR_SEEN=1
+      [[ $GLM5_BF16_QKV_DECODE_MULTIPTR == 0 || $GLM5_BF16_QKV_DECODE_MULTIPTR == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED=*)
+      (( GLM5_BF16_WMMA_QKV_FUSED_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_BF16_WMMA_QKV_FUSED=${env_kv#*=}
+      GLM5_BF16_WMMA_QKV_FUSED_SEEN=1
+      [[ $GLM5_BF16_WMMA_QKV_FUSED == 0 || $GLM5_BF16_WMMA_QKV_FUSED == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_BF16_WMMA_HILO=*)
+      (( GLM5_BF16_WMMA_HILO_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_BF16_WMMA_HILO was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_BF16_WMMA_HILO=${env_kv#*=}
+      GLM5_BF16_WMMA_HILO_SEEN=1
+      [[ $GLM5_BF16_WMMA_HILO == 0 || $GLM5_BF16_WMMA_HILO == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_BF16_WMMA_HILO must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
     DS4_GLM5_NEXT_PREFILL_BATCH=*)
       (( GLM5_PREFILL_BATCH_SEEN == 0 )) || {
         echo "error: DS4_GLM5_NEXT_PREFILL_BATCH was supplied more than once" >&2
@@ -251,6 +341,119 @@ for env_kv in "${EXTRA_ENV[@]}"; do
       }
       (( GLM5_PREFILL_BATCH <= 1024 )) || {
         echo "error: DS4_GLM5_NEXT_PREFILL_BATCH must be at most 1024" >&2
+        exit 2
+      }
+      ;;
+    DS4_GLM5_SPARSE_BATCH_BRIDGE=*)
+      (( GLM5_SPARSE_BATCH_BRIDGE_SEEN == 0 )) || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_BATCH_BRIDGE=${env_kv#*=}
+      GLM5_SPARSE_BATCH_BRIDGE_SEEN=1
+      [[ $GLM5_SPARSE_BATCH_BRIDGE == 0 ||
+         $GLM5_SPARSE_BATCH_BRIDGE == 1 ]] || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_GLM5_SPARSE_BATCH_OUTPUT=*)
+      (( GLM5_SPARSE_BATCH_OUTPUT_SEEN == 0 )) || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_BATCH_OUTPUT=${env_kv#*=}
+      GLM5_SPARSE_BATCH_OUTPUT_SEEN=1
+      [[ $GLM5_SPARSE_BATCH_OUTPUT == 0 ||
+         $GLM5_SPARSE_BATCH_OUTPUT == 1 ]] || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_GLM5_SPARSE_BATCH_PRELUDE=*)
+      (( GLM5_SPARSE_BATCH_PRELUDE_SEEN == 0 )) || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_BATCH_PRELUDE=${env_kv#*=}
+      GLM5_SPARSE_BATCH_PRELUDE_SEEN=1
+      [[ $GLM5_SPARSE_BATCH_PRELUDE == 0 ||
+         $GLM5_SPARSE_BATCH_PRELUDE == 1 ]] || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_GLM5_SPARSE_BATCH_VALUE=*)
+      (( GLM5_SPARSE_BATCH_VALUE_SEEN == 0 )) || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_VALUE was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_BATCH_VALUE=${env_kv#*=}
+      GLM5_SPARSE_BATCH_VALUE_SEEN=1
+      [[ $GLM5_SPARSE_BATCH_VALUE == 0 ||
+         $GLM5_SPARSE_BATCH_VALUE == 1 ]] || {
+        echo "error: DS4_GLM5_SPARSE_BATCH_VALUE must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=*)
+      (( GLM5_SPARSE_ATTN_HEAD_SHARED_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_HEAD_SHARED=${env_kv#*=}
+      GLM5_SPARSE_ATTN_HEAD_SHARED_SEEN=1
+      [[ $GLM5_SPARSE_ATTN_HEAD_SHARED == 0 ||
+         $GLM5_SPARSE_ATTN_HEAD_SHARED == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=*)
+      (( GLM5_SPARSE_ATTN_F16_GEMM_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_F16_GEMM=${env_kv#*=}
+      GLM5_SPARSE_ATTN_F16_GEMM_SEEN=1
+      [[ $GLM5_SPARSE_ATTN_F16_GEMM == 0 ||
+         $GLM5_SPARSE_ATTN_F16_GEMM == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16=*)
+      (( GLM5_SPARSE_ATTN_COMPARE_F16_SEEN == 0 )) || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16 was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_COMPARE_F16=${env_kv#*=}
+      GLM5_SPARSE_ATTN_COMPARE_F16_SEEN=1
+      [[ $GLM5_SPARSE_ATTN_COMPARE_F16 == 0 ||
+         $GLM5_SPARSE_ATTN_COMPARE_F16 == 1 ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16 must be 0 or 1" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_LAYER=*)
+      [[ -z $GLM5_SPARSE_ATTN_COMPARE_F16_LAYER ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_LAYER was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_COMPARE_F16_LAYER=${env_kv#*=}
+      [[ $GLM5_SPARSE_ATTN_COMPARE_F16_LAYER =~ ^[0-9]+$ ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_LAYER must be an unsigned integer" >&2
+        exit 2
+      }
+      ;;
+    DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_POS=*)
+      [[ -z $GLM5_SPARSE_ATTN_COMPARE_F16_POS ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_POS was supplied more than once" >&2
+        exit 2
+      }
+      GLM5_SPARSE_ATTN_COMPARE_F16_POS=${env_kv#*=}
+      [[ $GLM5_SPARSE_ATTN_COMPARE_F16_POS =~ ^[0-9]+$ ]] || {
+        echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_POS must be an unsigned integer" >&2
         exit 2
       }
       ;;
@@ -281,13 +484,23 @@ for env_kv in "${EXTRA_ENV[@]}"; do
   esac
   if [[ $CANDIDATE == 1 ]]; then
     case $env_kv in
-      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*)
+      DS4_*GRAPH_DUMP*=*|DS4_*PROFILE*=*|DS4_*TP_REFERENCE*=*|DS4_ORACLE_*=*|DS4_ROCM_GLM_CAUSAL_ATTN_COMPARE=*|DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16=*|DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16_*=*)
         echo "error: candidate timing cannot enable graph dumps, profilers, or reference oracles: ${env_kv%%=*}" >&2
         exit 2
         ;;
     esac
   fi
 done
+if [[ $GLM5_BF16_WMMA_QKV_FUSED == 1 && $GLM5_BF16_WMMA_HILO != 1 ]]; then
+  echo "error: DS4_ROCM_GLM5_BF16_WMMA_QKV_FUSED=1 requires DS4_ROCM_GLM5_BF16_WMMA_HILO=1" >&2
+  exit 2
+fi
+if [[ (-n $GLM5_SPARSE_ATTN_COMPARE_F16_LAYER ||
+       -n $GLM5_SPARSE_ATTN_COMPARE_F16_POS) &&
+      $GLM5_SPARSE_ATTN_COMPARE_F16 != 1 ]]; then
+  echo "error: sparse F16 comparison selectors require DS4_ROCM_GLM5_SPARSE_ATTN_COMPARE_F16=1" >&2
+  exit 2
+fi
 if [[ $ATTN_STATIC_DIRECT_T2_REQUESTED == 1 &&
       $ATTN_STATIC_DIRECT_REQUESTED != 1 ]]; then
   echo "error: paired-query static attention requires DS4_ROCM_ATTENTION_PREFILL_STATIC_FLASH_DIRECT=1" >&2
@@ -368,6 +581,59 @@ if [[ $MODEL_ARCH == glm5-next ]]; then
     }
     echo "warning: GLM5 batch=1 run is a scalar regression guard, not prefill performance evidence" >&2
   fi
+  if (( GLM5_SPARSE_BATCH_OUTPUT == 1 &&
+        GLM5_SPARSE_BATCH_BRIDGE != 1 )); then
+    echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT=1 requires DS4_GLM5_SPARSE_BATCH_BRIDGE=1" >&2
+    exit 2
+  fi
+  if (( GLM5_SPARSE_BATCH_PRELUDE == 1 &&
+        GLM5_SPARSE_BATCH_OUTPUT != 1 )); then
+    echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE=1 requires DS4_GLM5_SPARSE_BATCH_OUTPUT=1" >&2
+    exit 2
+  fi
+  if (( GLM5_SPARSE_BATCH_VALUE == 1 &&
+        GLM5_SPARSE_BATCH_PRELUDE != 1 )); then
+    echo "error: DS4_GLM5_SPARSE_BATCH_VALUE=1 requires DS4_GLM5_SPARSE_BATCH_PRELUDE=1" >&2
+    exit 2
+  fi
+  if (( GLM5_SPARSE_BATCH_VALUE == 1 )); then
+    shared_pv=0
+    for env_kv in "${EXTRA_ENV[@]}"; do
+      [[ $env_kv == DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV=1 ]] && shared_pv=1
+    done
+    (( shared_pv == 1 )) || {
+      echo "error: DS4_GLM5_SPARSE_BATCH_VALUE=1 requires DS4_ROCM_GLM5_NOPE_ATTN_SHARED_PV=1" >&2
+      exit 2
+    }
+  fi
+  if (( GLM5_SPARSE_ATTN_HEAD_SHARED == 1 &&
+        GLM5_SPARSE_BATCH_VALUE != 1 )); then
+    echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1 requires DS4_GLM5_SPARSE_BATCH_VALUE=1" >&2
+    exit 2
+  fi
+  if (( GLM5_SPARSE_ATTN_F16_GEMM == 1 &&
+        GLM5_SPARSE_ATTN_HEAD_SHARED != 1 )); then
+    echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM=1 requires DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED=1" >&2
+    exit 2
+  fi
+elif (( GLM5_SPARSE_BATCH_BRIDGE_SEEN == 1 )); then
+  echo "error: DS4_GLM5_SPARSE_BATCH_BRIDGE applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_BATCH_OUTPUT_SEEN == 1 )); then
+  echo "error: DS4_GLM5_SPARSE_BATCH_OUTPUT applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_BATCH_PRELUDE_SEEN == 1 )); then
+  echo "error: DS4_GLM5_SPARSE_BATCH_PRELUDE applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_BATCH_VALUE_SEEN == 1 )); then
+  echo "error: DS4_GLM5_SPARSE_BATCH_VALUE applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_ATTN_HEAD_SHARED_SEEN == 1 )); then
+  echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_HEAD_SHARED applies only to GLM5 benchmarks" >&2
+  exit 2
+elif (( GLM5_SPARSE_ATTN_F16_GEMM_SEEN == 1 )); then
+  echo "error: DS4_ROCM_GLM5_SPARSE_ATTN_F16_GEMM applies only to GLM5 benchmarks" >&2
+  exit 2
 elif (( GLM5_PREFILL_BATCH_SEEN == 1 )); then
   echo "error: DS4_GLM5_NEXT_PREFILL_BATCH applies only to GLM5 benchmarks" >&2
   exit 2
@@ -427,6 +693,9 @@ else
       DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
       DS4_TP_GREEDY_TOP2=1
       DS4_TP_HOST_CALLBACK=1
+      DS4_TP_PREFILL_SPLIT_MIN_ATTN=2048
+      DS4_TP_PREFILL_SPLIT_RESUMED=1
+      DS4_TP_SUBGATE_PIPELINE=0
       DS4_TP_PREFILL_FFN_WAVEFRONT=1
       DS4_ROCM_TEMPORAL_COMPRESSOR=1
       DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
@@ -521,6 +790,22 @@ if [[ -n $DUMP_FRONTIER_LOGITS_DIR ]]; then
   esac
   mkdir -p "$DUMP_FRONTIER_LOGITS_DIR"
   COORD_ARGS+=(--dump-frontier-logits-dir "$DUMP_FRONTIER_LOGITS_DIR")
+fi
+if [[ -n $DUMP_GENERATED_TOKEN_FILE ]]; then
+  case $DUMP_GENERATED_TOKEN_FILE in
+    "$DS4_RESEARCH_ROOT"/*) ;;
+    *) echo "error: generated-token file must be under $DS4_RESEARCH_ROOT" >&2; exit 2 ;;
+  esac
+  [[ $FRONTIER == "$FRONTIER_MAX" && $TOKENS -gt 0 ]] || {
+    echo "error: generated-token export requires one fixed frontier and positive generation" >&2
+    exit 2
+  }
+  [[ $CANDIDATE == 0 && ! -e $DUMP_GENERATED_TOKEN_FILE ]] || {
+    echo "error: generated-token export is diagnostic-only and must not overwrite evidence" >&2
+    exit 2
+  }
+  mkdir -p "$(dirname -- "$DUMP_GENERATED_TOKEN_FILE")"
+  COORD_ARGS+=(--dump-generated-token-file "$DUMP_GENERATED_TOKEN_FILE")
 fi
 if [[ -n $FROZEN_TOKEN_FILE ]]; then
   [[ -r $FROZEN_TOKEN_FILE ]] || {
@@ -734,6 +1019,7 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'prompt=%s\n' "$PROMPT_FILE"
   printf 'prompt_size=%s\n' "$PROMPT_SIZE"
   printf 'prompt_sha256=%s\n' "$PROMPT_HASH"
+  printf 'dump_generated_token_file=%s\n' "$DUMP_GENERATED_TOKEN_FILE"
   printf 'frozen_token_file=%s\n' "$FROZEN_TOKEN_FILE"
   printf 'frozen_token_sha256=%s\n' "$FROZEN_TOKEN_HASH"
   printf 'frozen_logits_dir=%s\n' "$FROZEN_LOGITS_DIR"
@@ -742,6 +1028,8 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'binary_toolchain_comment=%s\n' "$BINARY_TOOLCHAIN_COMMENT"
   printf 'binary_runpath=%s\n' "$BINARY_RUNPATH"
   printf 'expected_binary_toolchain_sha256=%s\n' "$EXPECTED_TOOLCHAIN_SHA256"
+  printf 'rocprof_binary=%s\n' "$ROCPROF_RESOLVED"
+  printf 'rocprof_sha256=%s\n' "$ROCPROF_SHA256"
   printf 'frontier=%s\n' "$FRONTIER"
   printf 'frontier_max=%s\n' "$FRONTIER_MAX"
   printf 'step_incr=%s\n' "$STEP_INCR"
@@ -750,6 +1038,9 @@ printf -v EXTRA_ENV_Q '%q ' "${EXTRA_ENV[@]}"
   printf 'context=%s\n' "$CONTEXT"
   printf 'prefill_chunk=%s\n' "$PREFILL_CHUNK"
   printf 'prefill_batch=%s\n' "${GLM5_PREFILL_BATCH:-n/a}"
+  printf 'glm5_bf16_wmma_hilo=%s\n' "$GLM5_BF16_WMMA_HILO"
+  printf 'glm5_bf16_wmma_qkv_fused=%s\n' "$GLM5_BF16_WMMA_QKV_FUSED"
+  printf 'glm5_bf16_qkv_decode_multiptr=%s\n' "$GLM5_BF16_QKV_DECODE_MULTIPTR"
   printf 'rdma_profile=%s\n' "$RDMA_PROFILE"
   printf 'coordinator_addr=%s\n' "$COORDINATOR_ADDR"
   printf 'coordinator_rdma_device=%s\n' "$LOCAL_RDMA_DEVICE"
@@ -845,7 +1136,7 @@ echo "workload: frontier=$FRONTIER frontier_max=$FRONTIER_MAX step_incr=$STEP_IN
 echo "rdma_profile: $RDMA_PROFILE coordinator_device=$LOCAL_RDMA_DEVICE worker_device=$PEER_RDMA_DEVICE"
 if [[ $DSPARK == 1 ]]; then echo "dspark: 1 mtp=$MTP"; else echo "dspark: 0"; fi
 if [[ $DSPARK == 0 ]]; then echo "routed_expert_family: $ROUTED_FAMILY"; fi
-if [[ $ROCPROF == 1 ]]; then echo "rocprof: rank=$ROCPROF_RANK kernel trace (diagnostic; timing is not benchmark evidence)"; fi
+if [[ $ROCPROF == 1 ]]; then echo "rocprof: binary=$ROCPROF_RESOLVED rank=$ROCPROF_RANK kernel trace (diagnostic; timing is not benchmark evidence)"; fi
 echo "ds4_sha256: $LOCAL_DS4_HASH"
 echo "ds4_bench_tp_sha256: $LOCAL_BENCH_HASH"
 echo "model_sample_sha256: $LOCAL_MODEL_FINGERPRINT"
@@ -873,7 +1164,7 @@ if [[ $ROCPROF == 1 && $ROCPROF_RANK == worker ]]; then
     WORKER_TRACE=(--kernel-trace --marker-trace)
   fi
   WORKER_CMD=("${CLEAN_ENV[@]}" "${WORKER_ENV[@]}"
-              rocprofv3 "${WORKER_TRACE[@]}" --stats --summary
+              "$ROCPROF_RESOLVED" "${WORKER_TRACE[@]}" --stats --summary
               --summary-units usec --output-directory "$ROCPROF_OUT" --
               "${WORKER_APP[@]}")
 fi
@@ -906,7 +1197,7 @@ if [[ $ROCPROF == 1 && $ROCPROF_RANK == coordinator ]]; then
   fi
   COORD_ENV+=(DS4_BENCH_ROCPROF_SELECTED_REGIONS=1
              DS4_BENCH_ROCPROF_REGION="$ROCPROF_REGION")
-  COORD_CMD=(rocprofv3 "${ROCPROF_TRACE[@]}"
+  COORD_CMD=("$ROCPROF_RESOLVED" "${ROCPROF_TRACE[@]}"
              --stats --summary --summary-units usec
              --output-directory "$ROCPROF_OUT" -- "$REPO/ds4-bench-tp")
 elif [[ $ROCPROF != 0 && $ROCPROF != 1 ]]; then
@@ -939,9 +1230,71 @@ if ! "${PEER_SSH[@]}" "test -r '$WORKER_STATUSFILE'"; then
   exit 1
 fi
 "${PEER_SSH[@]}" "cat '$WORKER_STATUSFILE'" > "$OUT/worker-$TAG.status"
+if [[ $GLM5_SPARSE_ATTN_COMPARE_F16 == 1 ]]; then
+  compare_layer_re=${GLM5_SPARSE_ATTN_COMPARE_F16_LAYER:-'[0-9]+'}
+  compare_pos_re=${GLM5_SPARSE_ATTN_COMPARE_F16_POS:-'[0-9]+'}
+  compare_re="GLM5 sparse F16 real-row compare layer=${compare_layer_re} pos0=${compare_pos_re} rows=[0-9]+ max_abs=.* nonfinite=0"
+  for compare_log in "$COORD_LOG" "$WORKER_LOG"; do
+    grep -Eq "$compare_re" "$compare_log" || {
+      echo "error: requested sparse F16 real-row comparison did not complete in $compare_log" >&2
+      exit 1
+    }
+    ! grep -q 'GLM5 sparse F16 real-row compare failed' "$compare_log" || {
+      echo "error: sparse F16 real-row comparison failed in $compare_log" >&2
+      exit 1
+    }
+  done
+  echo "validated_glm5_sparse_f16_compare=layer:${GLM5_SPARSE_ATTN_COMPARE_F16_LAYER:-first},pos:${GLM5_SPARSE_ATTN_COMPARE_F16_POS:-first}"
+fi
 if [[ $MODEL_ARCH == glm5-next ]]; then
   "$REPO/scripts/check-glm5-prefill-proof.sh" \
-    "$COORD_LOG" "$WORKER_LOG" "$GLM5_PREFILL_BATCH" "$FRONTIER"
+    "$COORD_LOG" "$WORKER_LOG" "$GLM5_PREFILL_BATCH" "$FRONTIER" \
+    "$GLM5_SPARSE_BATCH_BRIDGE" "$GLM5_SPARSE_BATCH_VALUE" \
+    "$GLM5_SPARSE_ATTN_HEAD_SHARED" "$GLM5_SPARSE_ATTN_F16_GEMM"
+fi
+if [[ $GLM5_BF16_WMMA_HILO == 1 ]]; then
+  if [[ $MODEL_ARCH == glm5-next ]]; then
+    if [[ $GLM5_BF16_WMMA_QKV_FUSED == 1 ]]; then
+      if [[ $GLM5_BF16_QKV_DECODE_MULTIPTR == 1 ]]; then
+        # The one-token multipointer kernel intentionally bypasses the
+        # batched WMMA-QKV counter. Prove both its engagement and the regular
+        # hi/lo output path instead of falsely requiring qkv_fused>0.
+        wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* qkv_fused=0 output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+        wmma_decode_re='GLM5 BF16 decode QKV multiptr engaged out_dim=[0-9]+'
+      else
+        wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=0 k=0 v=0 qkv_fused=[1-9][0-9]* output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+        wmma_decode_re=
+      fi
+    else
+      wmma_summary_re='GLM5 BF16 WMMA hi/lo summary q=[1-9][0-9]* k=[1-9][0-9]* v=[1-9][0-9]* qkv_fused=0 output=[1-9][0-9]* other=0 not_applicable=[0-9]+ hard_failure=0'
+      wmma_decode_re=
+    fi
+    for wmma_log in "$COORD_LOG" "$WORKER_LOG"; do
+      grep -Eq "$wmma_summary_re" "$wmma_log" || {
+        echo "error: GLM5 BF16 WMMA hi/lo engagement proof failed in $wmma_log" >&2
+        exit 1
+      }
+      if [[ -n $wmma_decode_re ]]; then
+        grep -Eq "$wmma_decode_re" "$wmma_log" || {
+          echo "error: GLM5 BF16 decode QKV multiptr engagement proof failed in $wmma_log" >&2
+          exit 1
+        }
+      fi
+    done
+    if [[ -n $wmma_decode_re ]]; then
+      echo "validated_glm5_bf16_wmma_hilo=both-ranks,qkv-decode-multiptr-engaged,hard-failure:0"
+    else
+      echo "validated_glm5_bf16_wmma_hilo=both-ranks,qkv-output-engaged,hard-failure:0"
+    fi
+  else
+    for wmma_log in "$COORD_LOG" "$WORKER_LOG"; do
+      ! grep -q 'GLM5 BF16 WMMA hi/lo summary' "$wmma_log" || {
+        echo "error: GLM5-only BF16 WMMA path engaged for $MODEL_ARCH in $wmma_log" >&2
+        exit 1
+      }
+    done
+    echo "validated_glm5_bf16_wmma_hilo=non-glm-refusal,model-arch:$MODEL_ARCH"
+  fi
 fi
 if [[ $DECODE_SELF_CHECK == 1 ]]; then
   grep -q 'ds4-bench: decode self-check complete .*argmax_mismatches=0 ' \
@@ -1015,6 +1368,22 @@ if [[ -n $FROZEN_TOKEN_FILE ]]; then
   echo "frozen_logits_manifest=$FROZEN_LOGITS_DIR/manifest"
   echo "TP_FROZEN_TEACHER_LOGITS_RECORDED_NOT_BENCHMARKED"
   exit 0
+fi
+if [[ -n $DUMP_GENERATED_TOKEN_FILE ]]; then
+  DUMP_GENERATED_TOKEN_COUNT=$(wc -l < "$DUMP_GENERATED_TOKEN_FILE")
+  [[ $DUMP_GENERATED_TOKEN_COUNT == "$TOKENS" ]] || {
+    echo "error: generated-token file count mismatch: expected=$TOKENS actual=$DUMP_GENERATED_TOKEN_COUNT" >&2
+    exit 1
+  }
+  awk 'BEGIN { ok=1 } !/^[0-9]+$/ { ok=0 } END { exit !ok }' \
+    "$DUMP_GENERATED_TOKEN_FILE" || {
+      echo "error: generated-token file contains a malformed token ID" >&2
+      exit 1
+    }
+  DUMP_GENERATED_TOKEN_SHA256=$(sha256sum "$DUMP_GENERATED_TOKEN_FILE" |
+    awk '{print $1}')
+  printf 'dump_generated_token_sha256=%s\n' \
+    "$DUMP_GENERATED_TOKEN_SHA256" >> "$MANIFEST"
 fi
 "$REPO/scripts/check-ds4-bench-result.sh" \
   "$CSV" "$COORD_LOG" "$WORKER_LOG" "$EXPECTED_FNV64" "$TOKENS" "$CANDIDATE" \

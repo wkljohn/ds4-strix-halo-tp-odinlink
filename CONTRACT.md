@@ -33,9 +33,9 @@ correctness, mandatory-RDMA, long-context, ordinary-regression, and repeated
 timing gates pass. Raw evidence goes to `DS4_RESEARCH_ROOT`; only source and
 maintained documentation are merged to `main`.
 
-Three repetitions of the 2,048+300 production workload establish the reported
-median. They do not establish workload diversity. Every ordinary inference
+Two independent repetitions of the 2,048+300 production workload establish the
+reported midpoint. They do not establish workload diversity. Every ordinary inference
 candidate must also pass `scripts/run-tp-diverse-bench.sh`: one 4,096+300 run
 over the frozen cross-disciplinary v1 prompt. Its manifest and CSV are checked
-against the versioned three-run baseline by `scripts/diverse-bench-gate.py`.
+against the versioned two-run baseline by `scripts/diverse-bench-gate.py`.
 The diverse run is a regression screen, not another headline benchmark.

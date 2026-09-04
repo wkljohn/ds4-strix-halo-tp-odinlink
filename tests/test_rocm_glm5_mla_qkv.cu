@@ -7,6 +7,7 @@ extern "C" {
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -176,10 +177,11 @@ bool run_test() {
     ds4_gpu_tensor *d_kv_raw = alloc_f32((uint64_t)kRows * kKvLora);
     ds4_gpu_tensor *d_kv_norm = alloc_f32((uint64_t)kRows * kKvLora);
     ds4_gpu_tensor *d_qk_low = alloc_f32((uint64_t)kHeads * kKvLora);
+    ds4_gpu_tensor *d_qk_low_lds = alloc_f32((uint64_t)kHeads * kKvLora);
     ds4_gpu_tensor *d_k_nope = alloc_f32(
         (uint64_t)kRows * kHeads * kHeadDim);
     CHECK(d_hidden && d_q_a && d_q_resid && d_query && d_kv_raw &&
-          d_kv_norm && d_qk_low && d_k_nope,
+          d_kv_norm && d_qk_low && d_qk_low_lds && d_k_nope,
           "allocate bounded MLA QKV component tensors");
     ds4_gpu_tensor *d_query_hidden = ds4_gpu_tensor_view(
         d_hidden, (uint64_t)(kRows - 1u) * kHidden * sizeof(float),
@@ -213,17 +215,51 @@ bool run_test() {
           ds4_gpu_synchronize(),
           "execute real block-3 MLA Q/KV trunk");
 
+    CHECK(setenv("DS4_ROCM_GLM5_QK_LOW_LDS_EXACT", "1", 1) == 0 &&
+          ds4_gpu_glm_qk_lowrank_typed_tensor(
+              d_qk_low_lds, d_query, gguf.map, gguf.size, k_b_offset, 8u,
+              kHeads, kKvLora, kHeadDim, kHeadDim) &&
+          ds4_gpu_synchronize(),
+          "execute exact LDS-staged MLA k_b projection");
+    unsetenv("DS4_ROCM_GLM5_QK_LOW_LDS_EXACT");
+
     std::vector<float> got_q_a, got_q_resid, got_query, got_kv_raw,
-        got_kv_norm, got_qk_low, got_k_nope;
+        got_kv_norm, got_qk_low, got_qk_low_lds, got_k_nope;
     CHECK(read_tensor(d_q_a, kQRank, got_q_a) &&
           read_tensor(d_q_resid, kQRank, got_q_resid) &&
           read_tensor(d_query, kHeads * kHeadDim, got_query) &&
           read_tensor(d_kv_raw, kRows * kKvLora, got_kv_raw) &&
           read_tensor(d_kv_norm, kRows * kKvLora, got_kv_norm) &&
           read_tensor(d_qk_low, kHeads * kKvLora, got_qk_low) &&
+          read_tensor(d_qk_low_lds, kHeads * kKvLora, got_qk_low_lds) &&
           read_tensor(d_k_nope, (uint64_t)kRows * kHeads * kHeadDim,
                       got_k_nope),
           "read MLA QKV component outputs");
+    CHECK(got_qk_low.size() == got_qk_low_lds.size(),
+          "exact LDS-staged k_b output shape");
+    uint64_t lds_mismatches = 0u;
+    size_t lds_first = got_qk_low.size();
+    double lds_max_abs = 0.0;
+    for (size_t i = 0; i < got_qk_low.size(); ++i) {
+        if (got_qk_low[i] != got_qk_low_lds[i]) {
+            if (lds_first == got_qk_low.size()) lds_first = i;
+            lds_mismatches++;
+            lds_max_abs = std::max(
+                lds_max_abs,
+                std::fabs((double)got_qk_low[i] - got_qk_low_lds[i]));
+        }
+    }
+    std::fprintf(stderr,
+                 "GLM5 MLA k_b LDS exact mismatch=%llu first=%zu "
+                 "reference=%.9g candidate=%.9g max_abs=%.9g\n",
+                 (unsigned long long)lds_mismatches, lds_first,
+                 lds_first < got_qk_low.size() ? got_qk_low[lds_first] : 0.0f,
+                 lds_first < got_qk_low_lds.size() ?
+                     got_qk_low_lds[lds_first] : 0.0f,
+                 lds_max_abs);
+    CHECK(std::memcmp(got_qk_low.data(), got_qk_low_lds.data(),
+                      got_qk_low.size() * sizeof(float)) == 0,
+          "exact LDS-staged k_b output is byte-identical");
 
     /* Both independent gfx1151 nodes produced identical observations.  Keep
        a little over 2x headroom above those maxima without turning this into
@@ -248,6 +284,7 @@ bool run_test() {
 
     ds4_gpu_tensor_free(d_query_hidden);
     ds4_gpu_tensor_free(d_k_nope);
+    ds4_gpu_tensor_free(d_qk_low_lds);
     ds4_gpu_tensor_free(d_qk_low);
     ds4_gpu_tensor_free(d_kv_norm);
     ds4_gpu_tensor_free(d_kv_raw);

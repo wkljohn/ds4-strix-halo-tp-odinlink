@@ -106,7 +106,10 @@ KDA_ROUTED_PROFILE_REPEATS=${DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS:-0}
 KDA_ROUTED_CONTINUATION_ROWS=${DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS:-1}
 MLA_ROUTED_BATCH_TEST=${DS4_GLM5_MLA_ROUTED_BATCH_TEST:-0}
 MLA_ATTENTION_ONLY_TEST=${DS4_GLM5_MLA_ATTENTION_ONLY_TEST:-0}
+MLA_ATTENTION_MODE=${DS4_GLM5_MLA_ATTENTION_MODE:-}
+MLA_OUTPUT_DUMP=${DS4_GLM5_MLA_OUTPUT_DUMP:-}
 MLA_SPARSE_BOUNDARY_TEST=${DS4_GLM5_MLA_SPARSE_BOUNDARY_TEST:-0}
+MLA_LONGKEY_ATTENTION_TEST=${DS4_GLM5_MLA_LONGKEY_ATTENTION_TEST:-0}
 MLA_ROUTED_BATCH_ROWS=${DS4_GLM5_MLA_ROUTED_BATCH_ROWS:-3}
 MLA_ROUTED_PREFIX_ROWS=${DS4_GLM5_MLA_ROUTED_PREFIX_ROWS:-0}
 MLA_ROUTED_CONTINUATION_ROWS=${DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS:-1}
@@ -122,6 +125,9 @@ BIGGATE_PROFILE=${DS4_TP_BIGGATE_PROFILE:-}
 SMALL_GATE_DISABLE=${DS4_GLM5_DISABLE_SMALL_GATE:-}
 KDA_TP=${DS4_GLM5_KDA_TP:-}
 KDA_OUTPUT_KSLICE=${DS4_GLM5_KDA_OUTPUT_KSLICE:-}
+KDA_OUTPUT_ROWSLICE=${DS4_GLM5_KDA_OUTPUT_ROWSLICE:-}
+GPU_ROW_GATE=${DS4_GLM5_GPU_ROW_GATE:-}
+SMALL_GATE=${DS4_GLM5_SMALL_GATE:-}
 RESIDENT_EXPERTS=${DS4_GLM5_NEXT_RESIDENT_EXPERTS:-}
 WARM_RESIDENT=${DS4_GLM5_NEXT_WARM_RESIDENT:-}
 TP_SKIP_UNOWNED=${DS4_ROCM_TP_PREFILL_SKIP_UNOWNED:-}
@@ -135,7 +141,9 @@ STRIDED_F32_ROWS_DISABLE=${DS4_ROCM_GLM5_DISABLE_STRIDED_F32_ROWS:-}
 ZERO_WORKSPACE=${DS4_GLM5_ZERO_WORKSPACE:-}
 ZERO_MOE_EACH_LAYER=${DS4_GLM5_ZERO_MOE_EACH_LAYER:-}
 ZERO_PERSISTENT_MLA=${DS4_GLM5_ZERO_PERSISTENT_MLA:-}
-ALLOW_Q4_BATCH_MLA_OUTPUT=${DS4_GLM5_ALLOW_Q4_BATCH_MLA_OUTPUT:-}
+DISABLE_Q4_BATCH_MLA_OUTPUT=${DS4_GLM5_DISABLE_Q4_BATCH_MLA_OUTPUT:-}
+CAUSAL_ATTN_GEMM_NOPE=${DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE:-}
+CAUSAL_ATTN_GEMM_NOPE_F32=${DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32:-}
 KDA_BATCH_KSLICE_OUTPUT=${DS4_ROCM_GLM5_BATCH_KSLICE_OUTPUT:-}
 KDA_KSLICE_ROUTE_TOKTILE=${DS4_ROCM_KSLICE_ROUTE_TOKTILE:-}
 KDA_ATTENTION_MODE=${DS4_GLM5_KDA_ATTENTION_MODE:-}
@@ -171,12 +179,29 @@ for value in "$HOST" "$LOCAL_DEVICE" "$PEER_DEVICE" "$PEER_DIR" \
              "$PEER_RESEARCH_ROOT" \
              "$LOCAL_HOME" "$PEER_HOME" "$TEXT_PROMPT" \
              "$LOCAL_VERBS_LIB" "$PEER_VERBS_LIB" "$TRACE_PREFIX" \
-             "$TRACE_LAYER" "$TRACE_TOKEN" "$TRACE_FFN_SAME_INPUT"; do
+             "$TRACE_LAYER" "$TRACE_TOKEN" "$TRACE_FFN_SAME_INPUT" \
+             "$MLA_ATTENTION_MODE" "$MLA_OUTPUT_DUMP"; do
   [[ $value != *"'"* && $value != *$'\n'* ]] || {
     echo "error: environment values may not contain quotes or newlines" >&2
     exit 2
   }
 done
+[[ -z $MLA_ATTENTION_MODE || $MLA_ATTENTION_MODE == sequential ||
+   $MLA_ATTENTION_MODE == batch ]] || {
+  echo "error: DS4_GLM5_MLA_ATTENTION_MODE must be sequential or batch" >&2
+  exit 2
+}
+for value in "$CAUSAL_ATTN_GEMM_NOPE" "$CAUSAL_ATTN_GEMM_NOPE_F32"; do
+  [[ -z $value || $value == 0 || $value == 1 ]] || {
+    echo "error: GLM causal-attention GEMM selectors must be 0 or 1" >&2
+    exit 2
+  }
+done
+[[ $CAUSAL_ATTN_GEMM_NOPE_F32 != 1 ||
+   $CAUSAL_ATTN_GEMM_NOPE == 1 ]] || {
+  echo "error: FP32 NoPE GEMM requires DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE=1" >&2
+  exit 2
+}
 [[ $TEXT_TEACHER_IDS != *"'"* &&
    $TEXT_TEACHER_IDS != *$'\n'* ]] || {
   echo "error: teacher IDs may not contain quotes or newlines" >&2
@@ -315,14 +340,27 @@ done
   echo "error: MLA sparse boundary must be the isolated layer-3 gate" >&2
   exit 2
 }
+[[ $MLA_LONGKEY_ATTENTION_TEST == 0 ||
+   $MLA_LONGKEY_ATTENTION_TEST == 1 ]] || {
+  echo "error: DS4_GLM5_MLA_LONGKEY_ATTENTION_TEST must be 0 or 1" >&2
+  exit 2
+}
+[[ $MLA_LONGKEY_ATTENTION_TEST == 0 ||
+   ($FULL_TRUNK == 0 && -z $TEXT_PROMPT &&
+    $KDA_ROUTED_BATCH_TEST == 0 && $MLA_ROUTED_BATCH_TEST == 0 &&
+    $MLA_SPARSE_BOUNDARY_TEST == 0) ]] || {
+  echo "error: MLA long-key attention must be the isolated component gate" >&2
+  exit 2
+}
 [[ $MLA_ROUTED_BATCH_TEST == 0 ||
    ($FULL_TRUNK == 1 && -z $TEXT_PROMPT) ]] || {
   echo "error: MLA routed batch test requires full trunk and no text prompt" >&2
   exit 2
 }
 [[ $MLA_ROUTED_BATCH_ROWS == 3 || $MLA_ROUTED_BATCH_ROWS == 5 ||
-   $MLA_ROUTED_BATCH_ROWS == 33 || $MLA_ROUTED_BATCH_ROWS == 121 ]] || {
-  echo "error: DS4_GLM5_MLA_ROUTED_BATCH_ROWS must be 3, 5, 33, or 121" >&2
+   $MLA_ROUTED_BATCH_ROWS == 33 || $MLA_ROUTED_BATCH_ROWS == 121 ||
+   $MLA_ROUTED_BATCH_ROWS == 256 ]] || {
+  echo "error: DS4_GLM5_MLA_ROUTED_BATCH_ROWS must be 3, 5, 33, 121, or 256" >&2
   exit 2
 }
 [[ $MLA_ROUTED_PREFIX_ROWS =~ ^[0-3]$ ]] || {
@@ -391,8 +429,28 @@ done
   echo "error: DS4_GLM5_KDA_OUTPUT_KSLICE must be empty or 1" >&2
   exit 2
 }
+[[ -z $KDA_OUTPUT_ROWSLICE || $KDA_OUTPUT_ROWSLICE == 1 ]] || {
+  echo "error: DS4_GLM5_KDA_OUTPUT_ROWSLICE must be empty or 1" >&2
+  exit 2
+}
+[[ -z $GPU_ROW_GATE || $GPU_ROW_GATE == 1 ]] || {
+  echo "error: DS4_GLM5_GPU_ROW_GATE must be empty or 1" >&2
+  exit 2
+}
+[[ -z $SMALL_GATE || $SMALL_GATE == 1 ]] || {
+  echo "error: DS4_GLM5_SMALL_GATE must be empty or 1" >&2
+  exit 2
+}
 [[ -z $KDA_OUTPUT_KSLICE || -n $KDA_TP ]] || {
   echo "error: DS4_GLM5_KDA_OUTPUT_KSLICE requires DS4_GLM5_KDA_TP=1" >&2
+  exit 2
+}
+[[ -z $KDA_OUTPUT_ROWSLICE || -n $KDA_TP ]] || {
+  echo "error: DS4_GLM5_KDA_OUTPUT_ROWSLICE requires DS4_GLM5_KDA_TP=1" >&2
+  exit 2
+}
+[[ -z $KDA_OUTPUT_KSLICE || -z $KDA_OUTPUT_ROWSLICE ]] || {
+  echo "error: KDA output K-slice and output row-slice are mutually exclusive" >&2
   exit 2
 }
 [[ -z $EXPECTED_GENERATED_FNV ||
@@ -658,6 +716,7 @@ printf 'kda_routed_continuation_rows=%s\n' "$KDA_ROUTED_CONTINUATION_ROWS" >>"$O
 printf 'mla_routed_batch_test=%s\n' "$MLA_ROUTED_BATCH_TEST" >>"$OUT/run.env"
 printf 'mla_attention_only_test=%s\n' "$MLA_ATTENTION_ONLY_TEST" >>"$OUT/run.env"
 printf 'mla_sparse_boundary_test=%s\n' "$MLA_SPARSE_BOUNDARY_TEST" >>"$OUT/run.env"
+printf 'mla_longkey_attention_test=%s\n' "$MLA_LONGKEY_ATTENTION_TEST" >>"$OUT/run.env"
 printf 'mla_routed_batch_rows=%s\n' "$MLA_ROUTED_BATCH_ROWS" >>"$OUT/run.env"
 printf 'mla_routed_prefix_rows=%s\n' "$MLA_ROUTED_PREFIX_ROWS" >>"$OUT/run.env"
 printf 'mla_routed_continuation_rows=%s\n' "$MLA_ROUTED_CONTINUATION_ROWS" >>"$OUT/run.env"
@@ -683,6 +742,9 @@ printf 'kda_tp=%s\n' "$([[ -n $KDA_TP ]] && printf 1 || printf 0)" \
 printf 'kda_output_kslice=%s\n' \
   "$([[ -n $KDA_OUTPUT_KSLICE ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
+printf 'kda_output_rowslice=%s\n' \
+  "$([[ -n $KDA_OUTPUT_ROWSLICE ]] && printf 1 || printf 0)" \
+  >>"$OUT/run.env"
 printf 'resident_experts=%s\n' \
   "$([[ -n $RESIDENT_EXPERTS ]] && printf 1 || printf 0)" >>"$OUT/run.env"
 printf 'warm_resident=%s\n' \
@@ -702,9 +764,9 @@ printf 'shared_down_f32_enabled=%s\n' \
 printf 'strided_f32_rows_disabled=%s\n' \
   "$([[ -n $STRIDED_F32_ROWS_DISABLE ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
-printf 'zero_workspace=%s\nallow_q4_batch_mla_output=%s\n' \
+printf 'zero_workspace=%s\nq4_batch_mla_output_disabled=%s\n' \
   "$([[ -n $ZERO_WORKSPACE ]] && printf 1 || printf 0)" \
-  "$([[ -n $ALLOW_Q4_BATCH_MLA_OUTPUT ]] && printf 1 || printf 0)" \
+  "$([[ -n $DISABLE_Q4_BATCH_MLA_OUTPUT ]] && printf 1 || printf 0)" \
   >>"$OUT/run.env"
 printf 'batch_layer_trace=%s\ntrace_layer=%s\ntrace_token=%s\n' \
   "$([[ -n $BATCH_LAYER_TRACE ]] && printf 1 || printf 0)" \
@@ -806,6 +868,22 @@ if [[ -n $KDA_OUTPUT_KSLICE ]]; then
   local_candidate_env+=(DS4_GLM5_KDA_OUTPUT_KSLICE=1)
   remote_candidate_env+=' DS4_GLM5_KDA_OUTPUT_KSLICE=1'
 fi
+if [[ -n $KDA_OUTPUT_ROWSLICE ]]; then
+  local_candidate_env+=(DS4_GLM5_KDA_OUTPUT_ROWSLICE=1)
+  remote_candidate_env+=' DS4_GLM5_KDA_OUTPUT_ROWSLICE=1'
+fi
+if [[ -n $GPU_ROW_GATE ]]; then
+  local_candidate_env+=(DS4_GLM5_GPU_ROW_GATE=1)
+  remote_candidate_env+=' DS4_GLM5_GPU_ROW_GATE=1'
+fi
+if [[ -n $SMALL_GATE ]]; then
+  local_candidate_env+=(DS4_GLM5_SMALL_GATE=1)
+  remote_candidate_env+=' DS4_GLM5_SMALL_GATE=1'
+fi
+if [[ ${DS4_GLM5_ALLOW_PREFIX_MISMATCH:-} == 1 ]]; then
+  local_candidate_env+=(DS4_GLM5_ALLOW_PREFIX_MISMATCH=1)
+  remote_candidate_env+=' DS4_GLM5_ALLOW_PREFIX_MISMATCH=1'
+fi
 if [[ -n $RESIDENT_EXPERTS ]]; then
   local_candidate_env+=(DS4_GLM5_NEXT_RESIDENT_EXPERTS="$RESIDENT_EXPERTS")
   remote_candidate_env+=" DS4_GLM5_NEXT_RESIDENT_EXPERTS='$RESIDENT_EXPERTS'"
@@ -882,9 +960,25 @@ if [[ -n $ZERO_PERSISTENT_MLA ]]; then
   local_candidate_env+=(DS4_GLM5_ZERO_PERSISTENT_MLA="$ZERO_PERSISTENT_MLA")
   remote_candidate_env+=" DS4_GLM5_ZERO_PERSISTENT_MLA='$ZERO_PERSISTENT_MLA'"
 fi
-if [[ -n $ALLOW_Q4_BATCH_MLA_OUTPUT ]]; then
-  local_candidate_env+=(DS4_GLM5_ALLOW_Q4_BATCH_MLA_OUTPUT="$ALLOW_Q4_BATCH_MLA_OUTPUT")
-  remote_candidate_env+=" DS4_GLM5_ALLOW_Q4_BATCH_MLA_OUTPUT='$ALLOW_Q4_BATCH_MLA_OUTPUT'"
+if [[ -n $DISABLE_Q4_BATCH_MLA_OUTPUT ]]; then
+  local_candidate_env+=(DS4_GLM5_DISABLE_Q4_BATCH_MLA_OUTPUT="$DISABLE_Q4_BATCH_MLA_OUTPUT")
+  remote_candidate_env+=" DS4_GLM5_DISABLE_Q4_BATCH_MLA_OUTPUT='$DISABLE_Q4_BATCH_MLA_OUTPUT'"
+fi
+if [[ -n $CAUSAL_ATTN_GEMM_NOPE ]]; then
+  local_candidate_env+=(DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE="$CAUSAL_ATTN_GEMM_NOPE")
+  remote_candidate_env+=" DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE='$CAUSAL_ATTN_GEMM_NOPE'"
+fi
+if [[ -n $CAUSAL_ATTN_GEMM_NOPE_F32 ]]; then
+  local_candidate_env+=(DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32="$CAUSAL_ATTN_GEMM_NOPE_F32")
+  remote_candidate_env+=" DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32='$CAUSAL_ATTN_GEMM_NOPE_F32'"
+fi
+if [[ -n $MLA_ATTENTION_MODE ]]; then
+  local_candidate_env+=(DS4_GLM5_MLA_ATTENTION_MODE="$MLA_ATTENTION_MODE")
+  remote_candidate_env+=" DS4_GLM5_MLA_ATTENTION_MODE='$MLA_ATTENTION_MODE'"
+fi
+if [[ -n $MLA_OUTPUT_DUMP ]]; then
+  local_candidate_env+=(DS4_GLM5_MLA_OUTPUT_DUMP="$MLA_OUTPUT_DUMP")
+  remote_candidate_env+=" DS4_GLM5_MLA_OUTPUT_DUMP='$MLA_OUTPUT_DUMP'"
 fi
 if [[ -n $BATCH_LAYER_TRACE ]]; then
   local_candidate_env+=(DS4_GLM5_BATCH_LAYER_TRACE="$BATCH_LAYER_TRACE")
@@ -1009,6 +1103,7 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   DS4_GLM5_MLA_ROUTED_BATCH_TEST="$MLA_ROUTED_BATCH_TEST" \
   DS4_GLM5_MLA_ATTENTION_ONLY_TEST="$MLA_ATTENTION_ONLY_TEST" \
   DS4_GLM5_MLA_SPARSE_BOUNDARY_TEST="$MLA_SPARSE_BOUNDARY_TEST" \
+  DS4_GLM5_MLA_LONGKEY_ATTENTION_TEST="$MLA_LONGKEY_ATTENTION_TEST" \
   DS4_GLM5_MLA_ROUTED_BATCH_ROWS="$MLA_ROUTED_BATCH_ROWS" \
   DS4_GLM5_MLA_ROUTED_PREFIX_ROWS="$MLA_ROUTED_PREFIX_ROWS" \
   DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS="$MLA_ROUTED_CONTINUATION_ROWS" \
@@ -1021,7 +1116,7 @@ env -i PATH="$common_path" HOME="$LOCAL_HOME" \
   "${local_command[@]}" >"$OUT/leader.log" 2>&1 &
 leader_pid=$!
 ssh -o BatchMode=yes "$PEER" \
-  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ATTENTION_ONLY_TEST='$KDA_ATTENTION_ONLY_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS' DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS='$KDA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_MLA_ROUTED_BATCH_TEST='$MLA_ROUTED_BATCH_TEST' DS4_GLM5_MLA_ATTENTION_ONLY_TEST='$MLA_ATTENTION_ONLY_TEST' DS4_GLM5_MLA_SPARSE_BOUNDARY_TEST='$MLA_SPARSE_BOUNDARY_TEST' DS4_GLM5_MLA_ROUTED_BATCH_ROWS='$MLA_ROUTED_BATCH_ROWS' DS4_GLM5_MLA_ROUTED_PREFIX_ROWS='$MLA_ROUTED_PREFIX_ROWS' DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS='$MLA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_BATCH_PREFILL_TEST='$BATCH_PREFILL_TEST' DS4_GLM5_BATCH_PREFILL_COMPARE='$BATCH_PREFILL_COMPARE' DS4_GLM5_LAYER_TIMING='$LAYER_TIMING' DS4_ROCM_GLM5_BATCH_KSLICE_OUTPUT='$KDA_BATCH_KSLICE_OUTPUT'$remote_rdma_env$remote_candidate_env$remote_text_env '$PEER_BINARY'" \
+  "env -i PATH='$common_path' HOME='$PEER_HOME' DS4_GLM5_MODEL='$PEER_MODEL' DS4_GLM5_TP_ROLE=worker DS4_GLM5_TP_HOST='$HOST' DS4_GLM5_TP_PORT='$PORT' DS4_GLM5_TP_RDMA_DEVICE='$PEER_DEVICE' DS4_GLM5_TP_CONNECT_TIMEOUT_SEC='$TIMEOUT' DS4_GLM5_FULL_TRUNK='$FULL_TRUNK' DS4_GLM5_FULL_TOKENS='$FULL_TOKENS' DS4_GLM5_KDA_ROUTED_BATCH_TEST='$KDA_ROUTED_BATCH_TEST' DS4_GLM5_KDA_ATTENTION_ONLY_TEST='$KDA_ATTENTION_ONLY_TEST' DS4_GLM5_KDA_ROUTED_BATCH_ROWS='$KDA_ROUTED_BATCH_ROWS' DS4_GLM5_KDA_ROUTED_PROFILE_REPEATS='$KDA_ROUTED_PROFILE_REPEATS' DS4_GLM5_KDA_ROUTED_CONTINUATION_ROWS='$KDA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_MLA_ROUTED_BATCH_TEST='$MLA_ROUTED_BATCH_TEST' DS4_GLM5_MLA_ATTENTION_ONLY_TEST='$MLA_ATTENTION_ONLY_TEST' DS4_GLM5_MLA_SPARSE_BOUNDARY_TEST='$MLA_SPARSE_BOUNDARY_TEST' DS4_GLM5_MLA_LONGKEY_ATTENTION_TEST='$MLA_LONGKEY_ATTENTION_TEST' DS4_GLM5_MLA_ROUTED_BATCH_ROWS='$MLA_ROUTED_BATCH_ROWS' DS4_GLM5_MLA_ROUTED_PREFIX_ROWS='$MLA_ROUTED_PREFIX_ROWS' DS4_GLM5_MLA_ROUTED_CONTINUATION_ROWS='$MLA_ROUTED_CONTINUATION_ROWS' DS4_GLM5_BATCH_PREFILL_TEST='$BATCH_PREFILL_TEST' DS4_GLM5_BATCH_PREFILL_COMPARE='$BATCH_PREFILL_COMPARE' DS4_GLM5_LAYER_TIMING='$LAYER_TIMING' DS4_ROCM_GLM5_BATCH_KSLICE_OUTPUT='$KDA_BATCH_KSLICE_OUTPUT'$remote_rdma_env$remote_candidate_env$remote_text_env '$PEER_BINARY'" \
   >"$OUT/worker.log" 2>&1 &
 worker_pid=$!
 
@@ -1062,6 +1157,8 @@ for log in "$OUT/leader.log" "$OUT/worker.log"; do
     grep -q 'PASS GLM5 MLA-attention batch role=' "$log"
   elif [[ $MLA_SPARSE_BOUNDARY_TEST == 1 ]]; then
     grep -q 'PASS GLM5 sparse-MLA crossover role=' "$log"
+  elif [[ $MLA_LONGKEY_ATTENTION_TEST == 1 ]]; then
+    grep -q 'PASS GLM5 MLA long-key attention role=' "$log"
   elif [[ $MLA_ROUTED_BATCH_TEST == 1 ]]; then
     grep -q 'PASS GLM5 MLA+routed batch role=' "$log"
   elif [[ -n $TEXT_PROMPT ]]; then
@@ -1169,6 +1266,13 @@ elif [[ $MLA_SPARSE_BOUNDARY_TEST == 1 ]]; then
   WORKER_OUTPUT=$(sed -n '/PASS GLM5 sparse-MLA crossover role=/s/.* sparse=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
   [[ -n $LEADER_OUTPUT && $LEADER_OUTPUT == "$WORKER_OUTPUT" ]] || {
     echo "error: all-rank sparse-MLA crossover hashes differ" >&2
+    exit 1
+  }
+elif [[ $MLA_LONGKEY_ATTENTION_TEST == 1 ]]; then
+  LEADER_OUTPUT=$(sed -n '/GLM5 MLA long-key attention role=/s/.* gemm=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/leader.log" | tail -1)
+  WORKER_OUTPUT=$(sed -n '/GLM5 MLA long-key attention role=/s/.* gemm=\([0-9a-f]\{16\}\).*/\1/p' "$OUT/worker.log" | tail -1)
+  [[ -n $LEADER_OUTPUT && $LEADER_OUTPUT == "$WORKER_OUTPUT" ]] || {
+    echo "error: all-rank MLA long-key GEMM hashes differ" >&2
     exit 1
   }
 elif [[ $MLA_ROUTED_BATCH_TEST == 1 ]]; then

@@ -54,6 +54,7 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *dump_generated_token_file;
     const char *teacher_force_token_file;
     const char *teacher_force_logits_dir;
     ds4_dist_options dist;
@@ -363,6 +364,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-generated-token-file")) {
+            c.dump_generated_token_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--teacher-force-token-file")) {
             c.teacher_force_token_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--teacher-force-logits-dir")) {
@@ -489,6 +492,13 @@ static bench_config parse_options(int argc, char **argv) {
         fprintf(stderr,
                 "ds4-bench: --teacher-force-token-file and "
                 "--teacher-force-logits-dir must be used together\n");
+        exit(2);
+    }
+    if (c.dump_generated_token_file &&
+        (c.gen_tokens <= 0 || c.ctx_start != c.ctx_max)) {
+        fprintf(stderr,
+                "ds4-bench: --dump-generated-token-file requires one fixed "
+                "frontier and positive generation length\n");
         exit(2);
     }
     if (c.teacher_force_token_file && c.teacher_force_control) {
@@ -1443,6 +1453,7 @@ int main(int argc, char **argv) {
             .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
             .ctx_size = (uint32_t)cfg.ctx_alloc,
             .runtime_features = ds4_engine_tp_runtime_features(engine),
+            .prefill_config = ds4_engine_tp_prefill_config(engine),
         };
         ds4_engine_tp_gate_schedule(engine,
                                     &tp_id.gate_slot_start,
@@ -1677,7 +1688,9 @@ int main(int argc, char **argv) {
         uint64_t gen_cycles = 0;
         uint64_t gen_token_hash = UINT64_C(14695981039346656037);
         uint64_t accept_len_hist[17] = {0};
-        int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
+        int *gen_token_buf =
+            (cfg.show_output || cfg.dump_generated_token_file) &&
+            cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
@@ -1753,6 +1766,33 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "\"\n");
             fflush(stderr);
+        }
+        if (cfg.dump_generated_token_file && gen_token_buf &&
+            gen_token_count == cfg.gen_tokens) {
+            FILE *tokens_fp = fopen(cfg.dump_generated_token_file, "wb");
+            if (!tokens_fp) {
+                fprintf(stderr,
+                        "ds4-bench: failed to open generated-token file %s: %s\n",
+                        cfg.dump_generated_token_file, strerror(errno));
+                rc = 1;
+            } else {
+                for (int i = 0; i < gen_token_count; ++i) {
+                    if (fprintf(tokens_fp, "%d\n", gen_token_buf[i]) < 0) {
+                        rc = 1;
+                        break;
+                    }
+                }
+                if (fclose(tokens_fp) != 0) rc = 1;
+                if (rc != 0) {
+                    fprintf(stderr,
+                            "ds4-bench: failed writing generated-token file %s\n",
+                            cfg.dump_generated_token_file);
+                } else {
+                    fprintf(stderr,
+                            "ds4-bench: generated token IDs written tokens=%d file=%s\n",
+                            gen_token_count, cfg.dump_generated_token_file);
+                }
+            }
         }
         free(gen_token_buf);
         if (rc != 0) break;

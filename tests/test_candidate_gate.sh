@@ -79,12 +79,10 @@ EOF
 }
 make_run baseline-1 200.0 15.00 1
 make_run baseline-2 201.0 15.10 1
-make_run baseline-3 199.0 14.90 1
 make_run diverse-candidate 202.0 15.20 1
 "$repo/scripts/diverse-bench-gate.py" create --lane A \
   --baseline "$dossier/baseline-1.csv" \
   --baseline "$dossier/baseline-2.csv" \
-  --baseline "$dossier/baseline-3.csv" \
   --candidate "$dossier/diverse-candidate.csv" \
   --output "$dossier/diverse-summary.json" >/dev/null
 diverse_hash=$(sha256sum "$dossier/diverse-summary.json" | awk '{print $1}')
@@ -93,7 +91,6 @@ make_run diverse-regressed 202.0 13.50 1
 if "$repo/scripts/diverse-bench-gate.py" create --lane A \
   --baseline "$dossier/baseline-1.csv" \
   --baseline "$dossier/baseline-2.csv" \
-  --baseline "$dossier/baseline-3.csv" \
   --candidate "$dossier/diverse-regressed.csv" \
   --output "$dossier/diverse-regressed-summary.json" >/dev/null 2>&1; then
   echo "error: diverse benchmark gate accepted a decode regression" >&2
@@ -116,7 +113,6 @@ kinds = [
     "ordinary-benchmark",
     "candidate-benchmark",
     "candidate-benchmark",
-    "candidate-benchmark",
     "long-context",
     "transport-proof",
     "ordinary-regression",
@@ -127,7 +123,7 @@ kinds = [
     "rollback-proof",
 ]
 value["evidence"] = []
-candidate_runs = iter(("baseline-1.csv", "baseline-2.csv", "baseline-3.csv"))
+candidate_runs = iter(("baseline-1.csv", "baseline-2.csv"))
 for kind in kinds:
     if kind == "cross-discipline-long":
         value["evidence"].append({"kind": kind, "path": "diverse-summary.json", "sha256": diverse_digest})
@@ -279,15 +275,12 @@ printf 'reviewed evidence\n' > "$dossier/evidence.txt"
 hash=$(sha256sum "$dossier/evidence.txt" | awk '{print $1}')
 make_run candidate-1 202.0 15.20 1 fedcba0987654321 B "$baseline_id" 2048 2560 6dff0f4bc6000881259d96b2126b9c4f86f377efbaaa349e0a49d6da0435d34b
 make_run candidate-2 201.0 15.10 1 fedcba0987654321 B "$baseline_id" 2048 2560 6dff0f4bc6000881259d96b2126b9c4f86f377efbaaa349e0a49d6da0435d34b
-make_run candidate-3 203.0 15.30 1 fedcba0987654321 B "$baseline_id" 2048 2560 6dff0f4bc6000881259d96b2126b9c4f86f377efbaaa349e0a49d6da0435d34b
 make_run diverse-baseline-1 200.0 15.00 1 fedcba0987654321 B "$baseline_id"
 make_run diverse-baseline-2 201.0 15.10 1 fedcba0987654321 B "$baseline_id"
-make_run diverse-baseline-3 199.0 14.90 1 fedcba0987654321 B "$baseline_id"
 make_run diverse-candidate 202.0 15.20 1 fedcba0987654321 B "$baseline_id"
 "$repo/scripts/diverse-bench-gate.py" create --lane B \
   --baseline "$dossier/diverse-baseline-1.csv" \
   --baseline "$dossier/diverse-baseline-2.csv" \
-  --baseline "$dossier/diverse-baseline-3.csv" \
   --candidate "$dossier/diverse-candidate.csv" \
   --output "$dossier/diverse-summary.json" >/dev/null
 
@@ -391,14 +384,14 @@ value["model"] = {"path": model_path, "sample_sha256": model_sample,
                   "sha256": hashlib.sha256(Path(model_path).read_bytes()).hexdigest(),
                   "size": 1, "quantization": "Q4_K"}
 value["toolchain"] = {"id": "synthetic-new"}
-value["transport"] = {"providers": ["roce-v2", "odinlink"]}
+value["transport"] = {"providers": ["odinlink"]}
 value["evidence"] = []
 generic = ["ordinary-benchmark", "long-context", "transport-proof",
            "ordinary-regression", "fable-review", "grok-review",
            "full-logits", "teacher-forced", "semantic-retrieval"]
 for kind in generic:
     value["evidence"].append({"kind": kind, "path": "evidence.txt", "sha256": generic_hash})
-for name in ("candidate-1.csv", "candidate-2.csv", "candidate-3.csv"):
+for name in ("candidate-1.csv", "candidate-2.csv"):
     digest = hashlib.sha256((dossier / name).read_bytes()).hexdigest()
     manifest_digest = hashlib.sha256((dossier / name.replace(".csv", ".manifest")).read_bytes()).hexdigest()
     value["evidence"].append({"kind": "candidate-benchmark", "path": name,

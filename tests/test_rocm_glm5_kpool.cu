@@ -194,6 +194,87 @@ bool run_case(const Glm5TestGGUF &gguf, uint64_t ape_offset,
     return true;
 }
 
+bool run_batch_publication_equivalence(const Glm5TestGGUF &gguf,
+                                       uint64_t ape_offset) {
+    constexpr uint32_t n_rows = 256u;
+    constexpr uint32_t n_pools = n_rows / kPool;
+    std::vector<float> keys((size_t)n_rows * kDim);
+    std::vector<float> gates((size_t)n_rows * kDim);
+    std::vector<uint32_t> valid(n_rows, 1u);
+    for (uint32_t row = 0u; row < n_rows; ++row) {
+        for (uint32_t d = 0u; d < kDim; ++d) {
+            keys[(uint64_t)row * kDim + d] =
+                deterministic_key(row, d, 7u);
+            gates[(uint64_t)row * kDim + d] =
+                deterministic_gate(row, d, 7u);
+        }
+    }
+    const uint64_t rows_bytes = (uint64_t)n_rows * kDim * sizeof(float);
+    const uint64_t pooled_bytes = (uint64_t)n_pools * kDim * sizeof(float);
+    const uint64_t indices_bytes =
+        (uint64_t)n_pools * kPool * sizeof(int32_t);
+    const uint64_t valid_bytes = (uint64_t)n_pools * sizeof(uint32_t);
+    ds4_gpu_tensor *d_keys = ds4_gpu_tensor_alloc(rows_bytes);
+    ds4_gpu_tensor *d_gates = ds4_gpu_tensor_alloc(rows_bytes);
+    ds4_gpu_tensor *d_input_valid =
+        ds4_gpu_tensor_alloc((uint64_t)n_rows * sizeof(uint32_t));
+    ds4_gpu_tensor *d_reference = ds4_gpu_tensor_alloc(pooled_bytes);
+    ds4_gpu_tensor *d_candidate = ds4_gpu_tensor_alloc(pooled_bytes);
+    ds4_gpu_tensor *d_ref_indices = ds4_gpu_tensor_alloc(indices_bytes);
+    ds4_gpu_tensor *d_got_indices = ds4_gpu_tensor_alloc(indices_bytes);
+    ds4_gpu_tensor *d_ref_valid = ds4_gpu_tensor_alloc(valid_bytes);
+    ds4_gpu_tensor *d_got_valid = ds4_gpu_tensor_alloc(valid_bytes);
+    CHECK(d_keys && d_gates && d_input_valid && d_reference && d_candidate &&
+          d_ref_indices && d_got_indices && d_ref_valid && d_got_valid &&
+          ds4_gpu_tensor_write(d_keys, 0u, keys.data(), rows_bytes) &&
+          ds4_gpu_tensor_write(d_gates, 0u, gates.data(), rows_bytes) &&
+          ds4_gpu_tensor_write(d_input_valid, 0u, valid.data(),
+                               (uint64_t)n_rows * sizeof(uint32_t)) &&
+          ds4_gpu_glm5_kpool_tensor(
+              d_reference, d_ref_indices, d_ref_valid, d_keys, d_gates,
+              d_input_valid, gguf.map, gguf.size, ape_offset, n_rows,
+              kDim, kPool, 0u) &&
+          ds4_gpu_glm5_publish_pools_batch_tensor(
+              d_candidate, d_got_indices, d_got_valid, d_keys, d_gates,
+              gguf.map, gguf.size, ape_offset, 0u, n_rows, kDim) &&
+          ds4_gpu_synchronize(),
+          "execute aligned GLM5 batch pool publication");
+    std::vector<float> reference((size_t)n_pools * kDim);
+    std::vector<float> candidate(reference.size());
+    std::vector<int32_t> ref_indices((size_t)n_pools * kPool);
+    std::vector<int32_t> got_indices(ref_indices.size());
+    std::vector<uint32_t> ref_valid(n_pools), got_valid(n_pools);
+    CHECK(ds4_gpu_tensor_read(d_reference, 0u, reference.data(),
+                              pooled_bytes) &&
+          ds4_gpu_tensor_read(d_candidate, 0u, candidate.data(),
+                              pooled_bytes) &&
+          ds4_gpu_tensor_read(d_ref_indices, 0u, ref_indices.data(),
+                              indices_bytes) &&
+          ds4_gpu_tensor_read(d_got_indices, 0u, got_indices.data(),
+                              indices_bytes) &&
+          ds4_gpu_tensor_read(d_ref_valid, 0u, ref_valid.data(),
+                              valid_bytes) &&
+          ds4_gpu_tensor_read(d_got_valid, 0u, got_valid.data(),
+                              valid_bytes),
+          "read aligned GLM5 batch pool publication");
+    CHECK(std::memcmp(reference.data(), candidate.data(), pooled_bytes) == 0 &&
+          ref_indices == got_indices && ref_valid == got_valid,
+          "aligned batch pool publication is bit-identical");
+    std::fprintf(stderr,
+                 "GLM5 batch pool publication rows=%u pools=%u bit_exact=1\n",
+                 n_rows, n_pools);
+    ds4_gpu_tensor_free(d_got_valid);
+    ds4_gpu_tensor_free(d_ref_valid);
+    ds4_gpu_tensor_free(d_got_indices);
+    ds4_gpu_tensor_free(d_ref_indices);
+    ds4_gpu_tensor_free(d_candidate);
+    ds4_gpu_tensor_free(d_reference);
+    ds4_gpu_tensor_free(d_input_valid);
+    ds4_gpu_tensor_free(d_gates);
+    ds4_gpu_tensor_free(d_keys);
+    return true;
+}
+
 bool run_test() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     CHECK(model && model[0], "DS4_GLM5_MODEL environment");
@@ -227,6 +308,8 @@ bool run_test() {
         CHECK(run_case(gguf, ape_offset, 8192u, pattern & 3u, false,
                        pattern),
               "GLM5 kpool wide-logit numerical stress");
+    CHECK(run_batch_publication_equivalence(gguf, ape_offset),
+          "GLM5 aligned batch pool publication equivalence");
     CHECK(ds4_tp_test_get_exchange_calls() == 0u,
           "GLM5 kpool invokes no TP exchange API");
 

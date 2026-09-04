@@ -1007,6 +1007,25 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Research microbenchmark entry point. It is not selected by production
+ * inference and exists to compare exact-order Q8 decode schedules on real
+ * mapped GGUF tensor slices. */
+int ds4_gpu_rocm_q8_sharedx_prefetch_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              full_in_dim,
+        uint64_t              full_out_dim,
+        uint64_t              in_start,
+        uint64_t              in_count,
+        uint64_t              out_start,
+        uint64_t              out_count,
+        const ds4_gpu_tensor *x,
+        uint32_t              prefetch,
+        int                   nontemporal,
+        uint32_t              rows_per_block);
+
 int ds4_gpu_attention_q_b_qnorm_rope_q8_0_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -1252,6 +1271,51 @@ int ds4_gpu_matmul_bf16_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+/* Optional GLM-KDA BF16 WMMA dispatch: -1 means not applicable, 0 hard
+ * failure, and 1 successful launch.  Other model families use the ordinary
+ * BF16 entry above. */
+int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
+/* Optional GLM-KDA Q/K/V launch collapse over three independent BF16 weight
+ * pointers. Return semantics match the single-projection WMMA entry. */
+int ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
+
+/* Default-off decode experiment: computes three independent BF16 Q/K/V
+ * projections while staging the shared activation vector once. */
+int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok);
 
 /* BF16 K-slice over physical row stride full_in_dim.  Each input row is a
  * compact k_cnt-element slice; partial outputs from ranks are summed in fixed
@@ -1802,6 +1866,22 @@ int ds4_gpu_glm5_fill_pool_members_tensor(
         uint32_t              pool,
         uint32_t              first_token,
         uint32_t              n_rows);
+
+/* ROCm batch-prefill fast path for an aligned run of complete pool-4 rows.
+ * It consumes the already contiguous normalized key and pool-gate batches and
+ * publishes keys plus membership directly into the resident pool arrays. */
+int ds4_gpu_glm5_publish_pools_batch_tensor(
+        ds4_gpu_tensor       *pooled_keys,
+        ds4_gpu_tensor       *pool_indices,
+        ds4_gpu_tensor       *pool_valid,
+        const ds4_gpu_tensor *keys,
+        const ds4_gpu_tensor *gate_scores,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              pool_ape_offset,
+        uint32_t              first_pool,
+        uint32_t              n_tokens,
+        uint32_t              head_dim);
 
 /* Single-sequence GLM-5.3 decode selection helpers. The mask preserves the
  * upstream finite minimum sentinel. Expansion converts selected pool IDs back

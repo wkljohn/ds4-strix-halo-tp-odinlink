@@ -500,6 +500,8 @@ static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
 static void *g_attention_seq_scratch[DS4_MAX_GPUS];
 static uint64_t g_attention_seq_scratch_bytes[DS4_MAX_GPUS];
+static void *g_glm_causal_scratch[DS4_MAX_GPUS];
+static uint64_t g_glm_causal_scratch_bytes[DS4_MAX_GPUS];
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
@@ -843,6 +845,39 @@ static void *cuda_attention_seq_scratch_alloc(uint64_t bytes) {
     }
     g_attention_seq_scratch[device] = ptr;
     g_attention_seq_scratch_bytes[device] = bytes;
+    return ptr;
+}
+
+static void *cuda_glm_causal_scratch_alloc(uint64_t bytes) {
+    if (bytes == 0) return NULL;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        device < 0 || device >= DS4_MAX_GPUS) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM causal attention cannot resolve current device\n");
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    if (g_glm_causal_scratch_bytes[device] >= bytes) {
+        return g_glm_causal_scratch[device];
+    }
+    if (g_glm_causal_scratch[device]) {
+        (void)cudaFree(g_glm_causal_scratch[device]);
+        g_glm_causal_scratch[device] = NULL;
+        g_glm_causal_scratch_bytes[device] = 0;
+    }
+    void *ptr = NULL;
+    const cudaError_t err = cudaMalloc(&ptr, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                DS4_GPU_LOG_PREFIX
+                "GLM causal attention scratch alloc failed (%.2f MiB): %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    g_glm_causal_scratch[device] = ptr;
+    g_glm_causal_scratch_bytes[device] = bytes;
     return ptr;
 }
 
@@ -6870,9 +6905,57 @@ static int cuda_q4k_packed_slice_load_expert_impl(
     }
     const char *async_window = getenv("DS4_ROCM_GLM5_WINDOW_ASYNC");
     const int use_async = async_window && strcmp(async_window, "1") == 0;
+    /* Optional GLM diagnosis: read selected experts through the existing
+     * direct-file staging pool instead of faulting the mmap/GTT source.  This
+     * is deliberately synchronous and opt-in: it changes no production
+     * default, never creates a persistent weight cache, and is only useful
+     * for separating host page migration from the device upload cost. */
+    const char *fd_stage_env = getenv("DS4_ROCM_GLM5_WINDOW_FD_STAGE");
+    const int use_fd_stage = fd_stage_env && strcmp(fd_stage_env, "1") == 0 &&
+        g_model_fd >= 0 && !use_async;
+    const char *buffered_stage_env =
+        getenv("DS4_ROCM_GLM5_WINDOW_FD_STAGE_BUFFERED");
+    const int use_buffered_stage = use_fd_stage && buffered_stage_env &&
+        strcmp(buffered_stage_env, "1") == 0;
     const cudaStream_t stream = transfer_stream ? transfer_stream :
                                 (cudaStream_t)0;
-    if (contiguous) {
+    if (use_fd_stage) {
+        const uint64_t stage_need = source_window_bytes +
+            (g_model_direct_align > 1u ? g_model_direct_align : 1u);
+        if (!cuda_model_stage_pool_alloc(stage_need)) return 0;
+        const char *payload = NULL;
+        if (use_buffered_stage) {
+            if (!cuda_pread_full(g_model_fd, g_model_stage[0],
+                                 source_window_bytes, source_offset)) return 0;
+            payload = (const char *)g_model_stage[0];
+        } else if (!cuda_model_stage_read(g_model_stage[0],
+                                          g_model_stage_bytes, source_offset,
+                                          source_window_bytes, &payload)) {
+            return 0;
+        }
+        if (contiguous) {
+            err = cudaMemcpy(dst->ptr, payload,
+                             (size_t)p->packed_expert_bytes,
+                             cudaMemcpyHostToDevice);
+        } else {
+            std::vector<char> host_pack;
+            try {
+                host_pack.resize((size_t)p->packed_expert_bytes);
+            } catch (...) {
+                return 0;
+            }
+            for (uint32_t row = 0; row < p->row_count; ++row) {
+                memcpy(host_pack.data() +
+                           (uint64_t)row * p->column_byte_count,
+                       payload + (uint64_t)row * p->source_row_bytes +
+                           p->column_byte_base,
+                       (size_t)p->column_byte_count);
+            }
+            err = cudaMemcpy(dst->ptr, host_pack.data(),
+                             (size_t)p->packed_expert_bytes,
+                             cudaMemcpyHostToDevice);
+        }
+    } else if (contiguous) {
         err = use_async ? cudaMemcpyAsync(
             dst->ptr, source, (size_t)p->packed_expert_bytes,
             cudaMemcpyHostToDevice, stream) :
@@ -7256,6 +7339,31 @@ extern "C" int ds4_gpu_q4k_window_cache_prepare(
     }
     if (unique.size() > cache->slots) return 0;
     cache->prepares++;
+    if (getenv("DS4_ROCM_GLM5_WINDOW_SET_PROFILE")) {
+        std::vector<int32_t> ordered = unique;
+        std::sort(ordered.begin(), ordered.end());
+        uint64_t set_hash = UINT64_C(1469598103934665603);
+        uint64_t set_bits[5] = {};
+        for (int32_t expert : ordered) {
+            const uint32_t bits = (uint32_t)expert;
+            for (unsigned b = 0; b < 4u; ++b) {
+                set_hash ^= (uint8_t)(bits >> (8u * b));
+                set_hash *= UINT64_C(1099511628211);
+            }
+            set_bits[(uint32_t)expert >> 6u] |=
+                UINT64_C(1) << ((uint32_t)expert & 63u);
+        }
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM5 window set prepares=%llu pairs=%u unique=%zu "
+                "set_fnv64=%016llx bits=%016llx:%016llx:%016llx:%016llx:%016llx\n",
+                (unsigned long long)cache->prepares, count, unique.size(),
+                (unsigned long long)set_hash,
+                (unsigned long long)set_bits[0],
+                (unsigned long long)set_bits[1],
+                (unsigned long long)set_bits[2],
+                (unsigned long long)set_bits[3],
+                (unsigned long long)set_bits[4]);
+    }
 
     bool needs_fill = false;
     for (int32_t expert : unique) {
@@ -8152,6 +8260,14 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
         g_attention_seq_scratch[device] = NULL;
         g_attention_seq_scratch_bytes[device] = 0;
+    }
+    for (int device = 0; device < DS4_MAX_GPUS; device++) {
+        if (!g_glm_causal_scratch[device]) continue;
+        if (cudaSetDevice(device) == cudaSuccess) {
+            (void)cudaFree(g_glm_causal_scratch[device]);
+        }
+        g_glm_causal_scratch[device] = NULL;
+        g_glm_causal_scratch_bytes[device] = 0;
     }
     if (attention_seq_saved_device >= 0) {
         (void)cudaSetDevice(attention_seq_saved_device);

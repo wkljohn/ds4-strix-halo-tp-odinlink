@@ -752,19 +752,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             cuda_runtime_config()->q8_decode_sharedx_64k;
         if ((in_dim & 31u) == 0u &&
             (in_dim <= 8192u || extended_sharedx)) {
-            const unsigned rows_per_block = 32u;
-            const unsigned threads = rows_per_block * 32u;
-            matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
-                    (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
-                    threads,
-                    (size_t)in_dim * sizeof(float)>>>(
+            const cudaError_t launch_err =
+                cuda_launch_q8_sharedx_glm5_candidate(
                     (float *)out->ptr,
                     reinterpret_cast<const unsigned char *>(wptr),
-                    (const float *)x->ptr,
-                    (uint32_t)blocks,
-                    out_dim,
+                    (const float *)x->ptr, (uint32_t)blocks, out_dim,
                     blocks * 34u);
-            const cudaError_t launch_err = cudaGetLastError();
             if (launch_err == cudaSuccess) {
                 if (extended_sharedx) {
                     static int notice_printed = 0;
@@ -995,6 +988,71 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
                                            in_dim, out_dim, x, n_tok, "q8_0");
+}
+
+extern "C" int ds4_gpu_rocm_q8_sharedx_prefetch_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t full_out_dim,
+        uint64_t in_start, uint64_t in_count, uint64_t out_start,
+        uint64_t out_count, const ds4_gpu_tensor *x, uint32_t prefetch,
+        int nontemporal, uint32_t rows_per_block) {
+    if (!out || !x || !model_map || full_in_dim == 0u || full_out_dim == 0u ||
+        in_count == 0u || out_count == 0u || (full_in_dim & 31u) != 0u ||
+        (in_start & 31u) != 0u || (in_count & 31u) != 0u ||
+        in_start > full_in_dim || in_count > full_in_dim - in_start ||
+        out_start > full_out_dim || out_count > full_out_dim - out_start ||
+        in_count > 16384u || rows_per_block == 0u || rows_per_block > 32u ||
+        (rows_per_block & (rows_per_block - 1u)) != 0u ||
+        x->bytes < in_count * sizeof(float) ||
+        out->bytes < out_count * sizeof(float)) return 0;
+    if (prefetch != 0u && prefetch != 4u && prefetch != 8u &&
+        prefetch != 16u && prefetch != 32u) return 0;
+    const uint64_t full_blocks = full_in_dim / 32u;
+    const uint64_t slice_blocks = in_count / 32u;
+    const uint64_t row_bytes = full_blocks * 34u;
+    uint64_t weight_bytes = 0u;
+    if (!cuda_u64_mul_checked(full_out_dim, row_bytes, &weight_bytes) ||
+        weight_offset > model_size || weight_bytes > model_size - weight_offset)
+        return 0;
+    const char *base = cuda_model_range_ptr(model_map, weight_offset,
+                                             weight_bytes,
+                                             "q8 sharedx prefetch bench");
+    if (!base) return 0;
+    const unsigned char *weight =
+        reinterpret_cast<const unsigned char *>(base) +
+        out_start * row_bytes + (in_start / 32u) * 34u;
+    const dim3 grid((unsigned)((out_count + rows_per_block - 1u) /
+                               rows_per_block));
+    const dim3 block(rows_per_block * 32u);
+    const size_t shared_bytes = (size_t)in_count * sizeof(float);
+    if (prefetch == 0u) {
+        matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
+            grid, block, shared_bytes>>>((float *)out->ptr, weight,
+                                         (const float *)x->ptr,
+                                         (uint32_t)slice_blocks, out_count,
+                                         row_bytes);
+    } else {
+#define DS4_LAUNCH_Q8_PREFETCH(P, NT) \
+        matmul_q8_0_f32_sharedx_exact_prefetch_warp_rows_w32_kernel< \
+            P, NT><<<grid, block, shared_bytes>>>( \
+                (float *)out->ptr, weight, (const float *)x->ptr, \
+                (uint32_t)slice_blocks, out_count, row_bytes)
+        if (prefetch == 4u) {
+            if (nontemporal) DS4_LAUNCH_Q8_PREFETCH(4u, true);
+            else DS4_LAUNCH_Q8_PREFETCH(4u, false);
+        } else if (prefetch == 8u) {
+            if (nontemporal) DS4_LAUNCH_Q8_PREFETCH(8u, true);
+            else DS4_LAUNCH_Q8_PREFETCH(8u, false);
+        } else if (prefetch == 16u) {
+            if (nontemporal) DS4_LAUNCH_Q8_PREFETCH(16u, true);
+            else DS4_LAUNCH_Q8_PREFETCH(16u, false);
+        } else {
+            if (nontemporal) DS4_LAUNCH_Q8_PREFETCH(32u, true);
+            else DS4_LAUNCH_Q8_PREFETCH(32u, false);
+        }
+#undef DS4_LAUNCH_Q8_PREFETCH
+    }
+    return cuda_ok(cudaGetLastError(), "Q8 sharedx prefetch bench launch");
 }
 
 extern "C" int ds4_gpu_attention_q_b_qnorm_rope_q8_0_tensor(
@@ -1484,6 +1542,216 @@ static int matmul_bf16_f32_toktile_w32_launch(
     return first == n_tok;
 }
 
+static int matmul_bf16_f32_wmma_hilo_m256_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    matmul_bf16_f32_wmma_hilo_m256_kernel<2u><<<
+            dim3((out_dim + 31u) / 32u, (n_tok + 255u) / 256u),
+            16u * 32u>>>(out, weight, x, in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_bf16 WMMA hi/lo M256 launch");
+}
+
+/* GLM-KDA-only optional dispatch.  Return -1 when the guarded candidate is
+ * not applicable, 0 on a hard validation/launch failure, and 1 on launch. */
+extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    static const int batch_toktile_disabled =
+        getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
+        !ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, batch_toktile_disabled, (uint32_t)in_dim,
+            (uint32_t)out_dim, (uint32_t)n_tok, g_quality_mode,
+            cuda_runtime_config()->graph_dump)) return -1;
+    if (!out || !x || !out->ptr || !x->ptr || !model_map ||
+        out_dim > UINT64_MAX / in_dim) return 0;
+    const uint64_t weight_elems = out_dim * in_dim;
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t) ||
+        n_tok > UINT64_MAX / in_dim || n_tok > UINT64_MAX / out_dim)
+        return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    const uint64_t x_elems = n_tok * in_dim;
+    const uint64_t out_elems = n_tok * out_dim;
+    if (x_elems > UINT64_MAX / sizeof(float) ||
+        out_elems > UINT64_MAX / sizeof(float) ||
+        weight_offset > model_size ||
+        weight_bytes > model_size - weight_offset ||
+        x->bytes < x_elems * sizeof(float) ||
+        out->bytes < out_elems * sizeof(float) ||
+        cuda_u64_ranges_overlap(
+            (uint64_t)(uintptr_t)out->ptr, out_elems * sizeof(float),
+            (uint64_t)(uintptr_t)x->ptr, x_elems * sizeof(float))) return 0;
+    const char *wptr = cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "glm5_bf16_wmma_hilo");
+    if (!wptr) return 0;
+    return matmul_bf16_f32_wmma_hilo_m256_launch(
+        (float *)out->ptr, (const uint16_t *)wptr, (const float *)x->ptr,
+        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+}
+
+extern "C" int ds4_gpu_matmul_bf16_wmma_hilo_qkv_tensor(
+        ds4_gpu_tensor *out_q, ds4_gpu_tensor *out_k,
+        ds4_gpu_tensor *out_v, const void *model_map, uint64_t model_size,
+        uint64_t weight_q_offset, uint64_t weight_k_offset,
+        uint64_t weight_v_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    static const int batch_toktile_disabled =
+        getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
+    if (in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX ||
+        in_dim != 4096u || out_dim != 4096u ||
+        !ds4_bf16_wmma_hilo_dispatch_allowed(
+            true, batch_toktile_disabled, (uint32_t)in_dim,
+            (uint32_t)out_dim, (uint32_t)n_tok, g_quality_mode,
+            cuda_runtime_config()->graph_dump)) return -1;
+    if (!out_q || !out_k || !out_v || !x || !out_q->ptr || !out_k->ptr ||
+        !out_v->ptr || !x->ptr || !model_map ||
+        out_dim > UINT64_MAX / in_dim || n_tok > UINT64_MAX / in_dim ||
+        n_tok > UINT64_MAX / out_dim) return 0;
+    const uint64_t weight_elems = out_dim * in_dim;
+    const uint64_t x_elems = n_tok * in_dim;
+    const uint64_t out_elems = n_tok * out_dim;
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t) ||
+        x_elems > UINT64_MAX / sizeof(float) ||
+        out_elems > UINT64_MAX / sizeof(float)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    const uint64_t x_bytes = x_elems * sizeof(float);
+    const uint64_t out_bytes = out_elems * sizeof(float);
+    const uint64_t output_ptrs[] = {
+        (uint64_t)(uintptr_t)out_q->ptr,
+        (uint64_t)(uintptr_t)out_k->ptr,
+        (uint64_t)(uintptr_t)out_v->ptr,
+    };
+    if (out_q->bytes < out_bytes || out_k->bytes < out_bytes ||
+        out_v->bytes < out_bytes || x->bytes < x_bytes) return 0;
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        if (cuda_u64_ranges_overlap(
+                output_ptrs[i], out_bytes,
+                (uint64_t)(uintptr_t)x->ptr, x_bytes)) return 0;
+        for (uint32_t j = i + 1u; j < 3u; ++j)
+            if (cuda_u64_ranges_overlap(
+                    output_ptrs[i], out_bytes, output_ptrs[j], out_bytes))
+                return 0;
+    }
+    const uint64_t offsets[] = {
+        weight_q_offset, weight_k_offset, weight_v_offset,
+    };
+    const char *weights[3] = {};
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        if (offsets[i] > model_size ||
+            weight_bytes > model_size - offsets[i]) return 0;
+        weights[i] = cuda_model_range_ptr(
+            model_map, offsets[i], weight_bytes,
+            "glm5_bf16_wmma_hilo_qkv");
+        if (!weights[i]) return 0;
+    }
+    matmul_bf16_f32_wmma_hilo_qkv_multiptr_kernel<<<
+        dim3(3u * ((uint32_t)out_dim + 31u) / 32u,
+             ((uint32_t)n_tok + 255u) / 256u),
+        16u * 32u>>>(
+            (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+            (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+            (const uint16_t *)weights[2], (const float *)x->ptr,
+            (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_bf16 WMMA hi/lo QKV multiptr launch");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
+        ds4_gpu_tensor *out_q, ds4_gpu_tensor *out_k,
+        ds4_gpu_tensor *out_v, const void *model_map, uint64_t model_size,
+        uint64_t weight_q_offset, uint64_t weight_k_offset,
+        uint64_t weight_v_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    static const char *selector =
+        getenv("DS4_ROCM_GLM5_BF16_QKV_DECODE_MULTIPTR");
+    if (!selector || strcmp(selector, "1") != 0) return -1;
+    if (!out_q || !out_k || !out_v || !x || !model_map || !out_q->ptr ||
+        !out_k->ptr || !out_v->ptr || !x->ptr || n_tok != 1u ||
+        in_dim != 4096u || out_dim == 0u || out_dim > 4096u ||
+        (out_dim & 7u) != 0u) return -1;
+    const uint64_t weight_elems = in_dim * out_dim;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    const uint64_t out_bytes = out_dim * sizeof(float);
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t) ||
+        out_q->bytes < out_bytes || out_k->bytes < out_bytes ||
+        out_v->bytes < out_bytes || x->bytes < in_dim * sizeof(float))
+        return 0;
+    const uint64_t offsets[] = {weight_q_offset, weight_k_offset,
+                                weight_v_offset};
+    const char *weights[3] = {};
+    for (uint32_t i = 0u; i < 3u; ++i) {
+        if (offsets[i] > model_size || weight_bytes > model_size - offsets[i])
+            return 0;
+        weights[i] = cuda_model_range_ptr(model_map, offsets[i], weight_bytes,
+                                          "glm5_bf16_qkv_decode_multiptr");
+        if (!weights[i]) return 0;
+    }
+    matmul_bf16_f32_sharedx_qkv_multiptr_decode_kernel<64u><<<
+        (unsigned)((out_dim + 7u) / 8u), 24u * 32u,
+        (size_t)in_dim * sizeof(float)>>>(
+        (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+        (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+        (const uint16_t *)weights[2], (const float *)x->ptr,
+        (uint32_t)in_dim, (uint32_t)out_dim);
+    static int reported = 0;
+    if (!reported) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM5 BF16 decode QKV multiptr engaged out_dim=%llu\n",
+                (unsigned long long)out_dim);
+        reported = 1;
+    }
+    return cuda_ok(cudaGetLastError(),
+                   "BF16 decode QKV multiptr launch");
+}
+
+static int matmul_bf16_f32_rowtile2x16_w32_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    if (n_tok == 0u || (n_tok % 16u) != 0u) return 0;
+    matmul_bf16_f32_rowtile_w32_kernel<2u, 16u><<<
+            dim3((out_dim + 1u) / 2u, n_tok / 16u),
+            kDs4Bf16ToktileThreads>>>(
+        out, weight, x, in_dim, out_dim);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_bf16 adjacent-row tile2x16 launch");
+}
+
+static int matmul_bf16_f32_skinny_exact_toktile_launch(
+        float *out, const uint16_t *weight, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    uint32_t first = 0u;
+    const uint32_t chunks32 = n_tok / 32u;
+    if (chunks32 > 0u) {
+        matmul_bf16_f32_skinny_exact_toktile_kernel<32u><<<
+                dim3(out_dim, chunks32), kDs4Bf16ToktileThreads>>>(
+            out, weight, x, in_dim, out_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "matmul_bf16 skinny exact tile32 launch")) return 0;
+        first = chunks32 * 32u;
+    }
+#define DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(T) do {                       \
+        if (n_tok - first >= (T)) {                                     \
+            matmul_bf16_f32_skinny_exact_toktile_kernel<(T)><<<         \
+                out_dim, kDs4Bf16ToktileThreads>>>(                     \
+                out + (uint64_t)first * out_dim, weight,                \
+                x + (uint64_t)first * in_dim, in_dim, out_dim);         \
+            if (!cuda_ok(cudaGetLastError(),                            \
+                         "matmul_bf16 skinny exact tail launch"))      \
+                return 0;                                               \
+            first += (T);                                               \
+        }                                                               \
+    } while (0)
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(16u);
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(8u);
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(4u);
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(2u);
+    DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL(1u);
+#undef DS4_BF16_SKINNY_EXACT_LAUNCH_TAIL
+    return first == n_tok;
+}
+
 static int matmul_bf16_f32_kslice_toktile_w32_launch(
         float *out, const uint16_t *weight, const float *x,
         uint32_t full_in_dim, uint32_t k_off, uint32_t k_cnt,
@@ -1572,17 +1840,164 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
     if (n_tok == 1u && in_dim <= 8192u &&
         in_dim * sizeof(float) <= 65536u &&
         getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") == NULL) {
-        const uint32_t rows_per_block = 32u;
+        static const char *decode_qkv_prefetch_value =
+            getenv("DS4_ROCM_GLM5_BF16_QKV_PREFETCH");
+        static const char *decode_qkv_rows_value =
+            getenv("DS4_ROCM_GLM5_BF16_QKV_ROWS_PER_BLOCK");
+        static const char *decode_qkv_nontemporal_value =
+            getenv("DS4_ROCM_GLM5_BF16_QKV_NONTEMPORAL");
+        static const char *decode_output_prefetch_value =
+            getenv("DS4_ROCM_GLM5_BF16_OUTPUT_PREFETCH");
+        static const char *decode_output_rows_value =
+            getenv("DS4_ROCM_GLM5_BF16_OUTPUT_ROWS_PER_BLOCK");
+        static const char *decode_output_nontemporal_value =
+            getenv("DS4_ROCM_GLM5_BF16_OUTPUT_NONTEMPORAL");
+        static const uint32_t decode_qkv_prefetch =
+            decode_qkv_prefetch_value == NULL ? 0u :
+            strcmp(decode_qkv_prefetch_value, "0") == 0 ? 0u :
+            strcmp(decode_qkv_prefetch_value, "4") == 0 ? 4u :
+            strcmp(decode_qkv_prefetch_value, "8") == 0 ? 8u :
+            strcmp(decode_qkv_prefetch_value, "16") == 0 ? 16u :
+            strcmp(decode_qkv_prefetch_value, "32") == 0 ? 32u :
+            strcmp(decode_qkv_prefetch_value, "64") == 0 ? 64u : UINT32_MAX;
+        static const int decode_qkv_prefetch_valid =
+            decode_qkv_prefetch != UINT32_MAX;
+        static const int decode_qkv_nontemporal =
+            decode_qkv_nontemporal_value != NULL &&
+            strcmp(decode_qkv_nontemporal_value, "1") == 0;
+        static const int decode_qkv_nontemporal_valid =
+            decode_qkv_nontemporal_value == NULL ||
+            strcmp(decode_qkv_nontemporal_value, "0") == 0 ||
+            decode_qkv_nontemporal;
+        static const uint32_t decode_qkv_rows_per_block =
+            decode_qkv_rows_value == NULL ? 32u :
+            strcmp(decode_qkv_rows_value, "8") == 0 ? 8u :
+            strcmp(decode_qkv_rows_value, "16") == 0 ? 16u :
+            strcmp(decode_qkv_rows_value, "32") == 0 ? 32u : 0u;
+        static const uint32_t decode_output_prefetch =
+            decode_output_prefetch_value == NULL ? 0u :
+            strcmp(decode_output_prefetch_value, "0") == 0 ? 0u :
+            strcmp(decode_output_prefetch_value, "4") == 0 ? 4u :
+            strcmp(decode_output_prefetch_value, "8") == 0 ? 8u :
+            strcmp(decode_output_prefetch_value, "16") == 0 ? 16u :
+            strcmp(decode_output_prefetch_value, "32") == 0 ? 32u :
+            strcmp(decode_output_prefetch_value, "64") == 0 ? 64u :
+            UINT32_MAX;
+        static const int decode_output_prefetch_valid =
+            decode_output_prefetch != UINT32_MAX;
+        static const int decode_output_nontemporal =
+            decode_output_nontemporal_value != NULL &&
+            strcmp(decode_output_nontemporal_value, "1") == 0;
+        static const int decode_output_nontemporal_valid =
+            decode_output_nontemporal_value == NULL ||
+            strcmp(decode_output_nontemporal_value, "0") == 0 ||
+            decode_output_nontemporal;
+        static const uint32_t decode_output_rows_per_block =
+            decode_output_rows_value == NULL ? 32u :
+            strcmp(decode_output_rows_value, "8") == 0 ? 8u :
+            strcmp(decode_output_rows_value, "16") == 0 ? 16u :
+            strcmp(decode_output_rows_value, "32") == 0 ? 32u : 0u;
+        if (!decode_qkv_prefetch_valid || !decode_qkv_nontemporal_valid ||
+            (decode_qkv_nontemporal && decode_qkv_prefetch == 0u) ||
+            decode_qkv_rows_per_block == 0u ||
+            !decode_output_prefetch_valid ||
+            !decode_output_nontemporal_valid ||
+            (decode_output_nontemporal && decode_output_prefetch == 0u) ||
+            decode_output_rows_per_block == 0u) {
+            static int invalid_reported;
+            if (!invalid_reported) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "invalid GLM5 BF16 exact-order research selector\n");
+                invalid_reported = 1;
+            }
+            return 0;
+        }
+        const int decode_qkv_shape = in_dim == 4096u && out_dim == 4096u;
+        const int decode_output_shape = in_dim == 8192u && out_dim == 2048u;
+        const uint32_t decode_exact_prefetch = decode_qkv_shape
+            ? decode_qkv_prefetch
+            : decode_output_shape ? decode_output_prefetch : 0u;
+        const int decode_exact_nontemporal = decode_qkv_shape
+            ? decode_qkv_nontemporal
+            : decode_output_shape ? decode_output_nontemporal : 0;
+        const uint32_t rows_per_block = decode_qkv_shape
+            ? decode_qkv_rows_per_block
+            : decode_output_shape ? decode_output_rows_per_block : 32u;
         static const int decode_mlp64_disabled =
             getenv("DS4_ROCM_DISABLE_BF16_DECODE_MLP64") != NULL;
         const dim3 grid(
             ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block);
         const dim3 block(rows_per_block * 32u);
         const size_t shared_bytes = (size_t)in_dim * sizeof(float);
-        if (!decode_mlp64_disabled && in_dim >= 4096u) {
-            static const int split_order =
-                (getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER") != NULL &&
-                 strcmp(getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER"), "1") == 0);
+        if ((decode_qkv_shape || decode_output_shape) &&
+            decode_exact_prefetch != 0u) {
+#define DS4_LAUNCH_BF16_QKV_PREFETCH(P, NT) \
+            matmul_bf16_f32_sharedx_exact_prefetch_warp_rows_w32_kernel< \
+                    P, NT><<<grid, block, shared_bytes>>>( \
+                    (float *)out->ptr, (const uint16_t *)wptr, \
+                    (const float *)x->ptr, (uint32_t)in_dim, out_dim)
+            if (decode_exact_prefetch == 4u) {
+                if (decode_exact_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(4u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(4u, false);
+            } else if (decode_exact_prefetch == 8u) {
+                if (decode_exact_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(8u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(8u, false);
+            } else if (decode_exact_prefetch == 16u) {
+                if (decode_exact_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(16u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(16u, false);
+            } else if (decode_exact_prefetch == 32u) {
+                if (decode_exact_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(32u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(32u, false);
+            } else {
+                if (decode_exact_nontemporal)
+                    DS4_LAUNCH_BF16_QKV_PREFETCH(64u, true);
+                else DS4_LAUNCH_BF16_QKV_PREFETCH(64u, false);
+            }
+#undef DS4_LAUNCH_BF16_QKV_PREFETCH
+            static int qkv_prefetch_reported;
+            static int output_prefetch_reported;
+            int *prefetch_reported = decode_qkv_shape
+                ? &qkv_prefetch_reported : &output_prefetch_reported;
+            if (!*prefetch_reported) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "GLM5 BF16 %s exact prefetch engaged "
+                        "window=%u rows_per_block=%u nontemporal=%d\n",
+                        decode_qkv_shape ? "QKV" : "output",
+                        decode_exact_prefetch, rows_per_block,
+                        decode_exact_nontemporal);
+                *prefetch_reported = 1;
+            }
+        } else if (!decode_mlp64_disabled && in_dim >= 4096u) {
+            static const char *split_order_value =
+                getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER");
+            static const char *legacy_split_order_value =
+                getenv("DS4_ROCM_BF16_FULL_LEGACY_SPLIT_ORDER");
+            static const int split_order = split_order_value != NULL &&
+                strcmp(split_order_value, "1") == 0;
+            static const int legacy_split_order =
+                legacy_split_order_value != NULL &&
+                strcmp(legacy_split_order_value, "1") == 0;
+            static const int split_order_env_valid =
+                (split_order_value == NULL ||
+                 strcmp(split_order_value, "0") == 0 || split_order) &&
+                (legacy_split_order_value == NULL ||
+                 strcmp(legacy_split_order_value, "0") == 0 ||
+                 legacy_split_order) &&
+                !(split_order && legacy_split_order);
+            if (!split_order_env_valid) {
+                static int invalid_reported;
+                if (!invalid_reported) {
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX
+                            "invalid or conflicting BF16 full split-order "
+                            "diagnostic selectors\n");
+                    invalid_reported = 1;
+                }
+                return 0;
+            }
             if (split_order && in_dim == 8192u) {
                 matmul_bf16_f32_sharedx_mlp64_split4096_warp_rows_w32_kernel<<<
                         grid, block, shared_bytes>>>(
@@ -1590,6 +2005,21 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
                         (const uint16_t *)wptr,
                         (const float *)x->ptr,
                         out_dim);
+            } else if (legacy_split_order && in_dim == 8192u) {
+                /* Independent lawful-reorder null.  Keep the historical
+                 * two-accumulator source path available under a distinct
+                 * diagnostic selector: the repaired split-order control above
+                 * intentionally shares its exact half-reduction body with the
+                 * TP K-slice and therefore cannot calibrate recurrent
+                 * sensitivity independently. */
+                matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel<<<
+                        grid, block, shared_bytes>>>(
+                        (float *)out->ptr,
+                        (const uint16_t *)wptr,
+                        (const float *)x->ptr,
+                        (uint32_t)in_dim,
+                        out_dim,
+                        1);
             } else {
                 matmul_bf16_f32_sharedx_mlp64_warp_rows_w32_kernel<<<
                         grid, block, shared_bytes>>>(
@@ -1617,8 +2047,86 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         getenv("DS4_ROCM_DISABLE_BF16_BATCH_TOKTILE") != NULL;
     static const int lowrank128_toktile_disabled =
         getenv("DS4_ROCM_DISABLE_BF16_LOWRANK128_TOKTILE") != NULL;
+    static const char *rowtile2x16_value =
+        getenv("DS4_ROCM_GLM5_BF16_ROWTILE2X16");
+    static const int rowtile2x16_enabled = rowtile2x16_value != NULL &&
+        strcmp(rowtile2x16_value, "1") == 0;
+    static const int rowtile2x16_valid = rowtile2x16_value == NULL ||
+        strcmp(rowtile2x16_value, "0") == 0 || rowtile2x16_enabled;
+    if (!rowtile2x16_valid) {
+        static int invalid_reported;
+        if (!invalid_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "invalid GLM5 BF16 adjacent-row tile selector\n");
+            invalid_reported = 1;
+        }
+        return 0;
+    }
+    const bool rowtile2x16_shape =
+        in_dim <= UINT32_MAX && out_dim <= UINT32_MAX &&
+        n_tok <= UINT32_MAX &&
+        ds4_bf16_rowtile2x16_dispatch_allowed(
+            rowtile2x16_enabled, batch_toktile_disabled,
+            (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok,
+            g_quality_mode, cuda_runtime_config()->graph_dump);
+    if (rowtile2x16_shape) {
+        static int rowtile2x16_reported;
+        if (!rowtile2x16_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 adjacent-row tile2x16 engaged: "
+                    "tokens=%llu in=%llu out=%llu\n",
+                    (unsigned long long)n_tok,
+                    (unsigned long long)in_dim,
+                    (unsigned long long)out_dim);
+            rowtile2x16_reported = 1;
+        }
+        return matmul_bf16_f32_rowtile2x16_w32_launch(
+            (float *)out->ptr, (const uint16_t *)wptr,
+            (const float *)x->ptr, (uint32_t)in_dim,
+            (uint32_t)out_dim, (uint32_t)n_tok);
+    }
+    static const char *skinny_exact_value =
+        getenv("DS4_ROCM_GLM5_BF16_SKINNY_EXACT_TOKTILE");
+    static const int skinny_exact_enabled =
+        skinny_exact_value != NULL && strcmp(skinny_exact_value, "1") == 0;
+    static const int skinny_exact_valid =
+        skinny_exact_value == NULL || strcmp(skinny_exact_value, "0") == 0 ||
+        skinny_exact_enabled;
+    if (!skinny_exact_valid) {
+        static int invalid_reported;
+        if (!invalid_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "invalid GLM5 BF16 skinny exact token-tile selector\n");
+            invalid_reported = 1;
+        }
+        return 0;
+    }
+    const bool skinny_exact_shape = skinny_exact_enabled &&
+        ((in_dim == 4096u && (out_dim == 32u || out_dim == 128u)) ||
+         (in_dim == 16384u && out_dim == 24u));
+    if (skinny_exact_shape && n_tok >= 16u && in_dim <= UINT32_MAX &&
+        out_dim <= UINT32_MAX && n_tok <= UINT32_MAX && !g_quality_mode &&
+        !cuda_runtime_config()->graph_dump) {
+        static int skinny_exact_reported;
+        if (!skinny_exact_reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 BF16 skinny exact token-tile engaged: "
+                    "tokens=%llu in=%llu out=%llu\n",
+                    (unsigned long long)n_tok,
+                    (unsigned long long)in_dim,
+                    (unsigned long long)out_dim);
+            skinny_exact_reported = 1;
+        }
+        return matmul_bf16_f32_skinny_exact_toktile_launch(
+            (float *)out->ptr, (const uint16_t *)wptr,
+            (const float *)x->ptr, (uint32_t)in_dim,
+            (uint32_t)out_dim, (uint32_t)n_tok);
+    }
+    /* Full KDA expands 128 -> 8192.  True TP computes one contiguous head
+     * half at a time, so the same row-major kernel sees 128 -> 4096 after
+     * advancing wptr to rank 1's first row. */
     const bool low_rank_128 = !lowrank128_toktile_disabled &&
-        in_dim == 128u && out_dim == 8192u;
+        in_dim == 128u && (out_dim == 8192u || out_dim == 4096u);
     if (!batch_toktile_disabled && n_tok >= 16u &&
         ((in_dim >= 1024u && out_dim >= 1024u) || low_rank_128) &&
         in_dim <= UINT32_MAX && out_dim <= UINT32_MAX &&
@@ -1636,7 +2144,7 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
             verbose_reported = 1;
         }
         static int low_rank_reported = 0;
-        if (!low_rank_reported && in_dim == 128u && out_dim == 8192u &&
+        if (!low_rank_reported && low_rank_128 &&
             getenv("DS4_ROCM_BF16_BATCH_TOKTILE_VERBOSE") != NULL) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "BF16 F32 low-rank token-tile path engaged: tokens=%llu "
@@ -2119,17 +2627,13 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
                 row_bytes);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 kslice rows pack4 launch");
     }
-    matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
-            (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
-            threads,
-            (size_t)in_count * sizeof(float)>>>(
-            (float *)out->ptr,
-            reinterpret_cast<const unsigned char *>(wptr) + block_start * 34u,
-            (const float *)x->ptr,
-            (uint32_t)slice_blocks,
-            out_dim,
-            row_bytes);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0 kslice rows launch");
+    return cuda_ok(cuda_launch_q8_sharedx_glm5_candidate(
+                       (float *)out->ptr,
+                       reinterpret_cast<const unsigned char *>(wptr) +
+                           block_start * 34u,
+                       (const float *)x->ptr, (uint32_t)slice_blocks,
+                       out_dim, row_bytes),
+                   "matmul_q8_0 kslice rows launch");
 }
 
 /* GLM-5.3 MLA produces full-width head rows but each TP rank owns one

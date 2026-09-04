@@ -31,13 +31,15 @@ def routed_family(tensors):
     gate = {v for k, v in routed.items() if ".ffn_gate_exps." in k}
     up = {v for k, v in routed.items() if ".ffn_up_exps." in k}
     down = {v for k, v in routed.items() if ".ffn_down_exps." in k}
+    if gate == {12} and up == {12} and down == {12}:
+        return "Q4_K"
     # GLM-5.3 Flash Q2 control: IQ2_XXS gate/up (GGML type 16),
     # Q2_K down (GGML type 10).  Do not describe a different layout as Q2.
-    if gate != {16} or up != {16} or down != {10}:
-        raise ValueError(
-            f"unsupported routed expert types gate={sorted(gate)} "
-            f"up={sorted(up)} down={sorted(down)}")
-    return "IQ2_XXS+Q2_K"
+    if gate == {16} and up == {16} and down == {10}:
+        return "IQ2_XXS+Q2_K"
+    raise ValueError(
+        f"unsupported routed expert types gate={sorted(gate)} "
+        f"up={sorted(up)} down={sorted(down)}")
 
 
 def main(argv):

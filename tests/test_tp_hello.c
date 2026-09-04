@@ -25,6 +25,27 @@ static int check(const char *name, uint32_t local, uint32_t peer, int want,
     return 1;
 }
 
+static int check_prefill(const char *name, uint64_t local, uint64_t peer,
+                         int want, const char *want_error) {
+    char err[160] = "";
+    const int got = ds4_tp_test_hello_validate_prefill_config(
+            local, peer, err, sizeof(err));
+    if (got != want) {
+        fprintf(stderr,
+                "FAIL %s: local=0x%016llx peer=0x%016llx got=%d want=%d\n",
+                name, (unsigned long long)local,
+                (unsigned long long)peer, got, want);
+        return 0;
+    }
+    if (want_error && strcmp(err, want_error) != 0) {
+        fprintf(stderr, "FAIL %s: error='%s' want='%s'\n",
+                name, err, want_error);
+        return 0;
+    }
+    fprintf(stderr, "PASS %s\n", name);
+    return 1;
+}
+
 static int check_transport(const char *name,
                            ds4_tp_transport requested,
                            int local_rdma_ok,
@@ -170,13 +191,73 @@ static int check_invalid_gate_schedules(void) {
     return 1;
 }
 
+static int check_glm53_aux_schedule(void) {
+    uint32_t count = 0u;
+    for (uint32_t slot = 0u; slot < 92u; ++slot) {
+        const int eligible = ds4_tp_test_aux_gate_eligible(
+            DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE, 45u, slot);
+        const uint32_t layer = slot / DS4_TP_GATES_PER_LAYER;
+        const int want = (slot & 1u) == 0u && layer < 45u &&
+                         (layer & 3u) != 3u;
+        if (eligible != want) {
+            fprintf(stderr,
+                    "FAIL GLM53 aux schedule slot=%u got=%d want=%d\n",
+                    slot, eligible, want);
+            return 0;
+        }
+        count += (uint32_t)eligible;
+    }
+    if (count != 34u ||
+        ds4_tp_test_aux_gate_eligible(0u, 46u, 0u)) {
+        fprintf(stderr, "FAIL GLM53 aux schedule count=%u\n", count);
+        return 0;
+    }
+    fprintf(stderr, "PASS GLM53 paired auxiliary schedule (34 receives)\n");
+    return 1;
+}
+
 int main(void) {
     int ok = 1;
     ok &= check_glm53_gate_schedule();
+    ok &= check_glm53_aux_schedule();
     ok &= check_invalid_gate_schedules();
     ok &= check("hello equal-enabled",
                 DS4_TP_FEATURE_Q4K_WMMA, DS4_TP_FEATURE_Q4K_WMMA, 1, NULL);
     ok &= check("hello equal-disabled", 0, 0, 1, NULL);
+    const uint64_t prefill = ds4_tp_prefill_config_encode(
+        2048u, 32u, true, false, true);
+    ok &= check_prefill("hello equal-prefill-config",
+                        prefill, prefill, 1, NULL);
+    ok &= check_prefill(
+        "hello mismatched-prefill-config",
+        prefill,
+        ds4_tp_prefill_config_encode(2048u, 32u, false, false, true),
+        0,
+        "tp hello: prefill config mismatch (local=0x0000000500200800 peer=0x0000000400200800)");
+    ok &= check_prefill(
+        "hello mismatched-prefill-attn-threshold",
+        prefill, ds4_tp_prefill_config_encode(4096u, 32u, true, false, true),
+        0, NULL);
+    ok &= check_prefill(
+        "hello mismatched-prefill-ffn-threshold",
+        prefill, ds4_tp_prefill_config_encode(2048u, 64u, true, false, true),
+        0, NULL);
+    ok &= check_prefill(
+        "hello mismatched-prefill-subgate",
+        prefill, ds4_tp_prefill_config_encode(2048u, 32u, true, true, true),
+        0, NULL);
+    ok &= check_prefill(
+        "hello mismatched-prefill-wavefront",
+        prefill, ds4_tp_prefill_config_encode(2048u, 32u, true, false, false),
+        0, NULL);
+    if ((ds4_tp_prefill_config_encode(UINT32_MAX, UINT32_MAX,
+                                      false, false, false) &
+         UINT64_C(0xffffffff)) != UINT64_C(0xffffffff)) {
+        fprintf(stderr, "FAIL prefill config threshold saturation\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS prefill config threshold saturation\n");
+    }
     ok &= check("hello mismatched-feature-masks",
                 DS4_TP_FEATURE_Q4K_WMMA, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00000001 peer=0x00000000)");
@@ -240,6 +321,48 @@ int main(void) {
     ok &= check("hello mismatched-glm5-kda-output-kslice",
                 DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00800000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-kda-output-rowslice",
+                DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE,
+                DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE, 1, NULL);
+    ok &= check("hello mismatched-glm5-kda-output-rowslice",
+                DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x02000000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-small-gate-direct-send",
+                DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND,
+                DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND, 1, NULL);
+    ok &= check("hello mismatched-glm5-small-gate-direct-send",
+                DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x04000000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-sparse-batch-bridge",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE,
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE, 1, NULL);
+    ok &= check("hello mismatched-glm5-sparse-batch-bridge",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x08000000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-sparse-batch-output",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT,
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT, 1, NULL);
+    ok &= check("hello mismatched-glm5-sparse-batch-output",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x10000000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-sparse-batch-prelude",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE,
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE, 1, NULL);
+    ok &= check("hello mismatched-glm5-sparse-batch-prelude",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x20000000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-sparse-batch-value",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE,
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE, 1, NULL);
+    ok &= check("hello mismatched-glm5-sparse-batch-value",
+                DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x40000000 peer=0x00000000)");
+    ok &= check("hello equal-glm5-sparse-attn-f16-gemm",
+                DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM,
+                DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM, 1, NULL);
+    ok &= check("hello mismatched-glm5-sparse-attn-f16-gemm",
+                DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM, 0, 0,
+                "tp hello: runtime feature mismatch (local=0x80000000 peer=0x00000000)");
     ok &= check("hello q4k-wmma-kshard mismatch",
                 DS4_TP_FEATURE_Q4K_WMMA | DS4_TP_FEATURE_Q4K_KSHARD,
                 DS4_TP_FEATURE_Q4K_WMMA, 0,
@@ -287,8 +410,84 @@ int main(void) {
         DS4_TP_FEATURE_Q4K_KSHARD |
         DS4_TP_FEATURE_GLM5_RESIDENT_KDA |
         DS4_TP_FEATURE_GLM5_SMALL_GATE |
-        DS4_TP_FEATURE_GLM5_KDA_TP;
-    if ((DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE & prior_features) != 0u) {
+        DS4_TP_FEATURE_GLM5_KDA_TP |
+        DS4_TP_FEATURE_GLM5_GPU_ROW_GATE |
+        DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE |
+        DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE;
+    if ((DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE &
+         (prior_features | DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND)) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch bridge feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch bridge feature is disjoint\n");
+    }
+    if ((DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT &
+         (prior_features | DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE)) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch output feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch output feature is disjoint\n");
+    }
+    if ((DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE &
+         (prior_features | DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT)) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch prelude feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch prelude feature is disjoint\n");
+    }
+    if ((DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE &
+         (prior_features | DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE)) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch value feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch value feature is disjoint\n");
+    }
+    if ((DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM &
+         (prior_features | DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE |
+          DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE)) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-attention F16 GEMM feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-attention F16 GEMM feature is disjoint\n");
+    }
+    if ((DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND & prior_features) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 small-gate direct-send feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 small-gate direct-send feature is disjoint\n");
+    }
+    if ((DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE &
+         (prior_features & ~DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE)) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 KDA output row-slice feature overlaps prior bits\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 KDA output row-slice feature is disjoint\n");
+    }
+    if ((DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE &
+         (prior_features & ~DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE)) != 0u) {
         fprintf(stderr,
                 "FAIL GLM5 KDA output K-slice feature overlaps prior bits\n");
         ok = 0;
@@ -321,6 +520,135 @@ int main(void) {
     } else {
         fprintf(stderr, "PASS GLM5 KDA-TP advertisement predicate\n");
     }
+    if (ds4_tp_glm5_small_gate_feature("1", 1, 1, 0) !=
+            DS4_TP_FEATURE_GLM5_SMALL_GATE ||
+        ds4_tp_glm5_small_gate_feature(NULL, 1, 1, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("0", 1, 1, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("true", 1, 1, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("1", 0, 1, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("1", 1, 0, 0) != 0u ||
+        ds4_tp_glm5_small_gate_feature("1", 1, 1, 1) != 0u) {
+        fprintf(stderr, "FAIL GLM5 small-gate advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS GLM5 small-gate advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_small_gate_direct_send_feature(
+            "1", DS4_TP_FEATURE_GLM5_SMALL_GATE) !=
+            DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND ||
+        ds4_tp_glm5_small_gate_direct_send_feature(
+            NULL, DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u ||
+        ds4_tp_glm5_small_gate_direct_send_feature(
+            "0", DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u ||
+        ds4_tp_glm5_small_gate_direct_send_feature("1", 0u) != 0u ||
+        ds4_tp_glm5_small_gate_direct_send_feature(
+            "1", DS4_TP_FEATURE_GLM5_SMALL_GATE |
+                 DS4_TP_FEATURE_GLM5_GPU_ROW_GATE) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 small-gate direct-send advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 small-gate direct-send advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_sparse_batch_bridge_feature("1", 1, 1, 0) !=
+            DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE ||
+        ds4_tp_glm5_sparse_batch_bridge_feature(NULL, 1, 1, 0) != 0u ||
+        ds4_tp_glm5_sparse_batch_bridge_feature("0", 1, 1, 0) != 0u ||
+        ds4_tp_glm5_sparse_batch_bridge_feature("true", 1, 1, 0) != 0u ||
+        ds4_tp_glm5_sparse_batch_bridge_feature("1", 0, 1, 0) != 0u ||
+        ds4_tp_glm5_sparse_batch_bridge_feature("1", 1, 0, 0) != 0u ||
+        ds4_tp_glm5_sparse_batch_bridge_feature("1", 1, 1, 1) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch bridge advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch bridge advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_sparse_batch_output_feature(
+            "1", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) !=
+            DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT ||
+        ds4_tp_glm5_sparse_batch_output_feature(
+            NULL, DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u ||
+        ds4_tp_glm5_sparse_batch_output_feature(
+            "0", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u ||
+        ds4_tp_glm5_sparse_batch_output_feature(
+            "true", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u ||
+        ds4_tp_glm5_sparse_batch_output_feature("1", 0u) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch output advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch output advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_sparse_batch_prelude_feature(
+            "1", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT) !=
+            DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE ||
+        ds4_tp_glm5_sparse_batch_prelude_feature(
+            NULL, DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT) != 0u ||
+        ds4_tp_glm5_sparse_batch_prelude_feature(
+            "0", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT) != 0u ||
+        ds4_tp_glm5_sparse_batch_prelude_feature(
+            "true", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT) != 0u ||
+        ds4_tp_glm5_sparse_batch_prelude_feature("1", 0u) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch prelude advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch prelude advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_sparse_batch_value_feature(
+            "1", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE) !=
+            DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE ||
+        ds4_tp_glm5_sparse_batch_value_feature(
+            NULL, DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE) != 0u ||
+        ds4_tp_glm5_sparse_batch_value_feature(
+            "0", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE) != 0u ||
+        ds4_tp_glm5_sparse_batch_value_feature(
+            "true", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE) != 0u ||
+        ds4_tp_glm5_sparse_batch_value_feature("1", 0u) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-batch value advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-batch value advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_sparse_attn_f16_gemm_feature(
+            "1", "1", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE) !=
+            DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM ||
+        ds4_tp_glm5_sparse_attn_f16_gemm_feature(
+            NULL, "1", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE) != 0u ||
+        ds4_tp_glm5_sparse_attn_f16_gemm_feature(
+            "0", "1", DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE) != 0u ||
+        ds4_tp_glm5_sparse_attn_f16_gemm_feature(
+            "1", NULL, DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE) != 0u ||
+        ds4_tp_glm5_sparse_attn_f16_gemm_feature("1", "1", 0u) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 sparse-attention F16 GEMM advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 sparse-attention F16 GEMM advertisement predicate\n");
+    }
+    if (ds4_tp_glm5_gpu_row_gate_feature(
+            "1", DS4_TP_FEATURE_GLM5_SMALL_GATE, NULL) !=
+            DS4_TP_FEATURE_GLM5_GPU_ROW_GATE ||
+        ds4_tp_glm5_gpu_row_gate_feature(NULL,
+                                         DS4_TP_FEATURE_GLM5_SMALL_GATE, NULL) != 0u ||
+        ds4_tp_glm5_gpu_row_gate_feature("0",
+                                         DS4_TP_FEATURE_GLM5_SMALL_GATE, NULL) != 0u ||
+        ds4_tp_glm5_gpu_row_gate_feature("1", 0u, NULL) != 0u ||
+        ds4_tp_glm5_gpu_row_gate_feature(
+            "1", DS4_TP_FEATURE_GLM5_SMALL_GATE, "1") != 0u) {
+        fprintf(stderr, "FAIL GLM5 GPU row-gate advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS GLM5 GPU row-gate advertisement predicate\n");
+    }
     if (ds4_tp_glm5_kda_output_kslice_feature(
             "1", DS4_TP_FEATURE_GLM5_KDA_TP, 1) !=
             DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE ||
@@ -339,6 +667,29 @@ int main(void) {
     } else {
         fprintf(stderr,
                 "PASS GLM5 KDA output K-slice advertisement predicate\n");
+    }
+    const uint32_t rowslice_base = DS4_TP_FEATURE_GLM5_KDA_TP |
+                                    DS4_TP_FEATURE_GLM5_SMALL_GATE;
+    if (ds4_tp_glm5_kda_output_rowslice_feature(
+            "1", rowslice_base, 1) !=
+            DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            NULL, rowslice_base, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            "0", rowslice_base, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            "true", rowslice_base, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature("1", 0u, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            "1", DS4_TP_FEATURE_GLM5_KDA_TP, 1) != 0u ||
+        ds4_tp_glm5_kda_output_rowslice_feature(
+            "1", rowslice_base, 0) != 0u) {
+        fprintf(stderr,
+                "FAIL GLM5 KDA output row-slice advertisement predicate\n");
+        ok = 0;
+    } else {
+        fprintf(stderr,
+                "PASS GLM5 KDA output row-slice advertisement predicate\n");
     }
     const char *invalid_kshard_env[] = {
         NULL, "", "0", "true", "10", "1 ", "1\n"

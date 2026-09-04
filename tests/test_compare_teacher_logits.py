@@ -45,11 +45,18 @@ def dump(path: Path, logits: list[float], quality: bool = False,
 def score_manifest(path: Path, *, arm: str,
                    model_hash: str = "model-hash",
                    full_split_order: bool = False,
-                   fallback_mlp64: bool = False) -> None:
+                   fallback_mlp64: bool = False,
+                   attention_f32_gemm: bool = False,
+                   attention_repair: str | None = None,
+                   attention_repairs: tuple[str, ...] = (),
+                   attention_exact_split: str | None = None) -> None:
     selectors = {
         "kda-off": ("0", "0"),
         "kda-tp": ("1", "0"),
         "kda-kslice": ("1", "1"),
+        "attn-scalar": ("1", "0"),
+        "attn-gemm-f32": ("1", "0"),
+        "attn-exact-split": ("1", "0"),
     }
     kda_tp, kslice = selectors[arm]
     fields = {
@@ -73,7 +80,14 @@ def score_manifest(path: Path, *, arm: str,
                       ("DS4_ROCM_BF16_FULL_SPLIT_ORDER=1 "
                        if full_split_order else "") +
                       ("DS4_ROCM_DISABLE_BF16_DECODE_MLP64=1 "
-                       if fallback_mlp64 else "")),
+                       if fallback_mlp64 else "") +
+                      ("DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE=1 "
+                       "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_F32=1 "
+                       if attention_f32_gemm else "") +
+                      (f"{attention_repair}=1 " if attention_repair else "") +
+                      "".join(f"{repair}=1 " for repair in attention_repairs) +
+                      (f"DS4_ROCM_GLM_CAUSAL_ATTN_EXACT_SPLIT={attention_exact_split} "
+                       if attention_exact_split is not None else "")),
         "coordinator_features": (f"GLM5 TP features: kda_tp={kda_tp} "
                                  f"kda_output_kslice={kslice}"),
         "worker_features": (f"GLM5 TP features: kda_tp={kda_tp} "
@@ -247,6 +261,101 @@ def main() -> int:
         assert invalid_fallback_vs_kslice.returncode == 1
         assert "independent BF16 fallback only in the reference" in \
             invalid_fallback_vs_kslice.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(candidate / "manifest", arm="attn-gemm-f32",
+                       attention_f32_gemm=True)
+        attention = run(
+            str(reference), str(candidate),
+            "--score-arm-mode", "attn-scalar-vs-f32-gemm")
+        assert attention.returncode == 0, attention.stderr
+        score_manifest(reference / "manifest", arm="attn-scalar",
+                       attention_f32_gemm=True)
+        invalid_attention = run(
+            str(reference), str(candidate),
+            "--score-arm-mode", "attn-scalar-vs-f32-gemm")
+        assert invalid_attention.returncode == 1
+        assert "FP32 NoPE GEMM only in the candidate" in \
+            invalid_attention.stderr
+
+        for suffix, repair in (
+                ("sync", "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SYNC"),
+                ("postdiv", "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV"),
+                ("default-math",
+                 "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH")):
+            score_manifest(reference / "manifest", arm="attn-scalar")
+            score_manifest(candidate / "manifest", arm="attn-gemm-f32",
+                           attention_f32_gemm=True,
+                           attention_repair=repair)
+            repaired = run(
+                str(reference), str(candidate),
+                "--score-arm-mode", f"attn-scalar-vs-f32-gemm-{suffix}")
+            assert repaired.returncode == 0, repaired.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(
+            candidate / "manifest", arm="attn-gemm-f32",
+            attention_f32_gemm=True,
+            attention_repairs=(
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH"))
+        combined = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-f32-gemm-postdiv-default-math")
+        assert combined.returncode == 0, combined.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(
+            candidate / "manifest", arm="attn-gemm-f32",
+            attention_f32_gemm=True,
+            attention_repairs=(
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR"))
+        pv_scalar = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-f32-gemm-postdiv-pv-scalar")
+        assert pv_scalar.returncode == 0, pv_scalar.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(
+            candidate / "manifest", arm="attn-gemm-f32",
+            attention_f32_gemm=True,
+            attention_repairs=(
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_DEFAULT_MATH"))
+        pv_scalar_default = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math")
+        assert pv_scalar_default.returncode == 0, pv_scalar_default.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(
+            candidate / "manifest", arm="attn-gemm-f32",
+            attention_f32_gemm=True,
+            attention_repairs=(
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_POSTDIV",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_PV_SCALAR",
+                "DS4_ROCM_GLM_CAUSAL_ATTN_GEMM_NOPE_SCORE_SCALAR"))
+        score_pv_scalar = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar")
+        assert score_pv_scalar.returncode == 0, score_pv_scalar.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar",
+                       attention_exact_split="0")
+        score_manifest(candidate / "manifest", arm="attn-exact-split")
+        exact_split = run(
+            str(reference), str(candidate), "--score-arm-mode",
+            "attn-scalar-vs-exact-split")
+        assert exact_split.returncode == 0, exact_split.stderr
+
+        score_manifest(reference / "manifest", arm="attn-scalar")
+        score_manifest(candidate / "manifest", arm="attn-scalar")
+        attention_repeat = run(
+            str(reference), str(candidate),
+            "--score-arm-mode", "attn-repeat")
+        assert attention_repeat.returncode == 0, attention_repeat.stderr
     print("test_compare_teacher_logits: PASS")
     return 0
 

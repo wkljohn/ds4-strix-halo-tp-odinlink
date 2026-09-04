@@ -53,7 +53,8 @@ def write_manifest(path: Path, values: dict[str, object]) -> None:
     path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
 
 
-def build_fixture(root: Path, structured: bool = False) -> Path:
+def build_fixture(root: Path, structured: bool = False,
+                  providers: tuple[str, ...] = ("roce-v2", "odinlink")) -> Path:
     model = root / "model.gguf"
     model.write_bytes(b"synthetic model")
     model_size, model_sample = sampled(model)
@@ -69,7 +70,7 @@ def build_fixture(root: Path, structured: bool = False) -> Path:
     fnv = "1234567890abcdef"
 
     benchmarks: list[dict[str, str]] = []
-    for provider in ("roce-v2", "odinlink"):
+    for provider in providers:
         for index in range(3):
             name = f"{provider}-{index + 1}"
             csv_path = root / f"{name}.csv"
@@ -194,7 +195,7 @@ def build_fixture(root: Path, structured: bool = False) -> Path:
                 "prefill_chunk": "2048", "dspark": "0",
                 "frozen_token_sha256": token_sha,
             },
-            "rdma_providers": ["odinlink", "roce-v2"],
+            "rdma_providers": list(providers),
         },
         "reference": {
             "fnv64": fnv,
@@ -298,6 +299,17 @@ def main() -> int:
         assert value["schema_version"] == 2
         assert value["key"]["tp_layout"] == GLM_TP_LAYOUT
 
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        genesis = build_fixture(root, providers=("roce-v2",))
+        result = run_gate(root, genesis)
+        if result.returncode != 0:
+            raise AssertionError(result.stderr)
+        baseline_id = result.stdout.strip()
+        baseline = root / "baselines" / "sha256" / f"{baseline_id[7:]}.json"
+        value = json.loads(baseline.read_text())
+        assert value["key"]["rdma_providers"] == ["roce-v2"]
+
     expect_failure(
         lambda _root, genesis: mutate_genesis(
             genesis, lambda value: value["record"]["reference"].__setitem__(
@@ -317,6 +329,21 @@ def main() -> int:
             genesis, lambda value: value["record"]["thresholds"].__setitem__(
                 "oracle_numerical", value["record"]["thresholds"]["numerical"])),
         "cannot preapprove canonical oracles")
+    expect_failure(
+        lambda _root, genesis: mutate_genesis(
+            genesis, lambda value: value["record"]["key"].__setitem__(
+                "rdma_providers", [])),
+        "one or more distinct validated RDMA providers")
+    expect_failure(
+        lambda _root, genesis: mutate_genesis(
+            genesis, lambda value: value["record"]["key"].__setitem__(
+                "rdma_providers", ["roce-v2", "roce-v2"])),
+        "one or more distinct validated RDMA providers")
+    expect_failure(
+        lambda _root, genesis: mutate_genesis(
+            genesis, lambda value: value["record"]["key"].__setitem__(
+                "rdma_providers", ["tcp"])),
+        "one or more distinct validated RDMA providers")
     expect_failure(
         lambda _root, genesis: mutate_benchmark_manifest(
             genesis, 0,

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 
 
@@ -44,9 +45,16 @@ TEMPLATES = (
 )
 
 
-def render() -> str:
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def render(cycles: int = 24) -> str:
     chunks = [HEADER]
-    for cycle in range(1, 25):
+    for cycle in range(1, cycles + 1):
         values = {
             "n": cycle,
             "requests": 1700 + cycle * 37,
@@ -82,7 +90,15 @@ def render() -> str:
 
 
 def main() -> int:
-    sys.stdout.write(render())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--cycles",
+        type=positive_int,
+        default=24,
+        help="number of four-discipline record cycles to emit (default: 24)",
+    )
+    args = parser.parse_args()
+    sys.stdout.write(render(args.cycles))
     return 0
 
 

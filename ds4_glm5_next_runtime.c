@@ -43,10 +43,14 @@ int ds4_glm5_next_mla_sparse_selection_plan(
 }
 
 uint32_t ds4_glm5_next_prefill_chunk(
-        uint32_t position, uint32_t remaining, uint32_t requested_batch) {
+        uint32_t position, uint32_t remaining, uint32_t requested_batch,
+        bool allow_sparse_batch) {
     if (remaining == 0u) return 0u;
-    if (requested_batch < 2u ||
-        position >= DS4_GLM5_NEXT_INDEX_TOP_K) return 1u;
+    if (requested_batch < 2u) return 1u;
+    if (position >= DS4_GLM5_NEXT_INDEX_TOP_K) {
+        if (!allow_sparse_batch) return 1u;
+        return remaining < requested_batch ? remaining : requested_batch;
+    }
     uint32_t chunk = remaining < requested_batch ? remaining : requested_batch;
     const uint32_t dense_remaining = DS4_GLM5_NEXT_INDEX_TOP_K - position;
     if (chunk > dense_remaining) chunk = dense_remaining;

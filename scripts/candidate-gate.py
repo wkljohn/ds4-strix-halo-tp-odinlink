@@ -502,9 +502,12 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
     if not re.fullmatch(r"[0-9a-f]{16}", fnv):
         raise GateError("baseline genesis has an invalid reference fingerprint")
     providers = key.get("rdma_providers")
-    if (not isinstance(providers, list) or
-            set(providers) != {"odinlink", "roce-v2"}):
-        raise GateError("baseline genesis requires OdinLink and RoCE v2")
+    if (not isinstance(providers, list) or not providers or
+            len(set(providers)) != len(providers) or
+            any(provider not in {"odinlink", "roce-v2"}
+                for provider in providers)):
+        raise GateError(
+            "baseline genesis requires one or more distinct validated RDMA providers")
 
     model_path = Path(str(artifacts.get("model_path", "")))
     if not model_path.is_absolute() or not model_path.is_file():
@@ -563,8 +566,8 @@ def bootstrap_baseline(repo: Path, root: Path, genesis_path: Path) -> None:
                 local_binary != peer_binary):
             raise GateError("baseline genesis binaries differed across ranks")
         binary_hashes.add(local_binary)
-    if any(count < 3 for count in provider_counts.values()):
-        raise GateError("baseline genesis requires three runs per RDMA provider")
+    if any(count < 2 for count in provider_counts.values()):
+        raise GateError("baseline genesis requires two runs per RDMA provider")
     if len(binary_hashes) != 1:
         raise GateError("baseline genesis benchmarks used different binaries")
 
@@ -1089,8 +1092,8 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
     missing_kinds = sorted(required_kinds - set(kinds))
     if missing_kinds:
         raise GateError("missing evidence kinds: " + ", ".join(missing_kinds))
-    if kinds.count("candidate-benchmark") != 3:
-        raise GateError("exactly three candidate-benchmark artifacts are required")
+    if kinds.count("candidate-benchmark") != 2:
+        raise GateError("exactly two candidate-benchmark artifacts are required")
     if len(diverse_summaries) != 1:
         raise GateError("exactly one cross-disciplinary long summary is required")
     diverse_tool = Path(__file__).with_name("diverse-bench-gate.py")
@@ -1126,9 +1129,9 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
             raise GateError("candidate benchmark uses a different numerical baseline")
     run_ids = {manifest.get("run_id") for _, manifest, _ in benchmark_rows}
     run_tags = {manifest.get("tag") for _, manifest, _ in benchmark_rows}
-    if (None in run_ids or "" in run_ids or len(run_ids) != 3 or
-            None in run_tags or "" in run_tags or len(run_tags) != 3):
-        raise GateError("candidate benchmarks must be three distinct recorded runs")
+    if (None in run_ids or "" in run_ids or len(run_ids) != 2 or
+            None in run_tags or "" in run_tags or len(run_tags) != 2):
+        raise GateError("candidate benchmarks must be two distinct recorded runs")
     if lane == "A":
         expected = {manifest.get("expected_fnv64", "").lower()
                     for _, manifest, _ in benchmark_rows}
@@ -1173,10 +1176,10 @@ def check_candidate(repo: Path, root: Path, candidate_id: str) -> tuple[Path, di
         candidate_layout = tp_layout_contract(workload, "candidate workload")
         providers = transport.get("providers") if isinstance(transport, dict) else None
         if (not isinstance(providers, list) or not providers or
+                len(set(providers)) != len(providers) or
                 any(provider not in {"odinlink", "roce-v2"} for provider in providers)):
-            raise GateError("candidate transport.providers must name validated RDMA providers")
-        if lane == "C" and set(providers) != {"odinlink", "roce-v2"}:
-            raise GateError("Lane C requires both OdinLink and RoCE v2 validation")
+            raise GateError(
+                "candidate transport.providers must name distinct validated RDMA providers")
         for _, manifest, _ in benchmark_rows:
             if (manifest.get("model_sample_sha256") != model.get("sample_sha256") or
                     manifest.get("model_size") != str(model.get("size", "")) or

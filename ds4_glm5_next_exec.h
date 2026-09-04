@@ -12,6 +12,11 @@ extern "C" {
 struct ds4_tp;
 typedef struct ds4_glm5_next_workspace ds4_glm5_next_workspace;
 
+/* Reserve the bounded sparse-attention Lane-B tile workspace before timed
+ * prefill. A positive return means reserved, zero is a hard backend failure,
+ * and -1 means the backend does not provide the specialization. */
+int ds4_rocm_glm5_sparse_attention_f16_gemm_reserve(void);
+
 typedef struct {
     const void *model_map;
     uint64_t model_size;
@@ -48,6 +53,8 @@ typedef struct {
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create(void);
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity(
         uint32_t capacity_tokens);
+uint32_t ds4_glm5_next_workspace_capacity(
+        const ds4_glm5_next_workspace *workspace);
 /* Decode sparse-MLA scratch is sized from the session context independently
  * of the token-tile capacity. */
 ds4_glm5_next_workspace *ds4_glm5_next_workspace_create_capacity_context(
@@ -132,6 +139,20 @@ int ds4_glm5_next_layer_forward_batch(const ds4_glm5_next_exec_ctx *ctx,
                                       const ds4_gpu_tensor *hc_in,
                                       ds4_gpu_tensor *hc_out,
                                       uint32_t n_tokens);
+
+/* Exact sparse-boundary bridge. Dense MLA and KDA layers retain the ordinary
+ * batch entry. Sparse MLA attention rows use scalar_workspace in causal order,
+ * then their stateless routed FFN executes in batch_workspace as one tile. The
+ * scalar workspace must have token capacity one and full context capacity. */
+int ds4_glm5_next_layer_forward_batch_sparse_bridge(
+        const ds4_glm5_next_exec_ctx *ctx,
+        uint32_t layer,
+        ds4_glm5_next_state *state,
+        ds4_glm5_next_workspace *batch_workspace,
+        ds4_glm5_next_workspace *scalar_workspace,
+        const ds4_gpu_tensor *hc_in,
+        ds4_gpu_tensor *hc_out,
+        uint32_t n_tokens);
 
 #ifdef DS4_TP_TEST_HOOKS
 /* Test-only decomposition gate for KDA batch recurrence. It commits exactly

@@ -2,11 +2,255 @@
 // standalone real-shape/tail diagnostic. The including translation unit must
 // provide HIP builtins and fixed-width integer types.
 
+#include <rocwmma/rocwmma.hpp>
+
 static constexpr uint32_t kDs4Bf16ToktileThreads = 256u;
 static constexpr uint32_t kDs4Bf16ToktileWaves =
     kDs4Bf16ToktileThreads / 32u;
 static_assert(kDs4Bf16ToktileThreads % 32u == 0u,
               "BF16 token tile requires complete wave32 groups");
+
+static inline bool ds4_bf16_wmma_hilo_dispatch_allowed(
+        bool selector_enabled,
+        bool batch_toktile_disabled,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        bool quality_mode,
+        bool graph_dump) {
+    const bool supported_shape =
+        (in_dim == 4096u && out_dim == 4096u) ||
+        (in_dim == 4096u && out_dim == 8192u) ||
+        (in_dim == 8192u && out_dim == 4096u);
+    return selector_enabled && !batch_toktile_disabled && supported_shape &&
+        (in_dim % 16u) == 0u && (out_dim % 32u) == 0u &&
+        n_tok >= 256u && (n_tok % 256u) == 0u &&
+        !quality_mode && !graph_dump;
+}
+
+static __device__ __forceinline__ uint16_t ds4_bf16_rne_bits(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t magnitude = bits & 0x7fffffffu;
+    if (magnitude > 0x7f800000u)
+        return (uint16_t)((bits >> 16u) | 0x0040u);
+    const uint32_t tie_to_even = (bits >> 16u) & 1u;
+    return (uint16_t)((bits + 0x00007fffu + tie_to_even) >> 16u);
+}
+
+/* gfx1151 BF16-WMMA projection candidate.  One 512-thread workgroup covers a
+ * 256-row activation panel and two adjacent 16-column output tiles.  The
+ * weight tile is loaded once for all 16 M waves.  Splitting each F32
+ * activation into BF16 high and residual terms retains substantially more of
+ * the incumbent F32-activation accuracy without a persistent conversion
+ * buffer.  Production dispatch remains explicit and shape checked. */
+template <uint32_t NTilesN>
+__global__ __launch_bounds__(16u * 32u, 1)
+static void matmul_bf16_f32_wmma_hilo_m256_kernel(
+        float *out,
+        const uint16_t *weight,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t tokens) {
+    static_assert(NTilesN == 2u,
+                  "validated BF16 WMMA candidate uses two N tiles");
+    constexpr uint32_t BM = 16u;
+    constexpr uint32_t BN = 16u;
+    constexpr uint32_t BK = 16u;
+    constexpr uint32_t MTile = 256u;
+    constexpr uint32_t MTiles = MTile / BM;
+    constexpr uint32_t NThreads = MTiles * 32u;
+    __shared__ uint16_t sh_a_hi[MTile * BK];
+    __shared__ uint16_t sh_a_lo[MTile * BK];
+    __shared__ uint16_t sh_b[NTilesN * BK * BN];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t mt = tid >> 5u;
+    const uint32_t nbase = blockIdx.x * NTilesN * BN;
+    const uint32_t mbase = blockIdx.y * MTile;
+    if (mbase >= tokens) return;
+
+    using Bf16 = rocwmma::bfloat16_t;
+    using FragA = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK,
+                                     float>;
+    FragA a;
+    FragB b;
+    FragC acc[NTilesN];
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt)
+        rocwmma::fill_fragment(acc[nt], 0.0f);
+    for (uint32_t k0 = 0u; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < MTile * BK; j += NThreads) {
+            const uint32_t m = j / BK;
+            const uint32_t kk = j % BK;
+            const uint32_t global_m = mbase + m;
+            if (global_m < tokens) {
+                const float xv = x[(uint64_t)global_m * in_dim + k0 + kk];
+                const uint16_t hi = ds4_bf16_rne_bits(xv);
+                const float hi_f = __uint_as_float((uint32_t)hi << 16u);
+                sh_a_hi[j] = hi;
+                sh_a_lo[j] = ds4_bf16_rne_bits(xv - hi_f);
+            } else {
+                sh_a_hi[j] = 0u;
+                sh_a_lo[j] = 0u;
+            }
+        }
+        for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
+            const uint32_t nt = j / (BK * BN);
+            const uint32_t rem = j % (BK * BN);
+            const uint32_t kk = rem / BN;
+            const uint32_t nn = rem % BN;
+            const uint32_t n = nbase + nt * BN + nn;
+            sh_b[j] = n < out_dim
+                ? weight[(uint64_t)n * in_dim + k0 + kk]
+                : 0u;
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+            rocwmma::load_matrix_sync(
+                b, reinterpret_cast<const Bf16 *>(
+                    sh_b + nt * BK * BN), BN);
+            rocwmma::load_matrix_sync(
+                a, reinterpret_cast<const Bf16 *>(
+                    sh_a_hi + mt * BM * BK), BK);
+            rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+            rocwmma::load_matrix_sync(
+                a, reinterpret_cast<const Bf16 *>(
+                    sh_a_lo + mt * BM * BK), BK);
+            rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+        const uint32_t n0 = nbase + nt * BN;
+        if (n0 < out_dim && mbase + mt * BM < tokens)
+            rocwmma::store_matrix_sync(
+                out + (uint64_t)(mbase + mt * BM) * out_dim + n0,
+                acc[nt], out_dim, rocwmma::mem_row_major);
+    }
+}
+
+/* Collapse the three equal-shape GLM KDA Q/K/V projections into one grid.
+ * Each workgroup retains the validated single-projection arithmetic and owns
+ * exactly one weight/output pointer; removing the two kernel boundaries lets
+ * gfx1151 fill the final occupancy wave with work from the next projection.
+ * No weight concatenation or persistent cache is used. */
+__global__ __launch_bounds__(16u * 32u, 1)
+static void matmul_bf16_f32_wmma_hilo_qkv_multiptr_kernel(
+        float *out_q, float *out_k, float *out_v,
+        const uint16_t *weight_q, const uint16_t *weight_k,
+        const uint16_t *weight_v, const float *x,
+        uint32_t in_dim, uint32_t out_dim, uint32_t tokens) {
+    constexpr uint32_t BM = 16u;
+    constexpr uint32_t BN = 16u;
+    constexpr uint32_t BK = 16u;
+    constexpr uint32_t MTile = 256u;
+    constexpr uint32_t MTiles = MTile / BM;
+    constexpr uint32_t NTilesN = 2u;
+    constexpr uint32_t NThreads = MTiles * 32u;
+    const uint32_t blocks_per_projection = (out_dim + 31u) / 32u;
+    const uint32_t projection = blockIdx.x / blocks_per_projection;
+    const uint32_t nblock = blockIdx.x % blocks_per_projection;
+    if (projection >= 3u) return;
+    float *out = projection == 0u ? out_q :
+                 projection == 1u ? out_k : out_v;
+    const uint16_t *weight = projection == 0u ? weight_q :
+                             projection == 1u ? weight_k : weight_v;
+    __shared__ uint16_t sh_a_hi[MTile * BK];
+    __shared__ uint16_t sh_a_lo[MTile * BK];
+    __shared__ uint16_t sh_b[NTilesN * BK * BN];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t mt = tid >> 5u;
+    const uint32_t nbase = nblock * NTilesN * BN;
+    const uint32_t mbase = blockIdx.y * MTile;
+    if (mbase >= tokens) return;
+
+    using Bf16 = rocwmma::bfloat16_t;
+    using FragA = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragB = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK,
+                                     Bf16, rocwmma::row_major>;
+    using FragC = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK,
+                                     float>;
+    FragA a;
+    FragB b;
+    FragC acc[NTilesN];
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt)
+        rocwmma::fill_fragment(acc[nt], 0.0f);
+    for (uint32_t k0 = 0u; k0 < in_dim; k0 += BK) {
+        for (uint32_t j = tid; j < MTile * BK; j += NThreads) {
+            const uint32_t m = j / BK;
+            const uint32_t kk = j % BK;
+            const uint32_t global_m = mbase + m;
+            if (global_m < tokens) {
+                const float xv = x[(uint64_t)global_m * in_dim + k0 + kk];
+                const uint16_t hi = ds4_bf16_rne_bits(xv);
+                const float hi_f = __uint_as_float((uint32_t)hi << 16u);
+                sh_a_hi[j] = hi;
+                sh_a_lo[j] = ds4_bf16_rne_bits(xv - hi_f);
+            } else {
+                sh_a_hi[j] = 0u;
+                sh_a_lo[j] = 0u;
+            }
+        }
+        for (uint32_t j = tid; j < NTilesN * BK * BN; j += NThreads) {
+            const uint32_t nt = j / (BK * BN);
+            const uint32_t rem = j % (BK * BN);
+            const uint32_t kk = rem / BN;
+            const uint32_t nn = rem % BN;
+            const uint32_t n = nbase + nt * BN + nn;
+            sh_b[j] = n < out_dim
+                ? weight[(uint64_t)n * in_dim + k0 + kk]
+                : 0u;
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+            rocwmma::load_matrix_sync(
+                b, reinterpret_cast<const Bf16 *>(
+                    sh_b + nt * BK * BN), BN);
+            rocwmma::load_matrix_sync(
+                a, reinterpret_cast<const Bf16 *>(
+                    sh_a_hi + mt * BM * BK), BK);
+            rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+            rocwmma::load_matrix_sync(
+                a, reinterpret_cast<const Bf16 *>(
+                    sh_a_lo + mt * BM * BK), BK);
+            rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t nt = 0u; nt < NTilesN; ++nt) {
+        const uint32_t n0 = nbase + nt * BN;
+        if (n0 < out_dim && mbase + mt * BM < tokens)
+            rocwmma::store_matrix_sync(
+                out + (uint64_t)(mbase + mt * BM) * out_dim + n0,
+                acc[nt], out_dim, rocwmma::mem_row_major);
+    }
+}
+
+static inline bool ds4_bf16_rowtile2x16_dispatch_allowed(
+        bool selector_enabled,
+        bool batch_toktile_disabled,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        bool quality_mode,
+        bool graph_dump) {
+    const bool supported_shape =
+        (in_dim == 4096u && out_dim == 4096u) ||
+        (in_dim == 4096u && out_dim == 8192u) ||
+        (in_dim == 8192u && out_dim == 4096u);
+    return selector_enabled && !batch_toktile_disabled && supported_shape &&
+        n_tok >= 16u && (n_tok % 16u) == 0u && !quality_mode && !graph_dump;
+}
 
 static __device__ __forceinline__ float ds4_bf16_ordered_mul(float a,
                                                               float b) {
@@ -61,6 +305,126 @@ __global__ static void matmul_bf16_f32_toktile_w32_kernel(
         for (uint32_t wv = 0u; wv < kDs4Bf16ToktileWaves; ++wv)
             value += wave_sums[threadIdx.x][wv];
         out[(uint64_t)(token_base + threadIdx.x) * out_dim + row] = value;
+    }
+}
+
+/* Reuse each activation value across several adjacent output rows while
+ * retaining the token-tile kernel's per-thread K chains and wave32 reduction
+ * order.  Keep RowTile*TokenTile fixed at 32 so the accumulator footprint is
+ * comparable to the incumbent 1x32 kernel. Production dispatch keeps this
+ * behind an explicit, shape-checked research selector until its provider and
+ * diverse-prompt promotion gates are complete. */
+template <uint32_t RowTile, uint32_t TokenTile>
+__global__ static void matmul_bf16_f32_rowtile_w32_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    static_assert(RowTile >= 1u && TokenTile >= 1u,
+                  "BF16 row/token tiles must be nonzero");
+    static_assert(RowTile * TokenTile == 32u,
+                  "BF16 row/token tile keeps 32 accumulators");
+    const uint32_t row_base = blockIdx.x * RowTile;
+    const uint32_t token_base = blockIdx.y * TokenTile;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t wave = threadIdx.x >> 5u;
+    float sums[RowTile][TokenTile] = {};
+    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        float activations[TokenTile];
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token)
+            activations[token] =
+                x[(uint64_t)(token_base + token) * in_dim + i];
+#pragma unroll
+        for (uint32_t row = 0u; row < RowTile; ++row) {
+            const uint32_t output_row = row_base + row;
+            const float weight = output_row < out_dim
+                ? __uint_as_float((uint32_t)w[
+                    (uint64_t)output_row * in_dim + i] << 16u)
+                : 0.0f;
+#pragma unroll
+            for (uint32_t token = 0u; token < TokenTile; ++token)
+                sums[row][token] += weight * activations[token];
+        }
+    }
+    __shared__ float
+        wave_sums[RowTile][TokenTile][kDs4Bf16ToktileWaves];
+#pragma unroll
+    for (uint32_t row = 0u; row < RowTile; ++row) {
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token) {
+            float value = sums[row][token];
+#pragma unroll
+            for (uint32_t offset = 16u; offset > 0u; offset >>= 1u)
+                value += __shfl_down(value, offset, 32u);
+            if (lane == 0u) wave_sums[row][token][wave] = value;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < RowTile * TokenTile) {
+        const uint32_t row = threadIdx.x / TokenTile;
+        const uint32_t token = threadIdx.x % TokenTile;
+        const uint32_t output_row = row_base + row;
+        if (output_row < out_dim) {
+            float value = 0.0f;
+#pragma unroll
+            for (uint32_t wv = 0u; wv < kDs4Bf16ToktileWaves; ++wv)
+                value += wave_sums[row][token][wv];
+            out[(uint64_t)(token_base + token) * out_dim + output_row] =
+                value;
+        }
+    }
+}
+
+/* Exact-order token tiling for narrow-output BF16 projections.  The generic
+ * production kernel owns one [row, token] per block and reduces its 256
+ * thread-local K chains through a 256-wide LDS butterfly.  Preserve those
+ * chains and that butterfly independently for each token, but reuse every
+ * weight load across a 32-token prompt tile.  This is deliberately distinct
+ * from the lower-LDS wave reduction above, whose association differs from the
+ * generic kernel. */
+template <uint32_t TokenTile>
+__global__ static void matmul_bf16_f32_skinny_exact_toktile_kernel(
+        float *out,
+        const uint16_t *w,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    static_assert(TokenTile >= 1u && TokenTile <= 32u,
+                  "skinny exact BF16 token tile must be 1..32");
+    const uint32_t row = blockIdx.x;
+    const uint32_t token_base = blockIdx.y * TokenTile;
+    const uint32_t tid = threadIdx.x;
+    if (row >= out_dim || tid >= kDs4Bf16ToktileThreads) return;
+    const uint16_t *wr = w + (uint64_t)row * in_dim;
+    float sums[TokenTile] = {};
+    for (uint32_t i = tid; i < in_dim; i += kDs4Bf16ToktileThreads) {
+        const float weight = __uint_as_float((uint32_t)wr[i] << 16u);
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token)
+            sums[token] += weight *
+                x[(uint64_t)(token_base + token) * in_dim + i];
+    }
+    __shared__ float partial[TokenTile][kDs4Bf16ToktileThreads];
+#pragma unroll
+    for (uint32_t token = 0u; token < TokenTile; ++token)
+        partial[token][tid] = sums[token];
+    __syncthreads();
+    for (uint32_t stride = kDs4Bf16ToktileThreads >> 1u;
+         stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+#pragma unroll
+            for (uint32_t token = 0u; token < TokenTile; ++token)
+                partial[token][tid] += partial[token][tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+#pragma unroll
+        for (uint32_t token = 0u; token < TokenTile; ++token)
+            out[(uint64_t)(token_base + token) * out_dim + row] =
+                partial[token][0];
     }
 }
 

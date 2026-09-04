@@ -451,6 +451,22 @@ int main(int argc, char **argv) {
         else (void)hipFree(slab_host);
         return raw_mismatches == 0u ? 0 : 1;
     }
+    /* The staged wave consumer is intentionally restricted to mlx5's
+     * registered three-MR slab. OdinLink has exact raw/single-gate coverage
+     * but remains on its single-gate protocol; do not turn that documented
+     * capability boundary into a misleading sequence-9 failure. */
+    if (!ds4_tp_requires_host_slab(tp)) {
+        std::printf("TP_BIG_GATE_OVERLAP provider=%s wave_phase=skipped "
+                    "reason=provider_not_wave_capable\n", device);
+        (void)hipFree(production_out);
+        (void)hipFree(production_single_out);
+        (void)hipFree(pipeline_out);
+        (void)hipFree(serial_out);
+        ds4_tp_free(tp);
+        if (host_slab) (void)hipHostFree(slab_host);
+        else (void)hipFree(slab_host);
+        return 0;
+    }
     const double compute_ms = compute_only(serial_out, send_device, recv_device,
                                            chunks, chunk_values, rank,
                                            work_iters);

@@ -554,6 +554,151 @@ __global__ static void matmul_q8_0_f32_sharedx_warp_rows_w32_kernel(
     if (lane == 0u) out[row] = acc;
 }
 
+template <typename T, bool NONTEMPORAL>
+__device__ __forceinline__ static T q8_exact_load(const T *ptr) {
+    if constexpr (NONTEMPORAL) return __builtin_nontemporal_load(ptr);
+    return *ptr;
+}
+
+__device__ __forceinline__ static float q8_exact_ordered_mul(float a,
+                                                              float b) {
+    float out;
+    asm("v_mul_f32 %0, %1, %2" : "=v"(out) : "v"(a), "v"(b));
+    return out;
+}
+
+/* Exact-order decode experiment for GLM-5.3's ordinary Q8 projections.
+ * Loads are issued in a compile-time window to expose memory-level
+ * parallelism, but each lane's FMA sequence and the final wave reduction are
+ * deliberately identical to matmul_q8_0_f32_sharedx_warp_rows_w32_kernel. */
+template <uint32_t PREFETCH, bool NONTEMPORAL>
+__global__ static void matmul_q8_0_f32_sharedx_exact_prefetch_warp_rows_w32_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint64_t out_dim,
+        uint64_t row_bytes) {
+    static_assert(PREFETCH > 0u, "nonzero Q8 prefetch window");
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t rows_per_block = blockDim.x >> 5u;
+    const uint32_t in_dim = n_blocks << 5u;
+    for (uint32_t i = tid; i < in_dim; i += blockDim.x) shx[i] = x[i];
+    __syncthreads();
+
+    const uint64_t row = (uint64_t)blockIdx.x * rows_per_block + wave;
+    if (row >= out_dim) return;
+    const unsigned char *wr = w + row * row_bytes;
+    float acc = 0.0f;
+    uint32_t b = 0u;
+    for (; b + PREFETCH <= n_blocks; b += PREFETCH) {
+        float scales[PREFETCH];
+        int8_t weights[PREFETCH];
+        float inputs[PREFETCH];
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u) {
+            const unsigned char *blk = wr + (uint64_t)(b + u) * 34u;
+            uint16_t bits = 0u;
+            if (lane == 0u) {
+                bits = q8_exact_load<uint16_t, NONTEMPORAL>(
+                    reinterpret_cast<const uint16_t *>(blk));
+            }
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+            bits = __shfl(bits, 0, 32);
+#else
+            bits = __shfl_sync(FULL_WARP_MASK, bits, 0, 32);
+#endif
+            scales[u] = __half2float(__ushort_as_half(bits));
+            weights[u] = q8_exact_load<int8_t, NONTEMPORAL>(
+                reinterpret_cast<const int8_t *>(blk + 2u) + lane);
+            inputs[u] = shx[((b + u) << 5u) + lane];
+        }
+#pragma unroll
+        for (uint32_t u = 0u; u < PREFETCH; ++u) {
+            const float scaled_weight =
+                q8_exact_ordered_mul(scales[u], (float)weights[u]);
+            acc += scaled_weight * inputs[u];
+        }
+    }
+    for (; b < n_blocks; ++b) {
+        const unsigned char *blk = wr + (uint64_t)b * 34u;
+        const float d = q8_0_scale_broadcast_w32(blk);
+        const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+        acc += d * (float)q * shx[(b << 5u) + lane];
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) out[row] = acc;
+}
+
+static cudaError_t cuda_launch_q8_sharedx_glm5_candidate(
+        float *out, const unsigned char *weight, const float *x,
+        uint32_t n_blocks, uint64_t out_dim, uint64_t row_bytes,
+        cudaStream_t stream = 0) {
+    static const char *prefetch_value =
+        getenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH");
+    static const char *nontemporal_value =
+        getenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL");
+    static const char *rows_value =
+        getenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK");
+    static const uint32_t prefetch = prefetch_value == NULL ? 0u :
+        strcmp(prefetch_value, "0") == 0 ? 0u :
+        strcmp(prefetch_value, "4") == 0 ? 4u :
+        strcmp(prefetch_value, "8") == 0 ? 8u :
+        strcmp(prefetch_value, "16") == 0 ? 16u :
+        strcmp(prefetch_value, "32") == 0 ? 32u : UINT32_MAX;
+    static const int nontemporal = nontemporal_value != NULL &&
+        strcmp(nontemporal_value, "1") == 0;
+    static const uint32_t rows = rows_value == NULL ? 32u :
+        strcmp(rows_value, "8") == 0 ? 8u :
+        strcmp(rows_value, "16") == 0 ? 16u :
+        strcmp(rows_value, "32") == 0 ? 32u : 0u;
+    static const int valid = prefetch != UINT32_MAX && rows != 0u &&
+        (nontemporal_value == NULL ||
+         strcmp(nontemporal_value, "0") == 0 || nontemporal) &&
+        !(prefetch == 0u && nontemporal);
+    if (!valid) return cudaErrorInvalidValue;
+    const uint32_t selected_rows = prefetch == 0u ? 32u : rows;
+    const dim3 grid((unsigned)((out_dim + selected_rows - 1u) / selected_rows));
+    const dim3 block(selected_rows * 32u);
+    const size_t shared_bytes = (size_t)n_blocks * 32u * sizeof(float);
+    if (prefetch == 0u) {
+        matmul_q8_0_f32_sharedx_warp_rows_w32_kernel<<<
+            grid, block, shared_bytes, stream>>>(out, weight, x, n_blocks,
+                                                 out_dim, row_bytes);
+    } else {
+#define DS4_LAUNCH_Q8_GLM5_PREFETCH(P, NT) \
+        matmul_q8_0_f32_sharedx_exact_prefetch_warp_rows_w32_kernel< \
+            P, NT><<<grid, block, shared_bytes, stream>>>( \
+                out, weight, x, n_blocks, out_dim, row_bytes)
+        if (prefetch == 4u) {
+            if (nontemporal) DS4_LAUNCH_Q8_GLM5_PREFETCH(4u, true);
+            else DS4_LAUNCH_Q8_GLM5_PREFETCH(4u, false);
+        } else if (prefetch == 8u) {
+            if (nontemporal) DS4_LAUNCH_Q8_GLM5_PREFETCH(8u, true);
+            else DS4_LAUNCH_Q8_GLM5_PREFETCH(8u, false);
+        } else if (prefetch == 16u) {
+            if (nontemporal) DS4_LAUNCH_Q8_GLM5_PREFETCH(16u, true);
+            else DS4_LAUNCH_Q8_GLM5_PREFETCH(16u, false);
+        } else {
+            if (nontemporal) DS4_LAUNCH_Q8_GLM5_PREFETCH(32u, true);
+            else DS4_LAUNCH_Q8_GLM5_PREFETCH(32u, false);
+        }
+#undef DS4_LAUNCH_Q8_GLM5_PREFETCH
+        static int reported;
+        if (!reported) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "GLM5 Q8 shared-X exact prefetch engaged "
+                    "window=%u rows_per_block=%u nontemporal=%d\n",
+                    prefetch, rows, nontemporal);
+            reported = 1;
+        }
+    }
+    return cudaGetLastError();
+}
+
 /* gfx1151 TP decode path for the attention-output expansion.
  * Four eight-lane groups consume four Q8_0 blocks per wave iteration while
  * retaining one output row per wave.  Explicit byte reads avoid relying on

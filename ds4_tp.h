@@ -34,6 +34,33 @@ enum {
     DS4_TP_BATCH_MAX_ROWS = 8,
 };
 
+/* Prefill scheduling has more independently selectable paths than fit in the
+ * legacy 32-bit runtime feature word.  This separate hello value is not a
+ * capability bitmap: it records the effective row-split thresholds plus the
+ * switches that can change a TP big-gate schedule. */
+enum {
+    DS4_TP_PREFILL_CONFIG_RESUMED = UINT64_C(1) << 32,
+    DS4_TP_PREFILL_CONFIG_SUBGATE_PIPELINE = UINT64_C(1) << 33,
+    /* This records the request, not provider-dependent availability.  The
+     * latter is checked fail-closed after the RDMA endpoint is bound. */
+    DS4_TP_PREFILL_CONFIG_FFN_WAVEFRONT = UINT64_C(1) << 34,
+};
+
+static inline uint64_t ds4_tp_prefill_config_encode(
+        uint32_t min_attn,
+        uint32_t min_ffn,
+        bool resumed,
+        bool subgate_pipeline,
+        bool ffn_wavefront) {
+    if (min_attn > UINT16_MAX) min_attn = UINT16_MAX;
+    if (min_ffn > UINT16_MAX) min_ffn = UINT16_MAX;
+    return (uint64_t)min_attn |
+           ((uint64_t)min_ffn << 16) |
+           (resumed ? DS4_TP_PREFILL_CONFIG_RESUMED : 0u) |
+           (subgate_pipeline ? DS4_TP_PREFILL_CONFIG_SUBGATE_PIPELINE : 0u) |
+           (ffn_wavefront ? DS4_TP_PREFILL_CONFIG_FFN_WAVEFRONT : 0u);
+}
+
 enum {
     DS4_TP_FEATURE_Q4K_WMMA = UINT32_C(1) << 0,
     /* The verifier attention head split changes the per-layer big-gate
@@ -106,6 +133,39 @@ enum {
      * but payload meaning and FP32 reduction order change, so independently
      * launched ranks must agree before entering the KDA graph. */
     DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE = UINT32_C(1) << 23,
+    /* GLM-5.3 one-token reductions are ordered through the common GPU row
+     * gate encoder instead of a device-wide synchronize followed by a direct
+     * graph-thread exchange.  The wire verb and slab layout stay unchanged,
+     * but both ranks must choose the same gate sequence source. */
+    DS4_TP_FEATURE_GLM5_GPU_ROW_GATE = UINT32_C(1) << 24,
+    /* GLM-5.3 KDA preserves the incumbent full-K reduction while assigning
+     * disjoint output rows to the two ranks.  It performs one auxiliary
+     * registered-slab exchange after the normal attention gate, outside the
+     * decode receive-window sequence, so both ranks must opt in together. */
+    DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE = UINT32_C(1) << 25,
+    /* Skip the redundant one-token producer-to-ring copy and send directly
+     * from the already registered big-slab producer row.  Payload meaning and
+     * receive slots are unchanged, but both ranks must select the same
+     * scheduling path on their independent filesystems. */
+    DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND = UINT32_C(1) << 26,
+    /* Preserve layer-major prompt tiles after GLM-5.3 crosses the sparse MLA
+     * selector boundary. KDA layers remain batched; MLA attention retains its
+     * causal row order while its output exchange and routed FFN are tile-wide.
+     * Both independently launched ranks must negotiate the same schedule. */
+    DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE = UINT32_C(1) << 27,
+    /* Batch only the Q8 attention-output projection after sparse indexed MLA
+     * rows have completed in their established causal order. */
+    DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT = UINT32_C(1) << 28,
+    /* Batch the stateless sparse MLA HC/Q/KV/index projections while keeping
+     * pool publication, selection, and gathered attention query ordered. */
+    DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE = UINT32_C(1) << 29,
+    /* Retain causal/query-ordered sparse attention, but defer its compact
+     * latent outputs and batch the Q8 value projection for the prompt tile. */
+    DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE = UINT32_C(1) << 30,
+    /* Replace the exact sparse-prefill NoPE reduction with the bounded
+     * F16-input/F32-accumulate GEMM path.  This changes floating-point
+     * arithmetic, so independent ranks must agree before inference. */
+    DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM = UINT32_C(1) << 31,
 };
 
 static inline uint32_t ds4_tp_glm5_kda_tp_feature(
@@ -119,6 +179,69 @@ static inline uint32_t ds4_tp_glm5_kda_tp_feature(
         ? DS4_TP_FEATURE_GLM5_KDA_TP : 0u;
 }
 
+static inline uint32_t ds4_tp_glm5_small_gate_feature(
+        const char *env,
+        int glm5_next,
+        int rocm_ready,
+        int mtp_or_dspark) {
+    return env && env[0] == '1' && env[1] == '\0' && glm5_next &&
+           rocm_ready && !mtp_or_dspark
+        ? DS4_TP_FEATURE_GLM5_SMALL_GATE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_small_gate_direct_send_feature(
+        const char *env, uint32_t runtime_features) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_GPU_ROW_GATE) == 0u
+        ? DS4_TP_FEATURE_GLM5_SMALL_GATE_DIRECT_SEND : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_sparse_batch_bridge_feature(
+        const char *env,
+        int glm5_next,
+        int rocm_ready,
+        int mtp_or_dspark) {
+    return env && env[0] == '1' && env[1] == '\0' && glm5_next &&
+           rocm_ready && !mtp_or_dspark
+        ? DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_sparse_batch_output_feature(
+        const char *env,
+        uint32_t runtime_features) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SPARSE_BATCH_BRIDGE) != 0u
+        ? DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_sparse_batch_prelude_feature(
+        const char *env,
+        uint32_t runtime_features) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SPARSE_BATCH_OUTPUT) != 0u
+        ? DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_sparse_batch_value_feature(
+        const char *env,
+        uint32_t runtime_features) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SPARSE_BATCH_PRELUDE) != 0u
+        ? DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_sparse_attn_f16_gemm_feature(
+        const char *env,
+        const char *head_shared_env,
+        uint32_t runtime_features) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           head_shared_env && head_shared_env[0] == '1' &&
+           head_shared_env[1] == '\0' &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SPARSE_BATCH_VALUE) != 0u
+        ? DS4_TP_FEATURE_GLM5_SPARSE_ATTN_F16_GEMM : 0u;
+}
+
 static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(
         const char *env,
         uint32_t runtime_features,
@@ -127,6 +250,29 @@ static inline uint32_t ds4_tp_glm5_kda_output_kslice_feature(
            (runtime_features & DS4_TP_FEATURE_GLM5_KDA_TP) != 0u &&
            all_kda_outputs_bf16
         ? DS4_TP_FEATURE_GLM5_KDA_OUTPUT_KSLICE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_kda_output_rowslice_feature(
+        const char *env,
+        uint32_t runtime_features,
+        int all_kda_outputs_bf16) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           (runtime_features & (DS4_TP_FEATURE_GLM5_KDA_TP |
+                                DS4_TP_FEATURE_GLM5_SMALL_GATE)) ==
+               (DS4_TP_FEATURE_GLM5_KDA_TP |
+                DS4_TP_FEATURE_GLM5_SMALL_GATE) &&
+           all_kda_outputs_bf16
+        ? DS4_TP_FEATURE_GLM5_KDA_OUTPUT_ROWSLICE : 0u;
+}
+
+static inline uint32_t ds4_tp_glm5_gpu_row_gate_feature(
+        const char *env,
+        uint32_t runtime_features,
+        const char *callback_env) {
+    return env && env[0] == '1' && env[1] == '\0' &&
+           !(callback_env && callback_env[0] == '1' && callback_env[1] == '\0') &&
+           (runtime_features & DS4_TP_FEATURE_GLM5_SMALL_GATE) != 0u
+        ? DS4_TP_FEATURE_GLM5_GPU_ROW_GATE : 0u;
 }
 
 static inline uint32_t ds4_tp_glm5_resident_kda_feature(
@@ -176,6 +322,7 @@ typedef struct {
     uint32_t quant_bits;
     uint32_t ctx_size;
     uint32_t runtime_features;
+    uint64_t prefill_config;
     /* Decode gate schedule, used to place RDMA recvs into the right slab
      * slot. A non-empty mask lists the slots in sequence order. Otherwise
      * slot(seq) = start + ((seq-1) % per_token) * step.
@@ -252,6 +399,8 @@ int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
 /* True only when large batch gates use verbs instead of TCP fallback. */
 bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *tp);
+/* True only for an RDMA provider implementing the mlx5 wave protocol. */
+bool ds4_tp_big_gate_waves_transport_supported(const ds4_tp *tp);
 /* True when this payload lies wholly inside the registered slab, so the bulk
  * path will not stage through the batch regions. */
 bool ds4_tp_big_gate_is_direct(const ds4_tp *tp, const void *out,
@@ -265,6 +414,8 @@ uint64_t ds4_tp_vec_bytes(const ds4_tp *tp);
 #ifdef DS4_TP_TEST_HOOKS
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
                                                 char *err, size_t errlen);
+int ds4_tp_test_hello_validate_prefill_config(uint64_t local, uint64_t peer,
+                                              char *err, size_t errlen);
 int ds4_tp_test_select_transport(ds4_tp_transport requested,
                                  int local_rdma_ok,
                                  int peer_rdma_ok,
@@ -279,6 +430,8 @@ uint32_t ds4_tp_test_gate_slot(
         const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
         uint32_t start, uint32_t step, uint32_t per_token,
         uint32_t n_slots, uint64_t seq);
+int ds4_tp_test_aux_gate_eligible(uint32_t runtime_features,
+                                  uint32_t n_layer, uint32_t slot);
 uint32_t ds4_tp_test_rdma_provider_decode_max_msg(const char *device_name);
 uint32_t ds4_tp_test_rdma_negotiate_decode_max_msg(uint32_t local,
                                                    uint32_t peer);
@@ -317,12 +470,27 @@ uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
 uint64_t ds4_tp_slab_big_out_offset(const ds4_tp *tp);
 uint64_t ds4_tp_slab_big_in_offset(const ds4_tp *tp);
 uint32_t ds4_tp_big_capacity_rows(const ds4_tp *tp);
+/* GLM-5.3 KDA output-row auxiliary payloads.  These live in the latency
+ * slab and are available only when the negotiated row-slice feature is on. */
+uint64_t ds4_tp_slab_aux_out_payload_offset(const ds4_tp *tp, uint32_t layer);
+uint64_t ds4_tp_slab_aux_in_payload_offset(const ds4_tp *tp, uint32_t layer);
+uint64_t ds4_tp_aux_payload_bytes(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
 
 /* Exchange one gate: send out[layer][gate] to the peer's in[layer][gate]
  * and wait until the peer's partial for `seq` has fully landed locally.
  * Called from the GPU gate service thread.  Returns 0 on failure. */
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq);
+/* RDMA-only variant for a producer payload that already lies inside the
+ * registered TP slab.  The receive still lands in the normal preposted gate
+ * slot, so wire ordering and the consumer contract are unchanged.  It does
+ * not return until the local SEND CQE makes producer-row reuse safe. */
+int ds4_tp_gate_exchange_from_registered(ds4_tp *tp, uint32_t layer,
+                                         uint32_t gate, uint64_t seq,
+                                         const void *payload);
+/* Exchange the dependent KDA output-row half paired with the preceding
+ * logical attention gate.  It does not consume or advance a gate sequence. */
+int ds4_tp_aux_gate_exchange(ds4_tp *tp, uint32_t layer);
 
 /* Verify-block batch gate: exchange `rows` row partials for one layer in one
  * bulk RDMA transfer, with a symmetric TCP transfer as fallback. Called from

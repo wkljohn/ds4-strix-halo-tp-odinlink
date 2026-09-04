@@ -22,27 +22,41 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | DeepSeek V4 0731 TP=2 configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
-| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **209.60 t/s** | **20.09 t/s** | recorded candidate control; rollback 213.50/20.07, FNV unchanged |
+| **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | current branch probe; exact FNV `2a44e523bf2d7947` |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **233.04 t/s** | **19.17 t/s** | three-run median, exact fingerprint |
-| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **280.58 t/s** | **21.30 t/s** | recorded candidate control; rollback 276.59/21.24, FNV unchanged |
+| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **310.65 t/s** | **21.21 t/s** | two-run midpoint; exact FNV `0163c44015591445` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-### GLM-5.3 Flash TP=2 research-branch performance
+### Q4_K throughput through 10K context
+
+![Antirez DeepSeek V4 Flash Q4_K TP=2 throughput through 10K context](speed-bench/strix_halo_tp2_q4_roce_10k_ts.svg)
+
+This RoCE v2 sweep follows the upstream `ds4-bench` convention: each point
+adds 2,048 prompt tokens at the stated context frontier, then measures 300
+generated tokens. It uses the same diverse prompt corpus throughout. The
+separate full 10,240-token prefill has a three-run median of **289.23 t/s**;
+its decode median is **18.76 t/s**.
+
+```sh
+DS4_BENCH_RDMA_PROFILE=roce-v2 \
+  ./scripts/run-tp-context-sweep.sh q4-context-sweep \
+  /absolute/path/to/DeepSeek-V4-Flash-Q4_K.gguf
+```
+
+### GLM-5.3 Flash TP=2 performance
 
 These `ds4-bench-tp` results use the diverse 4,096-token prefill plus
-300-token decode workload at batch 256. They require research branch
-[`research/glm5-kb-lds-exact`](https://github.com/wkljohn/ds4-strix-halo-tp-odinlink/tree/ee9ca905f090a974b56fbfc2b92ed3d821dd0dd6)
-at commit `ee9ca90`; they are not yet enabled by `main`.
+300-token decode workload at batch 256. The staged GLM-5.3 Flash TP=2 path is
+included in this fork and remains isolated from DeepSeek's graph executor.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | three source-clean runs | **78.59 t/s** | **9.45 t/s** | three-run median; runs were 78.59/9.45, 77.78/9.54, and 79.05/9.42, FNV `9012bd4d7c5ce422` |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | 4,096 prompt + 300 decode, batch 256 | **95.42 t/s** | **9.95 t/s** | current source-clean run; exact FNV `9012bd4d7c5ce422` |
 | **GLM-5.3 Flash Q4_K over OdinLink** | one matched provider run | **76.00 t/s** | **9.43 t/s** | zero fallback; FNV `9012bd4d7c5ce422` |
-| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048-token control workload | **21.87–21.95 t/s** | **3.48–3.49 t/s** | opt-in mixed IQ2_XXS/Q2_K path; repeated fingerprint matched |
+| **GLM-5.3 Flash Q2 over RoCE v2** | 2,048 prompt + 300 decode, batch 256 | **52.74 t/s** | **10.35 t/s** | current source-clean mixed IQ2_XXS/Q2_K run; exact FNV `4dabfb16bc99c81b` |
 
-The Q4_K candidate keeps all 4,096 prompt rows batched, adds no persistent
-weight cache, and uses 45.07 MiB of reusable scratch per rank. It remains
-default-off pending its Lane-B quality review and three-run OdinLink median.
+The Q4_K path keeps all 4,096 prompt rows batched, adds no persistent weight
+cache, and uses 45.07 MiB of reusable scratch per rank.
 
 The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
 followed by 300 generated tokens over mandatory RDMA. Its current Q4_K rows
@@ -53,10 +67,14 @@ and Q4_K run without a persistent expanded-weight cache.
 The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
 release results.
 
-GLM-5.3 Flash support is an experimental TP=2 staged path in this branch; it
-keeps the model's KDA state sharded by attention head and does not change the
-validated DeepSeek production path. The GLM row is not an ordinary server
-benchmark: full session integration remains fail-closed until promoted.
+GLM-5.3 Flash support uses a staged TP=2 path that keeps the model's KDA state
+sharded by attention head and does not change the validated DeepSeek production
+path. The launcher applies the validated cache-free GLM staged environment and
+the full-logits sampling contract. The
+sampling-mode correction is documented at
+`$DS4_RESEARCH_ROOT/glm5-next-tp2/deployment-debug-20260903.md`; the full staged
+optimization record is at
+`$DS4_RESEARCH_ROOT/glm5-next-tp2/staged-optimization-plan-20260901.md`.
 
 The ordinary benchmark and deployment launchers enable the validated ordered
 ROCm TP callback, temporal-compressor schedule, shape-gated M256/K128 Q8
@@ -76,7 +94,7 @@ policy, and maintainer gates are preserved locally under
 |---|---|---|
 | [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the current Q4_K OdinLink and RoCE v2 rows. |
 | [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. The Q2_K file is used for the current Q2_K row. |
-| [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | **Experimental only.** TP=2 staged support; not yet an ordinary production server path. |
+| [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | Supported through the staged TP=2 path; Q4 is the validated reference configuration. |
 | Unsloth DeepSeek V4 Flash 0731 `UD-*` target weights | — | **Not supported:** their mixed-precision tensor layouts do not match the currently validated DS4 target paths. |
 
 The Unsloth warning applies to `UD-*` target-model weights, not to a separately
@@ -131,7 +149,7 @@ Run one fixed Q4_K benchmark:
 
 Select `DS4_BENCH_RDMA_PROFILE=roce-v2` in `bench.env.local` for Mellanox
 RoCE v2, or `ib-mlx4` for native Mellanox InfiniBand.
-Use distinct tags (`q4-r1`, `q4-r2`, `q4-r3`) and report the median. Candidate
+Use two distinct tags (`q4-r1`, `q4-r2`) and report their midpoint. Candidate
 fingerprints and the combined pre-main test belong to the
 local validation archive at
 `$DS4_RESEARCH_ROOT/reports/strix-halo-tp-validation-2026-08/`, not
@@ -263,13 +281,41 @@ deploy/ds4-tp-caddy.sh status
 See [deploy/README.md](deploy/README.md) for the required Caddy route, RoCE
 memlock handling, logs, and stop/restart commands.
 
-OpenCode can use the deployed DeepSeek service as an OpenAI-compatible provider
-by pointing its base URL at `http://127.0.0.1:8090/v1` (or the Caddy URL),
-selecting the model name returned by `GET /v1/models`, and supplying the server
-API key if authentication is enabled. GLM-5.3 is not selectable from this
-server yet: its staged TP harness is available for development, while ordinary
-GLM5.3 sessions intentionally fail closed until full session integration and
-an end-to-end correctness gate are promoted.
+OpenCode can use the deployed service as an OpenAI-compatible provider by
+pointing its base URL at `http://127.0.0.1:8090/v1` (or the Caddy URL), selecting
+the model name returned by `GET /v1/models`, and supplying the server API key if
+authentication is enabled.
+
+### GLM-5.3 branch deployment
+
+The ordinary GLM-5.3 TP launcher fix and its cache-free staged kernel settings
+are currently on the development branch, not `main`. Use the branch on both
+nodes before enabling GLM:
+
+```sh
+git fetch origin research/glm5-kb-lds-exact
+git switch --detach origin/research/glm5-kb-lds-exact
+make -j"$(nproc)" strix-halo
+```
+
+In `deploy/config.env.local`, set the local GLM model and enable the ordinary
+path:
+
+```sh
+MODEL=/absolute/path/GLM-5.3-Flash-Q4_K.gguf
+GLM5_ENABLE_ORDINARY=1
+GLM5_FULL_LOGITS=0
+GLM5_PREFILL_BATCH=256
+```
+
+Then populate `DS4_SERVER_SHA256` from the freshly built `ds4-server` and start
+both ranks with `deploy/ds4-tp-caddy.sh start`. The launcher applies GLM's
+full-logits sampling mode (`DS4_TP_GREEDY_TOP2=0`) after the generic DeepSeek
+defaults; this prevents the post-prefill sampling failure fixed in commit
+[`17cae42`](https://github.com/wkljohn/ds4-strix-halo-tp-odinlink/commit/17cae42).
+It also enables the validated GLM staged kernels from
+[`216a861`](https://github.com/wkljohn/ds4-strix-halo-tp-odinlink/commit/216a861)
+only for GLM. DeepSeek defaults and cache-free memory policy are unchanged.
 
 Agent clients should send an explicit completion limit. A practical starting
 point is 4,096–8,192 tokens: if the model leaves a DSML tool call open, DS4
