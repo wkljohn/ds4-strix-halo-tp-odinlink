@@ -206,6 +206,16 @@ pid_matches() {
   tr '\0' ' ' < "/proc/$pid/cmdline" | grep -Fq -- "$needle"
 }
 
+container_image_id() {
+  podman inspect --format '{{.Image}}' "$1" 2>/dev/null || true
+}
+
+container_is_owned() {
+  local image_id
+  image_id=$(container_image_id "$1")
+  [[ -n $image_id && ${image_id,,} == ${DS4_TP_CONTAINER_IMAGE_ID,,} ]]
+}
+
 coord_is_active() {
   if [[ $RDMA_PROFILE != odinlink && $CONTAINER == 0 ]]; then
     sudo -n systemctl is-active --quiet "$COORD_UNIT.service"
@@ -392,9 +402,32 @@ start() {
     echo "error: API port $API_PORT is already listening" >&2; exit 1;
   }
   if [[ $CONTAINER == 1 ]]; then
-    local running
-    running=$("${SSH[@]}" "podman ps -q --filter name=$CONTAINER_WORKER --filter status=running")
-    [[ -n $running ]] && { echo "error: owned worker is already running" >&2; exit 1; }
+    local coord_meta coord_running coord_image
+    coord_meta=$(podman inspect --format '{{.State.Running}} {{.Image}}' "$COORD_UNIT" 2>/dev/null || true)
+    if [[ -n $coord_meta ]]; then
+      read -r coord_running coord_image <<<"$coord_meta"
+      [[ ${coord_image,,} == ${DS4_TP_CONTAINER_IMAGE_ID,,} ]] || {
+        echo "error: local container name $COORD_UNIT belongs to another image; refusing to replace it" >&2
+        exit 1
+      }
+      [[ $coord_running != true ]] || {
+        echo "error: owned coordinator is already running" >&2; exit 1;
+      }
+      podman rm "$COORD_UNIT" >/dev/null
+    fi
+    local worker_meta worker_running worker_image
+    worker_meta=$("${SSH[@]}" "podman inspect --format '{{.State.Running}} {{.Image}}' '$CONTAINER_WORKER' 2>/dev/null || true")
+    if [[ -n $worker_meta ]]; then
+      read -r worker_running worker_image <<<"$worker_meta"
+      [[ ${worker_image,,} == ${DS4_TP_CONTAINER_IMAGE_ID,,} ]] || {
+        echo "error: peer container name $CONTAINER_WORKER belongs to another image; refusing to replace it" >&2
+        exit 1
+      }
+      [[ $worker_running != true ]] || {
+        echo "error: owned worker is already running" >&2; exit 1;
+      }
+      "${SSH[@]}" "podman rm '$CONTAINER_WORKER' >/dev/null"
+    fi
   else
     "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 0;; esac; test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker' && exit 7; fi; exit 0" || {
       rc=$?; [[ $rc == 7 ]] && echo "error: owned worker is already running" >&2; exit "$rc";
@@ -583,18 +616,41 @@ start() {
 }
 
 stop() {
-  if coord_is_active; then
-    coord_stop_service
-    echo "stopped coordinator service $COORD_UNIT"
-  elif pid_matches "$LOCAL_PIDFILE" "ds4-server"; then
-    pid=$(<"$LOCAL_PIDFILE"); kill -TERM "$pid"; echo "stopped coordinator $pid"
-  fi
   if [[ $CONTAINER == 1 ]]; then
-    # Backstop for containers that outlived their unit (e.g. after a crash);
-    # --rm removes them on stop.
-    podman stop -t 60 "$COORD_UNIT" >/dev/null 2>&1 || true
-    "${SSH[@]}" "podman stop -t 60 '$CONTAINER_WORKER' >/dev/null 2>&1 || true"
+    local coord_active=0 coord_image peer_image
+    coord_is_active && coord_active=1
+    coord_image=$(container_image_id "$COORD_UNIT")
+    peer_image=$("${SSH[@]}" "podman inspect --format '{{.Image}}' '$CONTAINER_WORKER' 2>/dev/null || true")
+    # Establish ownership of every existing target before stopping either
+    # rank. This prevents a partial shutdown if one of the fixed names was
+    # independently reused for an unrelated container.
+    if ((coord_active)) || [[ -n $coord_image ]]; then
+      [[ -n $coord_image && ${coord_image,,} == ${DS4_TP_CONTAINER_IMAGE_ID,,} ]] || {
+        echo "error: coordinator name/unit is not owned by the pinned image; refusing to stop it" >&2
+        return 1
+      }
+    fi
+    if [[ -n $peer_image ]]; then
+      [[ ${peer_image,,} == ${DS4_TP_CONTAINER_IMAGE_ID,,} ]] || {
+        echo "error: peer container name $CONTAINER_WORKER is not owned by the pinned image; refusing to stop it" >&2
+        return 1
+      }
+    fi
+    if ((coord_active)) || [[ -n $coord_image ]]; then
+      ((coord_active)) && coord_stop_service
+      podman stop -t 60 "$COORD_UNIT" >/dev/null 2>&1 || true
+      echo "stopped coordinator service $COORD_UNIT"
+    fi
+    if [[ -n $peer_image ]]; then
+      "${SSH[@]}" "podman stop -t 60 '$CONTAINER_WORKER' >/dev/null 2>&1 || true"
+    fi
   else
+    if coord_is_active; then
+      coord_stop_service
+      echo "stopped coordinator service $COORD_UNIT"
+    elif pid_matches "$LOCAL_PIDFILE" "ds4-server"; then
+      pid=$(<"$LOCAL_PIDFILE"); kill -TERM "$pid"; echo "stopped coordinator $pid"
+    fi
     "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 0;; esac; if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then kill -TERM \"\$p\"; echo stopped-worker-\$p; fi; fi"
   fi
 }
@@ -602,16 +658,20 @@ stop() {
 status() {
   local coord_ok=0 worker_ok=0 api_ok=0 worker_state
   if coord_is_active; then
-    echo "coordinator: running pid $(coord_main_pid)"
-    coord_ok=1
-  elif pid_matches "$LOCAL_PIDFILE" "ds4-server"; then
+    if [[ $CONTAINER == 0 ]] || container_is_owned "$COORD_UNIT"; then
+      echo "coordinator: running pid $(coord_main_pid)"
+      coord_ok=1
+    else
+      echo "coordinator: running but image ownership mismatch"
+    fi
+  elif [[ $CONTAINER == 0 ]] && pid_matches "$LOCAL_PIDFILE" "ds4-server"; then
     echo "coordinator: running pid $(<"$LOCAL_PIDFILE")"
     coord_ok=1
   else
     echo "coordinator: stopped"
   fi
   if [[ $CONTAINER == 1 ]]; then
-    worker_state=$("${SSH[@]}" "if test -n \"\$(podman ps -q --filter name=$CONTAINER_WORKER --filter status=running)\"; then echo worker-running-container; else echo worker-stopped; fi" 2>/dev/null) || worker_state=worker-unreachable
+    worker_state=$("${SSH[@]}" "m=\$(podman inspect --format '{{.State.Running}} {{.Image}}' '$CONTAINER_WORKER' 2>/dev/null || true); if test -z \"\$m\"; then echo worker-stopped; elif test \"\$m\" = 'true $DS4_TP_CONTAINER_IMAGE_ID'; then echo worker-running-container; else echo worker-image-mismatch; fi" 2>/dev/null) || worker_state=worker-unreachable
   else
     worker_state=$("${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then echo worker-running-pid-\$p; else echo worker-stopped; fi; else echo worker-stopped; fi" 2>/dev/null) || worker_state=worker-unreachable
   fi
