@@ -67,7 +67,7 @@ uint64_t ds4_tp_test_get_exchange_calls(void) {
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 10u
+#define DS4_TP_PROTOCOL_VERSION 11u
 
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
@@ -90,6 +90,7 @@ typedef struct {
     uint32_t role;
     uint32_t rdma_ok;    /* this side has a usable verbs device */
     uint64_t gguf_bytes;
+    uint64_t prefill_config;
     uint32_t model_id;
     uint32_t n_layer;
     uint32_t n_embd;
@@ -103,7 +104,7 @@ typedef struct {
     uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_hello_fixed;
 
-_Static_assert(sizeof(ds4_tp_hello_fixed) == 88,
+_Static_assert(sizeof(ds4_tp_hello_fixed) == 96,
                "ds4_tp_hello_fixed wire layout changed");
 
 typedef struct {
@@ -386,6 +387,15 @@ static int tp_hello_validate_runtime_features(uint32_t local, uint32_t peer,
     return 0;
 }
 
+static int tp_hello_validate_prefill_config(uint64_t local, uint64_t peer,
+                                            char *err, size_t errlen) {
+    if (local == peer) return 1;
+    tp_set_err(err, errlen,
+               "tp hello: prefill config mismatch (local=0x%016llx peer=0x%016llx)",
+               (unsigned long long)local, (unsigned long long)peer);
+    return 0;
+}
+
 /* Resolve the negotiated data transport in one fail-closed place.  AUTO may
  * deliberately fall back to TCP; an explicit RDMA request never may.  Keep
  * this separate from device probing and the hello socket so the policy has a
@@ -412,6 +422,11 @@ static int tp_select_transport(ds4_tp_transport requested,
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
                                                 char *err, size_t errlen) {
     return tp_hello_validate_runtime_features(local, peer, err, errlen);
+}
+
+int ds4_tp_test_hello_validate_prefill_config(uint64_t local, uint64_t peer,
+                                              char *err, size_t errlen) {
+    return tp_hello_validate_prefill_config(local, peer, err, errlen);
 }
 
 int ds4_tp_test_select_transport(ds4_tp_transport requested,
@@ -2557,6 +2572,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .role = (uint32_t)tp->opt.role,
         .rdma_ok = (uint32_t)rdma_ok,
         .gguf_bytes = id->gguf_bytes,
+        .prefill_config = id->prefill_config,
         .model_id = id->model_id,
         .n_layer = id->n_layer,
         .n_embd = id->n_embd,
@@ -2592,6 +2608,11 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
     if (!tp_hello_validate_runtime_features(mine.runtime_features,
                                             theirs.runtime_features,
                                             err, errlen)) {
+        return 0;
+    }
+    if (!tp_hello_validate_prefill_config(mine.prefill_config,
+                                          theirs.prefill_config,
+                                          err, errlen)) {
         return 0;
     }
     if (theirs.gguf_bytes != mine.gguf_bytes || theirs.model_id != mine.model_id ||
@@ -2745,6 +2766,16 @@ bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
 bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *tp) {
 #ifdef DS4_TP_HAVE_VERBS
     return tp && tp->rdma_active && tp_rdma_big_gate_capable(tp);
+#else
+    (void)tp;
+    return false;
+#endif
+}
+
+bool ds4_tp_big_gate_waves_transport_supported(const ds4_tp *tp) {
+#ifdef DS4_TP_HAVE_VERBS
+    return tp && tp->rdma_active && tp->rdma.is_mlx5 &&
+           tp_rdma_big_gate_capable(tp);
 #else
     (void)tp;
     return false;
@@ -3602,6 +3633,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
         .ctx_size = 0, /* adopt the leader's */
         .runtime_features = ds4_engine_tp_runtime_features(engine),
+        .prefill_config = ds4_engine_tp_prefill_config(engine),
     };
     ds4_engine_tp_gate_schedule(engine,
                                 &id.gate_slot_start,

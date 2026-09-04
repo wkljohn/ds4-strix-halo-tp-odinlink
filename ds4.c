@@ -28906,6 +28906,7 @@ static uint32_t metal_graph_tp_prefill_split_min_attn(void) {
 #endif
         }
         if (cached < 2) cached = 2;
+        if (cached > UINT16_MAX) cached = UINT16_MAX;
     }
     return (uint32_t)cached;
 }
@@ -28918,6 +28919,7 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
         if (!env || !env[0]) env = getenv("DS4_TP_PREFILL_SPLIT_MIN");
         if (env && env[0]) cached = atoi(env);
         if (cached < 2) cached = 2;
+        if (cached > UINT16_MAX) cached = UINT16_MAX;
     }
     return (uint32_t)cached;
 }
@@ -28961,14 +28963,22 @@ static bool metal_graph_tp_subgate_pipeline(void) {
  * chunk exactness tests. The waves share one mlx5 transport rendezvous;
  * OdinLink keeps its established coarse exchange and fails closed here.
  * This variable changes the TP gate schedule and must be set on both ranks. */
-static bool metal_graph_tp_prefill_ffn_wavefront(void) {
+static bool metal_graph_tp_prefill_ffn_wavefront_requested(void) {
 #ifdef DS4_ROCM_BUILD
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_TP_PREFILL_FFN_WAVEFRONT");
         cached = env && env[0] && atoi(env) != 0;
     }
-    if (!cached) return false;
+    return cached != 0;
+#else
+    return false;
+#endif
+}
+
+static bool metal_graph_tp_prefill_ffn_wavefront(void) {
+#ifdef DS4_ROCM_BUILD
+    if (!metal_graph_tp_prefill_ffn_wavefront_requested()) return false;
     return ds4_gpu_tp_big_gate_waves_available() != 0 &&
            (ds4_gpu_get_tp_runtime_features() &
             DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC) == 0u;
@@ -29145,6 +29155,7 @@ static bool metal_graph_encode_layer_attention_batch(
         tp_attn_n_comp > DS4_N_INDEXER_TOP_K;
     const bool tp_attn_resumed =
         !zero_prefix &&
+        !g->dspark_capture_enabled &&
         metal_graph_tp_prefill_split_resumed() &&
         n_tokens <= g->raw_cap &&
         (n_tokens % 128u) == 0u &&
@@ -53835,6 +53846,18 @@ uint32_t ds4_engine_tp_runtime_features(ds4_engine *e) {
 #endif
 }
 
+uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
+    if (!e || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) return 0u;
+    const bool dspark = e &&
+        e->support_kind == DS4_SUPPORT_DSPARK && e->dspark;
+    return ds4_tp_prefill_config_encode(
+        metal_graph_tp_prefill_split_min_attn(),
+        metal_graph_tp_prefill_split_min(),
+        metal_graph_tp_prefill_split_resumed() && !dspark,
+        metal_graph_tp_subgate_pipeline(),
+        metal_graph_tp_prefill_ffn_wavefront_requested());
+}
+
 bool ds4_engine_has_output_head(ds4_engine *e) {
     return e && weights_have_output_head(&e->weights);
 }
@@ -61359,6 +61382,16 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     ds4_gpu_tp_set_big_wave_exchange(
         ds4_tp_requires_host_slab(tp) ?
             ds4_engine_tp_big_wave_exchange : NULL);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+        metal_graph_tp_prefill_ffn_wavefront_requested() &&
+        (ds4_tp_runtime_features(tp) &
+         DS4_TP_FEATURE_ODINLINK_BATCH_ASYNC) == 0u &&
+        (!ds4_tp_big_gate_waves_transport_supported(tp) ||
+         ds4_gpu_tp_big_gate_waves_available() == 0)) {
+        snprintf(err, errlen,
+                 "TP prefill FFN wavefront requested but GPU/RDMA wave gates are unavailable");
+        return 0;
+    }
 #endif
     /* GLM keeps its replicated output head unsplit in v0: the
      * leader computes full logits and nothing crosses the wire. */

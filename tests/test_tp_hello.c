@@ -25,6 +25,27 @@ static int check(const char *name, uint32_t local, uint32_t peer, int want,
     return 1;
 }
 
+static int check_prefill(const char *name, uint64_t local, uint64_t peer,
+                         int want, const char *want_error) {
+    char err[160] = "";
+    const int got = ds4_tp_test_hello_validate_prefill_config(
+            local, peer, err, sizeof(err));
+    if (got != want) {
+        fprintf(stderr,
+                "FAIL %s: local=0x%016llx peer=0x%016llx got=%d want=%d\n",
+                name, (unsigned long long)local,
+                (unsigned long long)peer, got, want);
+        return 0;
+    }
+    if (want_error && strcmp(err, want_error) != 0) {
+        fprintf(stderr, "FAIL %s: error='%s' want='%s'\n",
+                name, err, want_error);
+        return 0;
+    }
+    fprintf(stderr, "PASS %s\n", name);
+    return 1;
+}
+
 static int check_transport(const char *name,
                            ds4_tp_transport requested,
                            int local_rdma_ok,
@@ -203,6 +224,40 @@ int main(void) {
     ok &= check("hello equal-enabled",
                 DS4_TP_FEATURE_Q4K_WMMA, DS4_TP_FEATURE_Q4K_WMMA, 1, NULL);
     ok &= check("hello equal-disabled", 0, 0, 1, NULL);
+    const uint64_t prefill = ds4_tp_prefill_config_encode(
+        2048u, 32u, true, false, true);
+    ok &= check_prefill("hello equal-prefill-config",
+                        prefill, prefill, 1, NULL);
+    ok &= check_prefill(
+        "hello mismatched-prefill-config",
+        prefill,
+        ds4_tp_prefill_config_encode(2048u, 32u, false, false, true),
+        0,
+        "tp hello: prefill config mismatch (local=0x0000000500200800 peer=0x0000000400200800)");
+    ok &= check_prefill(
+        "hello mismatched-prefill-attn-threshold",
+        prefill, ds4_tp_prefill_config_encode(4096u, 32u, true, false, true),
+        0, NULL);
+    ok &= check_prefill(
+        "hello mismatched-prefill-ffn-threshold",
+        prefill, ds4_tp_prefill_config_encode(2048u, 64u, true, false, true),
+        0, NULL);
+    ok &= check_prefill(
+        "hello mismatched-prefill-subgate",
+        prefill, ds4_tp_prefill_config_encode(2048u, 32u, true, true, true),
+        0, NULL);
+    ok &= check_prefill(
+        "hello mismatched-prefill-wavefront",
+        prefill, ds4_tp_prefill_config_encode(2048u, 32u, true, false, false),
+        0, NULL);
+    if ((ds4_tp_prefill_config_encode(UINT32_MAX, UINT32_MAX,
+                                      false, false, false) &
+         UINT64_C(0xffffffff)) != UINT64_C(0xffffffff)) {
+        fprintf(stderr, "FAIL prefill config threshold saturation\n");
+        ok = 0;
+    } else {
+        fprintf(stderr, "PASS prefill config threshold saturation\n");
+    }
     ok &= check("hello mismatched-feature-masks",
                 DS4_TP_FEATURE_Q4K_WMMA, 0, 0,
                 "tp hello: runtime feature mismatch (local=0x00000001 peer=0x00000000)");

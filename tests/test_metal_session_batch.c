@@ -168,6 +168,8 @@ int main(void) {
             .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
             .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
             .ctx_size = TEST_CTX,
+            .runtime_features = ds4_engine_tp_runtime_features(engine),
+            .prefill_config = ds4_engine_tp_prefill_config(engine),
         };
         ds4_engine_tp_gate_schedule(engine,
                                     &identity.gate_slot_start,

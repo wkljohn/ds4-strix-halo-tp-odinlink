@@ -116,12 +116,9 @@ STEP_INCR=${DS4_BENCH_STEP_INCR:-2048}
 STEP_MUL=${DS4_BENCH_STEP_MUL:-1}
 TOKENS=${DS4_BENCH_TOKENS:-300}
 CONTEXT=${DS4_BENCH_CONTEXT:-4096}
-PREFILL_CHUNK=${DS4_BENCH_PREFILL_CHUNK:-4096}
-if [[ $RDMA_PROFILE == roce-v2 && -z $PREFILL_CHUNK_EXPLICIT ]]; then
-  # ConnectX-4 Lx registers the 2048-row mapped slab but exhausts its
-  # pin/translation resources with the 4096-row direct layout.
-  PREFILL_CHUNK=2048
-fi
+# Both validated RDMA providers use the same 2,048-row production shape.
+# ConnectX-4 Lx also exhausts its pin/translation budget at 4,096 rows.
+PREFILL_CHUNK=${DS4_BENCH_PREFILL_CHUNK:-2048}
 DSPARK=${DS4_BENCH_DSPARK:-0}
 MTP=${DS4_BENCH_MTP:-}
 if [[ ${DS4_BENCH_OUT+x} ]]; then

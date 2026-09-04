@@ -34,6 +34,33 @@ enum {
     DS4_TP_BATCH_MAX_ROWS = 8,
 };
 
+/* Prefill scheduling has more independently selectable paths than fit in the
+ * legacy 32-bit runtime feature word.  This separate hello value is not a
+ * capability bitmap: it records the effective row-split thresholds plus the
+ * switches that can change a TP big-gate schedule. */
+enum {
+    DS4_TP_PREFILL_CONFIG_RESUMED = UINT64_C(1) << 32,
+    DS4_TP_PREFILL_CONFIG_SUBGATE_PIPELINE = UINT64_C(1) << 33,
+    /* This records the request, not provider-dependent availability.  The
+     * latter is checked fail-closed after the RDMA endpoint is bound. */
+    DS4_TP_PREFILL_CONFIG_FFN_WAVEFRONT = UINT64_C(1) << 34,
+};
+
+static inline uint64_t ds4_tp_prefill_config_encode(
+        uint32_t min_attn,
+        uint32_t min_ffn,
+        bool resumed,
+        bool subgate_pipeline,
+        bool ffn_wavefront) {
+    if (min_attn > UINT16_MAX) min_attn = UINT16_MAX;
+    if (min_ffn > UINT16_MAX) min_ffn = UINT16_MAX;
+    return (uint64_t)min_attn |
+           ((uint64_t)min_ffn << 16) |
+           (resumed ? DS4_TP_PREFILL_CONFIG_RESUMED : 0u) |
+           (subgate_pipeline ? DS4_TP_PREFILL_CONFIG_SUBGATE_PIPELINE : 0u) |
+           (ffn_wavefront ? DS4_TP_PREFILL_CONFIG_FFN_WAVEFRONT : 0u);
+}
+
 enum {
     DS4_TP_FEATURE_Q4K_WMMA = UINT32_C(1) << 0,
     /* The verifier attention head split changes the per-layer big-gate
@@ -295,6 +322,7 @@ typedef struct {
     uint32_t quant_bits;
     uint32_t ctx_size;
     uint32_t runtime_features;
+    uint64_t prefill_config;
     /* Decode gate schedule, used to place RDMA recvs into the right slab
      * slot. A non-empty mask lists the slots in sequence order. Otherwise
      * slot(seq) = start + ((seq-1) % per_token) * step.
@@ -371,6 +399,8 @@ int ds4_tp_rank(const ds4_tp *tp);
 bool ds4_tp_is_rdma(const ds4_tp *tp);
 /* True only when large batch gates use verbs instead of TCP fallback. */
 bool ds4_tp_big_gate_is_rdma_capable(const ds4_tp *tp);
+/* True only for an RDMA provider implementing the mlx5 wave protocol. */
+bool ds4_tp_big_gate_waves_transport_supported(const ds4_tp *tp);
 /* True when this payload lies wholly inside the registered slab, so the bulk
  * path will not stage through the batch regions. */
 bool ds4_tp_big_gate_is_direct(const ds4_tp *tp, const void *out,
@@ -384,6 +414,8 @@ uint64_t ds4_tp_vec_bytes(const ds4_tp *tp);
 #ifdef DS4_TP_TEST_HOOKS
 int ds4_tp_test_hello_validate_runtime_features(uint32_t local, uint32_t peer,
                                                 char *err, size_t errlen);
+int ds4_tp_test_hello_validate_prefill_config(uint64_t local, uint64_t peer,
+                                              char *err, size_t errlen);
 int ds4_tp_test_select_transport(ds4_tp_transport requested,
                                  int local_rdma_ok,
                                  int peer_rdma_ok,

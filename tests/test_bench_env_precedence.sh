@@ -79,7 +79,7 @@ expect_contains config-default \
   DS4_BENCH_PREFILL_CHUNK=2048
 
 expect_contains invocation-provider-and-address-win \
-  'rdma_profile=odinlink coordinator_addr=10.4.0.1 coordinator_rdma_device=odl_tb5_0 worker_rdma_device=odl_tb5_0' \
+  'rdma_profile=odinlink coordinator_addr=10.4.0.1 coordinator_rdma_device=odl_tb5_0 worker_rdma_device=odl_tb5_0 rdma_gid_index=n/a prefill_chunk=2048' \
   DS4_BENCH_RDMA_PROFILE=odinlink \
   DS4_COORDINATOR_ADDR=10.4.0.1
 
@@ -114,7 +114,7 @@ grep -q 'must be odinlink, roce-v2, or ib-mlx4' "$test_dir/bogus.out"
 echo 'PASS invalid-provider-still-rejected'
 
 expect_contains ib-mlx4-profile-defaults \
-  'rdma_profile=ib-mlx4 coordinator_addr=192.168.100.1 coordinator_rdma_device=ibp195s0 worker_rdma_device=ibp195s0 rdma_gid_index=0 prefill_chunk=4096' \
+  'rdma_profile=ib-mlx4 coordinator_addr=192.168.100.1 coordinator_rdma_device=ibp195s0 worker_rdma_device=ibp195s0 rdma_gid_index=0 prefill_chunk=2048' \
   DS4_BENCH_RDMA_PROFILE=ib-mlx4 \
   DS4_COORDINATOR_ADDR=192.168.100.1
 
