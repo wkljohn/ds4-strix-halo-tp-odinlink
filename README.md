@@ -165,7 +165,7 @@ validated userspace provider is pinned below:
 sudo apt install build-essential cmake linux-headers-"$(uname -r)" \
   libibverbs-dev rdma-core pkg-config libglib2.0-dev
 git clone https://github.com/wkljohn/OdinLink-Five.git
-git -C OdinLink-Five checkout 8b34b13beb4a0123301602c5853044257962af0a
+git -C OdinLink-Five checkout 65d4dd489c3c42ec4f1f50cc7bf672060fa3d0fc
 cmake -S OdinLink-Five -B OdinLink-Five/build \
   -DBUILD_VERBS=ON -DBUILD_DAEMON=ON -DBUILD_TRAY=OFF
 cmake --build OdinLink-Five/build -j"$(nproc)" \
@@ -173,9 +173,11 @@ cmake --build OdinLink-Five/build -j"$(nproc)" \
 ```
 
 Disable Secure Boot or enroll a trusted module-signing key before loading the
-out-of-tree driver. Load it on both nodes; the character device is created only
-after both peers advertise the OdinLink Thunderbolt service. Then verify the
-device and link before loading the model:
+out-of-tree driver. Install the same commit on both nodes and normally load it
+without `odl_ring_size`: each node first selects a size it can allocate, then
+both negotiate the smaller selection. The character device is created only
+after both peers advertise the OdinLink Thunderbolt service. Verify the device
+and link before loading the model:
 
 ```sh
 ls -l /dev/odl_tb5_0
@@ -184,14 +186,17 @@ ls -l /dev/odl_tb5_0
 # Node 2
 ./OdinLink-Five/build/cli/odl_tb5_cli client -d 0 -t latency
 
-# Either node: verify USB4, discovery, driver handshake, and READY state
+# Both nodes: require READY and matching local/peer packet-slot counts
 ./OdinLink-Five/build/cli/odl_tb5_cli diag -v
 ```
 
 Set `DS4_ODINLINK_ROOT`, both `odl_tb5_0` device names, and the coordinator's
 OdinLink address in `bench.env.local`. The optimized provider and Strix Halo
 settings are already defaults; users should not copy diagnostic environment
-switches into production.
+switches into production. The provider looks for IPv4 on `bond0`, then
+`thunderbolt0`. For a differently named data interface, append
+`ODL_RDMA_GID_IFACE=<interface>` to the benchmark command so the same strict
+choice reaches both ranks.
 
 ## Mellanox RoCE v2
 
