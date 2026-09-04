@@ -37308,7 +37308,11 @@ static bool metal_graph_prefill_chunked_range(
         }
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
-        float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
+        /* Progress records the completed KV/checkpoint boundary; it does not
+         * consume logits.  Only the final chunk's logits can be returned to
+         * the caller, so avoid running and reading the vocabulary head for
+         * every intermediate long-prompt chunk. */
+        float *chunk_logits = chunk_end == end ? logits : NULL;
         bool ok = metal_graph_prefill_layer_major(g,
                                                   model,
                                                   weights,
