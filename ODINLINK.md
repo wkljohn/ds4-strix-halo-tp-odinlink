@@ -36,7 +36,7 @@ belongs to the OdinLink provider and defaults on when DS4 explicitly loads an
 OdinLink provider. It accelerates
 reads from GPU-written, write-combined host memory with an ordinary unaligned
 prefix and AVX-512 streaming loads for the aligned body. It requires provider
-commit `8a77ccb` or later. Set `ODL_VERBS_WC_STREAM_COPY=0` to run a control
+commit `d0b54fc` or later. Set `ODL_VERBS_WC_STREAM_COPY=0` to run a control
 arm. Keep any override identical on both ranks.
 
 The gfx1151 packed Q8 attention-output low kernel is also a Strix Halo TP=2
@@ -68,7 +68,7 @@ unnecessary when the filesystems are independent.
 
 The 2026-08-06 A/B used two Ryzen AI MAX+ 395 systems, DeepSeek V4 Flash
 Q4_K, a 9,881-byte prompt, a 4,096-token context, and provider commit
-`8a77ccb`.
+`d0b54fc`.
 
 | Arm | Prefill | Generation |
 |---|---:|---:|

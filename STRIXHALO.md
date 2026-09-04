@@ -125,7 +125,7 @@ OdinLink's daemon remains enabled when the tray is disabled, so
 
 ```sh
 git clone https://github.com/wkljohn/OdinLink-Five.git
-git -C OdinLink-Five checkout 8a77ccbf051b5a615a2b4d9a75ede10af524614a
+git -C OdinLink-Five checkout d0b54fc6e6adb20cf88926ca0cf60eed51527b31
 cmake -S OdinLink-Five -B OdinLink-Five/build \
   -DBUILD_VERBS=ON -DBUILD_DAEMON=ON -DBUILD_TRAY=OFF
 cmake --build OdinLink-Five/build -j"$(nproc)" \
