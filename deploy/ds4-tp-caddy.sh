@@ -32,8 +32,13 @@ case $RDMA_PROFILE in
     PEER_RDMA_DEVICE=${PEER_RDMA_DEVICE:-mlx5_1}
     RDMA_GID_INDEX=${RDMA_GID_INDEX:-3}
     ;;
+  ib-mlx4)
+    LOCAL_RDMA_DEVICE=${LOCAL_RDMA_DEVICE:-ibp195s0}
+    PEER_RDMA_DEVICE=${PEER_RDMA_DEVICE:-ibp195s0}
+    RDMA_GID_INDEX=${RDMA_GID_INDEX:-0}
+    ;;
   *)
-    echo "error: RDMA_PROFILE must be odinlink or roce-v2" >&2
+    echo "error: RDMA_PROFILE must be odinlink, roce-v2, or ib-mlx4" >&2
     exit 2
     ;;
 esac
@@ -60,9 +65,83 @@ PEER_HOST_KEY_ALIAS=${PEER_HOST_KEY_ALIAS:-$PEER_MGMT}
 RUNTIME=$SCRIPT_DIR/runtime
 LOCAL_PIDFILE=$RUNTIME/coordinator.pid
 COORD_UNIT=${COORD_UNIT:-ds4-tp-coordinator}
+CONTAINER=${DS4_TP_CONTAINER:-0}
+[[ $CONTAINER == 0 || $CONTAINER == 1 ]] || {
+  echo "error: DS4_TP_CONTAINER must be 0 or 1" >&2
+  exit 2
+}
+if [[ $CONTAINER == 1 ]]; then
+  : "${DS4_TP_CONTAINER_IMAGE:?DS4_TP_CONTAINER_IMAGE is required when DS4_TP_CONTAINER=1}"
+  : "${DS4_TP_CONTAINER_VOLUME:?DS4_TP_CONTAINER_VOLUME is required when DS4_TP_CONTAINER=1}"
+  : "${DS4_TP_CONTAINER_IMAGE_ID:?DS4_TP_CONTAINER_IMAGE_ID is required when DS4_TP_CONTAINER=1}"
+  : "${DS4_TP_CONTAINER_WRITABLE_VOLUME:?DS4_TP_CONTAINER_WRITABLE_VOLUME is required when DS4_TP_CONTAINER=1}"
+  [[ $DS4_TP_CONTAINER_IMAGE_ID =~ ^[0-9a-fA-F]{64}$ ]] || {
+    echo "error: DS4_TP_CONTAINER_IMAGE_ID must be the 64-hex content ID" >&2; exit 2;
+  }
+  CONTAINER_VOLUME=$DS4_TP_CONTAINER_VOLUME
+  [[ $RDMA_PROFILE != odinlink ]] || {
+    echo "error: DS4_TP_CONTAINER=1 supports only the Mellanox profiles" >&2
+    exit 2
+  }
+  CONTAINER_INIT=${DS4_TP_CONTAINER_INIT:-}
+  CONTAINER_WORKER=ds4-tp-worker
+  # A container volume must be a dedicated directory, not a home directory
+  # or a broad host tree. It may contain only the deployment artifacts.
+  CONTAINER_VOLUME=$(realpath -e -- "$CONTAINER_VOLUME" 2>/dev/null) || {
+    echo "error: DS4_TP_CONTAINER_VOLUME must already exist" >&2; exit 2;
+  }
+  [[ $CONTAINER_VOLUME != / && $CONTAINER_VOLUME != /home &&
+     $CONTAINER_VOLUME != /root && $CONTAINER_VOLUME != /etc &&
+     $CONTAINER_VOLUME != /var && $CONTAINER_VOLUME != /tmp ]] || {
+    echo "error: DS4_TP_CONTAINER_VOLUME is too broad" >&2; exit 2;
+  }
+  while IFS=: read -r _ _ _ _ _ container_home _; do
+    [[ -n $container_home && $CONTAINER_VOLUME != "$container_home" ]] || {
+      echo "error: container volume must not be a user home directory" >&2; exit 2;
+    }
+  done < <(getent passwd)
+  [[ ! -e $CONTAINER_VOLUME/.ssh && ! -e $CONTAINER_VOLUME/.aws &&
+     ! -e $CONTAINER_VOLUME/.config ]] || {
+    echo "error: container volume contains a credentials directory" >&2; exit 2;
+  }
+  # Shared podman spec for both ranks. Host networking carries the TCP
+  # control plane and the RDMA verbs; the container's memlock ulimit
+  # replaces the system unit's LimitMEMLOCK, so this mode needs no sudo.
+  PODMAN_RUN=(podman run --rm
+    --entrypoint /bin/bash
+    --network host --ipc host
+    --cap-drop=all --security-opt no-new-privileges
+    --ulimit memlock=-1
+    --group-add keep-groups
+    --device /dev/kfd)
+  for device in /dev/dri/renderD* /dev/infiniband/uverbs* /dev/infiniband/rdma_cm; do
+    [[ -e $device ]] && PODMAN_RUN+=(--device "$device")
+  done
+  # Kernel verbs devices are not sufficient by themselves: userspace provider
+  # packages must be installed in the image with the image's own ABI. Never
+  # mount host provider libraries into the container. Only discovery sysfs is
+  # supplied by the host, read-only.
+  [[ -d /sys/class/infiniband ]] &&
+    PODMAN_RUN+=(--mount type=bind,src=/sys/class/infiniband,dst=/sys/class/infiniband,ro)
+  PODMAN_RUN+=(-v "$CONTAINER_VOLUME:$CONTAINER_VOLUME:ro")
+  WRITABLE_VOLUME=$(realpath -e -- "$DS4_TP_CONTAINER_WRITABLE_VOLUME" 2>/dev/null) || {
+    echo "error: writable container volume must already exist" >&2; exit 2;
+  }
+  [[ $WRITABLE_VOLUME != "$CONTAINER_VOLUME" ]] || {
+    echo "error: writable volume must be separate from the read-only volume" >&2; exit 2;
+  }
+  PODMAN_RUN+=(-v "$WRITABLE_VOLUME:$WRITABLE_VOLUME:rw")
+fi
 WORKER_PIDFILE=$DS4_PEER_RESEARCH_ROOT/deployment/worker.pid
 LOCAL_LOG=$DS4_RESEARCH_ROOT/deployment/coordinator.log
 WORKER_LOG=$DS4_PEER_RESEARCH_ROOT/deployment/worker.log
+if [[ $CONTAINER == 1 ]]; then
+  # Logs and PID state must remain writable without making model/repository
+  # artifacts writable inside the container.
+  LOCAL_LOG=$WRITABLE_VOLUME/deployment/coordinator.log
+  WORKER_LOG=$WRITABLE_VOLUME/deployment/worker.log
+  WORKER_PIDFILE=$WRITABLE_VOLUME/deployment/worker.pid
+fi
 if [[ $RDMA_PROFILE == odinlink ]]; then
   VERBS_LIB=$ODINLINK_ROOT/build/verbs/libodl_tb5_verbs.so.0.1.0
   ODL_LD_PATH=$ODINLINK_ROOT/build/lib:$ODINLINK_ROOT/build/verbs
@@ -74,9 +153,9 @@ is_uint() { [[ $1 =~ ^[1-9][0-9]*$ ]]; }
 is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$EXPERT_SPLIT" &&
   is_uint "$TP_TIMEOUT_SEC" && is_uint "$TP_PORT" &&
   is_uint "$API_PORT" || {
-    echo "error: context, chunk, expert split, TP timeout, and ports must be positive integers" >&2
-    exit 2
-  }
+  echo "error: context, chunk, expert split, TP timeout, and ports must be positive integers" >&2
+  exit 2
+}
 (( EXPERT_SPLIT < 256 )) || { echo "error: expert split must be in 1..255" >&2; exit 2; }
 [[ $DSPARK == 0 || $DSPARK == 1 ]] || { echo "error: DSPARK must be 0 or 1" >&2; exit 2; }
 [[ $PREFILL_FFN_WAVEFRONT == 0 || $PREFILL_FFN_WAVEFRONT == 1 ]] || {
@@ -128,7 +207,7 @@ pid_matches() {
 }
 
 coord_is_active() {
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  if [[ $RDMA_PROFILE != odinlink && $CONTAINER == 0 ]]; then
     sudo -n systemctl is-active --quiet "$COORD_UNIT.service"
   else
     systemctl --user is-active --quiet "$COORD_UNIT.service"
@@ -136,7 +215,7 @@ coord_is_active() {
 }
 
 coord_main_pid() {
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  if [[ $RDMA_PROFILE != odinlink && $CONTAINER == 0 ]]; then
     sudo -n systemctl show -p MainPID --value "$COORD_UNIT.service"
   else
     systemctl --user show -p MainPID --value "$COORD_UNIT.service"
@@ -144,7 +223,7 @@ coord_main_pid() {
 }
 
 coord_stop_service() {
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  if [[ $RDMA_PROFILE != odinlink && $CONTAINER == 0 ]]; then
     sudo -n systemctl stop "$COORD_UNIT.service"
   else
     systemctl --user stop "$COORD_UNIT.service"
@@ -174,29 +253,111 @@ preflight() {
       echo "error: peer binary, model, OdinLink device, or provider is missing" >&2; exit 1;
     }
   else
-    sudo -n true || {
-      echo "error: passwordless sudo is required to give the RoCE service unlimited memlock" >&2
-      exit 1
-    }
-    grep -qx 'RoCE v2' \
-      "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX" || {
-      echo "error: local mlx5 GID is not available as RoCE v2" >&2; exit 1;
-    }
-    "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX')\" = 'RoCE v2'" || {
-      echo "error: peer binary/model or RoCE v2 GID is unavailable" >&2; exit 1;
-    }
-    local peer_memlock
-    peer_memlock=$("${SSH[@]}" 'ulimit -l')
-    if [[ $peer_memlock != unlimited ]] &&
-       { [[ ! $peer_memlock =~ ^[0-9]+$ ]] || (( peer_memlock < 131072 )); }; then
-      echo "error: peer locked-memory limit is ${peer_memlock} KiB; RoCE deployment requires at least 128 MiB" >&2
-      exit 1
+    if [[ $CONTAINER == 1 ]]; then
+      local image_meta expected_image_id
+      image_meta=$(podman image inspect --format '{{.Id}} {{.Digest}} {{join .RepoDigests " "}}' "$DS4_TP_CONTAINER_IMAGE") || {
+        echo "error: local container image $DS4_TP_CONTAINER_IMAGE is missing" >&2
+        exit 1
+      }
+      expected_image_id=${image_meta%% *}
+      [[ ${expected_image_id,,} == ${DS4_TP_CONTAINER_IMAGE_ID,,} ]] || {
+        echo "error: local container image ID does not match DS4_TP_CONTAINER_IMAGE_ID" >&2
+        exit 1
+      }
+      if ! "${PODMAN_RUN[@]}" "$DS4_TP_CONTAINER_IMAGE" -c \
+          '[[ $(ulimit -l) == unlimited ]] && [[ -c /dev/kfd && -d /dev/dri && -e /dev/infiniband/uverbs0 ]] && command -v ibv_devinfo >/dev/null && ibv_devinfo -d "$1" -l >/dev/null && "$2/ds4" --help >/dev/null' \
+          _ "$LOCAL_RDMA_DEVICE" "$REPO"; then
+        echo "error: local container cannot execute DS4 or discover GPU/InfiniBand with unlimited memlock" >&2
+        exit 1
+      fi
+      if [[ -n $CONTAINER_INIT ]]; then
+        "${PODMAN_RUN[@]}" "$DS4_TP_CONTAINER_IMAGE" -c "set -e; $CONTAINER_INIT; true" || {
+          echo "error: DS4_TP_CONTAINER_INIT failed in a fresh local container" >&2
+          exit 1
+        }
+      fi
+      local podman_q
+      printf -v podman_q '%q ' "${PODMAN_RUN[@]}"
+      local peer_device_q peer_repo_q
+      printf -v peer_device_q '%q' "$PEER_RDMA_DEVICE"
+      printf -v peer_repo_q '%q' "$PEER_REPO"
+      "${SSH[@]}" "$podman_q '$DS4_TP_CONTAINER_IMAGE' -c '[[ \$(ulimit -l) == unlimited ]] && [[ -c /dev/kfd && -d /dev/dri && -e /dev/infiniband/uverbs0 ]] && command -v ibv_devinfo >/dev/null && ibv_devinfo -d \"\$1\" -l >/dev/null && \"\$2/ds4\" --help >/dev/null' _ $peer_device_q $peer_repo_q" || {
+        echo "error: peer container cannot execute DS4 or discover GPU/InfiniBand with unlimited memlock" >&2
+        exit 1
+      }
+      local peer_image_id
+      peer_image_id=$("${SSH[@]}" "podman image inspect --format '{{.Id}}' '$DS4_TP_CONTAINER_IMAGE'") || {
+        echo "error: peer container image cannot be inspected" >&2; exit 1;
+      }
+      [[ ${peer_image_id,,} == ${DS4_TP_CONTAINER_IMAGE_ID,,} ]] || {
+        echo "error: peer container image ID differs from local pinned image" >&2
+        exit 1
+      }
+      "${SSH[@]}" "test -d '$DS4_TP_CONTAINER_VOLUME' -a -d '$DS4_TP_CONTAINER_WRITABLE_VOLUME'" || {
+        echo "error: peer container volumes are missing" >&2; exit 1;
+      }
+      local peer_volume_q peer_writable_q
+      printf -v peer_volume_q '%q' "$DS4_TP_CONTAINER_VOLUME"
+      printf -v peer_writable_q '%q' "$DS4_TP_CONTAINER_WRITABLE_VOLUME"
+      "${SSH[@]}" "v=\$(realpath -e -- $peer_volume_q) && w=\$(realpath -e -- $peer_writable_q) && [[ \$v != / && \$v != /home && \$v != /root && \$v != /etc && \$v != /var && \$v != /tmp && \$v != \$w ]] && (getent passwd | awk -F: -v p=\"\$v\" '\$6 == p { bad=1 } END { exit bad }') && [[ ! -e \"\$v/.ssh\" && ! -e \"\$v/.aws\" && ! -e \"\$v/.config\" ]]" || {
+        echo "error: peer container volumes are broad, credential-bearing, or identical" >&2
+        exit 1
+      }
+      if [[ -n $CONTAINER_INIT ]]; then
+        local peer_init_q
+        printf -v peer_init_q '%q' "set -e; $CONTAINER_INIT; true"
+        "${SSH[@]}" "$podman_q '$DS4_TP_CONTAINER_IMAGE' -c $peer_init_q" || {
+          echo "error: DS4_TP_CONTAINER_INIT failed in a fresh peer container" >&2
+          exit 1
+        }
+      fi
+    else
+      sudo -n true || {
+        echo "error: passwordless sudo is required to give the RDMA service unlimited memlock" >&2
+        exit 1
+      }
+    fi
+    if [[ $RDMA_PROFILE == roce-v2 ]]; then
+      grep -qx 'RoCE v2' \
+        "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX" || {
+        echo "error: local mlx5 GID is not available as RoCE v2" >&2; exit 1;
+      }
+      "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX')\" = 'RoCE v2'" || {
+        echo "error: peer binary/model or RoCE v2 GID is unavailable" >&2; exit 1;
+      }
+    else
+      [[ "$(cat "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/link_layer" 2>/dev/null)" == InfiniBand ]] || {
+        echo "error: local $LOCAL_RDMA_DEVICE is not a native InfiniBand port" >&2; exit 1;
+      }
+      [[ "$(cat "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/state" 2>/dev/null)" == "4: ACTIVE" ]] || {
+        echo "error: local $LOCAL_RDMA_DEVICE port is not ACTIVE" >&2; exit 1;
+      }
+      [[ "$(cat "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/lid" 2>/dev/null)" != 0x0 ]] || {
+        echo "error: local $LOCAL_RDMA_DEVICE has no LID; is a subnet manager running?" >&2; exit 1;
+      }
+      "${SSH[@]}" "test -x '$PEER_REPO/ds4' -a -r '$MODEL' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/link_layer')\" = InfiniBand && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/state')\" = '4: ACTIVE' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/lid')\" != '0x0'" || {
+        echo "error: peer binary/model or native-InfiniBand port is unavailable" >&2; exit 1;
+      }
+    fi
+    if [[ $CONTAINER == 0 ]]; then
+      local peer_memlock
+      peer_memlock=$("${SSH[@]}" 'ulimit -l')
+      if [[ $peer_memlock != unlimited ]] &&
+         { [[ ! $peer_memlock =~ ^[0-9]+$ ]] || (( peer_memlock < 131072 )); }; then
+        echo "error: peer locked-memory limit is ${peer_memlock} KiB; RDMA deployment requires at least 128 MiB" >&2
+        exit 1
+      fi
     fi
   fi
   local local_bin peer_bin
   local_bin=$(sha256sum "$REPO/ds4" | awk '{print $1}')
   peer_bin=$("${SSH[@]}" "sha256sum '$PEER_REPO/ds4'" | awk '{print $1}')
   [[ $local_bin == "$peer_bin" ]] || { echo "error: node binaries differ" >&2; exit 1; }
+  local peer_server_hash
+  peer_server_hash=$("${SSH[@]}" "sha256sum '$PEER_REPO/ds4-server'" | awk '{print $1}')
+  [[ ${peer_server_hash,,} == ${DS4_SERVER_SHA256,,} ]] || {
+    echo "error: peer ds4-server does not match DS4_SERVER_SHA256" >&2; exit 1;
+  }
   [[ $(sample_fingerprint "$MODEL") == "$(remote_fingerprint "$MODEL")" ]] || {
     echo "error: target-model fingerprints differ" >&2; exit 1;
   }
@@ -213,6 +374,10 @@ preflight() {
   mkdir -p "$RUNTIME" "$(dirname -- "$LOCAL_LOG")"
   printf -v peer_research_deploy_q '%q' "$DS4_PEER_RESEARCH_ROOT/deployment"
   "${SSH[@]}" "mkdir -p $peer_research_deploy_q"
+  if [[ $CONTAINER == 1 ]]; then
+    printf -v writable_deploy_q '%q' "$WRITABLE_VOLUME/deployment"
+    "${SSH[@]}" "mkdir -p $writable_deploy_q"
+  fi
 }
 
 start() {
@@ -226,9 +391,15 @@ start() {
   ss -ltnH "sport = :$API_PORT" | grep -q . && {
     echo "error: API port $API_PORT is already listening" >&2; exit 1;
   }
-  "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 0;; esac; test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker' && exit 7; fi; exit 0" || {
-    rc=$?; [[ $rc == 7 ]] && echo "error: owned worker is already running" >&2; exit "$rc";
-  }
+  if [[ $CONTAINER == 1 ]]; then
+    local running
+    running=$("${SSH[@]}" "podman ps -q --filter name=$CONTAINER_WORKER --filter status=running")
+    [[ -n $running ]] && { echo "error: owned worker is already running" >&2; exit 1; }
+  else
+    "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 0;; esac; test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker' && exit 7; fi; exit 0" || {
+      rc=$?; [[ $rc == 7 ]] && echo "error: owned worker is already running" >&2; exit "$rc";
+    }
+  fi
 
   local -a common worker coordinator decode_env support_args
   local -a worker_rdma_args coordinator_rdma_args
@@ -320,14 +491,48 @@ start() {
   printf -v repo_q '%q' "$PEER_REPO"
   printf -v log_q '%q' "$WORKER_LOG"
   printf -v pid_q '%q' "$WORKER_PIDFILE"
-  # Keep the background operator scoped to ds4 itself. With `cd && cmd &`,
-  # POSIX shells background the whole AND-list and `$!` names a wrapper shell.
-  "${SSH[@]}" "cd $repo_q || exit 1; nohup setsid $worker_q >$log_q 2>&1 </dev/null & p=\$!; echo \$p >$pid_q"
+  if [[ $CONTAINER == 1 ]]; then
+    local worker_inner podman_q inner_q
+    if [[ -n $CONTAINER_INIT ]]; then
+      worker_inner="set -e; $CONTAINER_INIT; exec $worker_q >$log_q 2>&1"
+    else
+      worker_inner="exec $worker_q >$log_q 2>&1"
+    fi
+    printf -v podman_q '%q ' "${PODMAN_RUN[@]}"
+    printf -v inner_q '%q' "$worker_inner"
+    # Detached worker container; the pid file stores the container id and
+    # stdout lands in the same host log file as in host mode.
+    "${SSH[@]}" "$podman_q -d --name $CONTAINER_WORKER -w $repo_q '$DS4_TP_CONTAINER_IMAGE' -c $inner_q >$pid_q"
+  else
+    # Keep the background operator scoped to ds4 itself. With `cd && cmd &`,
+    # POSIX shells background the whole AND-list and `$!` names a wrapper shell.
+    "${SSH[@]}" "cd $repo_q || exit 1; nohup setsid $worker_q >$log_q 2>&1 </dev/null & p=\$!; echo \$p >$pid_q"
+  fi
 
-  # RoCE registration needs more than the user manager's inherited 8 MiB hard
-  # memlock limit. A system transient unit can genuinely raise that limit;
-  # `systemctl --user show` only reports the requested, not effective, value.
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  local coordinator_cmd_q coordinator_inner
+  if [[ $CONTAINER == 1 ]]; then
+    # Container mode: the memlock limit is the container's ulimit, so the
+    # coordinator is a --user transient unit supervising a foreground
+    # podman run (SIGTERM reaches the container through the client).
+    printf -v coordinator_cmd_q '%q ' "${coordinator[@]}"
+    # set -e makes a failed fixup abort the unit before the binary starts.
+    if [[ -n $CONTAINER_INIT ]]; then
+      coordinator_inner="set -e; $CONTAINER_INIT; exec $coordinator_cmd_q"
+    else
+      coordinator_inner="exec $coordinator_cmd_q"
+    fi
+    systemd-run --user --unit="$COORD_UNIT" --collect --service-type=exec \
+      --property="WorkingDirectory=$REPO" \
+      --property="StandardOutput=append:$LOCAL_LOG" \
+      --property="StandardError=append:$LOCAL_LOG" \
+      "${PODMAN_RUN[@]}" --name "$COORD_UNIT" -w "$REPO" \
+        "$DS4_TP_CONTAINER_IMAGE" \
+        -c "$coordinator_inner" >/dev/null
+  elif [[ $RDMA_PROFILE != odinlink ]]; then
+    # Mellanox RDMA registration needs more than the user manager's inherited
+    # 8 MiB hard memlock limit. A system transient unit can genuinely raise
+    # that limit; `systemctl --user show` only reports the requested, not
+    # effective, value.
     sudo -n systemd-run --unit="$COORD_UNIT" --collect --service-type=exec \
       --uid="$(id -u)" --gid="$(id -g)" \
       --property="WorkingDirectory=$REPO" \
@@ -346,13 +551,28 @@ start() {
   coord_pid=$(coord_main_pid)
   [[ $coord_pid =~ ^[1-9][0-9]*$ ]] || {
     echo "error: coordinator service failed to start" >&2
+    "${SSH[@]}" "podman stop -t 10 '$CONTAINER_WORKER' >/dev/null 2>&1 || true"
     return 1
   }
-  if [[ $RDMA_PROFILE == roce-v2 ]]; then
+  if [[ $CONTAINER == 1 ]]; then
+    local container_memlock
+    container_memlock=
+    for _ in $(seq 1 50); do
+      container_memlock=$(podman exec "$COORD_UNIT" /bin/bash -c 'ulimit -l' 2>/dev/null || true)
+      [[ $container_memlock == unlimited ]] && break
+      sleep 0.2
+    done
+    [[ $container_memlock == unlimited ]] || {
+      echo "error: coordinator container memlock is ${container_memlock:-unavailable}, expected unlimited" >&2
+      coord_stop_service
+      "${SSH[@]}" "podman stop -t 10 '$CONTAINER_WORKER' >/dev/null 2>&1 || true"
+      return 1
+    }
+  elif [[ $RDMA_PROFILE != odinlink ]]; then
     local effective_memlock
     effective_memlock=$(awk '$1 == "Max" && $2 == "locked" && $3 == "memory" { print $4 }' "/proc/$coord_pid/limits")
     [[ $effective_memlock == unlimited ]] || {
-      echo "error: coordinator effective memlock is $effective_memlock, expected unlimited" >&2
+      echo "error: coordinator effective memlock is ${effective_memlock}, expected unlimited" >&2
       coord_stop_service
       return 1
     }
@@ -369,7 +589,14 @@ stop() {
   elif pid_matches "$LOCAL_PIDFILE" "ds4-server"; then
     pid=$(<"$LOCAL_PIDFILE"); kill -TERM "$pid"; echo "stopped coordinator $pid"
   fi
-  "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 0;; esac; if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then kill -TERM \"\$p\"; echo stopped-worker-\$p; fi; fi"
+  if [[ $CONTAINER == 1 ]]; then
+    # Backstop for containers that outlived their unit (e.g. after a crash);
+    # --rm removes them on stop.
+    podman stop -t 60 "$COORD_UNIT" >/dev/null 2>&1 || true
+    "${SSH[@]}" "podman stop -t 60 '$CONTAINER_WORKER' >/dev/null 2>&1 || true"
+  else
+    "${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); case \"\$p\" in ''|*[!0-9]*) exit 0;; esac; if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then kill -TERM \"\$p\"; echo stopped-worker-\$p; fi; fi"
+  fi
 }
 
 status() {
@@ -383,9 +610,13 @@ status() {
   else
     echo "coordinator: stopped"
   fi
-  worker_state=$("${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then echo worker-running-pid-\$p; else echo worker-stopped; fi; else echo worker-stopped; fi" 2>/dev/null) || worker_state=worker-unreachable
+  if [[ $CONTAINER == 1 ]]; then
+    worker_state=$("${SSH[@]}" "if test -n \"\$(podman ps -q --filter name=$CONTAINER_WORKER --filter status=running)\"; then echo worker-running-container; else echo worker-stopped; fi" 2>/dev/null) || worker_state=worker-unreachable
+  else
+    worker_state=$("${SSH[@]}" "if test -r '$WORKER_PIDFILE'; then p=\$(cat '$WORKER_PIDFILE'); if test -r /proc/\$p/cmdline && tr '\\0' ' ' < /proc/\$p/cmdline | grep -Fq -- 'ds4 --role worker'; then echo worker-running-pid-\$p; else echo worker-stopped; fi; else echo worker-stopped; fi" 2>/dev/null) || worker_state=worker-unreachable
+  fi
   echo "$worker_state"
-  [[ $worker_state == worker-running-pid-* ]] && worker_ok=1
+  [[ $worker_state == worker-running-* ]] && worker_ok=1
   if curl --silent --show-error --fail --max-time 3 "http://$API_HOST:$API_PORT/health" >/dev/null; then
     api_ok=1
     if ((coord_ok && worker_ok)); then
@@ -407,10 +638,11 @@ logs() {
 }
 
 case ${1:-status} in
+  preflight) preflight ;;
   start) start ;;
   stop) stop ;;
   restart) stop; start ;;
   status) status ;;
   logs) logs ;;
-  *) echo "usage: $0 {start|stop|restart|status|logs}" >&2; exit 2 ;;
+  *) echo "usage: $0 {preflight|start|stop|restart|status|logs}" >&2; exit 2 ;;
 esac

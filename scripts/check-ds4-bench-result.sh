@@ -9,6 +9,8 @@ EXPECTED_FNV64=${4:-}
 EXPECTED_TOKENS=${5:?missing expected generated-token count}
 REQUIRE_SEMANTIC=${6:-0}
 RDMA_PROFILE=${7:-odinlink}
+RDMA_DEVICE=${8:-}
+RDMA_GID_INDEX=${9:-}
 
 for path in "$CSV" "$COORD_LOG" "$WORKER_LOG"; do
   [[ -r $path ]] || { echo "error: missing benchmark evidence: $path" >&2; exit 1; }
@@ -62,7 +64,7 @@ ACTUAL_FNV64=$(read_csv_field gen_token_fnv64) || {
 }
 
 "$(dirname -- "$0")/check-tp-rdma-logs.sh" \
-  "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE"
+  "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$RDMA_DEVICE" "$RDMA_GID_INDEX"
 if [[ $REQUIRE_SEMANTIC == 1 ]]; then
   grep -q 'ds4-bench: semantic suite passed cases=2' "$COORD_LOG" || {
     echo "error: candidate did not pass the complete semantic suite; rejecting result" >&2

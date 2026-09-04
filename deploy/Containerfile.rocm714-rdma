@@ -1,0 +1,10 @@
+FROM docker.io/kyuz0/vllm-rocm-gfx1151@sha256:0b1657cb060dd38b40e85ca4018404cdb43d726432fbfaee89418806713b3820
+
+# Keep userspace verbs and its providers from the same distribution/ABI.
+# Host kernel drivers, sysfs and character devices are supplied at run time.
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ibverbs-providers=50.0-2ubuntu0.2 \
+      ibverbs-utils=50.0-2ubuntu0.2 \
+      libibverbs1=50.0-2ubuntu0.2 \
+ && rm -rf /var/lib/apt/lists/*
