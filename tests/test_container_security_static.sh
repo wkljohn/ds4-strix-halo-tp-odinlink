@@ -9,6 +9,11 @@ containerfile=$repo/deploy/Containerfile.rocm714-rdma
 grep -q 'DS4_TP_CONTAINER_IMAGE_ID' "$launcher"
 grep -q 'DS4_TP_CONTAINER_IMAGE_ID must be the 64-hex content ID' "$launcher"
 grep -q 'peer container image ID differs' "$launcher"
+grep -q 'local container name .* belongs to another image; refusing to replace it' "$launcher"
+grep -q 'peer container name .* belongs to another image; refusing to replace it' "$launcher"
+grep -q 'coordinator name/unit is not owned by the pinned image; refusing to stop it' "$launcher"
+grep -q 'peer container name .* is not owned by the pinned image; refusing to stop it' "$launcher"
+grep -q 'worker-image-mismatch' "$launcher"
 grep -q -- '--entrypoint /bin/bash' "$launcher"
 grep -q -- '--cap-drop=all' "$launcher"
 grep -q -- '--security-opt no-new-privileges' "$launcher"
@@ -18,6 +23,7 @@ grep -q '^FROM .*@sha256:' "$containerfile"
 grep -q 'ibverbs-providers=' "$containerfile"
 grep -q 'ibverbs-utils=' "$containerfile"
 grep -q 'command -v ibv_devinfo' "$launcher"
+test -x "$repo/tests/test_container_ownership.sh"
 
 if grep -q -- '--security-opt label=disable' "$launcher"; then
   echo 'FAIL label separation is disabled by default' >&2
