@@ -23,7 +23,7 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 |---|---|---:|---:|---|
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
 | **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | current branch probe; exact FNV `2a44e523bf2d7947` |
-| **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **233.04 t/s** | **19.17 t/s** | three-run median, exact fingerprint |
+| **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **270.34 t/s** | **20.52 t/s** | current validation run; exact FNV `0163c44015591445`, zero fallback |
 | **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **310.65 t/s** | **21.21 t/s** | two-run midpoint; exact FNV `0163c44015591445` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
@@ -165,7 +165,7 @@ validated userspace provider is pinned below:
 sudo apt install build-essential cmake linux-headers-"$(uname -r)" \
   libibverbs-dev rdma-core pkg-config libglib2.0-dev
 git clone https://github.com/wkljohn/OdinLink-Five.git
-git -C OdinLink-Five checkout 8a77ccbf051b5a615a2b4d9a75ede10af524614a
+git -C OdinLink-Five checkout 8b34b13beb4a0123301602c5853044257962af0a
 cmake -S OdinLink-Five -B OdinLink-Five/build \
   -DBUILD_VERBS=ON -DBUILD_DAEMON=ON -DBUILD_TRAY=OFF
 cmake --build OdinLink-Five/build -j"$(nproc)" \
@@ -180,9 +180,12 @@ device and link before loading the model:
 ```sh
 ls -l /dev/odl_tb5_0
 # Node 1
-./OdinLink-Five/build/cli/odl_tb5_cli --server --device 0
+./OdinLink-Five/build/cli/odl_tb5_cli server -d 0
 # Node 2
-./OdinLink-Five/build/cli/odl_tb5_cli --client --device 0 --test latency
+./OdinLink-Five/build/cli/odl_tb5_cli client -d 0 -t latency
+
+# Either node: verify USB4, discovery, driver handshake, and READY state
+./OdinLink-Five/build/cli/odl_tb5_cli diag -v
 ```
 
 Set `DS4_ODINLINK_ROOT`, both `odl_tb5_0` device names, and the coordinator's
