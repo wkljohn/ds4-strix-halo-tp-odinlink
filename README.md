@@ -182,9 +182,9 @@ device and link before loading the model:
 ```sh
 ls -l /dev/odl_tb5_0
 # Node 1
-./OdinLink-Five/build/cli/odl_tb5_cli --server --device 0
+./OdinLink-Five/build/cli/odl_tb5_cli server -d 0
 # Node 2
-./OdinLink-Five/build/cli/odl_tb5_cli --client --device 0 --test latency
+./OdinLink-Five/build/cli/odl_tb5_cli client -d 0 -t latency
 ```
 
 Set `DS4_ODINLINK_ROOT`, both `odl_tb5_0` device names, and the coordinator's
