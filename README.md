@@ -24,25 +24,39 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
 | **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | current branch probe; exact FNV `2a44e523bf2d7947` |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **233.04 t/s** | **19.17 t/s** | three-run median, exact fingerprint |
-| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **255.49 t/s** | **21.01 t/s** | current GLM-branch probe; exact FNV `2a44e523bf2d7947` |
+| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **303.27 t/s** | **21.10 t/s** | three-run median; exact FNV `0163c44015591445` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
 
-### GLM-5.3 Flash TP=2 research-branch performance
+### Q4_K throughput through 10K context
+
+![Antirez DeepSeek V4 Flash Q4_K TP=2 throughput through 10K context](speed-bench/strix_halo_tp2_q4_roce_10k_ts.svg)
+
+This RoCE v2 sweep follows the upstream `ds4-bench` convention: each point
+adds 2,048 prompt tokens at the stated context frontier, then measures 300
+generated tokens. It uses the same diverse prompt corpus throughout. The
+separate full 10,240-token prefill has a three-run median of **289.23 t/s**;
+its decode median is **18.76 t/s**.
+
+```sh
+DS4_BENCH_RDMA_PROFILE=roce-v2 \
+  ./scripts/run-tp-context-sweep.sh q4-context-sweep \
+  /absolute/path/to/DeepSeek-V4-Flash-Q4_K.gguf
+```
+
+### GLM-5.3 Flash TP=2 performance
 
 These `ds4-bench-tp` results use the diverse 4,096-token prefill plus
-300-token decode workload at batch 256. They require research branch
-[`research/glm5-kb-lds-exact`](https://github.com/wkljohn/ds4-strix-halo-tp-odinlink/tree/ee9ca905f090a974b56fbfc2b92ed3d821dd0dd6)
-at commit `ee9ca90`; they are not yet enabled by `main`.
+300-token decode workload at batch 256. The staged GLM-5.3 Flash TP=2 path is
+included in this fork and remains isolated from DeepSeek's graph executor.
 
 | Configuration | Measurement | Prefill | Decode | Status |
 |---|---|---:|---:|---|
-| **GLM-5.3 Flash Q4_K over RoCE v2** | three source-clean runs | **78.59 t/s** | **9.45 t/s** | three-run median; runs were 78.59/9.45, 77.78/9.54, and 79.05/9.42, FNV `9012bd4d7c5ce422` |
+| **GLM-5.3 Flash Q4_K over RoCE v2** | three source-clean runs | **78.59 t/s** | **9.45 t/s** | three-run median; current-source control 79.57/9.36, same FNV `9012bd4d7c5ce422` |
 | **GLM-5.3 Flash Q4_K over OdinLink** | one matched provider run | **76.00 t/s** | **9.43 t/s** | zero fallback; FNV `9012bd4d7c5ce422` |
 | **GLM-5.3 Flash Q2 over RoCE v2** | 2,048-token control workload | **21.87–21.95 t/s** | **3.48–3.49 t/s** | opt-in mixed IQ2_XXS/Q2_K path; repeated fingerprint matched |
 
-The Q4_K candidate keeps all 4,096 prompt rows batched, adds no persistent
-weight cache, and uses 45.07 MiB of reusable scratch per rank. It remains
-default-off pending its Lane-B quality review and three-run OdinLink median.
+The Q4_K path keeps all 4,096 prompt rows batched, adds no persistent weight
+cache, and uses 45.07 MiB of reusable scratch per rank.
 
 The DeepSeek table above uses `ds4-bench-tp`: a fixed 2,048-token prefill
 followed by 300 generated tokens over mandatory RDMA. Its current Q4_K rows
@@ -53,10 +67,10 @@ and Q4_K run without a persistent expanded-weight cache.
 The `main` branch tracks the pinned ROCm 7.14 gfx1151 toolchain used for these
 release results.
 
-GLM-5.3 Flash support is an experimental TP=2 staged path in this branch; it
-keeps the model's KDA state sharded by attention head and does not change the
-validated DeepSeek production path. The branch launcher applies the validated
-cache-free GLM staged environment and the full-logits sampling contract. The
+GLM-5.3 Flash support uses a staged TP=2 path that keeps the model's KDA state
+sharded by attention head and does not change the validated DeepSeek production
+path. The launcher applies the validated cache-free GLM staged environment and
+the full-logits sampling contract. The
 sampling-mode correction is documented in
 `research-results/glm5-next-tp2/deployment-debug-20260903.md`; the full staged
 optimization record is in
@@ -80,7 +94,7 @@ policy, and maintainer gates are preserved locally under
 |---|---|---|
 | [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the current Q4_K OdinLink and RoCE v2 rows. |
 | [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. The Q2_K file is used for the current Q2_K row. |
-| [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | **Experimental only.** TP=2 staged support; not yet an ordinary production server path. |
+| [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | Supported through the staged TP=2 path; Q4 is the validated reference configuration. |
 | Unsloth DeepSeek V4 Flash 0731 `UD-*` target weights | — | **Not supported:** their mixed-precision tensor layouts do not match the currently validated DS4 target paths. |
 
 The Unsloth warning applies to `UD-*` target-model weights, not to a separately

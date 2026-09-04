@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<style>
+text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+.title { font-size: 26px; font-weight: 700; fill: #1f2933; }
+.axis-label { font-size: 14px; font-weight: 600; fill: #334155; }
+.tick { font-size: 12px; fill: #64748b; }
+.legend { font-size: 13px; font-weight: 600; fill: #1f2933; }
+</style>
+<rect width="960" height="540" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">DeepSeek V4 Flash Q4_K · 2× Strix Halo · RoCE v2</text>
+<line x1="82" y1="468.00" x2="878" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="472.00" text-anchor="end">0</text>
+<line x1="82" y1="367.50" x2="878" y2="367.50" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="371.50" text-anchor="end">100</text>
+<line x1="82" y1="267.00" x2="878" y2="267.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="271.00" text-anchor="end">200</text>
+<line x1="82" y1="166.50" x2="878" y2="166.50" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="170.50" text-anchor="end">300</text>
+<line x1="82" y1="66.00" x2="878" y2="66.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="70" y="70.00" text-anchor="end">400</text>
+<text class="tick" x="890" y="472.00" text-anchor="start">0</text>
+<text class="tick" x="890" y="391.60" text-anchor="start">5</text>
+<text class="tick" x="890" y="311.20" text-anchor="start">10</text>
+<text class="tick" x="890" y="230.80" text-anchor="start">15</text>
+<text class="tick" x="890" y="150.40" text-anchor="start">20</text>
+<text class="tick" x="890" y="70.00" text-anchor="start">25</text>
+<line x1="82.00" y1="66" x2="82.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="82.00" y="492" text-anchor="middle">0</text>
+<line x1="237.47" y1="66" x2="237.47" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="237.47" y="492" text-anchor="middle">2k</text>
+<line x1="392.94" y1="66" x2="392.94" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="392.94" y="492" text-anchor="middle">4k</text>
+<line x1="548.41" y1="66" x2="548.41" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="548.41" y="492" text-anchor="middle">6k</text>
+<line x1="703.88" y1="66" x2="703.88" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="703.88" y="492" text-anchor="middle">8k</text>
+<line x1="859.34" y1="66" x2="859.34" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="859.34" y="492" text-anchor="middle">10k</text>
+<line x1="82" y1="66" x2="82" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="878" y1="66" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<line x1="82" y1="468" x2="878" y2="468" stroke="#334155" stroke-width="1.4"/>
+<text class="axis-label" x="480.0" y="520" text-anchor="middle">ctx size</text>
+<text class="axis-label" x="22" y="267.0" text-anchor="middle" transform="rotate(-90 22 267.0)">prefill t/s</text>
+<text class="axis-label" x="938" y="267.0" text-anchor="middle" transform="rotate(90 938 267.0)">generation t/s</text>
+<polyline fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="241.20,140.35 400.40,176.80 559.60,179.50 718.80,184.66 878.00,189.85"/>
+<polyline fill="none" stroke="#dc2626" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="241.20,129.36 400.40,159.42 559.60,160.55 718.80,164.73 878.00,166.98"/>
+<rect x="694" y="66" width="176" height="62" rx="6" fill="#ffffff" stroke="#cbd5e1"/>
+<rect x="708" y="78" width="12" height="12" fill="#2563eb"/>
+<text class="legend" x="730" y="89">prefill</text>
+<rect x="708" y="104" width="12" height="12" fill="#dc2626"/>
+<text class="legend" x="730" y="115">generation</text>
+</svg>
