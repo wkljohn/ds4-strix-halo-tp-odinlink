@@ -28887,10 +28887,10 @@ static bool metal_graph_batch_heads_expand_owned_half(
 
 /* TP prefill threshold for row-splitting the replicated shared expert.
  * Routed experts remain ownership-split at every batch size. */
-/* Attention and FFN have separate row-split thresholds. The ROCm attention
- * range kernels are implemented and hardware-correct, but their added TP
- * exchange measured flat/slightly negative, so attention stays off by default.
- * The FFN split remains useful and keeps its independent threshold below. */
+/* Attention and FFN have separate row-split thresholds.  The repaired ROCm
+ * range path is exact, and current TP=2 hardware validation shows a clear win
+ * once a chunk reaches 2048 rows.  Keep smaller chunks replicated: their
+ * exchange crossover has not been established on both RDMA providers. */
 static uint32_t metal_graph_tp_prefill_split_min_attn(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -28900,10 +28900,7 @@ static uint32_t metal_graph_tp_prefill_split_min_attn(void) {
             cached = atoi(env);
         } else {
 #ifdef DS4_ROCM_BUILD
-            /* Hardware A/B: replicated mean 99.25 t/s, forced split mean
-             * 98.75 t/s. Keep the correct range path available for experiments
-             * without paying its output exchange in normal TP=2 prefill. */
-            cached = 1000000;
+            cached = 2048;
 #else
             cached = 32;
 #endif
