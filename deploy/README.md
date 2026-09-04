@@ -22,6 +22,12 @@ deploy/ds4-tp-caddy.sh status
 `config.env.local`. Startup fails closed if that pin does not match, so a stale
 coordinator cannot use a different TP gate schedule from the worker.
 
+Run the launcher on the coordinator. It opens an SSH session from the
+coordinator to `PEER_MGMT`; install that coordinator user's public key on the
+worker and verify `ssh -o BatchMode=yes` succeeds first. Keep `PEER_MGMT` on an
+independent NetworkManager-managed Ethernet or Wi-Fi address, not an OdinLink
+or Thunderbolt address.
+
 The launcher starts both independent model loads together, validates the
 selected RDMA provider plus matching binary and sampled model fingerprints,
 and refuses to replace unrelated processes. It uses a 262,144-token context
@@ -62,12 +68,57 @@ be shared. Logs are retained under
 
 Set `RDMA_PROFILE=roce-v2`, `COORDINATOR_RDMA_ADDR=192.168.99.1`,
 `LOCAL_RDMA_DEVICE=mlx5_0`, `PEER_RDMA_DEVICE=mlx5_1`, and
-`RDMA_GID_INDEX=3` for Mellanox. `ODINLINK_ROOT` is then unnecessary.
-RoCE also requires passwordless `sudo` for the launcher: the coordinator runs
-as the system transient service `ds4-tp-coordinator.service` with an actually
-unlimited locked-memory limit. The launcher verifies that effective process
-limit and checks the peer's SSH-session limit before model loading. OdinLink
-retains its transient user service and does not acquire this requirement.
+`RDMA_GID_INDEX=3` for Mellanox RoCE v2. `ODINLINK_ROOT` is then unnecessary.
+For a direct Mellanox InfiniBand cable (ConnectX-3, `mlx4`), set
+`RDMA_PROFILE=ib-mlx4`, the coordinator's InfiniBand interface address as
+`COORDINATOR_RDMA_ADDR`, `LOCAL_RDMA_DEVICE`/`PEER_RDMA_DEVICE` from
+`ibv_devinfo -l` on each node, and `RDMA_GID_INDEX=0`. A subnet manager
+(`opensm`) must run on one node so both ports get LIDs; the launcher checks
+link layer, ACTIVE state, and LID on both sides before model loading.
+Mellanox RDMA (RoCE v2 or InfiniBand) also requires passwordless `sudo` for
+the launcher: the coordinator runs as the system transient service
+`ds4-tp-coordinator.service` with an actually unlimited locked-memory limit.
+The launcher verifies that effective process limit and checks the peer's
+SSH-session limit before model loading. OdinLink retains its transient user
+service and does not acquire this requirement.
+
+Set `DS4_TP_CONTAINER=1` (plus the image reference, content-addressed image ID, dedicated
+read-only artifact volume, separate writable runtime volume, and optional init command)
+to run both ranks in podman containers instead, for hosts where ROCm exists
+only inside a container image. The memlock requirement then moves into the
+container (`--ulimit memlock=-1`), the coordinator runs as a `systemd --user`
+transient unit supervising a foreground `podman run`, the peer worker is a
+detached `--rm` container, and passwordless `sudo` is not required. The
+launcher probes the image, GPU/InfiniBand device access, and the memlock
+limit inside a throwaway container on both nodes before model loading. It
+refuses mutable tags, mismatched image IDs, broad/home/credential directories,
+and missing peer volumes. Container mode is a dedicated-host, administrator-
+only trust boundary: host networking/IPC and `/dev/kfd` remain necessary for
+this TP/RDMA design.
+
+Before enabling it, install the exact same image on both nodes and record its
+content identity:
+
+```sh
+podman build --pull=never -f deploy/Containerfile.rocm714-rdma \
+  -t localhost/ds4-rocm714-rdma:local .
+podman image inspect --format '{{.Id}} {{.Digest}} {{join .RepoDigests " "}}' \
+  localhost/ds4-rocm714-rdma:local
+```
+
+The supplied Containerfile pins the ROCm 7.14/gfx1151 base-image digest and
+installs matching, version-pinned Ubuntu `libibverbs` providers and inspection
+utilities. Do not bind-mount provider libraries from the host: a host/container
+ABI mismatch makes verbs discovery fail and may not be caught until after the
+large model has loaded.
+
+Set `DS4_TP_CONTAINER_IMAGE` to that local tag (or a registry digest) and
+`DS4_TP_CONTAINER_IMAGE_ID` to the 64-hex `.Id` returned on both nodes. Do not
+use a tag that was built independently on each machine. When an image is
+transferred with `podman save|load`, the manifest digest may be rewritten; the
+content-addressed image ID is therefore the mandatory parity pin. Use a dedicated pair
+of directories such as `/srv/ds4-container` and `/srv/ds4-container-runtime`;
+the launcher mounts artifacts read-only and runtime state separately.
 
 Useful commands:
 
@@ -77,9 +128,35 @@ deploy/ds4-tp-caddy.sh stop
 caddy validate --config /etc/caddy/Caddyfile
 ```
 
-The local Caddy route should proxy to `127.0.0.1:8090` with streaming flush
-enabled and a response timeout long enough for initial model loading. Keep
-port 8090 loopback-only; do not bypass Caddy's authentication at the firewall.
+The launcher requires Caddy to be installed, configured, and active before
+`start`. A fresh Ubuntu image can be bootstrapped with:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y caddy
+sudoedit /etc/caddy/Caddyfile
+```
+
+A minimal local configuration for the initial preflight is:
+
+```caddyfile
+:8080 {
+    reverse_proxy 127.0.0.1:8090
+}
+```
+
+Validate and activate it:
+
+```sh
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl enable --now caddy
+systemctl is-active caddy
+```
+
+Replace the bootstrap listener with the production TLS/authentication route as
+appropriate. It should proxy to `127.0.0.1:8090` with streaming flush enabled
+and a response timeout long enough for initial model loading. Keep port 8090
+loopback-only; do not bypass Caddy's authentication at the firewall.
 
 ## Agent-client completion limits
 

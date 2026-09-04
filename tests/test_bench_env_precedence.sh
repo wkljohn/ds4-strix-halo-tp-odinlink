@@ -33,6 +33,25 @@ printf '%s\n' \
   'DS4_COORDINATOR_ADDR=192.168.99.1' \
   > "$config"
 
+# Minimal GGUF whose only metadata is general.architecture; the harness
+# inspects the model architecture before its validate-config exit, so
+# /dev/null is unusable as the model argument.
+model=$test_dir/model.gguf
+python3 - "$model" <<'PY'
+import struct, sys
+def s(x):
+    b = x.encode()
+    return struct.pack('<Q', len(b)) + b
+with open(sys.argv[1], 'wb') as f:
+    f.write(b'GGUF')
+    f.write(struct.pack('<I', 3))
+    f.write(struct.pack('<Q', 0))
+    f.write(struct.pack('<Q', 1))
+    f.write(s('general.architecture'))
+    f.write(struct.pack('<I', 8))
+    f.write(s('deepseek4'))
+PY
+
 run_validate() {
   env -i PATH="$PATH" LANG=C.UTF-8 \
     DS4_BENCH_CONFIG="$config" \
@@ -91,8 +110,13 @@ if run_validate DS4_BENCH_RDMA_PROFILE=bogus >"$test_dir/bogus.out" 2>&1; then
   echo 'FAIL invalid-provider-still-rejected: unexpectedly succeeded' >&2
   exit 1
 fi
-grep -q 'must be odinlink or roce-v2' "$test_dir/bogus.out"
+grep -q 'must be odinlink, roce-v2, or ib-mlx4' "$test_dir/bogus.out"
 echo 'PASS invalid-provider-still-rejected'
+
+expect_contains ib-mlx4-profile-defaults \
+  'rdma_profile=ib-mlx4 coordinator_addr=192.168.100.1 coordinator_rdma_device=ibp195s0 worker_rdma_device=ibp195s0 rdma_gid_index=0 prefill_chunk=4096' \
+  DS4_BENCH_RDMA_PROFILE=ib-mlx4 \
+  DS4_COORDINATOR_ADDR=192.168.100.1
 
 if env -i PATH="$PATH" LANG=C.UTF-8 \
     DS4_BENCH_CONFIG="$config" \

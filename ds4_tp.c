@@ -257,6 +257,12 @@ static int tp_rdma_gid_is_ipv4_mapped(const union ibv_gid *gid) {
     return hi == 0 && mid == 0 && v4tag == 0xffff;
 }
 
+static int tp_rdma_gid_nonzero(const union ibv_gid *gid) {
+    for (int i = 0; i < 16; i++)
+        if (gid->raw[i]) return 1;
+    return 0;
+}
+
 #if defined(__linux__)
 static int tp_rdma_gid_type_sysfs(const char *device_name, int index) {
     char path[PATH_MAX];
@@ -902,10 +908,12 @@ static void tp_slab_layout(ds4_tp *tp) {
         (tp->aux_payload_bytes ? (uint64_t)tp->n_layer * DS4_TP_AUX_STRIDE : 0u);
     tp->big_capacity_rows = tp_big_direct_max_rows();
 #ifdef DS4_TP_HAVE_VERBS
-    /* ConnectX-4 Lx on the reference gfx1151 nodes can pin/register the
-     * 152 MiB 2048-row layout but rejects the 270/481 MiB 4096/8192-row
-     * layouts with ENOMEM. OdinLink does not have this restriction. */
-    if (tp->rdma.is_mlx5 && tp->big_capacity_rows > 2048u)
+    /* Real NICs on the reference gfx1151 nodes can pin/register the
+     * 152 MiB 2048-row layout but reject the 270/481 MiB 4096/8192-row
+     * layouts (ConnectX-4 Lx with ENOMEM). OdinLink does not have this
+     * restriction. */
+    if (tp->rdma_active && !tp->rdma.is_odinlink &&
+        tp->big_capacity_rows > 2048u)
         tp->big_capacity_rows = 2048u;
 #endif
     tp->big_out_off = tp->aux_in_off +
@@ -1055,6 +1063,30 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     /* One verbs device per Thunderbolt port (rdma_enN); pick the active one
      * unless the caller selected a device explicitly. */
     const char *want_name = tp->opt.rdma_device;
+    if (!want_name) {
+        int active = 0;
+        char active_names[256] = "";
+        for (int i = 0; i < num; i++) {
+            const char *name = r->api.get_device_name(devs[i]);
+            struct ibv_context *ctx = r->api.open_device(devs[i]);
+            if (!ctx) continue;
+            struct ibv_port_attr pa;
+            if (r->api.query_port(ctx, 1, &pa) == 0 &&
+                pa.state == IBV_PORT_ACTIVE) {
+                active++;
+                size_t off = strlen(active_names);
+                snprintf(active_names + off, sizeof(active_names) - off,
+                         "%s%s", off ? ", " : "", name);
+            }
+            r->api.close_device(ctx);
+        }
+        if (active > 1)
+            fprintf(stderr,
+                    "ds4-tp: warning: %d verbs devices have an active port "
+                    "(%s); using the first in enumeration order. Pin the "
+                    "device with --rdma-device.\n",
+                    active, active_names);
+    }
     char states[256] = "";
     for (int i = 0; i < num && !r->ctx; i++) {
         const char *name = r->api.get_device_name(devs[i]);
@@ -1125,11 +1157,27 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
                 break;
             }
         }
+#if defined(__linux__)
+        if (r->gid_index < 0 && !r->is_odinlink &&
+            r->port.link_layer == IBV_LINK_LAYER_INFINIBAND) {
+            /* A native InfiniBand port carries no IPv4 address in its GID
+             * table; the canonical entry is GID 0 (derived from the port
+             * GUID/LID). */
+            union ibv_gid tmp = {0};
+            const int gid_type = tp_rdma_query_gid_type(r, 0, &tmp);
+            if (gid_type >= 0 && tp_rdma_gid_nonzero(&tmp)) {
+                r->gid = tmp;
+                r->gid_index = 0;
+                r->gid_type = gid_type;
+            }
+        }
+#endif
         if (r->gid_index < 0) {
             tp_set_err(err, errlen,
-                       "tp rdma: no IPv4-mapped GID on the active port; give the "
-                       "Thunderbolt interface its own IPv4 (e.g. sudo ifconfig en1 "
-                       "inet 10.99.0.2/30 alias) on both machines");
+                       "tp rdma: no usable GID on the active port of %s; RoCE "
+                       "ports need the network interface to have its own IPv4 "
+                       "address on both machines",
+                       r->device_name);
             return 0;
         }
     }
@@ -1154,11 +1202,15 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     struct ibv_qp_init_attr qia = {0};
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
-    /* DS4-TP-gfx1151 (patch 8): try UC, fall back to RC. OdinLink's verbs
-     * provider rejects everything except IBV_QPT_RC
-     * (odl_tb5_verbs_qp.c:250). RC keeps the connected, in-order semantics
-     * this transport depends on and merely adds reliability. */
-    qia.qp_type = r->is_mlx5 ? IBV_QPT_RC : IBV_QPT_UC;
+    /* DS4-TP-gfx1151 (patch 8): RC for every real (non-OdinLink) device.
+     * The exchange is full-duplex post-recv/post-send, and UC silently drops
+     * a SEND that reaches the peer before its RECV WR is armed (no RNR
+     * retry) -- on a low-latency native-IB link that leaves the peer's recv
+     * pending forever. RC's RNR retry keeps the connected, in-order
+     * semantics and closes the race. Only the OdinLink shim keeps the
+     * UC-first attempt; its verbs provider rejects UC and falls back to RC
+     * (odl_tb5_verbs_qp.c:250). */
+    qia.qp_type = r->is_odinlink ? IBV_QPT_UC : IBV_QPT_RC;
     qia.cap.max_send_wr = 256;
     qia.cap.max_recv_wr = 64;
     qia.cap.max_send_sge = 1;
@@ -1181,6 +1233,8 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     r->use_rc = qia.qp_type == IBV_QPT_RC;
     if (r->is_mlx5)
         fprintf(stderr, "ds4-tp: mlx5 queue pair uses RC\n");
+    else if (r->use_rc)
+        fprintf(stderr, "ds4-tp: %s queue pair uses RC\n", r->device_name);
     r->max_inline = qia.cap.max_inline_data;
 
     pthread_mutex_init(&r->post_lock, NULL);
@@ -1227,6 +1281,10 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
                    (unsigned long long)core_bytes, strerror(errno));
         return 0;
     }
+    if (!r->is_mlx5)
+        fprintf(stderr,
+                "ds4-tp: %s registered slab as 1 MR (%.2f MiB)\n",
+                r->device_name, (double)core_bytes / 1048576.0);
     ds4_tp_rdma_info mine = {0};
     mine.slab_base = (uint64_t)(uintptr_t)tp->slab;
     mine.rkey = r->mr->rkey;
@@ -1296,7 +1354,9 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     a.ah_attr.grh.hop_limit = r->is_mlx5 ? 64 : 1;
     int rtr_mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
                    IBV_QP_DEST_QPN | IBV_QP_RQ_PSN;
-    if (r->is_mlx5) {
+    /* RC-only attributes for non-OdinLink providers: the OdinLink shim's
+     * RC QP is validated without them. */
+    if (r->use_rc && !r->is_odinlink) {
         a.max_dest_rd_atomic = 1;
         a.min_rnr_timer = 12;
         rtr_mask |= IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER;
@@ -1309,7 +1369,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     a.qp_state = IBV_QPS_RTS;
     a.sq_psn = mine.psn;
     int rts_mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
-    if (r->is_mlx5) {
+    if (r->use_rc && !r->is_odinlink) {
         a.timeout = 14;
         a.retry_cnt = 7;
         a.rnr_retry = 7;
@@ -2704,7 +2764,11 @@ bool ds4_tp_big_gate_is_direct(const ds4_tp *tp, const void *out,
 }
 bool ds4_tp_requires_host_slab(const ds4_tp *tp) {
 #ifdef DS4_TP_HAVE_VERBS
-    return tp && tp->rdma_active && tp->rdma.is_mlx5;
+    /* Every real verbs device on these nodes registers the slab from
+     * host-mapped memory: VRAM hipMalloc addresses cannot be pinned as an
+     * MR (reg_mr EFAULT on mlx4, and the mlx5 path is host-slab by design).
+     * Only the OdinLink shim maps VRAM allocations itself. */
+    return tp && tp->rdma_active && !tp->rdma.is_odinlink;
 #else
     (void)tp;
     return false;

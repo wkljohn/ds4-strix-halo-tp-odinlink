@@ -98,8 +98,14 @@ case $RDMA_PROFILE in
       exit 2
     }
     ;;
+  ib-mlx4)
+    COORDINATOR_ADDR=${DS4_COORDINATOR_ADDR:-}
+    LOCAL_RDMA_DEVICE=${DS4_LOCAL_RDMA_DEVICE:-ibp195s0}
+    PEER_RDMA_DEVICE=${DS4_PEER_RDMA_DEVICE:-ibp195s0}
+    RDMA_GID_INDEX=${DS4_RDMA_GID_INDEX:-0}
+    ;;
   *)
-    echo "error: DS4_BENCH_RDMA_PROFILE must be odinlink or roce-v2" >&2
+    echo "error: DS4_BENCH_RDMA_PROFILE must be odinlink, roce-v2, or ib-mlx4" >&2
     exit 2
     ;;
 esac
@@ -886,6 +892,26 @@ if [[ $RDMA_PROFILE == odinlink ]]; then
   "${PEER_SSH[@]}" "test -r '$MODEL' -a -r /dev/odl_tb5_0 -a -r '$VERBS_LIB'" || {
     echo "error: peer model, OdinLink device, or provider unavailable" >&2; exit 1;
   }
+elif [[ $RDMA_PROFILE == ib-mlx4 ]]; then
+  [[ "$(cat "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/link_layer" 2>/dev/null)" == InfiniBand ]] || {
+    echo "error: local $LOCAL_RDMA_DEVICE is not a native InfiniBand port" >&2; exit 1;
+  }
+  [[ "$(cat "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/state" 2>/dev/null)" == "4: ACTIVE" ]] || {
+    echo "error: local $LOCAL_RDMA_DEVICE port is not ACTIVE" >&2; exit 1;
+  }
+  [[ "$(cat "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/lid" 2>/dev/null)" != 0x0 ]] || {
+    echo "error: local $LOCAL_RDMA_DEVICE has no LID; is a subnet manager running?" >&2; exit 1;
+  }
+  [[ -r /sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX ]] || {
+    echo "error: local GID index $RDMA_GID_INDEX unavailable: $LOCAL_RDMA_DEVICE" >&2; exit 1;
+  }
+  grep -qx 'IB/RoCE v1' \
+    "/sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX" || {
+    echo "error: local GID index $RDMA_GID_INDEX is not IB/RoCE v1" >&2; exit 1;
+  }
+  "${PEER_SSH[@]}" "test -r '$MODEL' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/link_layer')\" = InfiniBand && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/state')\" = '4: ACTIVE' && test \"\$(cat '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/lid')\" != '0x0' && grep -qx 'IB/RoCE v1' '/sys/class/infiniband/$PEER_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX'" || {
+    echo "error: peer model or native-InfiniBand port unavailable" >&2; exit 1;
+  }
 else
   [[ -r /sys/class/infiniband/$LOCAL_RDMA_DEVICE/ports/1/gid_attrs/types/$RDMA_GID_INDEX ]] || {
     echo "error: local mlx5 RoCE device unavailable: $LOCAL_RDMA_DEVICE" >&2; exit 1;
@@ -1277,13 +1303,13 @@ if [[ $DECODE_SELF_CHECK == 1 ]]; then
       exit 1
     }
   "$REPO/scripts/check-tp-rdma-logs.sh" \
-    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE"
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" "${RDMA_GID_INDEX-}"
   echo "TP_DECODE_SELF_CHECK_PASSED"
   exit 0
 fi
 if [[ $TEACHER_FORCE_CONTROL == 1 ]]; then
   "$REPO/scripts/check-tp-rdma-logs.sh" \
-    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE"
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" "${RDMA_GID_INDEX-}"
   if [[ $RECORD_TEACHER_BASELINE == 1 ]]; then
     grep -E 'ds4-bench: teacher-force control complete .*mismatch_fnv64=[0-9a-f]{16} .*enforced=0' \
       "$COORD_LOG" || {
@@ -1303,7 +1329,7 @@ if [[ $TEACHER_FORCE_CONTROL == 1 ]]; then
 fi
 if [[ -n $FROZEN_TOKEN_FILE ]]; then
   "$REPO/scripts/check-tp-rdma-logs.sh" \
-    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE"
+    "$COORD_LOG" "$WORKER_LOG" "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" "${RDMA_GID_INDEX-}"
   completion=$(grep -E 'ds4-bench: frozen teacher logits complete prefix=[0-9]+ tokens=[0-9]+ ' \
     "$COORD_LOG" | tail -1 || true)
   [[ -n $completion ]] || {
@@ -1361,6 +1387,6 @@ if [[ -n $DUMP_GENERATED_TOKEN_FILE ]]; then
 fi
 "$REPO/scripts/check-ds4-bench-result.sh" \
   "$CSV" "$COORD_LOG" "$WORKER_LOG" "$EXPECTED_FNV64" "$TOKENS" "$CANDIDATE" \
-  "$RDMA_PROFILE"
+  "$RDMA_PROFILE" "$LOCAL_RDMA_DEVICE" "${RDMA_GID_INDEX-}"
 cat "$CSV"
 echo RUN_DONE
