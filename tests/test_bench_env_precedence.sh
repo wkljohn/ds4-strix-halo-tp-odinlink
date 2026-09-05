@@ -83,8 +83,8 @@ expect_contains invocation-provider-and-address-win \
   DS4_BENCH_RDMA_PROFILE=odinlink \
   DS4_COORDINATOR_ADDR=10.4.0.1
 
-expect_contains odinlink-low-bandwidth-attention-default \
-  'tp_prefill_split_min_attn=4096' \
+expect_contains odinlink-attention-direct-default \
+  'tp_prefill_split_min_attn=2048' \
   DS4_BENCH_RDMA_PROFILE=odinlink \
   DS4_COORDINATOR_ADDR=10.4.0.1
 

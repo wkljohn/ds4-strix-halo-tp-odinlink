@@ -109,16 +109,11 @@ case $RDMA_PROFILE in
     exit 2
     ;;
 esac
-# A 2,048-row attention split exchanges a large activation slab on every
-# layer. It wins on the validated 25 Gb/s RoCE link, but a 20 Gb/s-raw
-# OdinLink path (about 9.2 Gb/s measured payload) is faster when both ranks
-# compute attention locally. Keep the split available at 4,096 rows; trailing
-# runtime environment settings still override this launcher default.
-if [[ $RDMA_PROFILE == odinlink ]]; then
-  TP_PREFILL_SPLIT_MIN_ATTN_DEFAULT=4096
-else
-  TP_PREFILL_SPLIT_MIN_ATTN_DEFAULT=2048
-fi
+# The registered-slab attention output removes the former OdinLink staging
+# penalty, so the exact row-split path is profitable at the validated 2,048
+# rows on both providers. Trailing runtime environment settings can still
+# override this launcher default for diagnosis.
+TP_PREFILL_SPLIT_MIN_ATTN_DEFAULT=2048
 PROMPT_FILE=${DS4_BENCH_PROMPT_FILE:-$REPO/bench-prompts/codex-attn-rowsplit-implement-brief.md}
 FRONTIER=${DS4_BENCH_FRONTIER:-2048}
 FRONTIER_MAX=${DS4_BENCH_FRONTIER_MAX:-$FRONTIER}
