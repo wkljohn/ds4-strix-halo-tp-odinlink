@@ -465,7 +465,8 @@ start() {
     common=(env
       DS4_TP_ODINLINK_BATCH_ASYNC=1
       DS4_TP_VERBS_LIB="$VERBS_LIB"
-      LD_LIBRARY_PATH="$ODL_LD_PATH")
+      LD_LIBRARY_PATH="$ODL_LD_PATH"
+      ODL_RDMA_GID_IFACE="${ODL_RDMA_GID_IFACE:-thunderbolt0}")
     worker_rdma_args=(--rdma-device "$PEER_RDMA_DEVICE")
     coordinator_rdma_args=(--rdma-device "$LOCAL_RDMA_DEVICE")
   else
