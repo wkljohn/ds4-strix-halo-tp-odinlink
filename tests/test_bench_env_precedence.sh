@@ -83,6 +83,15 @@ expect_contains invocation-provider-and-address-win \
   DS4_BENCH_RDMA_PROFILE=odinlink \
   DS4_COORDINATOR_ADDR=10.4.0.1
 
+expect_contains odinlink-attention-direct-default \
+  'tp_prefill_split_min_attn=2048' \
+  DS4_BENCH_RDMA_PROFILE=odinlink \
+  DS4_COORDINATOR_ADDR=10.4.0.1
+
+expect_contains roce-attention-split-default \
+  'tp_prefill_split_min_attn=2048' \
+  DS4_BENCH_RDMA_PROFILE=roce-v2
+
 if run_validate DS4_BENCH_RDMA_PROFILE=odinlink \
     >"$test_dir/mixed-profile.out" 2>&1; then
   echo 'FAIL changed-provider-requires-address: unexpectedly succeeded' >&2

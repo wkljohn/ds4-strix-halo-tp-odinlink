@@ -24,8 +24,16 @@ native Mellanox InfiniBand cable (ConnectX-3, `mlx4`).
 | Original Q4_K baseline | archived pre-acceleration TP=2 run | **34.11 t/s** | **9.96 t/s** | historical baseline, not single-node scaling |
 | **Huihui Q2_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **197.08 t/s** | **19.89 t/s** | current branch probe; exact FNV `2a44e523bf2d7947` |
 | **Antirez Q4_K over OdinLink** | balanced 50/50, 2,048-token chunk | **270.34 t/s** | **20.52 t/s** | current validation run; exact FNV `0163c44015591445`, zero fallback |
-| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **310.65 t/s** | **21.21 t/s** | two-run midpoint; exact FNV `0163c44015591445` |
+| **Antirez Q4_K over RoCE v2** | balanced 50/50, 2,048-token chunk | **311.50 t/s** | **21.21 t/s** | current validation run; exact FNV `0163c44015591445` |
 | **Current Q4_K + DSpark** | 46/54 split | — | — | experimental revalidation pending |
+
+The registered-slab attention exchange is validated with both listed Q4_K
+layouts and both RDMA providers. On the affected OdinLink pair, the second
+Q4_K layout improved from 147.99 to **286.29 prefill t/s** while preserving
+**21.10 decode t/s**; its matched RoCE v2 run reached **319.05/21.22 t/s**.
+Both kept the exact token fingerprint and zero fallback. The repair reuses the
+existing communication slab, adds no cache, and replaces a separate 32 MiB
+attention-output allocation at the validated 2,048-row cap.
 
 ### Q4_K throughput through 10K context
 
@@ -93,7 +101,7 @@ policy, and maintainer gates are preserved locally under
 | Model source | Tested target files | Support |
 |---|---|---|
 | [Antirez DeepSeek V4 GGUF](https://huggingface.co/antirez/deepseek-v4-gguf) | `DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf` (164,633,502,592 bytes) | **Recommended.** Used for the current Q4_K OdinLink and RoCE v2 rows. |
-| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai/Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. The Q2_K file is used for the current Q2_K row. |
+| [Huihui DeepSeek V4 Flash 0731 GGUF](https://huggingface.co/huihui-ai) | `DeepSeek-V4-Flash-Q2_K-0731.gguf`; `DeepSeek-V4-Flash-Q4_K-0731.gguf` | Supported. The Q2_K file is used for the current Q2_K row. |
 | [GLM-5.3 Flash GGUF](https://huggingface.co/antirez/glm-5.3-flash-gguf) | GLM-5.3 Flash Q4/Q2 GGUF targets | Supported through the staged TP=2 path; Q4 is the validated reference configuration. |
 | Unsloth DeepSeek V4 Flash 0731 `UD-*` target weights | — | **Not supported:** their mixed-precision tensor layouts do not match the currently validated DS4 target paths. |
 
