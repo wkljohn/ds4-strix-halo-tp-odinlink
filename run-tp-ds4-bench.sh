@@ -109,6 +109,16 @@ case $RDMA_PROFILE in
     exit 2
     ;;
 esac
+# A 2,048-row attention split exchanges a large activation slab on every
+# layer. It wins on the validated 25 Gb/s RoCE link, but a 20 Gb/s-raw
+# OdinLink path (about 9.2 Gb/s measured payload) is faster when both ranks
+# compute attention locally. Keep the split available at 4,096 rows; trailing
+# runtime environment settings still override this launcher default.
+if [[ $RDMA_PROFILE == odinlink ]]; then
+  TP_PREFILL_SPLIT_MIN_ATTN_DEFAULT=4096
+else
+  TP_PREFILL_SPLIT_MIN_ATTN_DEFAULT=2048
+fi
 PROMPT_FILE=${DS4_BENCH_PROMPT_FILE:-$REPO/bench-prompts/codex-attn-rowsplit-implement-brief.md}
 FRONTIER=${DS4_BENCH_FRONTIER:-2048}
 FRONTIER_MAX=${DS4_BENCH_FRONTIER_MAX:-$FRONTIER}
@@ -693,7 +703,7 @@ else
       DS4_ROCM_Q4K_DECODE_STAGE_XQ=1
       DS4_TP_GREEDY_TOP2=1
       DS4_TP_HOST_CALLBACK=1
-      DS4_TP_PREFILL_SPLIT_MIN_ATTN=2048
+      DS4_TP_PREFILL_SPLIT_MIN_ATTN="$TP_PREFILL_SPLIT_MIN_ATTN_DEFAULT"
       DS4_TP_PREFILL_SPLIT_RESUMED=1
       DS4_TP_SUBGATE_PIPELINE=0
       DS4_TP_PREFILL_FFN_WAVEFRONT=1
@@ -726,7 +736,7 @@ fi
 }
 
 if [[ $VALIDATE_CONFIG_ONLY == 1 ]]; then
-  echo "validated_config model_arch=$MODEL_ARCH rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK prefill_batch=${GLM5_PREFILL_BATCH:-n/a} prefill_arg=$([[ $MODEL_ARCH == glm5-next ]] && echo omitted || echo passed) routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE candidate_lane=$CANDIDATE_LANE baseline_id=${BASELINE_ID:-n/a} tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} q2_zero_weight_tile_skip=$([[ $MODEL_ARCH == deepseek4 && ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
+  echo "validated_config model_arch=$MODEL_ARCH rdma_profile=$RDMA_PROFILE coordinator_addr=$COORDINATOR_ADDR coordinator_rdma_device=$LOCAL_RDMA_DEVICE worker_rdma_device=$PEER_RDMA_DEVICE rdma_gid_index=${RDMA_GID_INDEX:-n/a} prefill_chunk=$PREFILL_CHUNK prefill_batch=${GLM5_PREFILL_BATCH:-n/a} prefill_arg=$([[ $MODEL_ARCH == glm5-next ]] && echo omitted || echo passed) routed_expert_family=${ROUTED_FAMILY:-DSPARK} candidate=$CANDIDATE candidate_lane=$CANDIDATE_LANE baseline_id=${BASELINE_ID:-n/a} tp_prefill_skip_unowned=${TP_PREFILL_SKIP_UNOWNED:-n/a} tp_prefill_split_min_attn=$TP_PREFILL_SPLIT_MIN_ATTN_DEFAULT q2_zero_weight_tile_skip=$([[ $MODEL_ARCH == deepseek4 && ${ROUTED_FAMILY:-} == HYBRID_Q2 ]] && echo 1 || echo 0)"
   exit 0
 fi
 

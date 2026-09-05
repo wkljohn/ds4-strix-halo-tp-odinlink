@@ -51,6 +51,13 @@ GLM5_ENABLE_ORDINARY=${GLM5_ENABLE_ORDINARY:-0}
 GLM5_FULL_LOGITS=${GLM5_FULL_LOGITS:-0}
 GLM5_PREFILL_BATCH=${GLM5_PREFILL_BATCH:-256}
 PREFILL_FFN_WAVEFRONT=${PREFILL_FFN_WAVEFRONT:-1}
+if [[ -z ${PREFILL_ATTN_SPLIT_MIN:-} ]]; then
+  if [[ $RDMA_PROFILE == odinlink ]]; then
+    PREFILL_ATTN_SPLIT_MIN=4096
+  else
+    PREFILL_ATTN_SPLIT_MIN=2048
+  fi
+fi
 Q8_M256_K128=${Q8_M256_K128:-1}
 HC_STAGE_EXACT_COOP=${HC_STAGE_EXACT_COOP:-1}
 INDEXER_TOPK_RADIX_TREE=${INDEXER_TOPK_RADIX_TREE:-1}
@@ -167,6 +174,9 @@ is_uint "$CONTEXT" && is_uint "$PREFILL_CHUNK" && is_uint "$EXPERT_SPLIT" &&
 }
 is_uint "$GLM5_PREFILL_BATCH" || {
   echo "error: GLM5_PREFILL_BATCH must be a positive integer" >&2; exit 2;
+}
+is_uint "$PREFILL_ATTN_SPLIT_MIN" || {
+  echo "error: PREFILL_ATTN_SPLIT_MIN must be a positive integer" >&2; exit 2;
 }
 [[ $PREFILL_FFN_WAVEFRONT == 0 || $PREFILL_FFN_WAVEFRONT == 1 ]] || {
   echo "error: PREFILL_FFN_WAVEFRONT must be 0 or 1" >&2; exit 2;
@@ -475,6 +485,9 @@ start() {
     DS4_ROCM_STREAM_Q8_F16_CACHE_GB=0
     DS4_ROCM_Q8_DECODE_PAIR_DP4A=0
     DS4_ROCM_Q4K_DECODE_STAGE_XQ=1)
+  if (( model_is_glm5 == 0 )); then
+    common+=(DS4_TP_PREFILL_SPLIT_MIN_ATTN="$PREFILL_ATTN_SPLIT_MIN")
+  fi
   if [[ $GLM5_ENABLE_ORDINARY == 1 ]]; then
     echo "warning: GLM-5.3 ordinary session integration is explicitly enabled; this is an experimental deployment" >&2
     common+=(DS4_GLM5_NEXT_ENABLE_ORDINARY=1
