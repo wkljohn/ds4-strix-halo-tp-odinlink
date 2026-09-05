@@ -24,25 +24,26 @@ automatic replacement of a promoted table row.
 ## GLM-5.3 Flash Q4_K probe
 
 The executable was rebuilt from this same commit with the pinned ROCm
-7.14/gfx1151 toolchain and synchronized to the pair. The run used the staged
-ordinary GLM TP path, RoCE v2, batch 256, and the 4,096-token diverse prefill
-plus 300-token decode workload. Both ranks initialized correctly, but the
-coordinator produced no CSV row after approximately 11 minutes and the run
-was stopped. It is not a performance result and must not be published as one.
-
-The last valid GLM Q4_K source-clean record remains:
+7.14/gfx1151 toolchain and synchronized to the pair. The valid rerun used the
+staged ordinary GLM TP path, RoCE v2, batch 256, and the 4,096-token diverse
+prefill plus 300-token decode workload. Both ranks engaged the batched path,
+Q4_K WMMA, sparse NoPE F16 GEMM, and BF16 WMMA QKV/output kernels; the exact
+fingerprint and semantic checks passed.
 
 | Prefill | Decode | Fingerprint |
 |---:|---:|---|
-| 95.42 t/s | 9.95 t/s | `9012bd4d7c5ce422` |
+| **74.81 t/s** | **10.11 t/s** (10.12 steady) | `9012bd4d7c5ce422` |
 
-That record is archived at
+Raw evidence is archived at
+`$DS4_RESEARCH_ROOT/bench-runs/latest-pair-glm-q4-staged-20260905.{csv,manifest}`.
+The earlier 95.42/9.95 result came from a different source/binary build and is
+kept as historical comparison at
 `$DS4_RESEARCH_ROOT/bench-runs/glm5-q4-mainmerge-r1-20260904.csv`.
 
 ## Promotion state
 
 This branch contains documentation only; no production default or README
-promoted row was changed. Before merging new performance numbers, repeat the
-DeepSeek probe enough times for the applicable gate and diagnose the current
-GLM 7.14 hang. The failed GLM run left no inference process on either active
-node.
+promoted row was changed. The earlier minimal GLM probe was invalid and
+produced no row; the staged rerun above is the current valid measurement. The
+DeepSeek single run still needs the applicable repeated-run gate before it can
+replace the promoted table row because its fingerprint is different.
