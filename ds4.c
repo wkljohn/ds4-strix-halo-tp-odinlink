@@ -62206,6 +62206,32 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         ds4_gpu_tensor_free(s->graph.batch_routed_out_by_tier[0]);
                     }
                     s->graph.batch_routed_out_by_tier[0] = s->graph.tp_big_out;
+                    /* Attention and routed FFN execute serially within a
+                     * layer, so they can reuse the same registered output
+                     * region.  Use a distinct view descriptor: the prefill
+                     * workspace owns and frees both fields independently.
+                     * Without this alias the attention half-row swap falls
+                     * back to two CPU memcpys through the registered slab,
+                     * even though the following FFN exchange is direct. */
+                    if (g_ds4_shape.family == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+                        metal_graph_tp_env_flag(
+                            "DS4_TP_BIG_DIRECT_ATTN", true)) {
+                        ds4_gpu_tensor *attn_direct = ds4_gpu_tensor_view(
+                                e->tp.slab,
+                                ds4_tp_slab_big_out_offset(e->tp.ctx),
+                                big_bytes);
+                        if (attn_direct) {
+                            ds4_gpu_tensor_free(
+                                    s->graph.batch_attn_out_by_tier[0]);
+                            s->graph.batch_attn_out_by_tier[0] = attn_direct;
+                            fprintf(stderr,
+                                    "ds4-tp: attention big-gate direct=1 enabled\n");
+                        } else {
+                            fprintf(stderr,
+                                    "ds4-tp: attention big-gate direct view "
+                                    "creation failed, staying on the staged-copy path\n");
+                        }
+                    }
                     fprintf(stderr,
                             "ds4-tp: big-gate direct=1 enabled (capacity %u rows, "
                             "this session prefill_cap %u)\n",
