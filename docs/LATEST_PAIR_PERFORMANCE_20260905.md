@@ -4,22 +4,30 @@ This record covers only the current pair (`10.4.0.1` and `10.4.0.2`). Node
 182 was not contacted, rebooted, or used. The two checkouts were clean at
 commit `8f756592586d1274cc9e1849a0062d58baf3c39e` before the run.
 
-## Fresh DeepSeek Q4_K probe
+## DeepSeek Q4_K probes
 
 The run used `ds4-bench-tp`, the Antirez DeepSeek V4 Flash Q4_K model, RoCE
 v2 (`mlx5_0` / `mlx5_1`, GID 3), 2,048 prompt tokens plus 300 generated
 tokens, and a 2,048-token prefill chunk.
 
-| Prefill | Decode | Fingerprint | Result |
-|---:|---:|---|---|
-| 301.31 t/s | 19.57 t/s (19.60 steady) | `b7694f9d11a3760e` | valid single run; zero fallback; `kvcache_bytes=0` |
+The original single probe used an older ROCm 7.2 binary. It measured
+301.31/19.57 t/s and remains valid for that artifact, but it is not a sample of
+the current ROCm 7.14 build. After rebuilding, three source-clean ROCm 7.14
+runs produced:
 
-Raw evidence is retained at
-`$DS4_RESEARCH_ROOT/bench-runs/latest-pair-deepseek-q4-20260905.{csv,manifest}`.
-The manifest records source commit `8f756592...`, matching binary and model
-artifacts, and the exact workload. This fingerprint differs from the older
-promoted `0163c44015591445` row, so it is evidence for revalidation, not an
-automatic replacement of a promoted table row.
+| Run | Prefill | Decode | Fingerprint |
+|---|---:|---:|---|
+| 1 | 305.02 t/s | 21.12 t/s | `0163c44015591445` |
+| 2 | 333.22 t/s | 21.18 t/s | `0163c44015591445` |
+| 3 | 334.75 t/s | 21.17 t/s | `0163c44015591445` |
+| **Median** | **333.22 t/s** | **21.17 t/s** | exact match |
+
+Raw evidence is retained as
+`$DS4_RESEARCH_ROOT/bench-runs/warm-repeat-fixed-q4-r{2,3,4}-20260905.{csv,manifest}`.
+The manifests bind source commit `d97abb5...`, binary
+`c71bd76f...`, ROCm 7.14 toolchain fingerprint `d2346fc4...`, matching model
+and prompt artifacts, and the exact workload. The excluded ROCm 7.2 probe is
+kept at `latest-pair-deepseek-q4-20260905.{csv,manifest}` for provenance.
 
 ## GLM-5.3 Flash Q4_K probe
 
@@ -45,5 +53,5 @@ kept as historical comparison at
 This branch contains documentation only; no production default or README
 promoted row was changed. The earlier minimal GLM probe was invalid and
 produced no row; the staged rerun above is the current valid measurement. The
-DeepSeek single run still needs the applicable repeated-run gate before it can
-replace the promoted table row because its fingerprint is different.
+DeepSeek repeat series confirms the existing `0163c44015591445` arithmetic
+path and does not require a fingerprint promotion.
