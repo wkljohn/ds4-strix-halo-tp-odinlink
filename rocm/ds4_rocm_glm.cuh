@@ -4130,7 +4130,7 @@ static int glm_causal_gemm_scratch_part(
     return 1;
 }
 
-static int glm_attention_lora_causal_exact_head_shared(
+static int glm_attention_lora_causal_exact_head_shared_tile256(
         ds4_gpu_tensor *lora_out,
         const ds4_gpu_tensor *qk_low,
         const ds4_gpu_tensor *kv_lora_cache,
@@ -4223,6 +4223,63 @@ static int glm_attention_lora_causal_exact_head_shared(
                 n_selected, pos0, (unsigned long long)scratch_bytes,
                 (unsigned long long)reserve_bytes);
         logged_bytes = scratch_bytes;
+    }
+    return 1;
+}
+
+static int glm_attention_lora_causal_exact_head_shared(
+        ds4_gpu_tensor *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_selected,
+        uint32_t n_head,
+        uint32_t kv_lora_dim,
+        uint32_t qk_nope,
+        uint32_t qk_rope) {
+    if (n_tokens == 256u)
+        return glm_attention_lora_causal_exact_head_shared_tile256(
+            lora_out, qk_low, kv_lora_cache, n_tokens, pos0, n_selected,
+            n_head, kv_lora_dim, qk_nope, qk_rope);
+
+    uint32_t end_pos = 0u;
+    if ((n_tokens != 512u && n_tokens != 1024u) ||
+        n_head != 64u || kv_lora_dim != 512u || qk_nope != 256u ||
+        qk_rope != 0u ||
+        !glm_rocm_check_token_span(pos0, n_tokens, &end_pos) ||
+        n_selected != end_pos || n_selected > 2048u ||
+        !cuda_tensor_has_elems3(lora_out, n_tokens, n_head, kv_lora_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(qk_low, n_tokens, n_head, kv_lora_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems2(kv_lora_cache, n_selected, kv_lora_dim, sizeof(float)))
+        return 0;
+
+    /* Larger outer batches improve expert grouping and amortize layer/TP
+     * scheduling. Keep attention on its validated M256 geometry and bounded
+     * scratch. Match each serial tile's visible prefix, not merely its causal
+     * mask, so score layout and softmax/PV reduction spans stay unchanged. */
+    const uint64_t row_bytes = (uint64_t)n_head * kv_lora_dim * sizeof(float);
+    for (uint32_t base = 0u; base < n_tokens; base += 256u) {
+        const uint64_t offset = (uint64_t)base * row_bytes;
+        ds4_gpu_tensor out_view = *lora_out;
+        ds4_gpu_tensor low_view = *qk_low;
+        out_view.ptr = (char *)lora_out->ptr + offset;
+        low_view.ptr = (char *)qk_low->ptr + offset;
+        out_view.host_ptr = lora_out->host_ptr ? (char *)lora_out->host_ptr + offset : NULL;
+        low_view.host_ptr = qk_low->host_ptr ? (char *)qk_low->host_ptr + offset : NULL;
+        out_view.bytes = low_view.bytes = 256u * row_bytes;
+        out_view.owner = low_view.owner = 0;
+        const int result = glm_attention_lora_causal_exact_head_shared_tile256(
+            &out_view, &low_view, kv_lora_cache, 256u, pos0 + base,
+            pos0 + base + 256u, n_head, kv_lora_dim, qk_nope, qk_rope);
+        if (result != 1) return -1;  /* Never fall back over partial output. */
+    }
+    static int reported;
+    if (!reported) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "GLM exact head-shared attention M256 subtiles engaged "
+                "outer_tokens=%u scratch_capacity_unchanged=1\n", n_tokens);
+        reported = 1;
     }
     return 1;
 }
