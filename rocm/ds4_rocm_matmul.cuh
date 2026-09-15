@@ -1794,11 +1794,15 @@ static int cuda_glm5_bf16_qkv_with_panel(
                 panel_ptr, x_bytes, (uint64_t)(uintptr_t)weights[i],
                 weight_bytes)) return 0;
     }
-    if (panel && prepare_panel) {
-        if (((uintptr_t)x->ptr & 3u)) return 0;
-        ds4_bf16_hilo_prepare_kernel<<<(uint32_t)((x_elems + 255u) / 256u), 256>>>(
-            (uint32_t *)panel->ptr, (const float *)x->ptr, x_elems);
-        if (!cuda_ok(cudaGetLastError(), "GLM5 BF16 activation preparation")) return 0;
+    if (panel) {
+        if (prepare_panel) {
+            if (((uintptr_t)x->ptr & 3u)) return 0;
+            ds4_bf16_hilo_prepare_kernel<<<(uint32_t)((x_elems + 255u) / 256u), 256>>>(
+                (uint32_t *)panel->ptr, (const float *)x->ptr, x_elems);
+            if (!cuda_ok(cudaGetLastError(), "GLM5 BF16 activation preparation")) return 0;
+        }
+        // A fused RMSNorm producer has already filled the panel when
+        // prepare_panel is false. Both entries must use the panel consumer.
         matmul_bf16_f32_wmma_hilo_qkv_multiptr_kernel<1u><<<
             dim3(3u * ((uint32_t)out_dim / 32u), 1), 512>>>(
                 (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
