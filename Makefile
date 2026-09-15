@@ -448,6 +448,16 @@ test-rocm-glm5-nope-score: tests/test_rocm_glm5_nope_score
 		./tests/test_rocm_glm5_nope_score
 
 .PHONY: test-rocm-glm5-nope-attention
+.PHONY: test-rocm-glm5-dense-subtiles
+tests/test_rocm_glm5_dense_subtiles.o: tests/test_rocm_glm5_dense_subtiles.cu ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_dense_subtiles: tests/test_rocm_glm5_dense_subtiles.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
+test-rocm-glm5-dense-subtiles: tests/test_rocm_glm5_dense_subtiles
+	./tests/test_rocm_glm5_dense_subtiles
+
 tests/test_rocm_glm5_nope_attention.o: tests/test_rocm_glm5_nope_attention.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
