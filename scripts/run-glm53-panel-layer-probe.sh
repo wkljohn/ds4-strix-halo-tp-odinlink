@@ -39,7 +39,8 @@ printf '%q ' "$hip/bin/hipcc" "${link[@]}" > LINK-COMMAND
 sha256sum probe test.o "${objects[@]}" TEST-SOURCE ENGINE-SOURCE \
     COMPILE-COMMAND LINK-COMMAND compiler.txt tests/* *.h scripts/* > BUILD-SHA256SUMS
 export DS4_GLM5_MODEL=${DS4_GLM5_MODEL:-/home/wkljohn/Desktop/cc/models/antirez-glm-5.3-flash-gguf/GLM-5.3-Flash-Q4_K.gguf}
+stat --printf='model=%n\nsize=%s\nmtime=%y\n' "$DS4_GLM5_MODEL" > MODEL-IDENTITY
 ./probe > probe.log 2>&1
-sha256sum probe.log > RESULT-SHA256SUMS
+sha256sum probe.log MODEL-IDENTITY > RESULT-SHA256SUMS
 printf 'artifact=%s\n' "$artifact"
 cat probe.log
