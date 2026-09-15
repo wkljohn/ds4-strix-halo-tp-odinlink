@@ -1,4 +1,4 @@
-// Original-GGUF QKV differential probe. Time includes activation preparation.
+// Selected-GGUF QKV differential probe. Time includes activation preparation.
 // No engine selector or weight copy. See the canonical candidate dossier.
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -90,8 +90,9 @@ int main() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     require(model && *model, "DS4_GLM5_MODEL required");
     Glm5TestGGUF gguf;
-    require(gguf.open_file(model), "open original GGUF");
-    require(gguf.size == UINT64_C(190875526464), "original model size");
+    require(gguf.open_file(model), "open selected GGUF");
+    // Validate every mapped tensor's shape/type below. Container byte size
+    // also reflects chat metadata and cannot identify compatible weights.
     hipDeviceProp_t props{};
     hip_check(hipGetDeviceProperties(&props, 0), "device properties");
     require(std::strstr(props.gcnArchName, "gfx1151") && props.warpSize == 32,
@@ -110,7 +111,8 @@ int main() {
     hip_check(hipEventCreate(&begin), "begin event");
     hip_check(hipEventCreate(&end), "end event");
     const char *names[] = {"kda_q.weight", "kda_k.weight", "kda_v.weight"};
-    std::puts("workload=original-GGUF-QKV M=256 K=4096 N=4096 inputs=changing-synthetic");
+    std::printf("workload=selected-GGUF-QKV model=%s model_bytes=%llu M=256 K=4096 N=4096 inputs=changing-synthetic\n",
+                model, (unsigned long long)gguf.size);
     std::puts("arm=0 raw-QKV arm=1 prepare-row-major+QKV arm=2 prepare-tiled+QKV scratch_bytes=4194304");
     std::puts("arm=3 prepare-padded-tiled+QKV scratch_bytes=4210688");
     for (uint32_t layer : {0u, 4u, 20u, 44u}) {

@@ -1,4 +1,4 @@
-// Real KDA adapter/state comparison; original GGUF, local TP-half composition.
+// Real KDA adapter/state comparison; selected GGUF, local TP-half composition.
 #include "ds4_glm5_kda.h"
 #include "ds4_gpu_mgpu.h"
 #include "tests/glm5_gguf_test.hpp"
@@ -283,7 +283,9 @@ int main() {
     const char *model = std::getenv("DS4_GLM5_MODEL");
     check(model && *model, "DS4_GLM5_MODEL required");
     Glm5TestGGUF g;
-    check(g.open_file(model) && g.size == UINT64_C(190875526464), "original GGUF");
+    check(g.open_file(model), "selected GGUF");
+    // bind() validates the complete KDA layer's shapes and quantization.
+    // Metadata-only differences must not reject another compatible artifact.
     float eps = 0;
     check(g.metadata("glm5-next.attention.layer_norm_rms_epsilon", eps) && eps == 1.0e-5f,
           "GGUF RMS epsilon");
