@@ -13,6 +13,10 @@ extern "C" int ds4_rocm_glm5_bf16_qkv_panel_tensor(
     ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *,
     uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
     const ds4_gpu_tensor *, uint64_t, ds4_gpu_tensor *);
+extern "C" int ds4_rocm_glm5_bf16_qkv_panel_ready_tensor(
+    ds4_gpu_tensor *, ds4_gpu_tensor *, ds4_gpu_tensor *, const void *,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+    const ds4_gpu_tensor *, uint64_t, ds4_gpu_tensor *);
 
 static void check(bool ok, const char *what) {
     if (!ok) { std::fprintf(stderr, "FAIL %s\n", what); std::exit(1); }
@@ -254,6 +258,27 @@ static void run(const Glm5TestGGUF &g, const ds4_glm5_kda_weight_offsets &w, flo
             std::printf("timing actual-norm-QKV rank=%u arm=%u median_ms=%.6f min_ms=%.6f max_ms=%.6f\n",
                         rank, arm, samples[arm][4], samples[arm][0], samples[arm][8]);
         }
+        // The ready entry must consume the existing panel, independently of
+        // its raw F32 source. Ordinary equality alone misses a dispatch bug
+        // that silently recomputes from x while ignoring the prepared panel.
+        const uint64_t norm_values = UINT64_C(256) * 4096u;
+        std::vector<float> saved_norm(norm_values), zeros(norm_values, 0.0f);
+        check(ds4_gpu_tensor_read(raw.workspace.norm, 0, saved_norm.data(),
+                                  norm_values * sizeof(float)), "save panel source");
+        check(ds4_gpu_tensor_write(raw.workspace.norm, 0, zeros.data(),
+                                   norm_values * sizeof(float)), "replace raw panel source");
+        auto &ws = prepared.workspace;
+        check(ds4_rocm_glm5_bf16_qkv_panel_ready_tensor(
+            ws.q, ws.k, ws.v, g.map, g.size,
+            w.q + offset, w.k + offset, w.v + offset,
+            4096, 4096, raw.workspace.norm, 256, ws.qkv_activation_panel) == 1,
+            "ready QKV accepts prepared panel");
+        equal(raw.workspace.q, ws.q, norm_values, "ready panel supplies Q");
+        equal(raw.workspace.k, ws.k, norm_values, "ready panel supplies K");
+        equal(raw.workspace.v, ws.v, norm_values, "ready panel supplies V");
+        check(ds4_gpu_tensor_write(raw.workspace.norm, 0, saved_norm.data(),
+                                   norm_values * sizeof(float)), "restore panel source");
+        std::printf("PASS ready panel consumed rank=%u independently of raw source\n", rank);
     }
     auto validate = [&](ds4_gpu_tensor *panel, unsigned tokens) {
         auto &ws = prepared.workspace;
