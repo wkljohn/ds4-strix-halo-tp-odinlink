@@ -4,11 +4,14 @@ This workflow covers ordinary inference, transport, kernel, and harness
 research. DSpark-specific checks apply only when a DSpark candidate is in
 scope. A local checkpoint records work; it is not permission to merge or push.
 
-For this GLM5.3 Flash goal, the user explicitly requires Antirez's original
-GGUF with unchanged weights and quantization (2026-09-13). Do not create or
-substitute a compact/requantized model or requantize weights at runtime.
-The compact-model tracks are paused and retained unmerged. Continue improving
-the original-model kernels, scheduling and mandatory RoCE v2 transport.
+The original GLM5.3 Flash track requires Antirez's unchanged GGUF (2026-09-13).
+The user subsequently selected `GLM-5.3-Flash-Uncensored-Q4_K-ds4.gguf` for a
+distinct support and performance scope (2026-09-15). Preserve each artifact's
+bytes and quantization. Establish a same-model baseline and quality reference;
+the original artifact's promotion does not approve the selected artifact.
+Do not substitute a compact/requantized model or requantize weights at runtime.
+Compact-model tracks remain paused and unmerged. Mandatory RoCE v2, zero
+payload fallback and no persistent expanded-weight cache still apply.
 
 ## Before a change
 

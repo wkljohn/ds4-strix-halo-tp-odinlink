@@ -309,15 +309,13 @@ pointing its base URL at `http://127.0.0.1:8090/v1` (or the Caddy URL), selectin
 the model name returned by `GET /v1/models`, and supplying the server API key if
 authentication is enabled.
 
-### GLM-5.3 branch deployment
+### GLM-5.3 deployment
 
-The ordinary GLM-5.3 TP launcher fix and its cache-free staged kernel settings
-are currently on the development branch, not `main`. Use the branch on both
-nodes before enabling GLM:
+The ordinary GLM-5.3 TP launcher and its cache-free staged kernel settings
+are included in `main`. Build the same source revision with the same ROCm
+toolchain on both nodes, or deploy matching binaries from one build:
 
 ```sh
-git fetch origin research/glm5-kb-lds-exact
-git switch --detach origin/research/glm5-kb-lds-exact
 make -j"$(nproc)" strix-halo
 ```
 
@@ -330,6 +328,15 @@ GLM5_ENABLE_ORDINARY=1
 GLM5_FULL_LOGITS=0
 GLM5_PREFILL_BATCH=256
 ```
+
+The selected `GLM-5.3-Flash-Uncensored-Q4_K-ds4.gguf` also runs through this
+path without converting its weights. Set `MODEL` to that file's absolute path
+on both nodes. Its kernel research and performance promotion are separate from
+the Antirez measurements above. For the mandatory RoCE v2 configuration, set
+`RDMA_PROFILE=roce-v2`, the local/peer Mellanox devices and `RDMA_GID_INDEX=3`
+in the deployment config, and keep `DSPARK=0`. Start with `CONTEXT=16384`;
+benchmark evidence does not establish arbitrary long-context or multi-turn
+server correctness.
 
 Then populate `DS4_SERVER_SHA256` from the freshly built `ds4-server` and start
 both ranks with `deploy/ds4-tp-caddy.sh start`. The launcher applies GLM's
