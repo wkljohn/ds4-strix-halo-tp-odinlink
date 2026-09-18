@@ -165,6 +165,46 @@ static bool run_test(void) {
     CHECK(bad == 0u, "full vocabulary matches independent BF16 CPU oracle");
     CHECK(cpu_argmax == gpu_argmax, "CPU/GPU argmax agreement");
 
+    const uint32_t half = vocab / 2u;
+    ds4_gpu_tensor *half_logits = ds4_gpu_tensor_alloc((uint64_t)half * sizeof(float));
+    ds4_gpu_tensor *short_half = ds4_gpu_tensor_view(
+        half_logits, 0u, (uint64_t)(half - 1u) * sizeof(float));
+    CHECK(half_logits && short_half, "allocate half-head output");
+    CHECK(!ds4_glm5_next_output_logits_rows(
+              &exec, workspace, hidden, half_logits, 1u, half) &&
+          !ds4_glm5_next_output_logits_rows(
+              &exec, workspace, hidden, half_logits, 0u, 0u) &&
+          !ds4_glm5_next_output_logits_rows(
+              &exec, workspace, hidden, half_logits, vocab, half) &&
+          !ds4_glm5_next_output_logits_rows(
+              &exec, workspace, hidden, short_half, half, half),
+          "malformed and undersized half-head requests fail closed");
+    std::vector<float> full(vocab), composed(vocab);
+    for (uint32_t seed = 0u; seed < 3u; ++seed) {
+        for (size_t i = 0; i < host_hidden.size(); ++i)
+            host_hidden[i] = ((int)((i * 193u + seed * 761u + (i >> 3u) * 17u) % 997u) - 498) /
+                             (1001.3f + (float)(i % 7u));
+        CHECK(ds4_gpu_tensor_write(hidden, 0u, host_hidden.data(), host_hidden.size()*sizeof(float)) &&
+              ds4_glm5_next_output_logits(&exec, workspace, hidden, logits) &&
+              ds4_gpu_synchronize() &&
+              ds4_gpu_tensor_read(logits, 0u, full.data(), full.size()*sizeof(float)),
+              "full reference for half-head differential");
+        for (uint32_t rank = 0u; rank < 2u; ++rank) {
+            CHECK(ds4_gpu_tensor_fill_f32(half_logits,
+                      std::numeric_limits<float>::quiet_NaN(), half) &&
+                  ds4_glm5_next_output_logits_rows(&exec, workspace, hidden,
+                      half_logits, rank * half, half) && ds4_gpu_synchronize() &&
+                  ds4_gpu_tensor_read(half_logits, 0u, composed.data() + rank * half,
+                                       (uint64_t)half*sizeof(float)),
+                  "project disjoint half-head rows");
+        }
+        CHECK(std::memcmp(full.data(), composed.data(), full.size()*sizeof(float)) == 0,
+              "concatenated vocabulary halves exactly match full head");
+    }
+    std::fprintf(stderr, "PASS BF16 head halves exact: 3 inputs x %u logits\n", vocab);
+    ds4_gpu_tensor_free(short_half);
+    ds4_gpu_tensor_free(half_logits);
+
     std::fprintf(stderr,
         "PASS GLM5 output head logits=%u argmax=%u hash=%016llx "
         "max_abs=%.9g mean_abs=%.9g\n",

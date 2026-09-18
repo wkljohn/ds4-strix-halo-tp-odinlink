@@ -757,10 +757,28 @@ int ds4_glm5_next_output_logits(const ds4_glm5_next_exec_ctx *ctx,
                                 ds4_glm5_next_workspace *w,
                                 const ds4_gpu_tensor *hc_hidden,
                                 ds4_gpu_tensor *logits_out) {
+    return ds4_glm5_next_output_logits_rows(ctx, w, hc_hidden, logits_out,
+                                            0u, GLM5_VOCAB);
+}
+
+int ds4_glm5_next_output_logits_rows(const ds4_glm5_next_exec_ctx *ctx,
+                                    ds4_glm5_next_workspace *w,
+                                    const ds4_gpu_tensor *hc_hidden,
+                                    ds4_gpu_tensor *logits_out,
+                                    uint32_t row_start, uint32_t row_count) {
+    if (!context_valid(ctx) || !w || !hc_hidden || !logits_out) return 0;
+    const bool full = row_start == 0u && row_count == GLM5_VOCAB;
+    if (!full && (ctx->model->output_type != 30u ||
+        row_count != GLM5_VOCAB / 2u ||
+        (row_start != 0u && row_start != GLM5_VOCAB / 2u))) return 0;
+    const uint64_t offset = (uint64_t)row_start * GLM5_WIDTH * sizeof(uint16_t);
+    if (ctx->model->output > ctx->model_size ||
+        offset > ctx->model_size - ctx->model->output) return 0;
+    const uint64_t weight_offset = ctx->model->output + offset;
     const uint64_t hc_bytes =
         (uint64_t)GLM5_HC_WIDTH * sizeof(float);
     const uint64_t logits_bytes =
-        (uint64_t)GLM5_VOCAB * sizeof(float);
+        (uint64_t)row_count * sizeof(float);
     return context_valid(ctx) && w && hc_hidden && logits_out &&
            ds4_gpu_tensor_bytes(hc_hidden) >= hc_bytes &&
            ds4_gpu_tensor_bytes(logits_out) >= logits_bytes &&
@@ -774,13 +792,13 @@ int ds4_glm5_next_output_logits(const ds4_glm5_next_exec_ctx *ctx,
            ((ctx->model->output_type == 8u &&
              ds4_gpu_matmul_q8_0_tensor(
                  logits_out, ctx->model_map, ctx->model_size,
-                 ctx->model->output, GLM5_WIDTH, GLM5_VOCAB,
+                 weight_offset, GLM5_WIDTH, row_count,
                  w->output_norm, 1u)) ||
             ((ctx->model->output_type == 0u ||
               ctx->model->output_type == 30u) &&
              ds4_gpu_matmul_bf16_tensor(
                  logits_out, ctx->model_map, ctx->model_size,
-                 ctx->model->output, GLM5_WIDTH, GLM5_VOCAB,
+                 weight_offset, GLM5_WIDTH, row_count,
                  w->output_norm, 1u)));
 }
 
@@ -2006,7 +2024,8 @@ static int mla_sparse_prelude_rows(
         const ds4_gpu_tensor *hc_in,
         uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const ds4_glm5_next_mla_offsets *m = &layer->mla;
+    ds4_glm5_next_mla_offsets local_m = layer->mla;
+    const ds4_glm5_next_mla_offsets *m = &local_m;
     ds4_glm5_next_mla_state *mla = &state->mla[il];
     const uint32_t pos0 = mla->token_count;
     const uint64_t full_heads =
@@ -2077,6 +2096,51 @@ static int mla_sparse_prelude_rows(
             w->ffn_hidden, n_tokens);
 }
 
+/* Scalar MLA owns the same contiguous heads as its existing output K slice.
+ * Keep batched/deferred consumers on the full-head layout. Only native Q8
+ * pointer offsets change; the indexer, compact KV and collectives are shared.
+ */
+static int mla_scalar_head_layout(const ds4_glm5_next_exec_ctx *ctx,
+                                  bool scalar_consumer,
+                                  ds4_glm5_next_mla_offsets *m,
+                                  uint32_t *heads,
+                                  uint64_t *output_input_start) {
+    const char *value = getenv("DS4_GLM5_MLA_OWNED_HEADS");
+    if (value && strcmp(value, "0") != 0 && strcmp(value, "1") != 0)
+        return 0;
+    *heads = GLM5_HEADS;
+    *output_input_start =
+        (uint64_t)ctx->tp_rank * (GLM5_HEADS / 2u) * GLM5_HEAD_DIM;
+    if (!scalar_consumer || !value || strcmp(value, "1") != 0) return 1;
+    /* Full-layout tensor dumps have a separate contract; never emit a stale
+     * unowned half as if this were a complete 64-head projection. */
+    if (ctx->tp_rank > 1u || ctx->trace_prefix) return 0;
+    const uint64_t first_head = (uint64_t)ctx->tp_rank * (GLM5_HEADS / 2u);
+    const uint64_t q_offset = first_head * GLM5_HEAD_DIM *
+        (GLM5_Q_RANK / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+    const uint64_t k_offset = first_head * GLM5_KV_LORA *
+        (GLM5_HEAD_DIM / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+    const uint64_t v_offset = first_head * GLM5_HEAD_DIM *
+        (GLM5_KV_LORA / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+    if (m->q_b > UINT64_MAX - q_offset ||
+        m->k_b > UINT64_MAX - k_offset ||
+        m->v_b > UINT64_MAX - v_offset) return 0;
+    m->q_b += q_offset;
+    m->k_b += k_offset;
+    m->v_b += v_offset;
+    *heads = GLM5_HEADS / 2u;
+    *output_input_start = 0u;
+    static int reported[2];
+    if (!reported[ctx->tp_rank]) {
+        fprintf(stderr, "ds4: GLM5 scalar MLA owned heads active "
+                "rank=%u first=%llu heads=%u indexer_heads=%u\n",
+                ctx->tp_rank, (unsigned long long)first_head,
+                *heads, GLM5_INDEX_HEADS);
+        reported[ctx->tp_rank] = 1;
+    }
+    return 1;
+}
+
 /* The official selector uses the full visible range through top-k. Pooled
  * selection begins only when visible exceeds 2048 and is a separate path. */
 static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
@@ -2089,11 +2153,16 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
                                        uint32_t pool_index,
                                        bool publish_pool) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const ds4_glm5_next_mla_offsets *m = &layer->mla;
+    ds4_glm5_next_mla_offsets local_m = layer->mla;
+    const ds4_glm5_next_mla_offsets *m = &local_m;
+    uint32_t heads = GLM5_HEADS;
+    uint64_t output_input_start = 0u;
     ds4_glm5_next_mla_state *mla = &state->mla[il];
     const uint32_t pos = mla->token_count;
     const uint64_t half_heads =
         ((uint64_t)GLM5_HEADS * GLM5_HEAD_DIM) / 2u;
+    if (!mla_scalar_head_layout(ctx, true, &local_m,
+                                &heads, &output_input_start)) return 0;
     return
         ds4_gpu_rms_norm_plain_rows_tensor(
             w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u,
@@ -2116,7 +2185,7 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             m->q_a_norm, GLM5_Q_RANK, ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_query, ctx->model_map, ctx->model_size, m->q_b,
-            GLM5_Q_RANK, GLM5_HEADS * GLM5_HEAD_DIM,
+            GLM5_Q_RANK, heads * GLM5_HEAD_DIM,
             w->mla_q_resid, 1u) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_kv_raw, ctx->model_map, ctx->model_size, m->kv_a_mqa,
@@ -2133,7 +2202,7 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
         ds4_gpu_glm_qk_lowrank_typed_tensor(
             w->mla_qk_low, w->mla_query,
             ctx->model_map, ctx->model_size, m->k_b, 8u,
-            GLM5_HEADS, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+            heads, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
             GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, 1u) &&
@@ -2160,7 +2229,7 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             w->mla_heads, w->mla_query, w->mla_qk_low,
             mla->compact_kv, NULL, ctx->model_map, ctx->model_size,
             m->v_b, 8u, w->mla_selected_token, visible,
-            mla->capacity_tokens, false, GLM5_HEADS, GLM5_KV_LORA,
+            mla->capacity_tokens, false, heads, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, GLM5_HEAD_DIM, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
         ds4_gpu_matmul_q8_0_kslice_tensor(
@@ -2168,7 +2237,7 @@ static int mla_dense_selection_attention(const ds4_glm5_next_exec_ctx *ctx,
             GLM5_HEADS * GLM5_HEAD_DIM,
             (uint64_t)ctx->tp_rank * half_heads, half_heads,
             GLM5_WIDTH, w->mla_heads,
-            (uint64_t)ctx->tp_rank * half_heads) &&
+            output_input_start) &&
         tp_exchange(ctx, il, DS4_TP_GATE_ATTN) &&
         ds4_gpu_add_tensor(w->attention, ctx->tp_big_out, ctx->tp_big_in,
                            GLM5_WIDTH) &&
@@ -2195,7 +2264,10 @@ static int mla_sparse_selection_attention(
         bool project_output,
         bool finish_attention) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const ds4_glm5_next_mla_offsets *m = &layer->mla;
+    ds4_glm5_next_mla_offsets local_m = layer->mla;
+    const ds4_glm5_next_mla_offsets *m = &local_m;
+    uint32_t heads = GLM5_HEADS;
+    uint64_t output_input_start = 0u;
     ds4_glm5_next_mla_state *mla = &state->mla[il];
     const uint32_t pos = mla->token_count;
     uint32_t visible = 0u, n_pools = 0u, selected_pools = 0u;
@@ -2222,6 +2294,8 @@ static int mla_sparse_selection_attention(
          (!project_output || local_output != ctx->tp_big_out))) {
         return 0;
     }
+    if (!mla_scalar_head_layout(ctx, finish_attention, &local_m,
+                                &heads, &output_input_start)) return 0;
     int ok =
         ds4_gpu_rms_norm_plain_rows_tensor(
             w->hc_flat, hc_in, GLM5_HC_WIDTH, 1u,
@@ -2244,7 +2318,7 @@ static int mla_sparse_selection_attention(
             m->q_a_norm, GLM5_Q_RANK, ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_query, ctx->model_map, ctx->model_size, m->q_b,
-            GLM5_Q_RANK, GLM5_HEADS * GLM5_HEAD_DIM,
+            GLM5_Q_RANK, heads * GLM5_HEAD_DIM,
             w->mla_q_resid, 1u) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_kv_raw, ctx->model_map, ctx->model_size, m->kv_a_mqa,
@@ -2261,7 +2335,7 @@ static int mla_sparse_selection_attention(
         ds4_gpu_glm_qk_lowrank_typed_tensor(
             w->mla_qk_low, w->mla_query,
             ctx->model_map, ctx->model_size, m->k_b, 8u,
-            GLM5_HEADS, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+            heads, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
             GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, 1u) &&
@@ -2311,7 +2385,7 @@ static int mla_sparse_selection_attention(
             w->mla_heads, w->mla_query, w->mla_qk_low,
             mla->compact_kv, NULL, ctx->model_map, ctx->model_size,
             m->v_b, 8u, w->mla_selected_token, selected_tokens,
-            mla->capacity_tokens, false, GLM5_HEADS, GLM5_KV_LORA,
+            mla->capacity_tokens, false, heads, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, GLM5_HEAD_DIM, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     if (!project_output) return ok;
@@ -2321,7 +2395,7 @@ static int mla_sparse_selection_attention(
             GLM5_HEADS * GLM5_HEAD_DIM,
             (uint64_t)ctx->tp_rank * half_heads, half_heads,
             GLM5_WIDTH, w->mla_heads,
-            (uint64_t)ctx->tp_rank * half_heads);
+            output_input_start);
     if (!finish_attention) return ok;
     ok = ok && tp_exchange(ctx, il, DS4_TP_GATE_ATTN);
     ok = ok &&
@@ -2509,9 +2583,13 @@ static int mla_value_project_rows_batch(
         const ds4_glm5_next_mla_offsets *offsets,
         ds4_glm5_next_workspace *w,
         uint32_t n_tokens) {
+    const uint64_t full_bytes = (uint64_t)n_tokens * GLM5_HEADS *
+        GLM5_HEAD_DIM * sizeof(float);
+    const uint32_t heads = ds4_gpu_tensor_bytes(w->mla_heads) ==
+        full_bytes / 2u ? GLM5_HEADS / 2u : GLM5_HEADS;
     return ds4_gpu_glm_value_project_typed_batch_heads_tensor(
         w->mla_heads, w->routed_experts, ctx->model_map, ctx->model_size,
-        offsets->v_b, 8u, n_tokens, GLM5_HEADS,
+        offsets->v_b, 8u, n_tokens, heads,
         GLM5_KV_LORA, GLM5_HEAD_DIM);
 }
 
@@ -2794,6 +2872,10 @@ static int mla_output_project_rows_batch(
         (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
     const uint64_t half_heads = full_heads / 2u;
     const uint64_t in_start = (uint64_t)ctx->tp_rank * half_heads;
+    const bool owned = ds4_gpu_tensor_bytes(w->mla_heads) ==
+        (uint64_t)n_tokens * half_heads * sizeof(float);
+    const uint64_t activation_start = owned ? 0u : in_start;
+    const uint64_t activation_stride = owned ? half_heads : full_heads;
     /* A single row keeps the established decode implementation. Besides
      * avoiding a 64 KiB token-tile launch for one row, this makes the hook's
      * 0 return unambiguously mean that an engaged batch path failed. */
@@ -2804,7 +2886,7 @@ static int mla_output_project_rows_batch(
         const int ok = out && ds4_gpu_matmul_q8_0_kslice_tensor(
             out, ctx->model_map, ctx->model_size, offsets->output,
             full_heads, in_start, half_heads, GLM5_WIDTH, w->mla_heads,
-            in_start);
+            activation_start);
         ds4_gpu_tensor_free(out);
         return ok;
     }
@@ -2817,7 +2899,7 @@ static int mla_output_project_rows_batch(
         ds4_rocm_q8_kslice_f32_rows_strided(
             ctx->tp_big_out, ctx->model_map, ctx->model_size,
             offsets->output, full_heads, GLM5_WIDTH, in_start, half_heads,
-            w->mla_heads, in_start, n_tokens, full_heads);
+            w->mla_heads, activation_start, n_tokens, activation_stride);
     if (batch >= 0) return batch;
     /* Preserve the exact one-row implementation on backends without the
      * strided token-tile entry point. */
@@ -2829,7 +2911,7 @@ static int mla_output_project_rows_batch(
         const int ok = out && ds4_gpu_matmul_q8_0_kslice_tensor(
             out, ctx->model_map, ctx->model_size, offsets->output,
             full_heads, in_start, half_heads, GLM5_WIDTH, w->mla_heads,
-            (uint64_t)t * full_heads + in_start);
+            (uint64_t)t * activation_stride + activation_start);
         ds4_gpu_tensor_free(out);
         if (!ok) return 0;
     }
@@ -2844,12 +2926,67 @@ static int mla_dense_selection_attention_rows(
         const ds4_gpu_tensor *hc_in,
         uint32_t n_tokens) {
     const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
-    const ds4_glm5_next_mla_offsets *m = &layer->mla;
+    ds4_glm5_next_mla_offsets local_m = layer->mla;
+    const ds4_glm5_next_mla_offsets *m = &local_m;
     ds4_glm5_next_mla_state *mla = &state->mla[il];
     const uint32_t pos0 = mla->token_count;
     const uint32_t n_selected = pos0 + n_tokens;
-    const uint64_t full_heads =
-        (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
+    const bool owned = n_tokens >= 16u &&
+        getenv("DS4_GLM5_MLA_BATCH_OWNED_HEADS") != NULL &&
+        strcmp(getenv("DS4_GLM5_MLA_BATCH_OWNED_HEADS"), "1") == 0 &&
+        ctx->tp_rank < 2u && ctx->trace_prefix == NULL;
+    const uint32_t attention_heads = owned ? GLM5_HEADS / 2u : GLM5_HEADS;
+    ds4_gpu_tensor *query_view = NULL;
+    ds4_gpu_tensor *qk_view = NULL;
+    ds4_gpu_tensor *heads_view = NULL;
+    ds4_glm5_next_workspace owned_w = *w;
+    ds4_gpu_tensor *query = w->mla_query;
+    ds4_gpu_tensor *qk_low = w->mla_qk_low;
+    if (owned) {
+        const uint64_t first_head = (uint64_t)ctx->tp_rank * attention_heads;
+        const uint64_t q_offset = first_head * GLM5_HEAD_DIM *
+            (GLM5_Q_RANK / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+        const uint64_t k_offset = first_head * GLM5_KV_LORA *
+            (GLM5_HEAD_DIM / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+        const uint64_t v_offset = first_head * GLM5_HEAD_DIM *
+            (GLM5_KV_LORA / GLM5_Q8_QK) * GLM5_Q8_BLOCK_BYTES;
+        if (m->q_b > UINT64_MAX - q_offset ||
+            m->k_b > UINT64_MAX - k_offset ||
+            m->v_b > UINT64_MAX - v_offset) return 0;
+        local_m.q_b += q_offset;
+        local_m.k_b += k_offset;
+        local_m.v_b += v_offset;
+        query_view = ds4_gpu_tensor_view(
+            w->mla_query, 0u,
+            (uint64_t)n_tokens * attention_heads * GLM5_HEAD_DIM *
+                sizeof(float));
+        qk_view = ds4_gpu_tensor_view(
+            w->mla_qk_low, 0u,
+            (uint64_t)n_tokens * attention_heads * GLM5_KV_LORA *
+                sizeof(float));
+        heads_view = ds4_gpu_tensor_view(
+            w->mla_heads, 0u,
+            (uint64_t)n_tokens * attention_heads * GLM5_HEAD_DIM *
+                sizeof(float));
+        if (!query_view || !qk_view || !heads_view) {
+            ds4_gpu_tensor_free(heads_view);
+            ds4_gpu_tensor_free(qk_view);
+            ds4_gpu_tensor_free(query_view);
+            return 0;
+        }
+        query = query_view;
+        qk_low = qk_view;
+        owned_w.mla_query = query_view;
+        owned_w.mla_qk_low = qk_view;
+        owned_w.mla_heads = heads_view;
+        static int reported[2];
+        if (!reported[ctx->tp_rank]) {
+            fprintf(stderr,
+                    "ds4: GLM5 batched MLA owned heads active rank=%u heads=%u\n",
+                    ctx->tp_rank, attention_heads);
+            reported[ctx->tp_rank] = 1;
+        }
+    }
     const uint64_t elements = (uint64_t)n_tokens * GLM5_WIDTH;
     if (n_tokens == 0u || n_selected < pos0 ||
         n_selected > DS4_GLM5_NEXT_INDEX_TOP_K ||
@@ -2878,8 +3015,9 @@ static int mla_dense_selection_attention_rows(
             m->q_a_norm, GLM5_Q_RANK, n_tokens,
             ctx->model->rms_norm_eps) &&
         ds4_gpu_matmul_q8_0_tensor(
-            w->mla_query, ctx->model_map, ctx->model_size, m->q_b,
-            GLM5_Q_RANK, full_heads, w->mla_q_resid, n_tokens) &&
+            query, ctx->model_map, ctx->model_size, m->q_b,
+            GLM5_Q_RANK, (uint64_t)attention_heads * GLM5_HEAD_DIM,
+            w->mla_q_resid, n_tokens) &&
         ds4_gpu_matmul_q8_0_tensor(
             w->mla_kv_raw, ctx->model_map, ctx->model_size, m->kv_a_mqa,
             GLM5_WIDTH, GLM5_KV_LORA, w->ffn_hidden, n_tokens) &&
@@ -2893,9 +3031,9 @@ static int mla_dense_selection_attention_rows(
             pos0, n_tokens, mla->capacity_tokens, GLM5_KV_LORA,
             GLM5_KV_LORA, 0u, false) &&
         ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
-            w->mla_qk_low, w->mla_query,
+            qk_low, query,
             ctx->model_map, ctx->model_size, m->k_b, 8u, n_tokens,
-            GLM5_HEADS, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
+            attention_heads, GLM5_KV_LORA, GLM5_HEAD_DIM, GLM5_HEAD_DIM) &&
         ds4_gpu_matmul_bf16_tensor(
             w->mla_index_k_raw, ctx->model_map, ctx->model_size, m->index_k,
             GLM5_WIDTH, GLM5_INDEX_DIM, w->ffn_hidden, n_tokens) &&
@@ -2912,17 +3050,20 @@ static int mla_dense_selection_attention_rows(
             w->ffn_hidden, n_tokens) &&
         mla_stage_index_rows(ctx, m, mla, w, pos0, n_tokens) &&
         ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
-            w->routed_experts, w->mla_query, w->mla_qk_low,
+            w->routed_experts, query, qk_low,
             mla->compact_kv, NULL, n_tokens, pos0, n_selected,
-            mla->capacity_tokens, false, GLM5_HEADS, GLM5_KV_LORA,
+            mla->capacity_tokens, false, attention_heads, GLM5_KV_LORA,
             GLM5_HEAD_DIM, 0u, 0u,
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
-        mla_value_project_rows_batch(ctx, m, w, n_tokens) &&
+        mla_value_project_rows_batch(ctx, m, owned ? &owned_w : w, n_tokens) &&
         mla_output_project_rows_batch(
-            ctx, m, w, n_tokens,
+            ctx, m, owned ? &owned_w : w, n_tokens,
             !(layer->ffn_weight.gate_exps_type == 16u &&
               layer->ffn_weight.up_exps_type == 16u &&
               layer->ffn_weight.down_exps_type == 10u));
+    ds4_gpu_tensor_free(heads_view);
+    ds4_gpu_tensor_free(qk_view);
+    ds4_gpu_tensor_free(query_view);
     return ok &&
         tp_exchange_rows(ctx, il, DS4_TP_GATE_ATTN, n_tokens) &&
         ds4_gpu_add_tensor(w->attention, ctx->tp_big_out, ctx->tp_big_in,

@@ -119,6 +119,15 @@ int ds4_glm5_next_output_logits(const ds4_glm5_next_exec_ctx *ctx,
                                 const ds4_gpu_tensor *hc_hidden,
                                 ds4_gpu_tensor *logits_out);
 
+/* Output rows are written compactly at offset zero. The BF16 half-head
+ * preserves the full projection's per-row arithmetic; the caller must gather
+ * the two halves before exposing logits. No transport or weight copy here. */
+int ds4_glm5_next_output_logits_rows(const ds4_glm5_next_exec_ctx *ctx,
+                                    ds4_glm5_next_workspace *workspace,
+                                    const ds4_gpu_tensor *hc_hidden,
+                                    ds4_gpu_tensor *logits_out,
+                                    uint32_t row_start, uint32_t row_count);
+
 /* Execute exactly one trunk layer. Unsupported kind combinations fail closed.
  * No workspace allocation is performed inside this call. Preconditions fail
  * without mutation; any backend failure invalidates the complete sequence. */

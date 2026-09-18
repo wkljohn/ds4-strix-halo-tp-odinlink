@@ -52,6 +52,9 @@ enum {
     DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH = UINT64_C(1) << 35,
     /* Equivalent-arithmetic MLA output candidate must match on both ranks. */
     DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA = UINT64_C(1) << 36,
+    /* Ordinary GLM output-row split adds an RDMA logits exchange after each
+     * prompt tile and decoded token. Both ranks must select the same path. */
+    DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_ROWSPLIT = UINT64_C(1) << 37,
 };
 
 static inline uint64_t ds4_tp_prefill_config_encode(

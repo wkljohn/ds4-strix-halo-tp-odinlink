@@ -51528,6 +51528,27 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         return 0;
     }
     const uint32_t capacity = (uint32_t)ctx_size;
+    const char *output_rowsplit = getenv("DS4_GLM5_OUTPUT_ROWSPLIT");
+    if (output_rowsplit && strcmp(output_rowsplit, "0") != 0 &&
+        strcmp(output_rowsplit, "1") != 0) {
+        fprintf(stderr, "ds4: DS4_GLM5_OUTPUT_ROWSPLIT must be 0 or 1\n");
+        return 0;
+    }
+    if ((ds4_tp_prefill_config(e->tp.ctx) &
+         DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_ROWSPLIT) != 0u) {
+        const uint32_t features = ds4_tp_runtime_features(e->tp.ctx);
+        if (e->glm5_next->offsets.output_type != 30u ||
+            (features & DS4_TP_FEATURE_RDMA_LOGITS) == 0u ||
+            (features & (DS4_TP_FEATURE_GREEDY_TOP2 |
+                         DS4_TP_FEATURE_RANK0_FULL_LOGITS)) != 0u) {
+            fprintf(stderr, "ds4: GLM5 output row split requires BF16, "
+                    "RDMA logits and full-vector sampling\n");
+            return 0;
+        }
+        fprintf(stderr, "ds4: GLM5 BF16 output rowsplit enabled rank=%d "
+                "rows=%u payload_bytes=%u\n", e->tp.rank,
+                DS4_N_VOCAB / 2u, DS4_N_VOCAB / 2u * (unsigned)sizeof(float));
+    }
     const char *mla_output_wmma = getenv("DS4_ROCM_GLM5_MLA_OUTPUT_WMMA");
     if (mla_output_wmma && strcmp(mla_output_wmma, "0") != 0 &&
         strcmp(mla_output_wmma, "1") != 0) {
@@ -51759,6 +51780,31 @@ static void ds4_session_glm5_next_release(ds4_session *s) {
     s->glm5_next_ready = false;
 }
 
+/* GLM keeps the outer vocab_split protocol disabled. Gather here for both
+ * prompt tiles and decode, so every host consumer sees complete logits and
+ * prompt logits never use the legacy TCP command-payload route. */
+static int ds4_session_glm5_next_output(ds4_session *s,
+                                        ds4_glm5_next_workspace *w,
+                                        const ds4_gpu_tensor *hidden) {
+    ds4_tp *tp = s->engine->tp.ctx;
+    const bool split = (ds4_tp_prefill_config(tp) &
+                       DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_ROWSPLIT) != 0u;
+    const uint32_t count = split ? DS4_N_VOCAB / 2u : DS4_N_VOCAB;
+    const uint32_t first = split ? (uint32_t)s->engine->tp.rank * count : 0u;
+    if (split && (!ds4_tp_is_rdma(tp) ||
+        (ds4_tp_runtime_features(tp) & DS4_TP_FEATURE_RDMA_LOGITS) == 0u))
+        return 0;
+    if (!ds4_glm5_next_output_logits_rows(&s->glm5_next_exec, w, hidden,
+            s->glm5_next_logits, first, count) || !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(s->glm5_next_logits, 0u, s->logits + first,
+                             (uint64_t)count * sizeof(float))) return 0;
+    if (split && !ds4_tp_exchange_logits_halves(tp, s->logits, count)) {
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
+    return 1;
+}
+
 static int ds4_session_glm5_next_forward_token(ds4_session *s, int token,
                                                char *err, size_t errlen) {
     if (!s || !s->glm5_next_ready || !s->engine || token < 0 ||
@@ -51783,11 +51829,8 @@ static int ds4_session_glm5_next_forward_token(ds4_session *s, int token,
         s->glm5_next_cur = s->glm5_next_out;
         s->glm5_next_out = tmp;
     }
-    if (!ds4_glm5_next_output_logits(x, s->glm5_next_ws,
-                                     s->glm5_next_cur, s->glm5_next_logits) ||
-        !ds4_gpu_synchronize() ||
-        !ds4_gpu_tensor_read(s->glm5_next_logits, 0u, s->logits,
-                             (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+    if (!ds4_session_glm5_next_output(s, s->glm5_next_ws,
+                                      s->glm5_next_cur)) {
         snprintf(err, errlen, "GLM5 output projection failed");
         return 1;
     }
@@ -51897,11 +51940,7 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
     if (ok) {
         ds4_gpu_tensor *last = ds4_gpu_tensor_view(
             cur, (uint64_t)(n_tokens - 1u) * row_bytes * 4u, row_bytes * 4u);
-        ok = last && ds4_glm5_next_output_logits(
-            &s->glm5_next_exec, w, last, s->glm5_next_logits) &&
-             ds4_gpu_synchronize() &&
-             ds4_gpu_tensor_read(s->glm5_next_logits, 0u, s->logits,
-                                 (uint64_t)DS4_N_VOCAB * sizeof(float));
+        ok = last && ds4_session_glm5_next_output(s, w, last);
         ds4_gpu_tensor_free(last);
     }
     if (ok) {
@@ -53904,6 +53943,11 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm5_next &&
         mla_wmma && strcmp(mla_wmma, "1") == 0) {
         config |= DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA;
+    }
+    const char *output_rowsplit = getenv("DS4_GLM5_OUTPUT_ROWSPLIT");
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm5_next &&
+        output_rowsplit && strcmp(output_rowsplit, "1") == 0) {
+        config |= DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_ROWSPLIT;
     }
 #endif
     return config;
@@ -61445,9 +61489,16 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         return 0;
     }
 #endif
-    /* GLM keeps its replicated output head unsplit in v0: the
-     * leader computes full logits and nothing crosses the wire. */
-    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
+    /* GLM normally gathers complete logits in its output stage.  An explicit
+     * opt-in enables the existing vocab-half/top2 protocol for greedy decode;
+     * probabilistic sampling remains fail-closed in ds4_session_sample(). */
+    const char *glm5_vocab_split = getenv("DS4_GLM5_VOCAB_SPLIT");
+    const bool glm5_vocab_split_enabled =
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        glm5_vocab_split && glm5_vocab_split[0] &&
+        strcmp(glm5_vocab_split, "0") != 0;
+    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
+        glm5_vocab_split_enabled;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
     e->tp.glm5_gate_seq = 0;
