@@ -631,6 +631,16 @@ tests/test_tp_hello: tests/test_tp_hello.c tests/ds4_tp_hello_test.o tests/ds4_g
 test-tp-hello: tests/test_tp_hello
 	./tests/test_tp_hello
 
+tests/ds4_compact_logits_test.o: ds4.c ds4.h ds4_tp.h
+	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -DDS4_TEST_HOOKS -ffunction-sections -fdata-sections -c -o $@ ds4.c
+
+tests/test_glm5_compact_logits: tests/test_glm5_compact_logits.c tests/ds4_compact_logits_test.o tests/ds4_tp_hello_test.o ds4.h ds4_tp.h
+	$(CC) $(CFLAGS) -DDS4_TEST_HOOKS -DDS4_TP_TEST_HOOKS -Wl,--gc-sections -I. -o $@ tests/test_glm5_compact_logits.c tests/ds4_compact_logits_test.o tests/ds4_tp_hello_test.o $(LDLIBS)
+
+.PHONY: test-glm5-compact-logits
+test-glm5-compact-logits: tests/test_glm5_compact_logits
+	./tests/test_glm5_compact_logits
+
 tests/roce_v2_mr_probe: tests/roce_v2_mr_probe.cpp
 	$(HIPCC) -O2 -o $@ $< -libverbs
 

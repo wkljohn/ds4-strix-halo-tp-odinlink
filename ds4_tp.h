@@ -52,9 +52,9 @@ enum {
     DS4_TP_PREFILL_CONFIG_GLM5_INDEXER_SCORE_BATCH = UINT64_C(1) << 35,
     /* Equivalent-arithmetic MLA output candidate must match on both ranks. */
     DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA = UINT64_C(1) << 36,
-    /* Ordinary GLM output-row split adds an RDMA logits exchange after each
-     * prompt tile and decoded token. Both ranks must select the same path. */
-    DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_ROWSPLIT = UINT64_C(1) << 37,
+    /* Exact greedy GLM output with two candidates per rank over RDMA.
+     * Bit 37 belongs to the retired research full-half exchange protocol. */
+    DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_TOP2_RDMA = UINT64_C(1) << 38,
 };
 
 static inline uint64_t ds4_tp_prefill_config_encode(
@@ -617,6 +617,23 @@ uint64_t ds4_tp_test_get_exchange_calls(void);
 #endif
 int ds4_tp_send_logits_top2(ds4_tp *tp, const ds4_tp_logits_top2 *top2);
 int ds4_tp_recv_logits_top2(ds4_tp *tp, ds4_tp_logits_top2 *top2);
+
+/* Compact GLM output is a separate negotiated protocol, never the legacy
+ * TCP top2 frame. IDs are global, finite values descend, ties use lower ID. */
+int ds4_tp_logits_top2_make(const float *logits, uint32_t first,
+                           uint32_t count, ds4_tp_logits_top2 *top2);
+int ds4_tp_logits_top2_valid(const ds4_tp_logits_top2 *top2,
+                            uint32_t first, uint32_t count);
+bool ds4_tp_logits_top2_rdma_ready(const ds4_tp *tp);
+int ds4_tp_exchange_logits_top2_rdma(ds4_tp *tp,
+                                     const ds4_tp_logits_top2 *local,
+                                     ds4_tp_logits_top2 *peer,
+                                     uint32_t half_count);
+#ifdef DS4_TP_TEST_HOOKS
+int ds4_tp_test_top2_rdma_refusal(ds4_tp_transport requested,
+                                  int active, int negotiated);
+int ds4_tp_test_top2_rdma_desync(void);
+#endif
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks

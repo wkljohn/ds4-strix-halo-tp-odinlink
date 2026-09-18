@@ -3599,6 +3599,148 @@ int ds4_tp_recv_logits_top2(ds4_tp *tp, ds4_tp_logits_top2 *top2) {
     return tp_read_full(tp->control_fd, top2, sizeof(*top2));
 }
 
+_Static_assert(sizeof(ds4_tp_logits_top2) == 16u, "top2 wire layout changed");
+
+static void tp_logits_top2_clear(ds4_tp_logits_top2 *top2) {
+    if (top2) *top2 = (ds4_tp_logits_top2){{-1, -1}, {0.0f, 0.0f}};
+}
+
+int ds4_tp_logits_top2_valid(const ds4_tp_logits_top2 *top2,
+                            uint32_t first, uint32_t count) {
+    if (!top2 || count < 2u || first > INT32_MAX ||
+        count > (uint32_t)INT32_MAX - first) return 0;
+    for (unsigned i = 0; i < 2u; ++i) {
+        if (top2->id[i] < 0 || (uint32_t)top2->id[i] < first ||
+            (uint32_t)top2->id[i] >= first + count ||
+            !isfinite(top2->value[i])) return 0;
+    }
+    return top2->id[0] != top2->id[1] &&
+        (top2->value[0] > top2->value[1] ||
+         (top2->value[0] == top2->value[1] && top2->id[0] < top2->id[1]));
+}
+
+int ds4_tp_logits_top2_make(const float *logits, uint32_t first,
+                           uint32_t count, ds4_tp_logits_top2 *top2) {
+    tp_logits_top2_clear(top2);
+    if (!logits || !top2 || count < 2u || first > INT32_MAX ||
+        count > (uint32_t)INT32_MAX - first) return 0;
+    ds4_tp_logits_top2 result = {{-1, -1}, {0.0f, 0.0f}};
+    for (uint32_t i = 0; i < count; ++i) {
+        const float value = logits[i];
+        if (!isfinite(value)) return 0;
+        const int32_t id = (int32_t)(first + i);
+        if (result.id[0] < 0 || value > result.value[0]) {
+            result.id[1] = result.id[0];
+            result.value[1] = result.value[0];
+            result.id[0] = id;
+            result.value[0] = value;
+        } else if (result.id[1] < 0 || value > result.value[1]) {
+            result.id[1] = id;
+            result.value[1] = value;
+        }
+    }
+    *top2 = result;
+    return 1;
+}
+
+bool ds4_tp_logits_top2_rdma_ready(const ds4_tp *tp) {
+    return tp && !ds4_tp_failed(tp) && tp->rank >= 0 && tp->rank <= 1 &&
+        tp->opt.transport == DS4_TP_TRANSPORT_RDMA &&
+        (tp->prefill_config & DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_TOP2_RDMA) &&
+        (tp->runtime_features & DS4_TP_FEATURE_RDMA_LOGITS) &&
+        !(tp->runtime_features & (DS4_TP_FEATURE_GREEDY_TOP2 |
+                                   DS4_TP_FEATURE_RANK0_FULL_LOGITS)) &&
+        ds4_tp_big_gate_is_rdma_capable(tp);
+}
+
+int ds4_tp_exchange_logits_top2_rdma(ds4_tp *tp,
+                                     const ds4_tp_logits_top2 *local,
+                                     ds4_tp_logits_top2 *peer,
+                                     uint32_t half_count) {
+    /* Clear stale candidates even when eligibility or the transport fails.
+     * Preflight before any header/payload: AUTO and TCP are never allowed. */
+    tp_logits_top2_clear(peer);
+    if (!peer || !ds4_tp_logits_top2_rdma_ready(tp) || half_count < 2u ||
+        half_count > (uint32_t)INT32_MAX / 2u ||
+        tp->logits_seq == UINT64_MAX ||
+        !ds4_tp_logits_top2_valid(local, (uint32_t)tp->rank * half_count,
+                                  half_count)) goto failed;
+    ds4_tp_logits_top2 received;
+    if (!ds4_tp_big_gate_exchange(tp, UINT16_MAX - 2u, ++tp->logits_seq,
+                                  local, &received, sizeof(received)) ||
+        !ds4_tp_logits_top2_valid(&received,
+            (uint32_t)(1 - tp->rank) * half_count, half_count)) goto failed;
+    *peer = received;
+    return 1;
+failed:
+    ds4_tp_mark_failed(tp);
+    return 0;
+}
+
+#ifdef DS4_TP_TEST_HOOKS
+int ds4_tp_test_top2_rdma_refusal(ds4_tp_transport requested,
+                                  int active, int negotiated) {
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return 0;
+    ds4_tp tp = {
+        .opt = {.transport = requested}, .data_fd = sockets[0],
+        .control_fd = sockets[0], .rank = 0, .rdma_active = active,
+        .runtime_features = DS4_TP_FEATURE_RDMA_LOGITS,
+        .prefill_config = negotiated ?
+            DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_TOP2_RDMA : 0u,
+    };
+    ds4_tp_logits_top2 local = {{0, 1}, {2.0f, 1.0f}};
+    ds4_tp_logits_top2 peer = {{2, 3}, {9.0f, 8.0f}};
+    const int exchanged = ds4_tp_exchange_logits_top2_rdma(&tp, &local,
+                                                          &peer, 2u);
+    char byte;
+    const ssize_t received = recv(sockets[1], &byte, 1u, MSG_DONTWAIT);
+    const int ok = !exchanged && ds4_tp_failed(&tp) &&
+        tp.payload_fallback_calls == 0u && peer.id[0] == -1 &&
+        peer.id[1] == -1 && received == -1 &&
+        (errno == EAGAIN || errno == EWOULDBLOCK);
+    close(sockets[0]);
+    close(sockets[1]);
+    return ok;
+}
+
+int ds4_tp_test_top2_rdma_desync(void) {
+#ifdef DS4_TP_HAVE_VERBS
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return 0;
+    ds4_tp tp = {
+        .opt = {.transport = DS4_TP_TRANSPORT_RDMA},
+        .data_fd = sockets[0], .rank = 0, .rdma_active = true,
+        .runtime_features = DS4_TP_FEATURE_RDMA_LOGITS,
+        .prefill_config = DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_TOP2_RDMA,
+        .n_layer = 46u, .vec_bytes = 4096u * sizeof(float),
+    };
+    /* Non-null capability sentinels: the stale sequence must be rejected
+     * before the transport can dereference either handle. */
+    tp.rdma.qp = (struct ibv_qp *)(uintptr_t)1u;
+    tp.rdma.mr = (struct ibv_mr *)(uintptr_t)1u;
+    const ds4_tp_gate_header stale = {
+        DS4_TP_BATCH_MAGIC, UINT16_MAX - 2u, 0xB16u, 0u
+    };
+    int ok = ds4_tp_logits_top2_rdma_ready(&tp) &&
+        tp_write_full(sockets[1], &stale, sizeof(stale));
+    ds4_tp_logits_top2 local = {{0, 1}, {2.0f, 1.0f}};
+    ds4_tp_logits_top2 peer = {{2, 3}, {9.0f, 8.0f}};
+    if (ok) ok = !ds4_tp_exchange_logits_top2_rdma(&tp, &local, &peer, 2u);
+    ds4_tp_gate_header sent;
+    if (ok) ok = tp_read_full(sockets[1], &sent, sizeof(sent)) &&
+        sent.seq == 1u && sent.layer == UINT16_MAX - 2u &&
+        ds4_tp_failed(&tp) && tp.payload_fallback_calls == 0u &&
+        peer.id[0] == -1 && peer.id[1] == -1;
+    close(sockets[0]);
+    close(sockets[1]);
+    return ok;
+#else
+    return -1; /* No verbs build: test driver reports the skipped case. */
+#endif
+}
+#endif
+
 int ds4_tp_exchange_logits_halves(ds4_tp *tp, float *logits,
                                   uint32_t half_count) {
     DS4_TP_TEST_COUNT_EXCHANGE();

@@ -51448,6 +51448,7 @@ struct ds4_session {
     float *logits;
     ds4_tp_logits_top2 tp_peer_top2;
     bool tp_peer_top2_valid;
+    bool tp_glm5_compact_logits; /* immutable, negotiated at session init */
     float *sample_probs;
     float *mtp_logits;
     int greedy_splitkv_anchor_len;
@@ -51528,26 +51529,25 @@ static int ds4_session_glm5_next_init(ds4_session *s, ds4_engine *e,
         return 0;
     }
     const uint32_t capacity = (uint32_t)ctx_size;
-    const char *output_rowsplit = getenv("DS4_GLM5_OUTPUT_ROWSPLIT");
-    if (output_rowsplit && strcmp(output_rowsplit, "0") != 0 &&
-        strcmp(output_rowsplit, "1") != 0) {
-        fprintf(stderr, "ds4: DS4_GLM5_OUTPUT_ROWSPLIT must be 0 or 1\n");
+    const char *output_top2 = getenv("DS4_GLM5_OUTPUT_TOP2_RDMA");
+    if (output_top2 && strcmp(output_top2, "0") != 0 &&
+        strcmp(output_top2, "1") != 0) {
+        fprintf(stderr, "ds4: DS4_GLM5_OUTPUT_TOP2_RDMA must be 0 or 1\n");
         return 0;
     }
     if ((ds4_tp_prefill_config(e->tp.ctx) &
-         DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_ROWSPLIT) != 0u) {
-        const uint32_t features = ds4_tp_runtime_features(e->tp.ctx);
+         DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_TOP2_RDMA) != 0u) {
         if (e->glm5_next->offsets.output_type != 30u ||
-            (features & DS4_TP_FEATURE_RDMA_LOGITS) == 0u ||
-            (features & (DS4_TP_FEATURE_GREEDY_TOP2 |
-                         DS4_TP_FEATURE_RANK0_FULL_LOGITS)) != 0u) {
-            fprintf(stderr, "ds4: GLM5 output row split requires BF16, "
-                    "RDMA logits and full-vector sampling\n");
+            e->support_kind != DS4_SUPPORT_NONE || e->glm_mtp || e->mtp_ready ||
+            !ds4_tp_logits_top2_rdma_ready(e->tp.ctx)) {
+            fprintf(stderr, "ds4: GLM5 compact output requires BF16, "
+                    "explicit bulk RDMA and ordinary greedy sampling\n");
             return 0;
         }
-        fprintf(stderr, "ds4: GLM5 BF16 output rowsplit enabled rank=%d "
+        s->tp_glm5_compact_logits = true;
+        fprintf(stderr, "ds4: GLM5 BF16 compact output enabled rank=%d "
                 "rows=%u payload_bytes=%u\n", e->tp.rank,
-                DS4_N_VOCAB / 2u, DS4_N_VOCAB / 2u * (unsigned)sizeof(float));
+                DS4_N_VOCAB / 2u, (unsigned)sizeof(ds4_tp_logits_top2));
     }
     const char *mla_output_wmma = getenv("DS4_ROCM_GLM5_MLA_OUTPUT_WMMA");
     if (mla_output_wmma && strcmp(mla_output_wmma, "0") != 0 &&
@@ -51780,33 +51780,37 @@ static void ds4_session_glm5_next_release(ds4_session *s) {
     s->glm5_next_ready = false;
 }
 
-/* GLM keeps the outer vocab_split protocol disabled. Gather here for both
- * prompt tiles and decode, so every host consumer sees complete logits and
- * prompt logits never use the legacy TCP command-payload route. */
+/* GLM keeps the outer vocab_split protocol disabled. Both prompt and decode
+ * exchange compact candidates here; the legacy TCP logits path is unused. */
 static int ds4_session_glm5_next_output(ds4_session *s,
                                         ds4_glm5_next_workspace *w,
                                         const ds4_gpu_tensor *hidden) {
     ds4_tp *tp = s->engine->tp.ctx;
-    const bool split = (ds4_tp_prefill_config(tp) &
-                       DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_ROWSPLIT) != 0u;
+    const bool split = s->tp_glm5_compact_logits;
     const uint32_t count = split ? DS4_N_VOCAB / 2u : DS4_N_VOCAB;
     const uint32_t first = split ? (uint32_t)s->engine->tp.rank * count : 0u;
-    if (split && (!ds4_tp_is_rdma(tp) ||
-        (ds4_tp_runtime_features(tp) & DS4_TP_FEATURE_RDMA_LOGITS) == 0u))
-        return 0;
+    s->tp_peer_top2_valid = false;
+    if (split && !ds4_tp_logits_top2_rdma_ready(tp)) return 0;
     if (!ds4_glm5_next_output_logits_rows(&s->glm5_next_exec, w, hidden,
             s->glm5_next_logits, first, count) || !ds4_gpu_synchronize() ||
         !ds4_gpu_tensor_read(s->glm5_next_logits, 0u, s->logits + first,
                              (uint64_t)count * sizeof(float))) return 0;
-    if (split && !ds4_tp_exchange_logits_halves(tp, s->logits, count)) {
-        ds4_tp_mark_failed(tp);
-        return 0;
+    if (split) {
+        ds4_tp_logits_top2 local;
+        if (!ds4_tp_logits_top2_make(s->logits + first, first, count, &local) ||
+            !ds4_tp_exchange_logits_top2_rdma(tp, &local, &s->tp_peer_top2,
+                                             count)) {
+            ds4_tp_mark_failed(tp);
+            return 0;
+        }
+        s->tp_peer_top2_valid = true;
     }
     return 1;
 }
 
 static int ds4_session_glm5_next_forward_token(ds4_session *s, int token,
                                                char *err, size_t errlen) {
+    if (s) s->tp_peer_top2_valid = false;
     if (!s || !s->glm5_next_ready || !s->engine || token < 0 ||
         (uint32_t)s->checkpoint.len >= (uint32_t)s->ctx_size) {
         snprintf(err, errlen, "GLM5 ordinary executor is not ready or context is full");
@@ -51850,6 +51854,7 @@ static int ds4_session_glm5_next_forward_rows(ds4_session *s,
                                               uint32_t n_tokens,
                                               uint32_t pos0,
                                               char *err, size_t errlen) {
+    if (s) s->tp_peer_top2_valid = false;
     if (!s || !s->glm5_next_ready || !tokens || n_tokens == 0u ||
         pos0 != (uint32_t)s->checkpoint.len ||
         pos0 > (uint32_t)s->ctx_size || n_tokens > (uint32_t)s->ctx_size - pos0) {
@@ -53944,10 +53949,10 @@ uint64_t ds4_engine_tp_prefill_config(ds4_engine *e) {
         mla_wmma && strcmp(mla_wmma, "1") == 0) {
         config |= DS4_TP_PREFILL_CONFIG_GLM5_MLA_OUTPUT_WMMA;
     }
-    const char *output_rowsplit = getenv("DS4_GLM5_OUTPUT_ROWSPLIT");
+    const char *output_top2 = getenv("DS4_GLM5_OUTPUT_TOP2_RDMA");
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm5_next &&
-        output_rowsplit && strcmp(output_rowsplit, "1") == 0) {
-        config |= DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_ROWSPLIT;
+        output_top2 && strcmp(output_top2, "1") == 0) {
+        config |= DS4_TP_PREFILL_CONFIG_GLM5_OUTPUT_TOP2_RDMA;
     }
 #endif
     return config;
@@ -61489,16 +61494,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         return 0;
     }
 #endif
-    /* GLM normally gathers complete logits in its output stage.  An explicit
-     * opt-in enables the existing vocab-half/top2 protocol for greedy decode;
-     * probabilistic sampling remains fail-closed in ds4_session_sample(). */
-    const char *glm5_vocab_split = getenv("DS4_GLM5_VOCAB_SPLIT");
-    const bool glm5_vocab_split_enabled =
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
-        glm5_vocab_split && glm5_vocab_split[0] &&
-        strcmp(glm5_vocab_split, "0") != 0;
-    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
-        glm5_vocab_split_enabled;
+    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
     e->tp.glm5_gate_seq = 0;
@@ -64534,6 +64530,7 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 }
 
 static bool ds4_session_tp_greedy_top2(const ds4_session *s) {
+    if (s && s->tp_glm5_compact_logits) return true;
     return s && s->engine && s->engine->tp.active &&
         s->engine->tp.rank == 0 &&
         (ds4_tp_runtime_features(s->engine->tp.ctx) &
@@ -64543,14 +64540,16 @@ static bool ds4_session_tp_greedy_top2(const ds4_session *s) {
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->logits) return -1;
     const bool tp_top2 = ds4_session_tp_greedy_top2(s);
-    /* In this negotiated mode rank 0 intentionally materializes only its
-     * lower vocab half.  Never fall back to scanning the stale upper half if
-     * the worker candidate frame is absent. */
-    if (tp_top2 && !s->tp_peer_top2_valid) return -1;
+    /* Compact modes own only one vocab half. Never scan stale peer logits
+     * when the current candidate record is absent or the transport failed. */
+    if (tp_top2 && (!s->tp_peer_top2_valid ||
+        ds4_tp_failed(s->engine->tp.ctx))) return -1;
     const uint32_t limit = tp_top2 ? DS4_N_VOCAB / 2u : DS4_N_VOCAB;
+    const uint32_t first = s->tp_glm5_compact_logits ?
+        (uint32_t)s->engine->tp.rank * limit : 0u;
     int best = -1;
     float best_logit = DS4_NEG_INF;
-    for (uint32_t i = 0; i < limit; i++) {
+    for (uint32_t i = first; i < first + limit; i++) {
         if ((int)i == excluded_id) continue;
         const float v = s->logits[i];
         if (best < 0 || v > best_logit) {
@@ -64671,9 +64670,69 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
+    if (s->tp_glm5_compact_logits) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
 }
+
+#ifdef DS4_TEST_HOOKS
+/* CPU-only fixture exercises the real public consumers, including poisoned
+ * unowned logits and stale records. No transport or model inference mocked. */
+int ds4_test_glm5_compact_consumers(void) {
+    const uint32_t n = DS4_N_VOCAB, half = n / 2u;
+    if (n < 8u || n % 2u) return 0;
+    float *logits = malloc((size_t)n * sizeof(float));
+    float *copy = malloc((size_t)n * sizeof(float));
+    if (!logits || !copy) { free(logits); free(copy); return 0; }
+    int ok = 1;
+    for (int rank = 0; rank < 2; ++rank) {
+        for (uint32_t i = 0; i < n; ++i) logits[i] = -5.0f;
+        logits[1] = 7.0f;
+        logits[half] = 7.0f;
+        logits[half + 1u] = 6.0f;
+        ds4_engine engine = {0};
+        engine.tp.rank = rank;
+        ds4_session session = {0};
+        session.engine = &engine;
+        session.logits = logits;
+        session.tp_glm5_compact_logits = true;
+        const uint32_t peer_first = (uint32_t)(1 - rank) * half;
+        ok &= ds4_tp_logits_top2_make(logits + peer_first, peer_first, half,
+                                      &session.tp_peer_top2);
+        session.tp_peer_top2_valid = true;
+        /* A mistaken full scan would choose a poisoned ID. */
+        for (uint32_t i = peer_first; i < peer_first + half; ++i)
+            logits[i] = 1000.0f;
+        uint64_t rng = 123u;
+        ds4_token_score score;
+        ok &= ds4_session_argmax(&session) == 1;
+        ok &= ds4_session_argmax_excluding(&session, 1) == (int)half;
+        ok &= ds4_session_argmax_excluding(&session, (int)half) == 1;
+        ok &= ds4_session_sample(&session, 0.0f, 0, 1.0f, 0.0f, &rng) == 1;
+        ok &= ds4_session_sample(&session, 1.0f, 0, 1.0f, 0.0f, &rng) == -1;
+        ok &= ds4_session_copy_logits(&session, copy, (int)n) == 0;
+        ok &= ds4_session_top_logprobs(&session, &score, 1) == 0;
+        ok &= ds4_session_token_logprob(&session, 1, &score) == 0;
+        ok &= ds4_session_set_logits(&session, logits, (int)n) != 0;
+        session.tp_peer_top2_valid = false;
+        ok &= ds4_session_argmax(&session) == -1;
+        ok &= ds4_session_argmax_excluding(&session, 1) == -1;
+        session.tp_peer_top2_valid = true;
+        ds4_session_rewind(&session, 0);
+        ok &= !session.tp_peer_top2_valid && ds4_session_argmax(&session) == -1;
+        session.tp_peer_top2_valid = true;
+        ds4_session_invalidate(&session);
+        ok &= !session.tp_peer_top2_valid && ds4_session_argmax(&session) == -1;
+        session.tp_glm5_compact_logits = false;
+        ok &= ds4_session_copy_logits(&session, copy, (int)n) == (int)n;
+        ok &= memcmp(copy, logits, (size_t)n * sizeof(float)) == 0;
+        ok &= ds4_session_set_logits(&session, copy, (int)n) == 0;
+    }
+    free(copy);
+    free(logits);
+    return ok;
+}
+#endif
 
 /* Pay the one-time first-submission GPU cost (pipeline ramp plus model-heap
  * residency for the batched prefill kernels) outside any measured window.

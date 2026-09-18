@@ -188,8 +188,8 @@
       "decision": "adapted",
       "donor_commit": "5c3147571e1eecc9fb09bfb0f6926ed0365e9636",
       "donor_commit_name": "5c31475",
-      "donor_patch_id": "7b7c9452637bc9b418b68a114dc5ea530c28df5e",
-      "donor_patch_sha256": "ec21ca4456dd3e665a8147856b17caedd33b5813208241cfef5be9d9ea98fa64",
+      "donor_patch_id": "59f159b096af701b1077cac1ef57cbbf12c98cae",
+      "donor_patch_sha256": "e70f29aaea618d5884d785b3e886800a19a1cefc436af0437de0d613a39b20c2",
       "evidence": [
         "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-uncensored-greedy-20260918/research/README.md"
       ],
@@ -200,11 +200,11 @@
         "ds4_tp.h",
         "tests/test_rocm_glm5_output_head.cu"
       ],
-      "reason": "Transfer the donor's BF16 vocabulary row split to a fresh branch rooted at current main. Keep full-vector ordinary sampling, mandatory RoCE v2 exchange, zero payload fallback, unchanged GGUF bytes, and no expanded weight cache. The donor's compact greedy top2 switch is intentionally not imported into this candidate.",
+      "reason": "Initial adaptation imported the range 5c31475^..7c13531, including unrelated owned-MLA changes and the legacy VOCAB_SPLIT switch. The initial full-half exchange is not compact greedy and is superseded by the subsequent repair on this track. Donor hashes here describe only 5c31475; result hashes bind the actual broader initial patch. No speed or promotion claim.",
       "recorded_at": "2026-09-18T00:00:00+00:00",
       "research_branch": "research/glm53-uncensored-greedy-20260918",
       "result_commit": "8d82784",
-      "result_patch_id": "7b7c9452637bc9b418b68a114dc5ea530c28df5e",
+      "result_patch_id": "d8ffc579b82eadebb7ff97a1c042d431673a5315",
       "result_patch_sha256": "ec21ca4456dd3e665a8147856b17caedd33b5813208241cfef5be9d9ea98fa64",
       "source": {
         "access_date": "2026-09-18",
