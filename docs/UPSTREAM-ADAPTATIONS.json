@@ -203,7 +203,7 @@
       "reason": "Transfer the donor's BF16 vocabulary row split to a fresh branch rooted at current main. Keep full-vector ordinary sampling, mandatory RoCE v2 exchange, zero payload fallback, unchanged GGUF bytes, and no expanded weight cache. The donor's compact greedy top2 switch is intentionally not imported into this candidate.",
       "recorded_at": "2026-09-18T00:00:00+00:00",
       "research_branch": "research/glm53-uncensored-greedy-20260918",
-      "result_commit": "e877b5d",
+      "result_commit": "8d82784",
       "result_patch_id": "7b7c9452637bc9b418b68a114dc5ea530c28df5e",
       "result_patch_sha256": "ec21ca4456dd3e665a8147856b17caedd33b5813208241cfef5be9d9ea98fa64",
       "source": {
