@@ -211,6 +211,36 @@
         "title": "DS4 research: shard GLM BF16 vocabulary rows with RDMA logits gather",
         "url": "local:research/glm53-flash-roce-v2-successor-20260914@5c31475"
       }
+    },
+    {
+      "decision": "adapted",
+      "donor_commit": "8d82784dd1ab918bcadd660f4109d5d35506f7a8",
+      "donor_commit_name": "8d82784",
+      "donor_patch_id": "d7c157fbdd3bcfccac9b09dc7fdf8ef1de6337d1",
+      "donor_patch_sha256": "b2412699bedd6041a95280403581c9b64d0fa5744c47e3e8ddea961ea64b9248",
+      "evidence": [
+        "/home/wkljohn/Desktop/cc/research-results/candidates/glm53-uncensored-greedy-20260918/research/README.md"
+      ],
+      "paths": [
+        "Makefile",
+        "ds4.c",
+        "ds4.h",
+        "ds4_glm5_next_exec.c",
+        "ds4_tp.c",
+        "ds4_tp.h",
+        "tests/test_glm5_compact_logits.c"
+      ],
+      "reason": "Repair the initial range adaptation: remove unrelated MLA edits and legacy VOCAB_SPLIT. Keep the exact BF16 row helper and replace full-half exchange with validated 16-byte top2 records over mandatory registered RDMA. Separate hello bit rejects retired protocol binaries. Full-logit APIs refuse compact state. Local checks only; real dual-rank benefit and promotion remain pending.",
+      "recorded_at": "2026-09-18T00:00:00+00:00",
+      "research_branch": "research/glm53-uncensored-greedy-20260918",
+      "result_commit": "c5541852e4087e31af7d86061989288af077eab7",
+      "result_patch_id": "ce28ed794b69136820682e16e7cfcd70319bd9e4",
+      "result_patch_sha256": "02ddba2e3906c836f916bb8a6055ce3ae8df1b8f0255ef5c88a9b63cc7482dc4",
+      "source": {
+        "access_date": "2026-09-18",
+        "title": "DS4 initial GLM vocabulary split research adaptation",
+        "url": "local:research/glm53-uncensored-greedy-20260918@8d82784"
+      }
     }
   ],
   "schema": 1

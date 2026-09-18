@@ -3,9 +3,13 @@
 #include "ds4_gpu_mgpu.h"
 #include "tests/glm5_gguf_test.hpp"
 #include "tests/glm5_next_real_offsets.hpp"
+extern "C" {
+#include "ds4_tp.h"
+}
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -202,6 +206,51 @@ static bool run_test(void) {
               "concatenated vocabulary halves exactly match full head");
     }
     std::fprintf(stderr, "PASS BF16 head halves exact: 3 inputs x %u logits\n", vocab);
+    const char *bench = std::getenv("DS4_GLM5_HEAD_BENCH");
+    if (bench && std::strcmp(bench, "1") == 0) {
+        /* Local stage budget only. The half-head arms include host readback
+         * and CPU top2; they exclude the live two-rank RDMA/barrier cost. */
+        std::vector<double> elapsed[3];
+        uint64_t selection_sum = 0;
+        for (unsigned round = 0; round < 12u; ++round) {
+            for (unsigned order = 0; order < 3u; ++order) {
+                const unsigned arm = (round + order) % 3u;
+                const uint32_t first = arm == 2u ? half : 0u;
+                const uint32_t count = arm == 0u ? vocab : half;
+                ds4_gpu_tensor *target = arm == 0u ? logits : half_logits;
+                const auto begin = std::chrono::steady_clock::now();
+                CHECK(ds4_glm5_next_output_logits_rows(&exec, workspace, hidden,
+                          target, first, count) && ds4_gpu_synchronize() &&
+                      ds4_gpu_tensor_read(target, 0u, composed.data(),
+                          (uint64_t)count * sizeof(float)), "timed head stage");
+                if (arm == 0u) {
+                    selection_sum += (uint64_t)std::distance(composed.begin(),
+                        std::max_element(composed.begin(), composed.end()));
+                } else {
+                    ds4_tp_logits_top2 top;
+                    CHECK(ds4_tp_logits_top2_make(composed.data(), first, count,
+                                                  &top), "timed local top2");
+                    selection_sum += (uint64_t)top.id[0];
+                }
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - begin).count();
+                if (round >= 3u) {
+                    elapsed[arm].push_back(ms);
+                    std::fprintf(stderr, "HEAD_STAGE_SAMPLE arm=%u round=%u ms=%.6f\n",
+                                 arm, round - 3u, ms);
+                }
+            }
+        }
+        for (unsigned arm = 0; arm < 3u; ++arm) {
+            std::sort(elapsed[arm].begin(), elapsed[arm].end());
+            std::fprintf(stderr, "HEAD_STAGE_LOCAL arm=%u median_ms=%.6f "
+                         "min_ms=%.6f max_ms=%.6f samples=%zu rdma_excluded=1\n",
+                         arm, elapsed[arm][4], elapsed[arm].front(),
+                         elapsed[arm].back(), elapsed[arm].size());
+        }
+        std::fprintf(stderr, "HEAD_STAGE_SELECTION_SUM=%llu\n",
+                     (unsigned long long)selection_sum);
+    }
     ds4_gpu_tensor_free(short_half);
     ds4_gpu_tensor_free(half_logits);
 
