@@ -21,6 +21,7 @@ args=(-j3 ds4 ds4-bench-tp tests/test_rocm_glm5_indexer_score_one
       tests/test_rocm_glm5_expert_pairs tests/test_glm5_expert_pairs
       tests/test_rocm_glm5_layer_verify
       tests/test_rocm_glm5_mla_prelude_small_m
+      tests/test_rocm_glm5_small_m
       tests/test_tp_native_cycle tests/test_glm5_native_session
       tests/test_glm5_target_commit tests/test_glm5_shared_route_order
       "HIPCC=$hip/bin/hipcc" "ROCM_HOME=$hip" "CORE_OBJS=$core"
@@ -34,6 +35,7 @@ sha256sum ds4 ds4-bench-tp *.o tests/test_rocm_glm5_indexer_score_one \
   tests/test_rocm_glm5_indexer_select tests/test_rocm_glm5_expert_pairs \
   tests/test_rocm_glm5_layer_verify \
   tests/test_rocm_glm5_mla_prelude_small_m \
+  tests/test_rocm_glm5_small_m \
   tests/test_glm5_expert_pairs tests/test_tp_native_cycle tests/test_glm5_native_session \
   tests/test_glm5_target_commit tests/test_glm5_shared_route_order tests/*.o rocm/*.cuh \
   run-tp-ds4-bench.sh scripts/tp-worker-supervisor.sh scripts/build-glm53-research.sh \

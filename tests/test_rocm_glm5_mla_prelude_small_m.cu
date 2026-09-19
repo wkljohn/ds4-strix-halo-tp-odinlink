@@ -9,26 +9,30 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define REQUIRE(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 
 struct Guarded {
     ds4_gpu_tensor *storage, *view;
-    uint64_t count;
-    explicit Guarded(uint64_t n) : storage(ds4_gpu_tensor_alloc((n + 32u) * 4u)),
-        view(storage ? ds4_gpu_tensor_view(storage, 64u, n * 4u) : nullptr), count(n) {
+    uint64_t count, tail;
+    explicit Guarded(uint64_t n, uint64_t extra_tail = 0u) :
+        storage(ds4_gpu_tensor_alloc((n + 32u + extra_tail) * 4u)),
+        view(storage ? ds4_gpu_tensor_view(storage, 64u, n * 4u) : nullptr),
+        count(n), tail(extra_tail) {
         REQUIRE(view);
     }
     ~Guarded() { ds4_gpu_tensor_free(view); ds4_gpu_tensor_free(storage); }
-    void poison() { REQUIRE(ds4_gpu_tensor_fill_f32(storage, 12345.0f, count + 32u)); }
+    void poison() { REQUIRE(ds4_gpu_tensor_fill_f32(storage, 12345.0f, count + 32u + tail)); }
     std::vector<float> read() {
-        std::vector<float> values(count + 32u);
+        std::vector<float> values(count + 32u + tail);
         REQUIRE(ds4_gpu_tensor_read(storage, 0u, values.data(), values.size() * 4u));
         for (unsigned i = 0u; i < 16u; ++i)
             REQUIRE(values[i] == 12345.0f && values[count + 16u + i] == 12345.0f);
+        for (uint64_t i = count + 32u; i < values.size(); ++i) REQUIRE(values[i] == 12345.0f);
         for (uint64_t i = 16u; i < count + 16u; ++i) REQUIRE(std::isfinite(values[i]));
-        return {values.begin() + 16, values.end() - 16};
+        return {values.begin() + 16, values.begin() + 16 + count};
     }
 };
 
@@ -36,6 +40,14 @@ struct Projection { unsigned layer, k, full_n, n; uint64_t offset; const char *r
 
 int main() {
     const char *path = std::getenv("DS4_GLM5_MODEL"); REQUIRE(path);
+    const char *tile = std::getenv("DS4_ROCM_GLM5_Q8_DECODE_TILE");
+    const char *prefetch = std::getenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH");
+    REQUIRE(tile && std::strcmp(tile, "1") == 0);
+    REQUIRE(prefetch && std::strcmp(prefetch, "8") == 0);
+    const char *nt = std::getenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL");
+    const char *rows = std::getenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK");
+    const bool had_nt = nt != nullptr, had_rows = rows != nullptr;
+    const std::string original_nt = nt ? nt : "", original_rows = rows ? rows : "";
     REQUIRE(setenv("DS4_GLM5_NEXT_ENABLE_ORDINARY", "1", 1) == 0);
     Glm5TestGGUF gguf; REQUIRE(gguf.open_file(path));
     std::vector<Projection> projections;
@@ -71,7 +83,9 @@ int main() {
         for (unsigned m : {2u, 4u, 6u}) {
         const unsigned first = p.full_n == 16384u ? rank * p.n : 0u;
         const uint64_t stride = (uint64_t)p.k / 32u * 34u;
-        Guarded x((uint64_t)m * p.k), y((uint64_t)m * p.n);
+        // Keep packed token rows; pad only the allocation's end so a final
+        // K1536->K2048 overread encounters explicit poison, never unmapped data.
+        Guarded x((uint64_t)m * p.k, p.k == 1536u ? 512u : 0u), y((uint64_t)m * p.n);
         std::vector<ds4_gpu_tensor *> xs(m), ys(m);
         for (unsigned t = 0u; t < m; ++t) {
             xs[t] = ds4_gpu_tensor_view(x.view, (uint64_t)t * p.k * 4u, p.k * 4u);
@@ -124,6 +138,8 @@ int main() {
             REJECT(y.view, gguf.size, p.offset, 30u, p.k, p.full_n, first, p.n, stride, x.view, m);
             REJECT(y.view, gguf.size, p.offset, 8u, p.k - 32u, p.full_n, first, p.n, stride, x.view, m);
             REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first + 1u, p.n, stride, x.view, m);
+            REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n + 1u, first, p.n, stride, x.view, m);
+            REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, p.full_n, p.n, stride, x.view, m);
             REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n - 1u, stride, x.view, m);
             REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride + 34u, x.view, m);
             REJECT(y.view, gguf.size, p.offset + 1u, 8u, p.k, p.full_n, first, p.n, stride, x.view, m);
@@ -133,16 +149,62 @@ int main() {
             auto *short_x = ds4_gpu_tensor_view(x.view, 0u, x.count * 4u - 4u);
             auto *short_y = ds4_gpu_tensor_view(y.view, 0u, y.count * 4u - 4u);
             auto *unaligned = ds4_gpu_tensor_view(y.storage, 65u, y.count * 4u);
-            REQUIRE(short_x && short_y && unaligned);
+            auto *unaligned_x = ds4_gpu_tensor_view(x.storage, 65u, x.count * 4u);
+            REQUIRE(short_x && short_y && unaligned && unaligned_x);
             REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, short_x, m);
             REJECT(short_y, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m);
             REJECT(unaligned, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m);
+            REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, unaligned_x, m);
+            Guarded touching(x.count + y.count);
+            touching.poison();
+            auto *overlap = ds4_gpu_tensor_view(touching.view, 4u, x.count * 4u);
+            REQUIRE(overlap);
+            REJECT(touching.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, overlap, m);
+            for (float value : touching.read()) REQUIRE(value == 12345.0f);
+            ds4_gpu_tensor_free(overlap);
+            REQUIRE(!ds4_rocm_glm5_mla_prelude_q8_small_m_supported(y.view, gguf.map + 1u,
+                gguf.size - 1u, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m));
+            REQUIRE(!ds4_rocm_glm5_mla_prelude_q8_small_m(y.view, gguf.map + 1u,
+                gguf.size - 1u, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m));
+            for (const char *mode : {"0", "2", "3", "4", "5", "6", "invalid"}) {
+                REQUIRE(setenv("DS4_ROCM_GLM5_Q8_DECODE_TILE", mode, 1) == 0);
+                REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m);
+            }
+            REQUIRE(setenv("DS4_ROCM_GLM5_Q8_DECODE_TILE", "1", 1) == 0);
+            REQUIRE(unsetenv("DS4_GLM5_NEXT_ENABLE_ORDINARY") == 0);
+            REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m);
+            REQUIRE(setenv("DS4_GLM5_NEXT_ENABLE_ORDINARY", "1", 1) == 0);
             REQUIRE(setenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH", "0", 1) == 0);
             REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m);
             REQUIRE(setenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH", "8", 1) == 0);
+            ds4_gpu_set_quality(true);
+            REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m);
+            ds4_gpu_set_quality(false);
+            REQUIRE(setenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL", "invalid", 1) == 0);
+            REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m);
+            REQUIRE((had_nt ? setenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL", original_nt.c_str(), 1) :
+                unsetenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL")) == 0);
+            REQUIRE(setenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK", "7", 1) == 0);
+            REJECT(y.view, gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, x.view, m);
+            REQUIRE((had_rows ? setenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK", original_rows.c_str(), 1) :
+                unsetenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK")) == 0);
 #undef REJECT
             ds4_gpu_tensor_free(short_x); ds4_gpu_tensor_free(short_y); ds4_gpu_tensor_free(unaligned);
+            ds4_gpu_tensor_free(unaligned_x);
             REQUIRE(y.read() == before);
+            const auto input = x.read();
+            auto *adjacent_out = ds4_gpu_tensor_view(touching.view, 0u, y.count * 4u);
+            auto *adjacent_x = ds4_gpu_tensor_view(touching.view, y.count * 4u, x.count * 4u);
+            REQUIRE(adjacent_out && adjacent_x);
+            REQUIRE(ds4_gpu_tensor_write(adjacent_x, 0u, input.data(), x.count * 4u));
+            REQUIRE(ds4_rocm_glm5_mla_prelude_q8_small_m(adjacent_out, gguf.map,
+                gguf.size, p.offset, 8u, p.k, p.full_n, first, p.n, stride, adjacent_x, m));
+            REQUIRE(ds4_gpu_synchronize());
+            const auto adjacent = touching.read();
+            REQUIRE(!std::memcmp(adjacent.data(), before.data(), y.count * 4u));
+            REQUIRE(!std::memcmp(adjacent.data() + y.count, input.data(), x.count * 4u));
+            compared += y.count;
+            ds4_gpu_tensor_free(adjacent_out); ds4_gpu_tensor_free(adjacent_x);
             hipEvent_t start, end;
             REQUIRE(hipEventCreate(&start) == hipSuccess && hipEventCreate(&end) == hipSuccess);
             for (unsigned sample = 0u; sample < 12u; ++sample) for (unsigned turn = 0u; turn < 2u; ++turn) {
