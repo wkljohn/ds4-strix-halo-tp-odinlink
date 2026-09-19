@@ -177,6 +177,16 @@ int main(int argc, char **argv) {
                 REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","invalid",1)==0);
                 REQUIRE(!launch(2u));
                 REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_EXACT","1",1)==0);
+                const char *prefetch_env=std::getenv("DS4_ROCM_GLM5_BF16_SMALL_M_PREFETCH");
+                const std::string saved_prefetch=prefetch_env?prefetch_env:"0";
+                for (const char *bad : {"", "1", "08", "-8", "invalid"}) {
+                    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_PREFETCH",bad,1)==0);
+                    REQUIRE(ds4_gpu_tensor_fill_f32(storage,12345.0f,got.size()));
+                    REQUIRE(!launch(2u));
+                    REQUIRE(ds4_gpu_tensor_read(storage,0u,got.data(),got.size()*sizeof(float)));
+                    for (float value:got) REQUIRE(value==12345.0f);
+                }
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_SMALL_M_PREFETCH",saved_prefetch.c_str(),1)==0);
                 REQUIRE(setenv("DS4_ROCM_DISABLE_BF16_SHAREDX","1",1)==0);
                 REQUIRE(!launch(2u));
                 REQUIRE(unsetenv("DS4_ROCM_DISABLE_BF16_SHAREDX")==0);

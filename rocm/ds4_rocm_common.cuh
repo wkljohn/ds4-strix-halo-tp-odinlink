@@ -530,7 +530,7 @@ __global__ static void matmul_bf16_f32_sharedx_exact_prefetch_warp_rows_w32_kern
 /* Small target-verification batches reuse unchanged BF16 weights across
  * independent token accumulators. Keep the M1 lane/K traversal and reduction;
  * activation panels bound LDS at 32 KiB even for eight tokens. */
-template <uint32_t Tokens, uint32_t PanelK = 1024u>
+template <uint32_t Tokens, uint32_t PanelK = 1024u, uint32_t Prefetch = 1u>
 __global__ static void matmul_bf16_f32_small_m_exact_kernel(
         float *out, const uint16_t *weight, const float *x,
         uint32_t in_dim, uint32_t out_dim) {
@@ -538,6 +538,8 @@ __global__ static void matmul_bf16_f32_small_m_exact_kernel(
                   "supported small verification batches");
     static_assert(PanelK == 1024u || PanelK == 128u,
                   "wide projection or KDA low-rank expansion");
+    static_assert(Prefetch == 1u || (Prefetch == 8u && PanelK == 1024u && Tokens != 8u),
+                  "bounded wide-projection load window for M2/M4/M6");
     constexpr uint32_t Rows = 8u;
     __shared__ float panel[Tokens][PanelK];
     const uint32_t tid = threadIdx.x;
@@ -550,11 +552,18 @@ __global__ static void matmul_bf16_f32_small_m_exact_kernel(
                 x[(uint64_t)(i / PanelK) * in_dim + first + i % PanelK];
         __syncthreads();
         const uint16_t *wr = weight + (uint64_t)row * in_dim + first;
-        for (uint32_t k = lane; k < PanelK; k += 32u) {
-            const float w = __uint_as_float((uint32_t)wr[k] << 16u);
+        for (uint32_t k = lane; k < PanelK; k += 32u * Prefetch) {
+            uint16_t weights[Prefetch];
 #pragma unroll
-            for (uint32_t t = 0u; t < Tokens; ++t)
-                sum[t] += w * panel[t][k];
+            for (uint32_t u = 0u; u < Prefetch; ++u)
+                weights[u] = wr[k + 32u * u];
+#pragma unroll
+            for (uint32_t u = 0u; u < Prefetch; ++u) {
+                const float w = __uint_as_float((uint32_t)weights[u] << 16u);
+#pragma unroll
+                for (uint32_t t = 0u; t < Tokens; ++t)
+                    sum[t] += w * panel[t][k + 32u * u];
+            }
         }
         __syncthreads();
     }

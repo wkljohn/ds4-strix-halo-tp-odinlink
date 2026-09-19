@@ -2720,6 +2720,11 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         if (small_m && strcmp(small_m, "0") != 0 && strcmp(small_m, "1") != 0)
             return 0;
         if (small_m && strcmp(small_m, "1") == 0) {
+            const char *prefetch_option = getenv("DS4_ROCM_GLM5_BF16_SMALL_M_PREFETCH");
+            if (prefetch_option && strcmp(prefetch_option, "0") != 0 &&
+                strcmp(prefetch_option, "8") != 0) return 0;
+            const bool prefetch8 = prefetch_option && strcmp(prefetch_option, "8") == 0;
+            if (prefetch8 && n_tok == 8u) return 0;
             const char *split = getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER");
             const char *legacy = getenv("DS4_ROCM_BF16_FULL_LEGACY_SPLIT_ORDER");
             if (getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") ||
@@ -2730,20 +2735,24 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
             // KDA gate shapes here so verification also preserves recurrence.
             // The vocabulary head shares this M1 order and original BF16
             // pointer; only its output width is larger (still divisible by 8).
-#define DS4_SMALL_M_EXACT(T, K) \
-            matmul_bf16_f32_small_m_exact_kernel<T, K><<<out_dim / 8u, 256u>>>( \
+#define DS4_SMALL_M_EXACT(T, K, P) \
+            matmul_bf16_f32_small_m_exact_kernel<T, K, P><<<out_dim / 8u, 256u>>>( \
                 (float *)out->ptr, (const uint16_t *)wptr, \
                 (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim)
             if (in_dim == 128u) {
-                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 128u);
-                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 128u);
-                else if (n_tok == 6u) DS4_SMALL_M_EXACT(6u, 128u);
-                else DS4_SMALL_M_EXACT(8u, 128u);
+                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 128u, 1u);
+                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 128u, 1u);
+                else if (n_tok == 6u) DS4_SMALL_M_EXACT(6u, 128u, 1u);
+                else DS4_SMALL_M_EXACT(8u, 128u, 1u);
+            } else if (prefetch8) {
+                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 1024u, 8u);
+                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 1024u, 8u);
+                else DS4_SMALL_M_EXACT(6u, 1024u, 8u);
             } else {
-                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 1024u);
-                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 1024u);
-                else if (n_tok == 6u) DS4_SMALL_M_EXACT(6u, 1024u);
-                else DS4_SMALL_M_EXACT(8u, 1024u);
+                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 1024u, 1u);
+                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 1024u, 1u);
+                else if (n_tok == 6u) DS4_SMALL_M_EXACT(6u, 1024u, 1u);
+                else DS4_SMALL_M_EXACT(8u, 1024u, 1u);
             }
 #undef DS4_SMALL_M_EXACT
             return cuda_ok(cudaGetLastError(), "BF16 small-M exact launch");

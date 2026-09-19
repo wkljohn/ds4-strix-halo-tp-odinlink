@@ -145,6 +145,14 @@ accepted output. Prefill, arithmetic and weights are unchanged. Profiled
 throughput is not clean timing evidence; see `draft-subphase-plan.md` in
 the active ROCm10 dossier.
 
+`DS4_ROCM_GLM5_BF16_SMALL_M_PREFETCH=8` is a default-off Lane A
+weight-load scheduling experiment inside exact M2/M4/M6 BF16 projections.
+It reuses original pointers, existing activation LDS and scalar arithmetic
+order; it allocates no weights. K128 keeps the previous kernel, M8 with the
+option refuses, and large prefill is unchanged. See
+`bf16-small-m-prefetch-plan.md` in the active ROCm10 dossier for tests and
+results; a local fixture gain does not establish whole-model throughput.
+
 `research/glm53-uncensored-six-kda-20260917` extends current main with
 default-off exact BF16 reuse and accepted-prefix target verification for the
 unchanged uncensored Q4 GGUF. Its dossier is
