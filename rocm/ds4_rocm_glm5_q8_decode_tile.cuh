@@ -563,6 +563,111 @@ extern "C" int ds4_rocm_glm5_shared_q8_small_m(
     return cuda_ok(cudaGetLastError(), "GLM5 shared Q8 small-M exact launch");
 }
 
+/* Research MLA input projections. A 512-element panel exactly divides both
+ * K4096 and K1536; the latter must not use the shared FFN's full Panel1024
+ * loads. Each lane keeps the scalar block order and scale*code rounding. */
+template <unsigned Tokens>
+__global__ static void glm5_mla_prelude_q8_small_m_kernel(
+        float *out, const unsigned char *weight, const float *x,
+        unsigned in_dim, unsigned out_dim, uint64_t row_bytes) {
+    static_assert(Tokens == 2u || Tokens == 4u || Tokens == 6u, "native widths");
+    constexpr unsigned Panel = 512u, Rows = 8u;
+    __shared__ float sx[Tokens][Panel];
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned row = blockIdx.x * Rows + (threadIdx.x >> 5u);
+    float sums[Tokens] = {};
+    for (unsigned first = 0u; first < in_dim; first += Panel) {
+        for (unsigned i = threadIdx.x; i < Tokens * Panel; i += Rows * 32u)
+            sx[i / Panel][i % Panel] =
+                x[(uint64_t)(i / Panel) * in_dim + first + i % Panel];
+        __syncthreads();
+        for (unsigned b = 0u; b < Panel / 32u; ++b) {
+            const unsigned char *block = weight + (uint64_t)row * row_bytes +
+                (first / 32u + b) * 34u;
+            const float scale = q8_0_scale_broadcast_w32(block);
+            const float scaled = q8_exact_ordered_mul(
+                scale, (float)((const int8_t *)(block + 2u))[lane]);
+#pragma unroll
+            for (unsigned t = 0u; t < Tokens; ++t)
+                sums[t] += scaled * sx[t][b * 32u + lane];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (unsigned t = 0u; t < Tokens; ++t) {
+        const float result = warp_sum_f32(sums[t]);
+        if (lane == 0u) out[(uint64_t)t * out_dim + row] = result;
+    }
+}
+
+static int glm5_mla_prelude_q8_small_m_impl(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t weight_type, uint32_t in_dim,
+        uint32_t full_out_dim, uint32_t row_first, uint32_t out_dim,
+        uint64_t row_bytes, const ds4_gpu_tensor *x, uint32_t tokens,
+        bool launch) {
+    const bool q_a_or_kv = in_dim == 4096u && row_first == 0u &&
+        full_out_dim == out_dim && (out_dim == 1536u || out_dim == 512u);
+    const bool q_b = in_dim == 1536u && full_out_dim == 16384u &&
+        out_dim == 8192u && (row_first == 0u || row_first == 8192u);
+    if (!out || !x || !model_map || ((uintptr_t)model_map & 1u) ||
+        weight_type != 8u || (!q_a_or_kv && !q_b) ||
+        (tokens != 2u && tokens != 4u && tokens != 6u) ||
+        row_bytes != (uint64_t)in_dim / 32u * 34u) return 0;
+    const char *prefetch = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_PREFETCH");
+    const char *nt = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_NONTEMPORAL");
+    const char *rows = getenv("DS4_ROCM_GLM5_Q8_SHAREDX_ROWS_PER_BLOCK");
+    if (glm5_q8_decode_tile_mode() != 1 || g_quality_mode ||
+        !cuda_runtime_config()->q8_decode_sharedx_64k ||
+        !prefetch || strcmp(prefetch, "8") ||
+        (nt && strcmp(nt, "0") && strcmp(nt, "1")) ||
+        (rows && strcmp(rows, "8") && strcmp(rows, "16") && strcmp(rows, "32")))
+        return 0;
+    const uint64_t x_bytes = (uint64_t)tokens * in_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)tokens * out_dim * sizeof(float);
+    if (!cuda_tensor_has_bytes(x, x_bytes) || !cuda_tensor_has_bytes(out, out_bytes) ||
+        offset % 2u || !cuda_model_range_fits(
+            model_size, offset, (uint64_t)full_out_dim * row_bytes)) return 0;
+    const uintptr_t op = (uintptr_t)out->ptr, xp = (uintptr_t)x->ptr;
+    if (!op || !xp || op % 4u || xp % 4u ||
+        (op <= xp ? out_bytes > xp - op : x_bytes > op - xp)) return 0;
+    const uint64_t local_offset = offset + (uint64_t)row_first * row_bytes;
+    const uint64_t local_bytes = (uint64_t)out_dim * row_bytes;
+    if (!cuda_model_range_is_cached(model_map, local_offset, local_bytes)) return 0;
+    const auto *weight = (const unsigned char *)cuda_model_range_ptr(
+        model_map, local_offset, local_bytes, "mla_prelude_q8_small_m");
+    if (!weight) return 0;
+    const uintptr_t wp = (uintptr_t)weight;
+    if (wp % 2u || (op <= wp ? out_bytes > wp - op : local_bytes > op - wp)) return 0;
+    if (!launch) return 1;
+#define DS4_MLA_PRELUDE_Q8_LAUNCH(M) \
+    glm5_mla_prelude_q8_small_m_kernel<M><<<out_dim / 8u, 256u>>>( \
+        (float *)out->ptr, weight, (const float *)x->ptr, in_dim, out_dim, row_bytes)
+    if (tokens == 2u) DS4_MLA_PRELUDE_Q8_LAUNCH(2u);
+    else if (tokens == 4u) DS4_MLA_PRELUDE_Q8_LAUNCH(4u);
+    else DS4_MLA_PRELUDE_Q8_LAUNCH(6u);
+#undef DS4_MLA_PRELUDE_Q8_LAUNCH
+    return cuda_ok(cudaGetLastError(), "GLM5 MLA prelude Q8 small-M exact launch");
+}
+
+extern "C" int ds4_rocm_glm5_mla_prelude_q8_small_m_supported(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t weight_type, uint32_t in_dim,
+        uint32_t full_out_dim, uint32_t row_first, uint32_t out_dim,
+        uint64_t row_bytes, const ds4_gpu_tensor *x, uint32_t tokens) {
+    return glm5_mla_prelude_q8_small_m_impl(out, model_map, model_size, offset,
+        weight_type, in_dim, full_out_dim, row_first, out_dim, row_bytes, x, tokens, false);
+}
+
+extern "C" int ds4_rocm_glm5_mla_prelude_q8_small_m(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t weight_type, uint32_t in_dim,
+        uint32_t full_out_dim, uint32_t row_first, uint32_t out_dim,
+        uint64_t row_bytes, const ds4_gpu_tensor *x, uint32_t tokens) {
+    return glm5_mla_prelude_q8_small_m_impl(out, model_map, model_size, offset,
+        weight_type, in_dim, full_out_dim, row_first, out_dim, row_bytes, x, tokens, true);
+}
+
 /* Dedicated original-Q8 MLA output leaf. Keep the shared-expert admission
  * unchanged: this tensor has a full K16384 source row and a packed K8192
  * activation row. The caller establishes Q8_0 type and rank/slice ownership.

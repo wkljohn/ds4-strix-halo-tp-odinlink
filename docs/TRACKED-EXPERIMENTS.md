@@ -125,6 +125,17 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+The active track was fast-forwarded to main `eda6285` for the unchanged
+uncensored GGUF on pinned ROCm10. Its new dossier is
+`$DS4_RESEARCH_ROOT/candidates/glm53-uncensored-rocm10-20260919/`.
+`ds4_rocm_glm5_mla_prelude_q8_small_m` is a production-unused Lane A leaf:
+M2/4/6 original Q8_0 Q_a/KV_a and rank-local Q_b, complete K512 panels,
+resident-only admission and scalar accumulation order. The real-weight
+fixture covers all eleven MLA layers and both rank slices. No inference
+selector or transport change is enabled by this leaf. Results and unresolved
+checks belong in that dossier's `METRICS.md`; no new promotion exception is
+inherited from the SDK migration.
+
 `research/glm53-uncensored-six-kda-20260917` extends current main with
 default-off exact BF16 reuse and accepted-prefix target verification for the
 unchanged uncensored Q4 GGUF. Its dossier is

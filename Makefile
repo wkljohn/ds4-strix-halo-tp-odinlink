@@ -616,6 +616,12 @@ test-rocm-glm5-mla-owned-heads: tests/test_rocm_glm5_mla_owned_heads
 tests/test_rocm_glm5_mla_qkv.o: tests/test_rocm_glm5_mla_qkv.cu tests/glm5_gguf_test.hpp ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
+tests/test_rocm_glm5_mla_prelude_small_m.o: tests/test_rocm_glm5_mla_prelude_small_m.cu tests/glm5_gguf_test.hpp ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h
+	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -I. -c -o $@ $<
+
+tests/test_rocm_glm5_mla_prelude_small_m: tests/test_rocm_glm5_mla_prelude_small_m.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
+	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
+
 tests/test_rocm_glm5_mla_qkv: tests/test_rocm_glm5_mla_qkv.o tests/ds4_tp_hello_test.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o
 	$(HIPCC) $(ROCM_CFLAGS) -Wl,--gc-sections -o $@ $^ $(ROCM_LDLIBS)
 

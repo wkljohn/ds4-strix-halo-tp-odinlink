@@ -37,6 +37,24 @@ int ds4_rocm_glm5_shared_q8_small_m(
         uint32_t in_dim, uint32_t out_dim, uint64_t row_bytes,
         uint32_t k_first, const ds4_gpu_tensor *x, uint32_t tokens);
 
+/* Production-unused MLA input-projection leaf, M2/4/6, original resident Q8_0.
+ * Q_a: K4096/N1536; KV_a: K4096/N512; both full rows, row_first=0.
+ * Q_b: K1536/fullN16384, localN8192, row_first=rank*8192. Contiguous
+ * F32 inputs/outputs and original full Q8 row_bytes are mandatory. Caller
+ * supplies independently validated GGUF weight_type=8. No allocation, retry
+ * or weight cache; no automatic production dispatch. The supported query
+ * performs the same admission without launching or mutating output. */
+int ds4_rocm_glm5_mla_prelude_q8_small_m_supported(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t weight_type, uint32_t in_dim,
+        uint32_t full_out_dim, uint32_t row_first, uint32_t out_dim,
+        uint64_t row_bytes, const ds4_gpu_tensor *x, uint32_t tokens);
+int ds4_rocm_glm5_mla_prelude_q8_small_m(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t offset, uint32_t weight_type, uint32_t in_dim,
+        uint32_t full_out_dim, uint32_t row_first, uint32_t out_dim,
+        uint64_t row_bytes, const ds4_gpu_tensor *x, uint32_t tokens);
+
 /* Research MLA output leaf: resident original Q8_0, M=2/4/6 only.
  * Full K16384 row_bytes17408, local K8192/N4096, k_first0/8192.
  * x must contain packed contiguous local rows, not full 64-head rows.
