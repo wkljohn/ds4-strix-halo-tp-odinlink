@@ -136,6 +136,15 @@ selector or transport change is enabled by this leaf. Results and unresolved
 checks belong in that dossier's `METRICS.md`; no new promotion exception is
 inherited from the SDK migration.
 
+`DS4_GLM5_NATIVE_DRAFT_PROFILE=1` separately instruments the native draft
+layer's completed input, MLA, routed FFN and norm/head/publication spans,
+plus session readback, host selection, chain submission and agreement.
+It adds diagnostic fences only when exactly1; unset/0 keeps the previous
+schedule. Per-step proposal IDs bind both ranks' rejected work as well as
+accepted output. Prefill, arithmetic and weights are unchanged. Profiled
+throughput is not clean timing evidence; see `draft-subphase-plan.md` in
+the active ROCm10 dossier.
+
 `research/glm53-uncensored-six-kda-20260917` extends current main with
 default-off exact BF16 reuse and accepted-prefix target verification for the
 unchanged uncensored Q4 GGUF. Its dossier is

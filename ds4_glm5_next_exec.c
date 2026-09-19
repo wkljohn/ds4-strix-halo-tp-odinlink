@@ -5464,6 +5464,11 @@ int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
         ds4_glm5_next_mla_state *s, ds4_glm5_next_workspace *w,
         const ds4_gpu_tensor *previous, uint32_t token,
         ds4_gpu_tensor *hidden, ds4_gpu_tensor *logits) {
+    const char *profile_option = getenv("DS4_GLM5_NATIVE_DRAFT_PROFILE");
+    const bool profile = profile_option && strcmp(profile_option, "1") == 0;
+    const double begin = profile ? glm5_exec_now_sec() : 0.0;
+    double last = begin, admission_sec = 0.0, input_sec = 0.0;
+    double attention_sec = 0.0, ffn_sec = 0.0, head_sec = 0.0;
     uint32_t slot = 0, pool = 0, visible = 0;
     bool publish = false;
     if (!context_valid(ctx) || !tp_context_valid(ctx) || ctx->trace_prefix ||
@@ -5496,7 +5501,18 @@ int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
     for (unsigned trunk = 3; trunk < DS4_GLM5_NEXT_TRUNK_COUNT; ++trunk)
         if (local_q4k_half_residency(ctx, &ctx->model->layer[trunk]) != 1) return 0;
     draft_bind(ctx, s->owner, w);
+    if (profile) { last = glm5_exec_now_sec(); admission_sec = last - begin; }
     int ok = native_project_inputs(ctx, w, previous, &token, 1u);
+    /* Diagnostic-only completion fences. The off path keeps the existing
+     * enqueue and terminal-completion schedule, including error handling. */
+#define GLM5_DRAFT_PROFILE_MARK(field) do { \
+    if (profile) { \
+        if (ok) ok = ds4_gpu_synchronize(); \
+        const double now = glm5_exec_now_sec(); \
+        field = now - last; last = now; \
+    } \
+} while (0)
+    GLM5_DRAFT_PROFILE_MARK(input_sec);
     ds4_glm5_next_exec_ctx bulk = *ctx;
     bulk.force_bulk_gates = true;
     const uint32_t pos = s->token_count;
@@ -5504,8 +5520,10 @@ int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
         mla_dense_selection_attention(&bulk, il, s, w, w->collapsed, visible, slot, pool, publish) :
         mla_sparse_selection_attention(&bulk, il, s, w, w->collapsed, slot, pool,
             publish, DS4_GLM5_NEXT_INDEX_TOP_K, bulk.tp_big_out, true, true);
-    if (ok) ok = routed_ffn_one(&bulk, il, pos, w, w->output_hidden) &&
-        ds4_gpu_rms_norm_weight_tensor(hidden, w->output_hidden,
+    GLM5_DRAFT_PROFILE_MARK(attention_sec);
+    if (ok) ok = routed_ffn_one(&bulk, il, pos, w, w->output_hidden);
+    GLM5_DRAFT_PROFILE_MARK(ffn_sec);
+    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(hidden, w->output_hidden,
             ctx->model_map, ctx->model_size, ctx->model->nextn_shared_head_norm,
             GLM5_WIDTH, ctx->model->rms_norm_eps);
     if (ok) ok = ctx->model->output_type == 8u ?
@@ -5515,6 +5533,15 @@ int ds4_glm5_next_draft_step(const ds4_glm5_next_exec_ctx *ctx,
             ctx->model->output, GLM5_WIDTH, GLM5_VOCAB, hidden, 1u);
     if (ok) ok = ds4_gpu_synchronize() && ds4_glm5_next_mla_append_commit(s);
     if (!ok) { ds4_gpu_synchronize(); ds4_glm5_next_state_invalidate(s->owner); }
+    if (profile) {
+        const double end = glm5_exec_now_sec();
+        head_sec = end - last;
+        fprintf(stderr, "NATIVE_DRAFT rank=%u pos=%u token=%u ok=%d admission_ms=%.6f input_ms=%.6f attention_ms=%.6f ffn_ms=%.6f norm_head_publish_ms=%.6f total_ms=%.6f\n",
+            ctx->tp_rank, pos, token, ok, admission_sec * 1000.0,
+            input_sec * 1000.0, attention_sec * 1000.0, ffn_sec * 1000.0,
+            head_sec * 1000.0, (end - begin) * 1000.0);
+    }
+#undef GLM5_DRAFT_PROFILE_MARK
     return ok;
 }
 

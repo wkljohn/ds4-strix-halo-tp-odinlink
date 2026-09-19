@@ -81,6 +81,8 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
     const uint32_t rows = c->rows;
     const char *profile_env = getenv("DS4_GLM5_NATIVE_PHASE_PROFILE");
     const bool profile = profile_env && strcmp(profile_env, "1") == 0;
+    const char *draft_profile_env = getenv("DS4_GLM5_NATIVE_DRAFT_PROFILE");
+    const bool draft_profile = draft_profile_env && strcmp(draft_profile_env, "1") == 0;
     const double cycle_start = profile ? glm5_native_wall_sec() : 0.0;
     double draft_sec = 0.0, agree_sec = 0.0, verify_sec = 0.0;
     double select_sec = 0.0, commit_sec = 0.0, phase_start = 0.0;
@@ -127,20 +129,31 @@ static int ds4_session_glm5_native_cycle_run(ds4_session *s,
     ds4_glm5_next_workspace_begin_decode(s->glm5_next_ws);
     for (uint32_t t = 0; t < rows - 1u; ++t) {
         if (profile) phase_start = glm5_native_wall_sec();
+        const double step_begin = draft_profile ? glm5_native_wall_sec() : 0.0;
         if (ok) ok = ds4_glm5_next_draft_step(x, view, s->glm5_native_ws,
-            s->glm5_native_chain, tokens[t], s->glm5_native_hidden, s->glm5_next_logits) &&
-            ds4_gpu_tensor_read(s->glm5_next_logits, 0, s->sample_probs, vocab_row);
+            s->glm5_native_chain, tokens[t], s->glm5_native_hidden, s->glm5_next_logits);
+        const double step_end = draft_profile ? glm5_native_wall_sec() : 0.0;
+        if (ok) ok = ds4_gpu_tensor_read(s->glm5_next_logits, 0, s->sample_probs, vocab_row);
+        const double read_end = draft_profile ? glm5_native_wall_sec() : 0.0;
         const int proposed = ok ? glm5_native_argmax(s->sample_probs) : -1;
+        const double argmax_end = draft_profile ? glm5_native_wall_sec() : 0.0;
         ok = ok && proposed >= 0;
         tokens[t + 1u] = proposed >= 0 ? (uint32_t)proposed : UINT32_MAX;
         if (ok && t + 1u < rows - 1u) ok = ds4_gpu_tensor_copy(s->glm5_native_chain,
             0, s->glm5_native_hidden, 0, row);
+        const double chain_end = draft_profile ? glm5_native_wall_sec() : 0.0;
         if (profile) {
             const double now = glm5_native_wall_sec();
             draft_sec += now - phase_start; phase_start = now;
         }
         if (!ds4_tp_native_agree(e->tp.ctx, c, t + 1u, 0u, tokens, ok, err, errlen)) goto failed;
         if (profile) agree_sec += glm5_native_wall_sec() - phase_start;
+        if (draft_profile) fprintf(stderr,
+            "NATIVE_DRAFT_HOST rank=%u cycle=%llu prefix=%u step=%u token=%u proposal=%u step_ms=%.6f readback_ms=%.6f argmax_ms=%.6f chain_submit_ms=%.6f agreement_ms=%.6f\n",
+            x->tp_rank, (unsigned long long)c->cycle, c->prefix, t, tokens[t], tokens[t + 1u],
+            (step_end - step_begin) * 1000.0, (read_end - step_end) * 1000.0,
+            (argmax_end - read_end) * 1000.0, (chain_end - argmax_end) * 1000.0,
+            (glm5_native_wall_sec() - chain_end) * 1000.0);
     }
     if (profile) phase_start = glm5_native_wall_sec();
     ok = ds4_glm5_next_target_verify(x, &s->glm5_next_state, batch, s->glm5_next_ws,
