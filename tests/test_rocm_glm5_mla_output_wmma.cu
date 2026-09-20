@@ -166,7 +166,6 @@ int main(int argc, char **argv) {
                         activation_argmax / K, activation_argmax % K,
                         first_bad == gather.size() ? ULLONG_MAX : (unsigned long long)first_bad);
             std::fflush(stdout);
-            require(nonfinite == 0 && overflow == 0, "finite original and FP16-rounded activation range");
             require(run(false, false) == 1 && ds4_gpu_synchronize() &&
                     ds4_gpu_tensor_read(out, 0, baseline.data(), OutBytes), "incumbent output");
             if (capture) {
@@ -174,6 +173,7 @@ int main(int argc, char **argv) {
                 require(std::memcmp(baseline.data(), oracle.data(), OutBytes) == 0,
                         "replay matches captured production output exactly");
             }
+            require(nonfinite == 0 && overflow == 0, "finite original and FP16-rounded activation range");
             require(run(true, false) == 1 && ds4_gpu_synchronize() &&
                     ds4_gpu_tensor_read(out, 0, candidate.data(), OutBytes), "strided WMMA output");
             require(run(true, true) == 1 && ds4_gpu_synchronize() &&

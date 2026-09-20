@@ -783,6 +783,9 @@ tests/test_glm5_route_profile: tests/test_glm5_route_profile.c ds4_glm5_route_pr
 tests/test_glm5_expert_pairs: tests/test_glm5_expert_pairs.c ds4_glm5_expert_pairs.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ $< -lm
 
+tests/test_glm5_mla_capture: tests/test_glm5_mla_capture.c ds4_glm5_mla_capture.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ $<
+
 tests/test_glm5_shared_route_order: tests/test_glm5_shared_route_order.c ds4_glm5_next_exec.c ds4_glm5_mla_capture.h ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
 	$(CC) $(CFLAGS) -fno-fast-math -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ $< -lm
 
