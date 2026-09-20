@@ -538,8 +538,9 @@ __global__ static void matmul_bf16_f32_small_m_exact_kernel(
                   "supported small verification batches");
     static_assert(PanelK == 1024u || PanelK == 128u,
                   "wide projection or KDA low-rank expansion");
-    static_assert(Prefetch == 1u || (Prefetch == 8u && PanelK == 1024u && Tokens != 8u),
+    static_assert(Prefetch == 1u || ((Prefetch == 4u || Prefetch == 8u) && PanelK == 1024u && Tokens != 8u),
                   "bounded wide-projection load window for M2/M4/M6");
+    static_assert(PanelK % (32u * Prefetch) == 0u, "complete load windows only");
     constexpr uint32_t Rows = 8u;
     __shared__ float panel[Tokens][PanelK];
     const uint32_t tid = threadIdx.x;

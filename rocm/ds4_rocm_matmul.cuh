@@ -2722,9 +2722,10 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
         if (small_m && strcmp(small_m, "1") == 0) {
             const char *prefetch_option = getenv("DS4_ROCM_GLM5_BF16_SMALL_M_PREFETCH");
             if (prefetch_option && strcmp(prefetch_option, "0") != 0 &&
-                strcmp(prefetch_option, "8") != 0) return 0;
+                strcmp(prefetch_option, "4") != 0 && strcmp(prefetch_option, "8") != 0) return 0;
+            const bool prefetch4 = prefetch_option && strcmp(prefetch_option, "4") == 0;
             const bool prefetch8 = prefetch_option && strcmp(prefetch_option, "8") == 0;
-            if (prefetch8 && n_tok == 8u) return 0;
+            if ((prefetch4 || prefetch8) && n_tok == 8u) return 0;
             const char *split = getenv("DS4_ROCM_BF16_FULL_SPLIT_ORDER");
             const char *legacy = getenv("DS4_ROCM_BF16_FULL_LEGACY_SPLIT_ORDER");
             if (getenv("DS4_ROCM_DISABLE_BF16_SHAREDX") ||
@@ -2744,6 +2745,10 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(ds4_gpu_tensor *out, const void *model
                 else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 128u, 1u);
                 else if (n_tok == 6u) DS4_SMALL_M_EXACT(6u, 128u, 1u);
                 else DS4_SMALL_M_EXACT(8u, 128u, 1u);
+            } else if (prefetch4) {
+                if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 1024u, 4u);
+                else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 1024u, 4u);
+                else DS4_SMALL_M_EXACT(6u, 1024u, 4u);
             } else if (prefetch8) {
                 if (n_tok == 2u) DS4_SMALL_M_EXACT(2u, 1024u, 8u);
                 else if (n_tok == 4u) DS4_SMALL_M_EXACT(4u, 1024u, 8u);
