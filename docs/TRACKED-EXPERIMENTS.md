@@ -125,6 +125,17 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+`compare-teacher-logits.py --score-arm-mode q4k-global` and
+`q4k-global-repeat` compare explicit GLOBAL0/1 or same-mode captures using
+the existing kda-tp scorer arm. These modes are diagnostic-only: legacy GLM
+captures do not attest prompt/continuation contents at capture time. They
+require `--score-fixture`/`--score-root`, one case per process, full-M batched
+prefill and both-rank engagement, original same-build identities, complete
+dump inventories, clean terminal proof, RoCE v2 and zero fallback/cache.
+Quality/threshold bypasses refuse. Fixture content is hashed at comparison,
+not misrepresented as capture-time proof. Existing modes and tolerances stay
+unchanged. See the active dossier's `global-long-quality-plan.md`.
+
 `DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL=1` is a default-off Lane B experiment
 within the grouped/partition256 recipe. Complete M512/768/1024 use one expert
 domain, original I64/J16 kernels and packed weights, threshold6 gate/up and

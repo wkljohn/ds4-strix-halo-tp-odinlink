@@ -168,9 +168,36 @@ def capture_main(argv: list[str]) -> int:
         return 1
 
 
+def verify_score_capture_artifacts(directory: Path, meta: dict, *, fixture_bound: bool = True) -> Path:
+    """Reopen shared score, terminal and complete teacher-dump evidence."""
+    terminal = runpy.run_path(str(Path(__file__).with_name('compare-quality-scores.py')))['terminal_proof']
+    identity_keys = ('ds4_sha256', 'scorer_sha256', 'files_sha256')
+    if fixture_bound:
+        identity_keys += ('fixture_content_sha256',)
+    require(all(re.fullmatch(r'[0-9a-f]{64}', meta.get(key, '')) for key in identity_keys),
+            'invalid teacher capture identity')
+    scores = Path(meta['scores_path'])
+    terminal(scores, meta, required=True)
+    require(sha256(directory / 'files.sha256') == meta['files_sha256'], 'changed dump inventory')
+    inventory = []
+    for line in (directory / 'files.sha256').read_text().splitlines():
+        digest, name = line.split('  ', 1)
+        require(re.fullmatch(r'decode_[0-9]{6}.logits.json', name) is not None,
+                'invalid dump inventory filename')
+        require(sha256(directory / name) == digest, 'changed teacher dump')
+        inventory.append(name)
+    require(inventory == [p.name for p in sorted(directory.glob('decode_*.logits.json'))],
+            'dump inventory coverage differs')
+    require(len(inventory) == int(meta['teacher_positions']), 'wrong teacher position count')
+    validate_score_capture(directory, scores, meta['model'])
+    with scores.open() as stream:
+        require(len(list(csv.DictReader(stream, delimiter='\t'))) == int(meta['cases']),
+                'wrong case count')
+    return scores
+
+
 def verify_deepseek_captures(directories: tuple[Path, Path], manifests: tuple[dict, dict]) -> None:
     """An attested SDK diagnostic only; never an admission or threshold bypass."""
-    terminal = runpy.run_path(str(Path(__file__).with_name('compare-quality-scores.py')))['terminal_proof']
     require(manifests[0].get('run_id') != manifests[1].get('run_id'), 'teacher comparison reuses a process run')
     prior_env = prior_features = None
     for directory, meta in zip(directories, manifests):
@@ -178,26 +205,7 @@ def verify_deepseek_captures(directories: tuple[Path, Path], manifests: tuple[di
                 'DeepSeek comparison requires two deepseek-ordinary captures')
         require(meta['source_dirty'] == '0' and meta['rdma_profile'] == 'roce-v2',
                 'DeepSeek capture requires clean source and RoCE v2')
-        require(all(re.fullmatch(r'[0-9a-f]{64}', meta.get(key, '')) for key in
-                    ('ds4_sha256', 'scorer_sha256', 'fixture_content_sha256', 'files_sha256')),
-                'invalid DeepSeek capture identity')
-        scores = Path(meta['scores_path'])
-        terminal(scores, meta, required=True)
-        require(sha256(directory / 'files.sha256') == meta['files_sha256'], 'changed dump inventory')
-        inventory = []
-        for line in (directory / 'files.sha256').read_text().splitlines():
-            digest, name = line.split('  ', 1)
-            require(re.fullmatch(r'decode_[0-9]{6}.logits.json', name) is not None,
-                    'invalid dump inventory filename')
-            require(sha256(directory / name) == digest, 'changed teacher dump')
-            inventory.append(name)
-        require(inventory == [p.name for p in sorted(directory.glob('decode_*.logits.json'))],
-                'dump inventory coverage differs')
-        require(len(inventory) == int(meta['teacher_positions']), 'wrong teacher position count')
-        validate_score_capture(directory, scores, meta['model'])
-        with scores.open() as stream:
-            require(len(list(csv.DictReader(stream, delimiter='\t'))) == int(meta['cases']),
-                    'wrong case count')
+        verify_score_capture_artifacts(directory, meta)
         for rank in ('coordinator', 'worker'):
             items = [item.split('=', 1) for item in shlex.split(meta[rank + '_env'])]
             env = dict(items)
@@ -211,6 +219,82 @@ def verify_deepseek_captures(directories: tuple[Path, Path], manifests: tuple[di
             feature = meta[rank + '_features'].replace('startup rank=1 ', 'startup rank=0 ')
             require(prior_features is None or feature == prior_features, 'DeepSeek negotiated features differ')
             prior_features = feature
+
+
+def verify_global_captures(directories: tuple[Path, Path], manifests: tuple[dict, dict],
+                           repeat: bool, fixture: Path, source_root: Path) -> str:
+    """Diagnostic only: legacy GLM captures lack capture-time fixture digests."""
+    key = 'DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL'
+    require(manifests[0].get('run_id') != manifests[1].get('run_id'),
+            'teacher comparison reuses a process run')
+    prior_env = None
+    modes = []
+    for directory, meta in zip(directories, manifests):
+        require(meta.get('teacher_arm') == 'kda-tp' and
+                meta.get('model_arch') == 'glm5-next' and meta['source_dirty'] == '0' and
+                meta['rdma_profile'] == 'roce-v2', 'global capture requires clean GLM over RoCE v2')
+        require(meta['cases'] == '1', 'global diagnostic requires one case per process for engagement proof')
+        require(sha256(fixture) == meta['quality_input_sha256'], 'global fixture manifest differs')
+        rows, content_digest = score_fixture(fixture, source_root, int(meta['start_case']), 1)
+        scores = verify_score_capture_artifacts(directory, meta, fixture_bound=False)
+        validate_score_capture(directory, scores, meta['model'], [rows[0][0]])
+        rank_modes = []
+        for rank, index in (('coordinator', 0), ('worker', 1)):
+            items = [item.split('=', 1) for item in shlex.split(meta[rank + '_env'])]
+            env = dict(items)
+            require(len(env) == len(items), 'duplicate effective setting')
+            require(env.pop('DS4_BENCH_RUN_ID', None) == meta['run_id'], 'mixed effective run identity')
+            mode = env.pop(key, None)
+            require(mode in ('0', '1'), 'global capture requires explicit GLOBAL=0 or GLOBAL=1')
+            rank_modes.append(mode)
+            required = dict(DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED='1',
+                            DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION='256',
+                            DS4_GLM5_KDA_TP='1', DS4_GLM5_KDA_OUTPUT_KSLICE='0',
+                            DS4_GLM5_NATIVE_DRAFT='0', DS4_TP_RDMA_LOGITS='1',
+                            DS4_GLM5_SPARSE_BATCH_BRIDGE='1', DS4_GLM5_PREFILL_PROOF='1')
+            require(all(env.get(k) == v for k, v in required.items()) and
+                    env.get('DS4_GLM5_NEXT_PREFILL_BATCH') in ('512', '768', '1024') and
+                    env.get('DS4_TP_GREEDY_TOP2', '0') == '0' and
+                    not any(k.startswith('DS4_DSPARK_') for k in env),
+                    'invalid global capture prerequisites')
+            require(prior_env is None or env == prior_env, 'global effective settings differ')
+            prior_env = env
+            log = Path(meta[rank + '_log_path']).read_text(errors='replace')
+            proof = 'ds4-tp: transport proof requested=rdma active=rdma payload_fallback_calls=0 failed=0'
+            require([line for line in log.splitlines() if line.startswith('ds4-tp: transport proof ')] == [proof]
+                    and re.search(r'rdma GID index \d+ \(RoCE v2\)', log) is not None and
+                    re.search(r'expanded_weight_cache_bytes=0(?:\s|$)', log) is not None and
+                    re.search(r'expanded_weight_cache_bytes=[1-9]', log) is None,
+                    'global capture lacks RoCE/zero-fallback/cache proof')
+            engaged = re.findall(r'global expert domain engaged rank=(\d+) rows=(\d+) groups=1', log)
+            batch = env['DS4_GLM5_NEXT_PREFILL_BATCH']
+            require((bool(engaged) and (str(index), batch) in engaged and
+                     all(r == str(index) and m in ('512', '768', '1024') for r, m in engaged))
+                    if mode == '1' else not engaged,
+                    'global capture engagement disagrees with rank/setting')
+            if mode == '0':
+                require(f'grouped prefill engaged rows={batch} groups={int(batch) // 256} ' in log,
+                        'global control lacks grouped engagement')
+            with scores.open() as stream:
+                prefix = int(next(csv.DictReader(stream, delimiter='\t'))['prompt_tokens'])
+                require(prefix >= int(batch),
+                        'global capture has no full-batch prefix')
+            if rank == 'coordinator':
+                proofs = re.findall(r'GLM5 prefill execution rank=0 start=0 prompt_tokens=(\d+) '
+                                    r'requested_batch=(\d+) batched_tiles=(\d+) batched_rows=(\d+) '
+                                    r'scalar_rows=(\d+) min_tile=(\d+) max_tile=(\d+)', log)
+                require(len(proofs) == 1, 'missing or ambiguous global prefill proof')
+                tokens, requested, tiles, batched, scalar, smallest, largest = map(int, proofs[0])
+                require(tokens == prefix and requested == largest == int(batch) and
+                        tiles > 0 and smallest > 0 and batched + scalar == prefix and
+                        batched >= int(batch) and 0 <= scalar < 256,
+                        'global capture did not execute the declared batched prefix')
+        require(rank_modes[0] == rank_modes[1], 'global rank settings differ')
+        modes.append(rank_modes[0])
+    require((modes[0] == modes[1]) if repeat else modes == ['0', '1'],
+            'global comparison requires same-mode repeat' if repeat else
+            'global comparison requires explicit GLOBAL=0 versus GLOBAL=1')
+    return content_digest
 
 
 def probability_metrics(reference: np.ndarray, candidate: np.ndarray) -> tuple[float, float, float, float]:
@@ -538,6 +622,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--steps-output", type=Path,
                         help="write every per-position metric as JSON Lines")
+    parser.add_argument('--score-fixture', type=Path,
+                        help='fixture TSV for the diagnostic global grouping modes')
+    parser.add_argument('--score-root', type=Path,
+                        help='fixture path root for the diagnostic global grouping modes')
     parser.add_argument("--allow-quality-difference", action="store_true",
                         help="explicitly compare an unfused quality oracle with an optimized path")
     parser.add_argument(
@@ -553,15 +641,26 @@ def main() -> int:
             "attn-scalar-vs-f32-gemm-postdiv-pv-scalar-default-math",
             "attn-scalar-vs-f32-gemm-postdiv-score-pv-scalar",
             "attn-scalar-vs-exact-split",
-            "attn-repeat", "deepseek-sdk"),
+            "attn-repeat", "deepseek-sdk", "q4k-global", "q4k-global-repeat"),
         help="required score_official arm relationship; deepseek-sdk is threshold-free only")
     args = parser.parse_args()
     deepseek_sdk = args.score_arm_mode == 'deepseek-sdk'
+    global_capture = args.score_arm_mode in ('q4k-global', 'q4k-global-repeat')
+    global_fixture_digest = None
     try:
         if deepseek_sdk and (args.thresholds or args.allow_quality_difference):
             raise ValueError('DeepSeek SDK comparison is diagnostic-only, without thresholds or quality-mode changes')
         if args.score_arm_mode == "q8-decode-tile" and args.allow_quality_difference:
             raise ValueError("Q8 decode tile comparison forbids --allow-quality-difference")
+        if global_capture and args.allow_quality_difference:
+            raise ValueError('global capture forbids --allow-quality-difference')
+        if global_capture:
+            require(not args.thresholds, 'global comparison is diagnostic-only pending capture-time fixture binding')
+            require(args.score_fixture is not None and args.score_root is not None,
+                    'global comparison requires --score-fixture and --score-root')
+        else:
+            require(args.score_fixture is None and args.score_root is None,
+                    'score fixture arguments require a global comparison mode')
         thresholds = load_thresholds(args.thresholds)
         reference_files = sorted(args.reference_dir.glob("decode_*.logits.json"))
         candidate_files = sorted(args.candidate_dir.glob("decode_*.logits.json"))
@@ -569,6 +668,9 @@ def main() -> int:
             raise ValueError("reference and candidate decode-logit file sets must be non-empty and identical")
         first_pair = (load(reference_files[0], reference=True),
                       load(candidate_files[0]))
+        if global_capture:
+            require(all(value['quant_bits'] == 4 for value in first_pair),
+                    'global grouping diagnostic requires Q4 captures')
         score_official_source = any(
             value.get("source") == "ds4-score-official-frozen-teacher"
             for value in first_pair)
@@ -599,6 +701,9 @@ def main() -> int:
                                         ('ds4_sha256', 'scorer_sha256')) + (
                     'inference_source_commit', 'model_arch', 'context', 'fixture_content_sha256',
                     'quality_launcher_sha256', 'capture_validator_sha256')
+            if global_capture:
+                identity_fields += ('inference_source_commit', 'model_arch', 'context',
+                                    'quality_launcher_sha256')
             missing = [field for field in identity_fields
                        if field not in reference_manifest or
                        field not in candidate_manifest]
@@ -613,12 +718,19 @@ def main() -> int:
             if deepseek_sdk:
                 verify_deepseek_captures((args.reference_dir, args.candidate_dir),
                                         (reference_manifest, candidate_manifest))
+            if global_capture:
+                global_fixture_digest = verify_global_captures(
+                    (args.reference_dir, args.candidate_dir),
+                    (reference_manifest, candidate_manifest),
+                    args.score_arm_mode == 'q4k-global-repeat', args.score_fixture, args.score_root)
             if not deepseek_sdk:
                 expected_arms = {
                     "kda-tp": ("kda-off", "kda-tp"),
                     "kda-kslice": ("kda-tp", "kda-kslice"),
                     "repeat": ("kda-kslice", "kda-kslice"),
                     "q8-decode-tile": ("kda-tp", "kda-tp"),
+                    "q4k-global": ("kda-tp", "kda-tp"),
+                    "q4k-global-repeat": ("kda-tp", "kda-tp"),
                     "full-split-order-null": ("kda-tp", "kda-tp"),
                     "null-vs-kslice": ("kda-tp", "kda-kslice"),
                     "fallback-vs-kslice": ("kda-tp", "kda-kslice"),
@@ -659,6 +771,14 @@ def main() -> int:
                 ref_env = parse_env(reference_manifest.get("extra_env", ""))
                 cand_env = parse_env(candidate_manifest.get("extra_env", ""))
                 selectors = {"DS4_GLM5_KDA_TP", "DS4_GLM5_KDA_OUTPUT_KSLICE"}
+                if global_capture:
+                    selectors.add('DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL')
+                    # The effective maps are authoritative; declared switches
+                    # must also agree with each corresponding rank map.
+                    for meta, declared in ((reference_manifest, ref_env), (candidate_manifest, cand_env)):
+                        effective = dict(item.split('=', 1) for item in shlex.split(meta['coordinator_env']))
+                        require(all(effective.get(k) == v for k, v in declared.items()),
+                                'declared global settings differ from effective settings')
                 if args.score_arm_mode == "q8-decode-tile":
                     tile_key = "DS4_ROCM_GLM5_Q8_DECODE_TILE"
                     if (ref_env.get(tile_key), cand_env.get(tile_key)) != ("0", "1"):
@@ -829,12 +949,12 @@ def main() -> int:
 
         steps = [compare_pair(first_pair[0], first_pair[1], thresholds,
                               args.allow_quality_difference,
-                              args.score_arm_mode == "q8-decode-tile")]
+                              global_capture or args.score_arm_mode == "q8-decode-tile")]
         for ref_path, cand_path in zip(reference_files[1:], candidate_files[1:]):
             steps.append(compare_pair(load(ref_path, reference=True),
                                       load(cand_path), thresholds,
                                       args.allow_quality_difference,
-                                      args.score_arm_mode == "q8-decode-tile"))
+                                      global_capture or args.score_arm_mode == "q8-decode-tile"))
     except (OSError, ValueError, KeyError, TypeError) as error:
         print(f"teacher-logits: FAIL {error}", file=sys.stderr)
         return 1
@@ -991,6 +1111,9 @@ def main() -> int:
         "baseline_id": thresholds["baseline_id"] if thresholds else None,
         "allow_quality_difference": args.allow_quality_difference,
         "mode": "gate" if thresholds else "diagnostic",
+        "score_arm_mode": args.score_arm_mode,
+        "fixture_content_sha256_at_comparison": global_fixture_digest,
+        "capture_time_fixture_bound": False if global_capture else None,
         "steps": len(steps),
         "argmax_mismatches": len(mismatches),
         "far_margin_inversions": len(far_margin) if thresholds else None,
