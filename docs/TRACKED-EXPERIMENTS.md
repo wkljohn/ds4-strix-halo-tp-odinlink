@@ -125,6 +125,17 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+The production-unused dense-prefill fixture compares the existing F32
+K4096/N12288 token tile, two explicit original-Q8 WMMA128 GEMMs plus SwiGLU,
+and paired WMMA128 with clamp10 at M256/M1024. Test-only admission, NaN poison,
+one-hot addressing, precise host dots and original frozen production-control
+hashes distinguish addressing and build effects from Lane B arithmetic.
+It changes no production selector, weights, window size or transport. Full-FFN
+component timing is not model throughput or quality admission. The uniquely
+frozen build helper and active dossier's dense-prefill-component-plan.md bind
+the hook and independent control separately. Integration and actual4K/8K model
+timing remain required before any production performance claim.
+
 `DS4_GLM5_MLA_OUTPUT_CAPTURE_PREFIX` with explicit capture position3072/7168
 records production MLA heads and local output at layers3/23/43, M1024,
 full-head stride16384. Exclusive files bind rank/layer/position/weight offset

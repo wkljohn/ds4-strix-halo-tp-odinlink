@@ -32,6 +32,66 @@ static uint32_t shared_gate_up_wmma_batch_tile(void) {
     return 128u;
 }
 
+#if defined(DS4_ENABLE_TEST_HOOKS) && DS4_ENABLE_TEST_HOOKS
+/* Component-only dense admission. Neither production dispatch nor the
+ * existing kernel bodies change. The fixture independently checks GGUF types. */
+extern "C" int ds4_gpu_test_glm5_dense_prefill(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset,
+        uint64_t up_offset, const ds4_gpu_tensor *x, uint32_t rows,
+        unsigned mode, unsigned store_gate_up) {
+    constexpr uint64_t k = 4096u, n = 12288u, row_bytes = k / 32u * 34u;
+    constexpr uint64_t weight_bytes = n * row_bytes;
+    if (!model_map || (rows != 256u && rows != 1024u) || mode > 2u ||
+        store_gate_up > 1u || g_quality_mode || cuda_runtime_config()->graph_dump ||
+        !cuda_model_range_fits(model_size, gate_offset, weight_bytes) ||
+        !cuda_model_range_fits(model_size, up_offset, weight_bytes) ||
+        (gate_offset < up_offset + weight_bytes && up_offset < gate_offset + weight_bytes)) return 0;
+    const ds4_gpu_tensor *buffers[] = {x, gate, up, mid};
+    const uint64_t bytes[] = {rows * k * sizeof(float), rows * n * sizeof(float),
+                             rows * n * sizeof(float), rows * n * sizeof(float)};
+    for (unsigned i = 0; i < 4; ++i) {
+        if (!cuda_tensor_has_bytes(buffers[i], bytes[i]) || !buffers[i]->ptr ||
+            (uintptr_t)buffers[i]->ptr > UINTPTR_MAX - bytes[i]) return 0;
+        for (unsigned j = 0; j < i; ++j) {
+            const uintptr_t a = (uintptr_t)buffers[i]->ptr, b = (uintptr_t)buffers[j]->ptr;
+            if (a < b + bytes[j] && b < a + bytes[i]) return 0;
+        }
+    }
+    const char *wg = cuda_model_range_ptr(model_map, gate_offset, weight_bytes, "test_dense_gate_q8");
+    const char *wu = cuda_model_range_ptr(model_map, up_offset, weight_bytes, "test_dense_up_q8");
+    if (!wg || !wu) return 0;
+    if (mode == 0u) {
+        shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel<16u,16u>
+            <<<dim3(n / 32u, rows / 16u),1024u,16u * 16u * 32u * sizeof(float)>>>(
+                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                (const unsigned char *)wg, (const unsigned char *)wu, (const float *)x->ptr,
+                k / 32u, n, rows, row_bytes, (int)store_gate_up, 10.0f);
+    } else if (mode == 1u) {
+        shared_gate_up_swiglu_q8_0_batch_wmma_kernel<128u,128u>
+            <<<dim3(n / 128u, rows / 64u),256u>>>(
+                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                (const unsigned char *)wg, (const unsigned char *)wu, (const float *)x->ptr,
+                rows, k, n, row_bytes, (int)store_gate_up, 10.0f);
+    } else {
+        // Explicit geometry for the separate-GEMM control: no cached selector
+        // can silently substitute another kernel in this component experiment.
+        matmul_q8_0_f32_batch_wmma_kernel<128u,128u>
+            <<<dim3(n / 128u, rows / 64u),256u>>>(
+                (float *)gate->ptr, (const unsigned char *)wg,
+                (const float *)x->ptr, rows, k, n, row_bytes);
+        if (!cuda_ok(cudaGetLastError(), "test dense gate launch")) return 0;
+        matmul_q8_0_f32_batch_wmma_kernel<128u,128u>
+            <<<dim3(n / 128u, rows / 64u),256u>>>(
+                (float *)up->ptr, (const unsigned char *)wu,
+                (const float *)x->ptr, rows, k, n, row_bytes);
+        if (!cuda_ok(cudaGetLastError(), "test dense up launch")) return 0;
+        return ds4_gpu_swiglu_tensor(mid, gate, up, rows * n, 10.0f, 1.0f);
+    }
+    return cuda_ok(cudaGetLastError(), "test dense prefill launch");
+}
+#endif
+
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,

@@ -124,5 +124,6 @@ __pycache__/
 .*.swp
 .DS_Store
 tests/test_rocm_glm5_kda_ref
+tests/test_rocm_glm5_dense_q8_prefill
 tests/test_rocm_glm5_conv_ref
 tests/test_glm5_kda_state
