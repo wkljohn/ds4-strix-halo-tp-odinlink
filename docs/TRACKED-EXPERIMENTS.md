@@ -129,7 +129,7 @@ pins; retain the stale-build check and original build dossier. See
 `q4k-global-repeat` compare explicit GLOBAL0/1 or same-mode captures using
 the existing kda-tp scorer arm. These modes are diagnostic-only: legacy GLM
 captures do not attest prompt/continuation contents at capture time. They
-require `--score-fixture`/`--score-root`, one case per process, full-M batched
+require `--score-fixture`/`--score-root`/`--score-rdma-gid`, one case per process, full-M batched
 prefill and both-rank engagement, original same-build identities, complete
 dump inventories, clean terminal proof, RoCE v2 and zero fallback/cache.
 Quality/threshold bypasses refuse. Fixture content is hashed at comparison,

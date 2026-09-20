@@ -85,7 +85,8 @@ class GlobalTeacher(unittest.TestCase):
             (directory / 'manifest').write_text(''.join(f'{k}={v}\n' for k, v in meta.items()))
         return subprocess.run([sys.executable, str(TOOL), *map(str, self.dirs),
                                '--score-arm-mode', mode, '--score-fixture', str(self.fixture),
-                               '--score-root', str(self.root), *extra], text=True, capture_output=True)
+                               '--score-root', str(self.root), '--score-rdma-gid', '3',
+                               *extra], text=True, capture_output=True)
 
     def test_complete_diagnostic_and_numeric_drift(self):
         fixtures['dump'](self.dirs[1] / 'decode_000000.logits.json', [0., 1., 4., 3.],
@@ -146,6 +147,58 @@ class GlobalTeacher(unittest.TestCase):
                          quality=True, source='ds4-score-official-frozen-teacher')
         self.inventory(1)
         self.assertIn('ordinary production arithmetic', self.run_tool().stderr)
+
+    def test_gid_and_worker_engagement_refused(self):
+        path = Path(self.meta[1]['worker_log_path'])
+        original = path.read_text()
+        self.bind(1, 'worker_log', path, original.replace('GID index 3', 'GID index 4'))
+        self.assertIn('RoCE/zero-fallback', self.run_tool().stderr)
+        self.bind(1, 'worker_log', path, original.replace('global expert domain engaged', 'not engaged'))
+        self.assertIn('engagement disagrees', self.run_tool().stderr)
+
+    def test_bad_prerequisites_and_extra_case_refused(self):
+        for before, after in (('GROUPED=1', 'GROUPED=0'), ('BRIDGE=1', 'BRIDGE=0'),
+                              ('PROOF=1', 'PROOF=0'), ('KSLICE=0', 'KSLICE=1'),
+                              ('BATCH=1024', 'BATCH=256'), ('DRAFT=0', 'DRAFT=6')):
+            originals = [m['coordinator_env'] for m in self.meta]
+            for m in self.meta:
+                m['coordinator_env'] = m['coordinator_env'].replace(before, after)
+            with self.subTest(before=before):
+                self.assertIn('prerequisites', self.run_tool().stderr)
+            for m, original in zip(self.meta, originals):
+                m['coordinator_env'] = original
+        self.meta[1]['cases'] = '2'
+        self.assertNotEqual(self.run_tool().returncode, 0)
+
+    def test_build_and_declared_selector_mismatch_refused(self):
+        for field in ('source_commit', 'ds4_sha256'):
+            old = self.meta[1][field]
+            self.meta[1][field] = 'wrong'
+            with self.subTest(field=field):
+                self.assertIn('manifest ' + field, self.run_tool().stderr)
+            self.meta[1][field] = old
+        self.meta[1]['extra_env'] = self.meta[1]['extra_env'].replace(GLOBAL + '=1', '')
+        self.assertIn('explicit declared GLOBAL', self.run_tool().stderr)
+
+    def test_missing_control_and_coordinator_proofs_refused(self):
+        path = Path(self.meta[0]['worker_log_path'])
+        original = path.read_text()
+        self.bind(0, 'worker_log', path, original.replace('grouped prefill engaged', 'not engaged'))
+        self.assertIn('control lacks grouped', self.run_tool().stderr)
+        self.bind(0, 'worker_log', path, original)
+        path = Path(self.meta[1]['coordinator_log_path'])
+        self.bind(1, 'coordinator_log', path, path.read_text().replace('GLM5 prefill execution', 'other record'))
+        self.assertIn('prefill proof', self.run_tool().stderr)
+
+    def test_fixture_content_rewrite_remains_explicitly_diagnostic(self):
+        first = json.loads(self.run_tool().stdout)
+        (self.root / 'prompt.txt').write_text('changed after capture: this is not capture-time binding')
+        result = self.run_tool()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        second = json.loads(result.stdout)
+        self.assertNotEqual(first['fixture_content_sha256_at_comparison'],
+                            second['fixture_content_sha256_at_comparison'])
+        self.assertFalse(second['capture_time_fixture_bound'])
 
 
 if __name__ == '__main__':

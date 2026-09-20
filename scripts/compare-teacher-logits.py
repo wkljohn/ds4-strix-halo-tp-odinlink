@@ -222,7 +222,7 @@ def verify_deepseek_captures(directories: tuple[Path, Path], manifests: tuple[di
 
 
 def verify_global_captures(directories: tuple[Path, Path], manifests: tuple[dict, dict],
-                           repeat: bool, fixture: Path, source_root: Path) -> str:
+                           repeat: bool, fixture: Path, source_root: Path, gid_index: int) -> str:
     """Diagnostic only: legacy GLM captures lack capture-time fixture digests."""
     key = 'DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL'
     require(manifests[0].get('run_id') != manifests[1].get('run_id'),
@@ -262,7 +262,7 @@ def verify_global_captures(directories: tuple[Path, Path], manifests: tuple[dict
             log = Path(meta[rank + '_log_path']).read_text(errors='replace')
             proof = 'ds4-tp: transport proof requested=rdma active=rdma payload_fallback_calls=0 failed=0'
             require([line for line in log.splitlines() if line.startswith('ds4-tp: transport proof ')] == [proof]
-                    and re.search(r'rdma GID index \d+ \(RoCE v2\)', log) is not None and
+                    and re.findall(r'rdma GID index (\d+) \(RoCE v2\)', log) == [str(gid_index)] and
                     re.search(r'expanded_weight_cache_bytes=0(?:\s|$)', log) is not None and
                     re.search(r'expanded_weight_cache_bytes=[1-9]', log) is None,
                     'global capture lacks RoCE/zero-fallback/cache proof')
@@ -626,6 +626,8 @@ def main() -> int:
                         help='fixture TSV for the diagnostic global grouping modes')
     parser.add_argument('--score-root', type=Path,
                         help='fixture path root for the diagnostic global grouping modes')
+    parser.add_argument('--score-rdma-gid', type=int,
+                        help='expected RoCE v2 GID on both ranks for global diagnostics')
     parser.add_argument("--allow-quality-difference", action="store_true",
                         help="explicitly compare an unfused quality oracle with an optimized path")
     parser.add_argument(
@@ -658,8 +660,10 @@ def main() -> int:
             require(not args.thresholds, 'global comparison is diagnostic-only pending capture-time fixture binding')
             require(args.score_fixture is not None and args.score_root is not None,
                     'global comparison requires --score-fixture and --score-root')
+            require(args.score_rdma_gid is not None and 0 <= args.score_rdma_gid <= 255,
+                    'global comparison requires --score-rdma-gid in 0..255')
         else:
-            require(args.score_fixture is None and args.score_root is None,
+            require(args.score_fixture is None and args.score_root is None and args.score_rdma_gid is None,
                     'score fixture arguments require a global comparison mode')
         thresholds = load_thresholds(args.thresholds)
         reference_files = sorted(args.reference_dir.glob("decode_*.logits.json"))
@@ -722,7 +726,8 @@ def main() -> int:
                 global_fixture_digest = verify_global_captures(
                     (args.reference_dir, args.candidate_dir),
                     (reference_manifest, candidate_manifest),
-                    args.score_arm_mode == 'q4k-global-repeat', args.score_fixture, args.score_root)
+                    args.score_arm_mode == 'q4k-global-repeat', args.score_fixture, args.score_root,
+                    args.score_rdma_gid)
             if not deepseek_sdk:
                 expected_arms = {
                     "kda-tp": ("kda-off", "kda-tp"),
@@ -776,6 +781,8 @@ def main() -> int:
                     # The effective maps are authoritative; declared switches
                     # must also agree with each corresponding rank map.
                     for meta, declared in ((reference_manifest, ref_env), (candidate_manifest, cand_env)):
+                        require(declared.get('DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL') in ('0', '1'),
+                                'global comparison requires an explicit declared GLOBAL setting')
                         effective = dict(item.split('=', 1) for item in shlex.split(meta['coordinator_env']))
                         require(all(effective.get(k) == v for k, v in declared.items()),
                                 'declared global settings differ from effective settings')
