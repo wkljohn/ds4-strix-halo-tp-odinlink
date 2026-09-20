@@ -125,6 +125,15 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+The component-only `NativeQkv` specialization of the live six-pointer BF16
+kernel drops the residual QKV product, retaining original weights and exact
+F32 skinny gates. It defaults false and has no production selector. The
+real-weight `test_rocm_glm5_six_native.cu` compares against an independently
+compiled parent, rounded-input controls and sampled FP64 dots before reporting
+complete-six timings. Its `--stream` walks all34 KDA layers on both slices;
+these synthetic-activation diagnostics do not establish model quality or
+throughput. See `bf16-six-live-native-plan.md` in the active ROCm10 dossier.
+
 `compare-teacher-logits.py --score-arm-mode q4k-global` and
 `q4k-global-repeat` compare explicit GLOBAL0/1 or same-mode captures using
 the existing kda-tp scorer arm. These modes are diagnostic-only: legacy GLM

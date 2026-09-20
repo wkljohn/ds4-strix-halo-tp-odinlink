@@ -1115,8 +1115,11 @@ static void matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_n1_kernel(
  * Those small recurrent gates must not silently inherit WMMA arithmetic.
  * Each exact workgroup handles two output rows and reuses each weight over
  * eight tokens. Its reduction storage aliases the existing WMMA panels.
- * All physical GGUF weights remain independent, unchanged pointers. */
-template <bool CoalescedWeights = false, bool SkinnyOnly = false>
+ * All physical GGUF weights remain independent, unchanged pointers.
+ * NativeQkv is a component-only Lane B probe: QKV uses BF16-rounded input,
+ * while the skinny gates below retain their original F32 arithmetic. */
+template <bool CoalescedWeights = false, bool SkinnyOnly = false,
+          bool NativeQkv = false>
 __global__ __launch_bounds__(16u * 32u, 1)
 static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
         float *out_q, float *out_k, float *out_v,
@@ -1126,6 +1129,8 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
         const uint16_t *weight_g, const uint16_t *weight_beta,
         const float *x, uint32_t in_dim, uint32_t q_rows,
         uint32_t low_rows, uint32_t beta_rows, uint32_t tokens) {
+    static_assert(!NativeQkv || (!SkinnyOnly && !CoalescedWeights),
+                  "native QKV probe cannot combine geometry experiments");
     constexpr uint32_t BM = 16u;
     constexpr uint32_t BN = 16u;
     constexpr uint32_t BK = 16u;
@@ -1249,12 +1254,14 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
             if (global_m < tokens) {
                 const float xv = x[(uint64_t)global_m * in_dim + k0 + kk];
                 const uint16_t hi = ds4_bf16_rne_bits(xv);
-                const float hi_f = __uint_as_float((uint32_t)hi << 16u);
                 sh_a_hi[j] = hi;
-                sh_a_lo[j] = ds4_bf16_rne_bits(xv - hi_f);
+                if constexpr (!NativeQkv) {
+                    const float hi_f = __uint_as_float((uint32_t)hi << 16u);
+                    sh_a_lo[j] = ds4_bf16_rne_bits(xv - hi_f);
+                }
             } else {
                 sh_a_hi[j] = 0u;
-                sh_a_lo[j] = 0u;
+                if constexpr (!NativeQkv) sh_a_lo[j] = 0u;
             }
         }
         if constexpr (CoalescedWeights) {
@@ -1292,10 +1299,12 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
                 a, reinterpret_cast<const Bf16 *>(
                     sh_a_hi + mt * BM * BK), BK);
             rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
-            rocwmma::load_matrix_sync(
-                a, reinterpret_cast<const Bf16 *>(
-                    sh_a_lo + mt * BM * BK), BK);
-            rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+            if constexpr (!NativeQkv) {
+                rocwmma::load_matrix_sync(
+                    a, reinterpret_cast<const Bf16 *>(
+                        sh_a_lo + mt * BM * BK), BK);
+                rocwmma::mma_sync(acc[nt], a, b, acc[nt]);
+            }
         }
         __syncthreads();
     }
