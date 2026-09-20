@@ -136,10 +136,49 @@ static void onehot_reference(const unsigned char *w,const std::vector<float>&v,
         layer,m,unsigned(rounded),changed,max_abs);
 }
 
+static std::vector<float> read_capture(const std::string &path,size_t count) {
+    std::vector<float> data(count);
+    FILE *fp=std::fopen(path.c_str(),"rb"); REQUIRE(fp);
+    REQUIRE(std::fread(data.data(),4,count,fp)==count);
+    REQUIRE(std::fgetc(fp)==EOF && !std::ferror(fp) && std::fclose(fp)==0);
+    for(float value:data) REQUIRE(std::isfinite(value));
+    return data;
+}
+
+static std::string capture_identity(const std::string &stem,unsigned rank,
+        unsigned layer,unsigned pos,const uint64_t *offsets) {
+    FILE *fp=std::fopen((stem+".meta").c_str(),"rb"); REQUIRE(fp);
+    std::unordered_map<std::string,std::string> values;
+    char line[1024];
+    while(std::fgets(line,sizeof(line),fp)) {
+        std::string s(line); REQUIRE(!s.empty() && s.back()=='\n'); s.pop_back();
+        auto split=s.find('='); REQUIRE(split!=std::string::npos);
+        REQUIRE(values.emplace(s.substr(0,split),s.substr(split+1)).second);
+    }
+    REQUIRE(!std::ferror(fp) && std::fclose(fp)==0 && values.size()==16);
+    const std::pair<const char*,std::string> expected[]={
+        {"schema","1"},{"implementation","f32-token-tile"},
+        {"rank",std::to_string(rank)},{"layer",std::to_string(layer)},
+        {"pos",std::to_string(pos)},{"rows","1024"},{"in_dim","4096"},
+        {"mid_dim","12288"},{"clamp","10"},
+        {"gate_offset",std::to_string(offsets[0])},{"up_offset",std::to_string(offsets[1])},
+        {"down_offset",std::to_string(offsets[2])},{"input_bytes","16777216"},
+        {"mid_bytes","50331648"},{"down_bytes","16777216"}};
+    for(const auto &item:expected) REQUIRE(values.at(item.first)==item.second);
+    REQUIRE(!values.at("run_id").empty());
+    return values.at("run_id");
+}
+
 int main(int argc,char **argv) {
-    REQUIRE(argc==3 && !std::strcmp(argv[1],"--rows"));
-    REQUIRE(!std::strcmp(argv[2],"256") || !std::strcmp(argv[2],"1024"));
-    const unsigned m=(unsigned)std::strtoul(argv[2],nullptr,10);
+    const char *capture=nullptr; unsigned position=0,m=0;
+    if(argc==4 && !std::strcmp(argv[1],"--replay")) {
+        REQUIRE(!std::strcmp(argv[3],"3072") || !std::strcmp(argv[3],"7168"));
+        capture=argv[2]; position=(unsigned)std::strtoul(argv[3],nullptr,10); m=1024;
+    } else {
+        REQUIRE(argc==3 && !std::strcmp(argv[1],"--rows"));
+        REQUIRE(!std::strcmp(argv[2],"256") || !std::strcmp(argv[2],"1024"));
+        m=(unsigned)std::strtoul(argv[2],nullptr,10);
+    }
     const char *path=std::getenv("DS4_GLM5_MODEL"); REQUIRE(path);
     const std::pair<const char*,const char*> settings[]={
         {"DS4_GLM5_NEXT_ENABLE_ORDINARY","1"}, {"DS4_ROCM_ENABLE_Q8_F16_CACHE","0"},
@@ -177,20 +216,44 @@ int main(int argc,char **argv) {
             return ok && (!complete || ds4_gpu_matmul_q8_0_tensor(down.view,g.map,g.size,
                 offsets[layer*3+2],N,K,mid.view,m));
         };
-        for(unsigned layer=0;layer<3;++layer) for(unsigned seed=0;seed<4;++seed) {
+        std::string captured_run;
+        for(unsigned layer=0;layer<3;++layer) for(unsigned seed=0;seed<(capture?2u:4u);++seed) {
             std::vector<float> x(input.count);
             for(size_t i=0;i<x.size();++i)
                 x[i]=seed==0||seed==3?0.0f:seed==1?float(std::sin(double(i)*0.017+layer)*0.31+
                     std::cos(double(i)*0.037)*0.19):float(std::sin(double(i)*0.019+layer))*
                     (i%3?0.00013f:10.0003f);
             if(seed==3) for(unsigned tok=0;tok<m;++tok) x[size_t(tok)*K+onehot_column(tok,layer)]=1.0f;
+            std::vector<float> captured_mid,captured_down;
+            if(capture) {
+                const std::string stem=std::string(capture)+".r"+std::to_string(seed)+
+                    ".l"+std::to_string(layer)+".p"+std::to_string(position)+".m1024";
+                const auto run_id=capture_identity(stem,seed,layer,position,offsets+3*layer);
+                if(captured_run.empty()) captured_run=run_id;
+                REQUIRE(captured_run==run_id);
+                x=read_capture(stem+".input.f32",input.count);
+                captured_mid=read_capture(stem+".mid.f32",mid.count);
+                captured_down=read_capture(stem+".down.f32",down.count);
+            }
             size_t overflows=0;
-            for(float v:x) overflows+=std::abs(v)>65504.0f || !std::isfinite(v);
+            double input_max=0; size_t subnormal=0,rounded_zero=0;
+            for(float v:x) {
+                overflows+=std::abs(v)>65504.0f || !std::isfinite(v);
+                input_max=std::max(input_max,std::abs(double(v)));
+                const float half=float((_Float16)v);
+                subnormal+=half!=0 && std::abs(half)<0x1p-14f;
+                rounded_zero+=v!=0 && half==0;
+            }
             REQUIRE(overflows==0);
             input.fill(); REQUIRE(ds4_gpu_tensor_write(input.view,0,x.data(),x.size()*4));
             for(auto *o:out) o->fill();
             REQUIRE(run(layer,0,false,true) && ds4_gpu_synchronize());
             auto production=mid.read(), production_down=down.read();
+            if(capture) {
+                REQUIRE(exact(production,captured_mid) && exact(production_down,captured_down));
+                std::printf("DENSE_REPLAY layer=%u rank=%u pos=%u run_id=%s exact=1 input_max=%.9g fp16_subnormal=%zu rounded_zero=%zu\n",
+                    layer,seed,position,captured_run.c_str(),input_max,subnormal,rounded_zero);
+            }
             gate.read(false); up.read(false);
             std::printf("DENSE_CONTROL layer=%u m=%u seed=%u mid=%016llx down=%016llx fp16_overflows=%zu\n",
                 layer,m,seed,(unsigned long long)digest(production),(unsigned long long)digest(production_down),overflows);
@@ -205,7 +268,7 @@ int main(int argc,char **argv) {
             REQUIRE(exact(production,result[0][2]) && exact(production_down,result[0][3]));
             // Independent separate-kernel operands/reduction check for fusion.
             REQUIRE(exact(result[1][0],result[2][0]) && exact(result[1][1],result[2][1]));
-            if(seed==1) REQUIRE(!exact(result[0][0],result[1][0]));
+            if(!capture && seed==1) REQUIRE(!exact(result[0][0],result[1][0]));
             // The ordinary generic route must agree with the explicit B kernel.
             for(auto *o:out) o->fill();
             REQUIRE(ds4_gpu_matmul_q8_0_tensor(gate.view,g.map,g.size,offsets[layer*3],K,N,input.view,m));
@@ -235,12 +298,13 @@ int main(int argc,char **argv) {
             }
             std::printf("DENSE_CLAMP layer=%u m=%u seed=%u crossings=%zu\n",layer,m,seed,crossings);
             for(unsigned p=0;p<2;++p) dot_reference(g.map+offsets[3*layer+p],x,result[0][p],result[1][p],layer,m,seed,p);
-            if(seed==3) for(unsigned arm=0;arm<3;++arm) for(unsigned p=0;p<2;++p)
+            if(!capture && seed==3) for(unsigned arm=0;arm<3;++arm) for(unsigned p=0;p<2;++p)
                 onehot_reference(g.map+offsets[3*layer+p],result[arm][p],m,layer,arm!=0);
 #endif
             std::fflush(stdout);
         }
 #ifndef DENSE_PREFILL_CONTROL_ONLY
+        if(!capture) {
         // Bad admissions cannot modify outputs. All selected calls must succeed.
         for(auto *o:out) o->fill();
         for(unsigned bad:{0u,1u,255u,257u,512u,1023u,1025u})
@@ -331,8 +395,10 @@ int main(int argc,char **argv) {
             std::printf("DENSE_MEDIAN m=%u arm=%u layers=3 complete_ms=%.6f\n",m,arm,
                 (complete_samples[arm][2]+complete_samples[arm][3])*0.5);
         }
+        }
 #endif
     }
     ds4_gpu_cleanup();
-    std::printf("PASS dense-prefill m=%u layers=3 weights=original expanded_weight_cache_bytes=0 quality_admission=0\n",m);
+    if(capture) std::printf("PASS dense-replay pos=%u m=%u cases=6 weights=original quality_admission=0\n",position,m);
+    else std::printf("PASS dense-prefill m=%u layers=3 weights=original expanded_weight_cache_bytes=0 quality_admission=0\n",m);
 }

@@ -465,7 +465,7 @@ test-glm5-dense-block0-external-reference: tests/test_rocm_glm5_dense_block0
 tests/test_rocm_glm5_prefix_layer3_tp.o: tests/test_rocm_glm5_prefix_layer3_tp.cu tests/glm5_gguf_test.hpp tests/glm5_next_real_offsets.hpp ds4.h ds4_glm5_kda.h ds4_glm5_next_exec.h ds4_gpu.h ds4_gpu_mgpu.h ds4_tp.h
 	$(HIPCC) $(ROCM_PRECISE_CFLAGS) -DDS4_ROCM_BUILD -DDS4_TP_TEST_HOOKS -I. -c -o $@ $<
 
-tests/ds4_glm5_next_exec_test.o: ds4_glm5_next_exec.c ds4_glm5_mla_capture.h ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
+tests/ds4_glm5_next_exec_test.o: ds4_glm5_next_exec.c ds4_glm5_dense_capture.h ds4_glm5_mla_capture.h ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
 	$(CC) $(CFLAGS) -DDS4_TP_TEST_HOOKS -c -o $@ $<
 
 tests/ds4_glm5_text_codec.o: ds4.c ds4.h
@@ -792,7 +792,10 @@ tests/test_glm5_expert_pairs: tests/test_glm5_expert_pairs.c ds4_glm5_expert_pai
 tests/test_glm5_mla_capture: tests/test_glm5_mla_capture.c ds4_glm5_mla_capture.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ $<
 
-tests/test_glm5_shared_route_order: tests/test_glm5_shared_route_order.c ds4_glm5_next_exec.c ds4_glm5_mla_capture.h ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
+tests/test_glm5_dense_capture: tests/test_glm5_dense_capture.c ds4_glm5_dense_capture.h ds4_glm5_mla_capture.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ $<
+
+tests/test_glm5_shared_route_order: tests/test_glm5_shared_route_order.c ds4_glm5_next_exec.c ds4_glm5_dense_capture.h ds4_glm5_mla_capture.h ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_gpu.h ds4_tp.h
 	$(CC) $(CFLAGS) -fno-fast-math -DDS4_ROCM_BUILD -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ $< -lm
 
 tests/test_glm5_next_state: tests/test_glm5_next_state.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h
@@ -800,7 +803,7 @@ tests/test_glm5_next_state: tests/test_glm5_next_state.c ds4_glm5_next_runtime.c
 
 # Retain only the production target-commit path; unused GPU executor entry
 # points are discarded so this host failure-injection fixture needs no GPU.
-tests/test_glm5_target_commit: tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_mla_capture.h ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
+tests/test_glm5_target_commit: tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_dense_capture.h ds4_glm5_mla_capture.h ds4_glm5_route_profile.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.c ds4_glm5_kda.h ds4_gpu.h ds4_tp.h
 	$(CC) $(CFLAGS) -DDS4_GLM5_TARGET_COMMIT_TEST -ffunction-sections -fdata-sections -I. -Wl,--gc-sections -o $@ tests/test_glm5_next_state.c ds4_glm5_next_exec.c ds4_glm5_next_runtime.c ds4_glm5_next_state.c ds4_glm5_kda.c $(LDLIBS)
 
 tests/ds4_tp_hello_test.o: ds4_tp.c ds4_tp.h ds4.h
@@ -1114,7 +1117,7 @@ ds4_glm5_next_runtime.o: ds4_glm5_next_runtime.c ds4_glm5_next_runtime.h ds4_glm
 ds4_glm5_next_state.o: ds4_glm5_next_state.c ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_state.c
 
-ds4_glm5_next_exec.o: ds4_glm5_next_exec.c ds4_glm5_mla_capture.h ds4_glm5_route_profile.h ds4_glm5_expert_pairs.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
+ds4_glm5_next_exec.o: ds4_glm5_next_exec.c ds4_glm5_dense_capture.h ds4_glm5_mla_capture.h ds4_glm5_route_profile.h ds4_glm5_expert_pairs.h ds4_glm5_next_exec.h ds4_glm5_next_runtime.h ds4_glm5_kda.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_glm5_next_exec.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h

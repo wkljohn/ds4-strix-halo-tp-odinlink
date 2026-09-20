@@ -125,6 +125,14 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+`DS4_GLM5_DENSE_CAPTURE_PREFIX` with explicit position3072/7168 captures original
+dense inputs/mid/down from layers0/1/2 at M1024, both ranks, without changing
+arithmetic. Exclusive files bind run/layer/rank/position/offsets; reads add
+diagnostic synchronization. The dense fixture's --replay first requires exact
+production mid/down, then compares existing original-Q8 alternatives. No
+production selector or quality admission is added. See the active dossier's
+dense-production-replay-plan.md; captured rates are not clean timing.
+
 The production-unused dense-prefill fixture compares the existing F32
 K4096/N12288 token tile, two explicit original-Q8 WMMA128 GEMMs plus SwiGLU,
 and paired WMMA128 with clamp10 at M256/M1024. Test-only admission, NaN poison,

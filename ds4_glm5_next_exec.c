@@ -12,6 +12,7 @@
 #include "ds4_glm5_route_profile.h"
 #include "ds4_glm5_expert_pairs.h"
 #include "ds4_glm5_mla_capture.h"
+#include "ds4_glm5_dense_capture.h"
 #ifdef DS4_ROCM_BUILD
 #include "ds4_gpu_mgpu.h"
 #endif
@@ -1378,6 +1379,14 @@ static int dense_kda_forward_rows(const ds4_glm5_next_exec_ctx *ctx,
                             n_tokens * GLM5_HC_WIDTH);
     }
     if (ok) ok = dense_ffn_rows(ctx, il, w, hc_out, n_tokens, finite_debug);
+    if (ok && getenv("DS4_GLM5_DENSE_CAPTURE_PREFIX")) {
+        const uint64_t end = state->kda.layer[il].token_count;
+        const ds4_glm5_next_layer_offsets *layer = &ctx->model->layer[il];
+        ok = end >= n_tokens && glm5_dense_prefill_capture(
+            ctx->tp_rank, il, end - n_tokens, n_tokens,
+            layer->ffn_weight.gate, layer->ffn_weight.up, layer->ffn_weight.down,
+            w->ffn_hidden, w->mid, w->down);
+    }
 #ifdef DS4_TP_TEST_HOOKS
     if (ok && n_tokens == 1u)
         ok = trace_tensor(
