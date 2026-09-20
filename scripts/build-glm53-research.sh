@@ -27,6 +27,7 @@ cflags='-O3 -ffast-math -g -march=native -Wall -Wextra -std=c99 -D_GNU_SOURCE -f
 # here while the Makefile applies it to the HIP compilation flags.
 if [[ $profile == 1 ]]; then cflags+=' -DDS4_ENABLE_PROFILING=1'; fi
 args=(-j3 ds4 ds4-bench-tp tests/test_rocm_glm5_indexer_score_one
+      gguf-tools/quality-testing/score_official
       tests/test_rocm_glm5_indexer_select
       tests/test_rocm_glm5_expert_pairs tests/test_glm5_expert_pairs
       tests/test_rocm_glm5_layer_verify
@@ -43,6 +44,7 @@ printf '%q ' make "${args[@]}" > BUILD-COMMAND
 printf '\n' >> BUILD-COMMAND
 make "${args[@]}" > build.log 2>&1
 sha256sum ds4 ds4-bench-tp *.o tests/test_rocm_glm5_indexer_score_one \
+  gguf-tools/quality-testing/score_official{,.o,.c} run-tp-quality-score.sh \
   tests/test_rocm_glm5_indexer_select tests/test_rocm_glm5_expert_pairs \
   tests/test_rocm_glm5_layer_verify \
   tests/test_rocm_glm5_mla_prelude_small_m \
