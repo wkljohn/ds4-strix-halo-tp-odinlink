@@ -9,6 +9,13 @@
 /ds4_agent_test
 /ds4_server_test
 /ds4_test
+# Frozen research builds retain these generated reports in the artifact tree.
+# Ignore only outputs; source snapshots and raw evidence stay in the archive.
+/BUILD-SOURCE
+/BUILD-COMMAND
+/BUILD-SHA256SUMS
+/compiler.txt
+/build.log
 /ds4flash.gguf
 /TODO.md
 /gguf/
@@ -55,6 +62,16 @@
 /tests/test_rocm_glm5_kpool
 /tests/test_rocm_glm5_indexer_select
 /tests/test_rocm_glm5_indexer_score_one
+/tests/test_glm5_expert_pairs
+/tests/test_glm5_native_session
+/tests/test_glm5_shared_route_order
+/tests/test_glm5_target_commit
+/tests/test_tp_native_cycle
+/tests/test_rocm_glm5_expert_pairs
+/tests/test_rocm_glm5_layer_verify
+/tests/test_rocm_glm5_mla_prelude_small_m
+/tests/test_rocm_glm5_q4k_batch_partition
+/tests/test_rocm_glm5_small_m
 /tests/test_rocm_glm5_bf16_round
 /tests/test_rocm_glm5_nope_score
 /tests/test_rocm_glm5_nope_attention
