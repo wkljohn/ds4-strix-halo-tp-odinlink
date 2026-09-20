@@ -125,6 +125,15 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+`scripts/build-glm53-research.sh` accepts `DS4_RESEARCH_PROFILE=1` for a
+separate `glm53-profile-REV` frozen artifact. It explicitly enables the
+existing CPU and HIP profiling hooks; unset/0 keeps the ordinary full build.
+Invalid values refuse and existing artifacts are never rebuilt in place.
+Profiled rates are diagnostic and cannot replace clean timing. The current
+transport attribution plan lives in the active ROCm10 dossier as
+`prefill-transport-attribution-plan.md`; no transport selector or completion
+boundary changes merely because the hooks are compiled.
+
 The active track was fast-forwarded to main `eda6285` for the unchanged
 uncensored GGUF on pinned ROCm10. Its new dossier is
 `$DS4_RESEARCH_ROOT/candidates/glm53-uncensored-rocm10-20260919/`.
