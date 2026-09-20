@@ -2214,6 +2214,21 @@ extern "C" int ds4_gpu_matmul_bf16_qkv_decode_multiptr_tensor(
                    "BF16 decode QKV multiptr launch");
 }
 
+static uint64_t glm5_six_live_native_calls = 0u;
+static uint64_t glm5_six_live_native_rows = 0u;
+static uint64_t glm5_six_live_native_tail_calls = 0u;
+static uint64_t glm5_six_live_native_tail_rows = 0u;
+static void glm5_six_live_native_report(void) {
+    fprintf(stderr, DS4_GPU_LOG_PREFIX
+            "GLM5 BF16 six live native counters calls=%llu rows=%llu "
+            "retained_tail_calls=%llu retained_tail_rows=%llu "
+            "weights=original cache_bytes=0 lane=B\n",
+            (unsigned long long)glm5_six_live_native_calls,
+            (unsigned long long)glm5_six_live_native_rows,
+            (unsigned long long)glm5_six_live_native_tail_calls,
+            (unsigned long long)glm5_six_live_native_tail_rows);
+}
+
 extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         ds4_gpu_tensor *out_q, ds4_gpu_tensor *out_k,
         ds4_gpu_tensor *out_v, ds4_gpu_tensor *out_f,
@@ -2235,6 +2250,13 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
         strcmp(decode_selector, "1") == 0;
     const int prefill_enabled =
         prefill_selector && strcmp(prefill_selector, "1") == 0;
+    const char *live_native_selector = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_LIVE_NATIVE_QKV");
+    const bool live_native = live_native_selector &&
+        strcmp(live_native_selector, "1") == 0;
+    if (live_native_selector && !live_native &&
+        strcmp(live_native_selector, "0") != 0) return 0;
+    if (live_native && !prefill_enabled) return 0;
     const char *shared_a_selector = getenv(
         "DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A");
     const int shared_a = shared_a_selector &&
@@ -2267,6 +2289,30 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
     const int coalesced = n_tok == 1u ? 0 :
         glm5_bf16_wmma_coalesced_weights_requested();
     if (coalesced < 0) return 0;
+    if (live_native && n_tok != 1u) {
+        if (shared_a || fused_shared_a || native_qkv || exact || coalesced ||
+            g_quality_mode || cuda_runtime_config()->graph_dump) return 0;
+        for (const char *name : {"DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE",
+                                "DS4_ROCM_GLM5_BF16_LT_HILO"}) {
+            const char *value = getenv(name);
+            if (value && strcmp(value,"0") != 0) return 0;
+        }
+        static int registered;
+        if (!registered) {
+            if (atexit(glm5_six_live_native_report) != 0) return 0;
+            registered = 1;
+        }
+        // Preserve the predeclared incumbent for incomplete physical tiles;
+        // this is arithmetic dispatch, never payload transport fallback.
+        if (n_tok>0u && (n_tok<256u || (n_tok%256u)!=0u)) {
+            ++glm5_six_live_native_tail_calls;
+            glm5_six_live_native_tail_rows += n_tok;
+            return -1;
+        }
+        if (in_dim != 4096u || low_out_dim != 128u ||
+            !((q_out_dim==4096u && beta_out_dim==32u) ||
+              (q_out_dim==8192u && beta_out_dim==64u))) return 0;
+    }
     if (exact && n_tok != 1u) {
         if (coalesced) return 0;
         if (shared_a) return 0;
@@ -2529,7 +2575,28 @@ extern "C" int ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
     } else {
         const uint32_t total_blocks =
             3u * q_blocks + 2u * low_blocks + beta_blocks;
-        if (coalesced) {
+        if (live_native) {
+            matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<false,false,true><<<
+                dim3(total_blocks, ((uint32_t)n_tok + 255u) / 256u),512>>>(
+                (float *)out_q->ptr, (float *)out_k->ptr, (float *)out_v->ptr,
+                (float *)out_f->ptr, (float *)out_g->ptr, (float *)out_beta->ptr,
+                (const uint16_t *)weights[0], (const uint16_t *)weights[1],
+                (const uint16_t *)weights[2], (const uint16_t *)weights[3],
+                (const uint16_t *)weights[4], (const uint16_t *)weights[5],
+                (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)q_out_dim,
+                (uint32_t)low_out_dim, (uint32_t)beta_out_dim,(uint32_t)n_tok);
+            if (!cuda_ok(cudaGetLastError(),"GLM BF16 six live native launch"))
+                return 0;
+            ++glm5_six_live_native_calls;
+            glm5_six_live_native_rows += n_tok;
+            static int native_reported;
+            if (!native_reported) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "GLM5 BF16 six live native engaged QKV=BF16-input "
+                        "skinny=F32-exact weights=original cache_bytes=0 lane=B\n");
+                native_reported = 1;
+            }
+        } else if (coalesced) {
             matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel<true><<<
                 dim3(total_blocks, ((uint32_t)n_tok + 255u) / 256u),
                 16u * 32u>>>(

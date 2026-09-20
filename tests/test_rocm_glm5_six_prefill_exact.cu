@@ -58,10 +58,13 @@ int main(int argc, char **argv) {
         std::strcmp(argv[2],"--fused-shared-a") == 0;
     const bool native_qkv = argc == 3 &&
         std::strcmp(argv[2],"--fused-native-qkv") == 0;
+    const bool live_native = argc == 3 &&
+        std::strcmp(argv[2],"--live-native-qkv") == 0;
     REQUIRE(argc != 3 || coalesced || m96 || shared_a || fused_shared_a ||
-            native_qkv);
-    const bool compare_modes = coalesced || m96;
+            native_qkv || live_native);
+    const bool compare_modes = coalesced || m96 || live_native;
     if (m96) weight_selector = "DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96";
+    if (live_native) weight_selector = "DS4_ROCM_GLM5_BF16_KDA_SIX_LIVE_NATIVE_QKV";
     const char *skinny = argc >= 2 ? argv[1] : "0";
     REQUIRE(std::strcmp(skinny,"0") == 0 || std::strcmp(skinny,"1") == 0);
     const char *model = std::getenv("DS4_GLM5_MODEL");
@@ -74,6 +77,8 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
                    "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_NATIVE_QKV",
+                   "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_LIVE_NATIVE_QKV",
                    "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_BF16_WMMA_NATIVE", "0", 1) == 0);
     if (m96) for (const char *name : {"DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT",
@@ -135,6 +140,29 @@ int main(int argc, char **argv) {
             for (unsigned i=3; i<6; ++i)
                 REQUIRE(ds4_gpu_matmul_bf16_tensor(reference[i],gguf.map,
                     gguf.size,local[i],4096,widths[i],input,rows));
+            if (live_native) {
+                // Independent host rounding by choosing adjacent BF16 values;
+                // keep the original-input reference for all skinny gates.
+                std::vector<float> rounded(x.size());
+                for (size_t i=0; i<x.size(); ++i) {
+                    uint32_t bits;
+                    std::memcpy(&bits,&x[i],4);
+                    uint32_t lo_bits=bits&0xffff0000u, hi_bits=lo_bits+0x10000u;
+                    float a,b;
+                    std::memcpy(&a,&lo_bits,4);
+                    std::memcpy(&b,&hi_bits,4);
+                    const double da=std::abs(double(x[i])-a), db=std::abs(double(x[i])-b);
+                    rounded[i]=da<db ? a : db<da ? b : ((bits>>16u)&1u) ? b : a;
+                }
+                auto *rounded_input=ds4_gpu_tensor_alloc(rounded.size()*4u);
+                REQUIRE(rounded_input && ds4_gpu_tensor_write(rounded_input,0,
+                    rounded.data(),rounded.size()*4u));
+                for (unsigned i=0; i<3; ++i)
+                    REQUIRE(ds4_gpu_matmul_bf16_wmma_hilo_tensor(reference[i],
+                        gguf.map,gguf.size,local[i],4096,q_width,rounded_input,rows)==1);
+                REQUIRE(ds4_gpu_synchronize());
+                ds4_gpu_tensor_free(rounded_input);
+            }
             auto launch = [&]() { return ds4_gpu_matmul_bf16_kda_six_multiptr_tensor(
                 candidate[0],candidate[1],candidate[2],candidate[3],
                 candidate[4],candidate[5],gguf.map,gguf.size,
@@ -167,6 +195,37 @@ int main(int argc, char **argv) {
                 REQUIRE(setenv(weight_selector,"invalid",1) == 0);
                 REQUIRE(launch() == 0);
                 REQUIRE(setenv(weight_selector,"1",1) == 0);
+            }
+            if (live_native) {
+                for (const char *invalid : {"", "2", "true"}) {
+                    REQUIRE(setenv(weight_selector,invalid,1)==0);
+                    REQUIRE(launch()==0);
+                }
+                REQUIRE(setenv(weight_selector,"1",1)==0);
+                for (const char *name : {"DS4_ROCM_GLM5_BF16_KDA_SIX_SHARED_A",
+                        "DS4_ROCM_GLM5_BF16_KDA_SIX_FUSED_SHARED_A",
+                        "DS4_ROCM_GLM5_BF16_KDA_SIX_NATIVE_QKV",
+                        "DS4_ROCM_GLM5_BF16_KDA_SIX_EXACT_M96",
+                        "DS4_ROCM_GLM5_BF16_WMMA_COALESCED_WEIGHT",
+                        "DS4_ROCM_GLM5_BF16_WMMA_WIDE_TILE",
+                        "DS4_ROCM_GLM5_BF16_LT_HILO"}) {
+                    REQUIRE(setenv(name,"1",1)==0);
+                    REQUIRE(launch()==0);
+                    REQUIRE(setenv(name,"0",1)==0);
+                }
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL","0",1)==0);
+                REQUIRE(launch()==0);
+                REQUIRE(setenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL","1",1)==0);
+                auto *saved=candidate[1];
+                candidate[1]=candidate[0];
+                REQUIRE(launch()==0);
+                candidate[1]=saved;
+                auto *short_out=ds4_gpu_tensor_view(candidate[0],0,uint64_t(rows)*q_width*4u-4u);
+                REQUIRE(short_out);
+                saved=candidate[0]; candidate[0]=short_out;
+                REQUIRE(launch()==0);
+                candidate[0]=saved;
+                ds4_gpu_tensor_free(short_out);
             }
             if (m96) {
                 for (const char *invalid : {"", "2"}) {

@@ -33,6 +33,7 @@ args=(-j3 ds4 ds4-bench-tp tests/test_rocm_glm5_indexer_score_one
       tests/test_rocm_glm5_layer_verify
       tests/test_rocm_glm5_mla_prelude_small_m
       tests/test_rocm_glm5_small_m
+      tests/test_rocm_glm5_six_prefill_exact
       tests/test_rocm_glm5_q4k_batch_partition
       tests/test_tp_native_cycle tests/test_glm5_native_session
       tests/test_glm5_target_commit tests/test_glm5_shared_route_order
@@ -49,6 +50,7 @@ sha256sum ds4 ds4-bench-tp *.o tests/test_rocm_glm5_indexer_score_one \
   tests/test_rocm_glm5_layer_verify \
   tests/test_rocm_glm5_mla_prelude_small_m \
   tests/test_rocm_glm5_small_m \
+  tests/test_rocm_glm5_six_prefill_exact \
   tests/test_rocm_glm5_q4k_batch_partition \
   tests/test_glm5_expert_pairs tests/test_tp_native_cycle tests/test_glm5_native_session \
   tests/test_glm5_target_commit tests/test_glm5_shared_route_order tests/*.o rocm/*.cuh \

@@ -534,6 +534,14 @@ static int rocm_glm5_kda_six_multiptr(
         getenv("DS4_ROCM_GLM5_BF16_KDA_SIX_PREFILL");
     const int prefill = args && args->n_tokens != 1u;
     const char *selector = prefill ? prefill_selector : decode_selector;
+    const char *live_native_value = getenv(
+        "DS4_ROCM_GLM5_BF16_KDA_SIX_LIVE_NATIVE_QKV");
+    const bool live_native = live_native_value &&
+        strcmp(live_native_value,"1")==0;
+    if (live_native_value && !live_native && strcmp(live_native_value,"0")!=0)
+        return 0;
+    if (live_native && (!prefill_selector || strcmp(prefill_selector,"1")!=0))
+        return 0;
     if (!selector || strcmp(selector, "0") == 0) return -1;
     if (strcmp(selector, "1") != 0) {
         static int invalid_reported;
@@ -543,6 +551,12 @@ static int rocm_glm5_kda_six_multiptr(
             invalid_reported = 1;
         }
         return 0;
+    }
+    if (live_native && prefill &&
+        (args->n_tokens<256u || args->n_tokens%256u!=0u)) {
+        fprintf(stderr,"ds4: GLM5 BF16 six live native retained physical tail rows=%u\n",
+                args->n_tokens);
+        return -1;
     }
     if (!args || !args->weights || !input ||
         (args->n_tokens == 1u ? !decode_selector ||

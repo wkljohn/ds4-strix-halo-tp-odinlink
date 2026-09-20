@@ -72,6 +72,7 @@
 /tests/test_rocm_glm5_mla_prelude_small_m
 /tests/test_rocm_glm5_q4k_batch_partition
 /tests/test_rocm_glm5_small_m
+/tests/test_rocm_glm5_six_prefill_exact
 /tests/test_rocm_glm5_bf16_round
 /tests/test_rocm_glm5_nope_score
 /tests/test_rocm_glm5_nope_attention

@@ -125,14 +125,22 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
-The component-only `NativeQkv` specialization of the live six-pointer BF16
+The default-off `NativeQkv` specialization of the live six-pointer BF16
 kernel drops the residual QKV product, retaining original weights and exact
-F32 skinny gates. It defaults false and has no production selector. The
+F32 skinny gates. `DS4_ROCM_GLM5_BF16_KDA_SIX_LIVE_NATIVE_QKV=1` selects it
+within the existing six-prefill path; malformed values, alternate geometries,
+quality/graph mode and missing prefill admission refuse. Complete M256 tiles
+use the candidate; incomplete physical tails retain the incumbent and report
+separate call/row counters. Decode retains its original arithmetic. The
 real-weight `test_rocm_glm5_six_native.cu` compares against an independently
 compiled parent, rounded-input controls and sampled FP64 dots before reporting
 complete-six timings. Its `--stream` walks all34 KDA layers on both slices;
 these synthetic-activation diagnostics do not establish model quality or
 throughput. See `bf16-six-live-native-plan.md` in the active ROCm10 dossier.
+The production-object fixture's `--live-native-qkv` arm requires exact skinny
+and rounded-input QKV outputs, exercises selector/conflict/buffer refusal, and
+records complete-six timing. It adds no new numerical tolerance. Model timing
+and engaged-state quality remain required before promotion.
 
 `compare-teacher-logits.py --score-arm-mode q4k-global` and
 `q4k-global-repeat` compare explicit GLOBAL0/1 or same-mode captures using

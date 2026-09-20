@@ -1116,7 +1116,7 @@ static void matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_n1_kernel(
  * Each exact workgroup handles two output rows and reuses each weight over
  * eight tokens. Its reduction storage aliases the existing WMMA panels.
  * All physical GGUF weights remain independent, unchanged pointers.
- * NativeQkv is a component-only Lane B probe: QKV uses BF16-rounded input,
+ * NativeQkv is a default-off Lane B probe: QKV uses BF16-rounded input,
  * while the skinny gates below retain their original F32 arithmetic. */
 template <bool CoalescedWeights = false, bool SkinnyOnly = false,
           bool NativeQkv = false>
