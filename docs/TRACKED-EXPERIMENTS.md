@@ -125,6 +125,15 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+The existing original-Q8 MLA-output WMMA fixture accepts explicit
+`--rows 256|1024` (default256), with output guards, both rank slices and all11
+MLA layers. It retains strided/gathered exactness, sampled original-Q8 dots,
+rollback and tail/refusal checks. Its synthetic inputs and analytic rounding
+envelope diagnose addressing/numerics, not model quality. The fixture build
+links frozen6eba8bd production objects while recording its newer harness
+source separately; no inference selector/default changes. See
+`mla-output-m1024-plan.md` in the active ROCm10 dossier.
+
 The component fixture's `--geometry` comparison tests native N32/N64 at
 M256/K16, existing SkinnyOnly and fused-shared-A native using a separate
 component API; the older native mode0/1 contract stays unchanged. N64 is a

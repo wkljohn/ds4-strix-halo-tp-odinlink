@@ -13,7 +13,15 @@ static void require(bool ok, const char *message) {
     if (!ok) { std::fprintf(stderr, "FAIL %s\n", message); std::exit(1); }
 }
 
-int main() {
+int main(int argc, char **argv) {
+    uint32_t M = 256u;
+    if (argc != 1) {
+        require(argc == 3 && std::strcmp(argv[1], "--rows") == 0 &&
+                (std::strcmp(argv[2], "256") == 0 ||
+                 std::strcmp(argv[2], "1024") == 0),
+                "usage: test_rocm_glm5_mla_output_wmma [--rows 256|1024]");
+        M = std::strcmp(argv[2], "1024") == 0 ? 1024u : 256u;
+    }
     const char *model = std::getenv("DS4_GLM5_MODEL");
     Glm5TestGGUF gguf;
     require(model && gguf.open_file(model), "open real GGUF");
@@ -22,13 +30,29 @@ int main() {
     require(ds4_gpu_init_multi(&config) &&
             ds4_gpu_set_model_fd_for_map(gguf.fd, gguf.map) &&
             ds4_gpu_set_model_map(gguf.map, gguf.size), "initialize mapped model");
-    constexpr uint32_t M = 256, FullK = 16384, K = 8192, N = 4096;
-    constexpr uint64_t OutBytes = (uint64_t)M * N * sizeof(float);
+    constexpr uint32_t FullK = 16384, K = 8192, N = 4096;
+    const uint64_t OutBytes = (uint64_t)M * N * sizeof(float);
+    constexpr uint64_t GuardBytes = 64u * sizeof(float);
+    constexpr float Canary = -1234567.0f;
     const uint64_t row_bytes = (uint64_t)(FullK / 32u) * 34u;
     ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)M * FullK * sizeof(float));
     ds4_gpu_tensor *packed = ds4_gpu_tensor_alloc((uint64_t)M * K * sizeof(float));
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(OutBytes);
+    ds4_gpu_tensor *out_storage = ds4_gpu_tensor_alloc(OutBytes + 2u * GuardBytes);
+    ds4_gpu_tensor *out = out_storage ?
+        ds4_gpu_tensor_view(out_storage, GuardBytes, OutBytes) : nullptr;
     require(x && packed && out, "bounded activation/output scratch");
+    const std::vector<float> guards(64u, Canary);
+    require(ds4_gpu_tensor_write(out_storage, 0, guards.data(), GuardBytes) &&
+            ds4_gpu_tensor_write(out_storage, GuardBytes + OutBytes,
+                                 guards.data(), GuardBytes), "write output canaries");
+    auto check_guards = [&]() {
+        std::vector<float> before(64u), after(64u);
+        require(ds4_gpu_tensor_read(out_storage, 0, before.data(), GuardBytes) &&
+                ds4_gpu_tensor_read(out_storage, GuardBytes + OutBytes,
+                                     after.data(), GuardBytes), "read output canaries");
+        require(before == guards && after == guards, "output canaries intact");
+    };
+    std::printf("fixture rows=%u layers=11 slices=2 weights=original synthetic_activations=1 quality_admission=0\n", M);
     std::vector<float> host((size_t)M * FullK), gather((size_t)M * K);
     for (size_t i = 0; i < host.size(); ++i)
         host[i] = 0.2f * std::sin((double)i * 0.037) +
@@ -42,7 +66,8 @@ int main() {
                             {FullK, N}, 8u, offset), "Q8 MLA output shape");
         for (uint32_t rank : {0u, 1u}) {
             const uint32_t start = rank * K;
-            auto run = [&](bool wmma, bool gathered, uint32_t rows = M) {
+            auto run = [&](bool wmma, bool gathered, uint32_t rows = 0u) {
+                if (rows == 0u) rows = M;
                 require(setenv("DS4_ROCM_GLM5_MLA_OUTPUT_WMMA", wmma ? "1" : "0", 1) == 0,
                         "set selector");
                 return ds4_rocm_q8_kslice_f32_rows_strided(
@@ -64,6 +89,7 @@ int main() {
                     ds4_gpu_tensor_read(out, 0, oracle.data(), OutBytes), "gathered WMMA oracle");
             require(std::memcmp(candidate.data(), oracle.data(), OutBytes) == 0,
                     "strided and gathered output bytes match");
+            check_guards();
             std::vector<float> errors(candidate.size());
             double sq_error = 0, sq_reference = 0;
             for (size_t i = 0; i < candidate.size(); ++i) {
@@ -95,13 +121,14 @@ int main() {
                 require(error <= (double)magnitude * 0.003 + 1.0e-6,
                         "canonical sampled Q8 dot rounding envelope");
             }
-            std::printf("numerical layer=%u rank=%u exact_gather=1 max_abs=%g p99_abs=%g nmse=%.9g cpu_max=%g\n",
-                        layer, rank, errors.back(), errors[errors.size() * 99u / 100u],
+            std::printf("numerical layer=%u rank=%u rows=%u exact_gather=1 max_abs=%g p99_abs=%g nmse=%.9g cpu_max=%g\n",
+                        layer, rank, M, errors.back(), errors[errors.size() * 99u / 100u],
                         sq_error / std::max(sq_reference, 1.0e-30), cpu_max);
             require(run(false, false) == 1 && ds4_gpu_synchronize() &&
                     ds4_gpu_tensor_read(out, 0, oracle.data(), OutBytes) &&
                     std::memcmp(baseline.data(), oracle.data(), OutBytes) == 0,
                     "selector rollback bytes");
+            check_guards();
             std::vector<double> times[2];
             for (uint32_t sample = 0; sample < 5; ++sample) {
                 for (uint32_t order = 0; order < 2; ++order) {
@@ -116,8 +143,9 @@ int main() {
                 }
             }
             for (auto &v : times) std::sort(v.begin(), v.end());
-            std::printf("timing layer=%u rank=%u control_ms=%.6f candidate_ms=%.6f speedup=%.3f\n",
-                        layer, rank, times[0][2], times[1][2], times[0][2] / times[1][2]);
+            std::printf("timing layer=%u rank=%u rows=%u control_ms=%.6f candidate_ms=%.6f speedup=%.3f\n",
+                        layer, rank, M, times[0][2], times[1][2], times[0][2] / times[1][2]);
+            check_guards();
             std::fflush(stdout);
         }
     }
@@ -138,15 +166,17 @@ int main() {
                     FullK, N, K, K, x, K, M - 1u, FullK) == 1 &&
                 ds4_gpu_synchronize() && ds4_gpu_tensor_read(out, 0,
                     arm ? candidate.data() : baseline.data(), (uint64_t)(M - 1u) * N * sizeof(float)),
-                "M255 incumbent fallback");
+                "nonmultiple-of-256 incumbent fallback");
     }
     require(std::memcmp(baseline.data(), candidate.data(),
                         (size_t)(M - 1u) * N * sizeof(float)) == 0,
-            "M255 selector retains incumbent bytes");
+            "nonmultiple-of-256 selector retains incumbent bytes");
     require(setenv("DS4_ROCM_GLM5_MLA_OUTPUT_WMMA", "invalid", 1) == 0 &&
             ds4_rocm_q8_kslice_f32_rows_strided(out, gguf.map, gguf.size, off,
                 FullK, N, K, K, x, K, M, FullK) == 0, "invalid selector rejected");
     unsetenv("DS4_ROCM_GLM5_MLA_OUTPUT_WMMA");
-    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(packed); ds4_gpu_tensor_free(x);
+    check_guards();
+    ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(out_storage);
+    ds4_gpu_tensor_free(packed); ds4_gpu_tensor_free(x);
     std::puts("PASS real-GGUF MLA output WMMA indexing, rounding and rollback");
 }
