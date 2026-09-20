@@ -23,7 +23,12 @@ int main(int argc, char **argv) {
     constexpr uint32_t width = 4096, mid_width = 1024;
     uint32_t rows = 1024;
     REQUIRE(argc <= 3);
-    const bool wide = argc == 3 && std::strcmp(argv[2], "--prefill-wide128") == 0;
+    const bool numerical = argc == 3 &&
+        std::strcmp(argv[2], "--prefill-wide128-numerical") == 0;
+    const bool wide = numerical ||
+        (argc == 3 && std::strcmp(argv[2], "--prefill-wide128") == 0);
+    if (numerical)
+        std::puts("NUMERICAL DIAGNOSTIC: candidate error and timing only; exact controls required; quality unassessed");
     const unsigned schedule = wide ? 1u : argc != 3 ? 0u :
         std::strcmp(argv[2], "--prefill-schedule1") == 0 ? 1u :
         std::strcmp(argv[2], "--prefill-schedule2") == 0 ? 2u : 0u;
@@ -301,29 +306,51 @@ int main(int argc, char **argv) {
         REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
         size_t different=0;
         double max_abs=0;
+        double error_sq=0, reference_sq=0;
         for (size_t i=0; i<actual.size(); ++i) {
             REQUIRE(std::isfinite(reference[i]) && std::isfinite(actual[i]));
             different += std::memcmp(&reference[i],&actual[i],sizeof(float)) != 0;
-            max_abs = std::fmax(max_abs,std::fabs(double(reference[i])-actual[i]));
+            const double error = double(reference[i])-actual[i];
+            max_abs = std::fmax(max_abs,std::fabs(error));
+            error_sq += error*error;
+            reference_sq += double(reference[i])*reference[i];
         }
         std::printf("rank=%u rows=%u values=%zu different=%zu max_abs=%.9g\n",
                     rank,rows,actual.size(),different,max_abs);
+        std::printf("numerical rank=%u stage=final rms_error=%.9g relative_l2=%.9g reference_l2=%.9g\n",
+                    rank,std::sqrt(error_sq/actual.size()),
+                    reference_sq > 0 ? std::sqrt(error_sq/reference_sq) :
+                        (error_sq == 0 ? 0.0 : INFINITY),std::sqrt(reference_sq));
         std::fflush(stdout);
-        REQUIRE(different == 0);
+        bool exact = different == 0;
         if (cold_coalesce) {
             for (unsigned stage=0; stage<2u; ++stage) {
                 REQUIRE(ds4_gpu_tensor_read(t[stage+2],0,stage_actual.data(),rows*strides[stage+2]));
-                size_t live_values=0;
+                size_t live_values=0, stage_different=0;
+                double stage_max=0, stage_error_sq=0, stage_reference_sq=0;
                 for (size_t i=0; i<stage_actual.size(); ++i) {
                     const size_t pair = i/mid_width;
                     if (selected[pair] < 0 || weights[pair] == 0.0f) continue;
                     REQUIRE(std::isfinite(stage_reference[stage][i]) && std::isfinite(stage_actual[i]));
-                    REQUIRE(std::memcmp(&stage_reference[stage][i],&stage_actual[i],sizeof(float)) == 0);
+                    stage_different += std::memcmp(&stage_reference[stage][i],&stage_actual[i],sizeof(float)) != 0;
+                    const double error = double(stage_reference[stage][i])-stage_actual[i];
+                    stage_max = std::fmax(stage_max,std::fabs(error));
+                    stage_error_sq += error*error;
+                    stage_reference_sq += double(stage_reference[stage][i])*stage_reference[stage][i];
                     ++live_values;
                 }
-                std::printf("rank=%u stage=%u live_values=%zu bit_exact=1\n",rank,stage,live_values);
+                exact = exact && stage_different == 0;
+                std::printf("rank=%u stage=%u live_values=%zu bit_exact=%u different=%zu max_abs=%.9g rms_error=%.9g relative_l2=%.9g\n",
+                    rank,stage,live_values,unsigned(stage_different == 0),stage_different,stage_max,
+                    live_values ? std::sqrt(stage_error_sq/live_values) : 0.0,
+                    stage_reference_sq > 0 ? std::sqrt(stage_error_sq/stage_reference_sq) :
+                        (stage_error_sq == 0 ? 0.0 : INFINITY));
             }
         }
+        std::fflush(stdout);
+        // Collect exposed-stage evidence before rejecting nonidentity. Only
+        // explicit candidate diagnostics may continue; both controls stay exact.
+        if (!(numerical && schedule_arm == 1u)) REQUIRE(exact);
         if (decode_rows) {
             REQUIRE(ds4_gpu_tensor_read(t[3],0,mid_actual.data(),strides[3]));
             for (size_t i=0; i<mid_actual.size(); ++i) {
@@ -523,5 +550,8 @@ int main(int argc, char **argv) {
     }
     for (auto *tensor:t) ds4_gpu_tensor_free(tensor);
     ds4_gpu_cleanup();
-    std::puts("PASS packed Q4_K batch equals independent <=M256 groups on both halves");
+    if (numerical)
+        std::puts("NUMERICAL DIAGNOSTIC complete on both halves; candidate exactness/quality not certified");
+    else
+        std::puts("PASS packed Q4_K batch equals independent <=M256 groups on both halves");
 }

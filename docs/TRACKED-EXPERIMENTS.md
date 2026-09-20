@@ -125,6 +125,15 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+The Q4_K partition fixture accepts `--prefill-wide128-numerical` for explicitly
+unqualified error/timing diagnostics. Independent M256 and same-build controls
+remain exact; nonfinite values and failed admission checks still fail. The
+candidate reports final/up/mid errors before complete-MoE timing, without an
+exactness or quality pass. This preserves earlier failed Lane A evidence and
+does not qualify an arithmetic change for promotion. New arithmetic designs
+use prospective Lane B numerical and quality evidence. See the active
+ROCm10 dossier's `q4k-numerical-diagnostic-plan.md` for artifact binding.
+
 `DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128=1` is a separate default-off grouped
 gate/up tile experiment. Eight waves share a J16 activation panel across128
 output columns, staging oneK128half at a time in20,736bytes LDS. Original
