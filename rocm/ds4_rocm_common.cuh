@@ -536,7 +536,7 @@ __global__ static void matmul_bf16_f32_small_m_exact_kernel(
         uint32_t in_dim, uint32_t out_dim) {
     static_assert(Tokens == 2u || Tokens == 4u || Tokens == 6u || Tokens == 8u,
                   "supported small verification batches");
-    static_assert(PanelK == 1024u || PanelK == 128u,
+    static_assert(PanelK == 1024u || PanelK == 512u || PanelK == 128u,
                   "wide projection or KDA low-rank expansion");
     static_assert(Prefetch == 1u || ((Prefetch == 4u || Prefetch == 8u) && PanelK == 1024u && Tokens != 8u),
                   "bounded wide-projection load window for M2/M4/M6");

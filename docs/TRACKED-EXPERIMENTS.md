@@ -152,6 +152,10 @@ order; it allocates no weights. K128 keeps the previous kernel, M8 with the
 option refuses, and large prefill is unchanged. See
 `bf16-small-m-prefetch-plan.md` in the active ROCm10 dossier for tests and
 results; a local fixture gain does not establish whole-model throughput.
+The separate `DS4_ROCM_GLM5_BF16_SMALL_M_PANEL=512` diagnostic halves
+activation LDS while preserving scalar K traversal. Default is1024;512
+requires prefetch0and refusesM8. It changes no persistent storage and
+must pass its own real-GGUF and model checks before selection.
 
 `research/glm53-uncensored-six-kda-20260917` extends current main with
 default-off exact BF16 reuse and accepted-prefix target verification for the
