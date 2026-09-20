@@ -39,6 +39,10 @@ int main(int argc, char **argv) {
     const bool wide_numerical = argc == 3 &&
         std::strcmp(argv[2], "--prefill-wide128-numerical") == 0;
     const bool numerical = global || wide_numerical;
+    const char *bad_threshold_env = std::getenv("DS4_TEST_MOE_GLOBAL_BAD_THRESHOLD");
+    const bool reject_threshold = bad_threshold_env != nullptr;
+    if (reject_threshold)
+        REQUIRE(global && std::strcmp(bad_threshold_env,"7") == 0);
     const bool wide = wide_numerical ||
         (argc == 3 && std::strcmp(argv[2], "--prefill-wide128") == 0);
     if (numerical)
@@ -101,7 +105,9 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_Q4K_KSHARD_RESEARCH", "1", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_WMMA", "1", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_DISABLE_Q4K_WMMA", "0", 1) == 0);
-    REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_MIN_COUNT", "6", 1) == 0);
+    // This setting is cached at startup. Its refusal must be exercised in a
+    // separate process, not by changing getenv after the first kernel call.
+    REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_MIN_COUNT", reject_threshold ? "7" : "6", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_PAIR_GATE_UP", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_FUSE_MID", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_Q4K_COLD_TILE4", "0", 1) == 0);
@@ -230,6 +236,22 @@ int main(int argc, char **argv) {
                     (rows*used+15u)/16u+experts*((rows+domain_rows-1u)/domain_rows));
       }
     }
+    unsigned global_counts[experts] = {}, domain_counts[4][experts] = {};
+    std::vector<bool> unchanged_row(rows, true);
+    if (global) {
+        for (unsigned r=0; r<rows; ++r) for (unsigned s=0; s<used; ++s) {
+            const int expert = selected[r*used+s];
+            if (expert < 0 || weights[r*used+s] == 0.0f) continue;
+            ++global_counts[expert];
+            ++domain_counts[r/tile][expert];
+        }
+        for (unsigned r=0; r<rows; ++r) for (unsigned s=0; s<used; ++s) {
+            const int expert = selected[r*used+s];
+            if (expert >= 0 && weights[r*used+s] != 0.0f &&
+                domain_counts[r/tile][expert] < 6u && global_counts[expert] >= 6u)
+                unchanged_row[r] = false;
+        }
+    }
     REQUIRE(ds4_gpu_tensor_write(t[7],0,x.data(),rows*strides[7]));
     REQUIRE(ds4_gpu_tensor_write(t[5],0,selected.data(),rows*strides[5]));
     REQUIRE(ds4_gpu_tensor_write(t[6],0,weights.data(),rows*strides[6]));
@@ -277,6 +299,18 @@ int main(int argc, char **argv) {
                 cold_coalesce && fixture == 2u ? 0.0f : 10.0f,v[7],3,count,&half_mid);
             return ok && !half_mid;
         };
+        if (reject_threshold) {
+            REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED","1",1) == 0);
+            REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_PARTITION","256",1) == 0);
+            REQUIRE(setenv(timing_selector,"1",1) == 0);
+            REQUIRE(ds4_gpu_tensor_fill_f32(t[0],NAN,rows*width));
+            REQUIRE(!call(t,rows));
+            REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+            for (float value:actual) REQUIRE(std::isnan(value));
+            std::printf("PASS global startup threshold7 refused rank=%u output_untouched=1\n",rank);
+            ds4_gpu_q4k_packed_slice_release_all();
+            continue;
+        }
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", cold_padding ? "1" : "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
@@ -321,6 +355,8 @@ int main(int argc, char **argv) {
         if (decode_rows) REQUIRE(setenv(timing_selector,candidate_mode,1) == 0);
         // Establish both the grouped control and the scheduling candidate
         // against the independent M256 oracle, including exposed up/mid.
+        bool control_permutation_exact = false;
+        const bool global_active = global && rows > tile && rows % tile == 0u;
         for (unsigned schedule_arm=0; schedule_arm<(candidate_experiment ? 2u : 1u); ++schedule_arm) {
         if (candidate_experiment) {
             REQUIRE(setenv(timing_selector,schedule_arm ? candidate_mode : "0",1) == 0);
@@ -345,6 +381,9 @@ int main(int argc, char **argv) {
                 (i/width) % tile != 0u && (i/width) % tile != 255u)
                 REQUIRE(actual[i] == 0.0f);
             if (global && fixture == 3u) REQUIRE(actual[i] == 0.0f);
+            if (global_active && schedule_arm == 1u &&
+                control_permutation_exact && unchanged_row[i/width])
+                REQUIRE(std::memcmp(&reference[i],&actual[i],sizeof(float)) == 0);
             reference_hash = hash_float(reference_hash, reference[i]);
             actual_hash = hash_float(actual_hash, actual[i]);
             different += std::memcmp(&reference[i],&actual[i],sizeof(float)) != 0;
@@ -367,6 +406,7 @@ int main(int argc, char **argv) {
             for (unsigned stage=0; stage<2u; ++stage) {
                 REQUIRE(ds4_gpu_tensor_read(t[stage+2],0,stage_actual.data(),rows*strides[stage+2]));
                 size_t live_values=0, stage_different=0;
+                size_t class_values[3] = {}, class_different[3] = {};
                 reference_hash=actual_hash=UINT64_C(14695981039346656037);
                 double stage_max=0, stage_error_sq=0, stage_reference_sq=0;
                 for (size_t i=0; i<stage_actual.size(); ++i) {
@@ -376,6 +416,15 @@ int main(int argc, char **argv) {
                     reference_hash=hash_float(reference_hash,stage_reference[stage][i]);
                     actual_hash=hash_float(actual_hash,stage_actual[i]);
                     stage_different += std::memcmp(&stage_reference[stage][i],&stage_actual[i],sizeof(float)) != 0;
+                    if (global_active && schedule_arm == 1u) {
+                        const unsigned expert = unsigned(selected[pair]);
+                        // A: already hot; B: remains cold; C: newly hot.
+                        const unsigned route_class = global_counts[expert] < 6u ? 1u :
+                            domain_counts[(pair/used)/tile][expert] >= 6u ? 0u : 2u;
+                        ++class_values[route_class];
+                        class_different[route_class] +=
+                            std::memcmp(&stage_reference[stage][i],&stage_actual[i],sizeof(float)) != 0;
+                    }
                     const double error = double(stage_reference[stage][i])-stage_actual[i];
                     stage_max = std::fmax(stage_max,std::fabs(error));
                     stage_error_sq += error*error;
@@ -390,14 +439,68 @@ int main(int argc, char **argv) {
                     live_values ? std::sqrt(stage_error_sq/live_values) : 0.0,
                     stage_reference_sq > 0 ? std::sqrt(stage_error_sq/stage_reference_sq) :
                         (stage_error_sq == 0 ? 0.0 : INFINITY));
+                if (global_active && schedule_arm == 1u) {
+                    for (unsigned c=0; c<3u; ++c)
+                        std::printf("route_class rank=%u stage=%u class=%c values=%zu different=%zu control_permutation_exact=%u\n",
+                            rank,stage,'A'+c,class_values[c],class_different[c],unsigned(control_permutation_exact));
+                    // Global-cold routes use the identical ordered cold union.
+                    REQUIRE(class_different[1] == 0u);
+                    if (control_permutation_exact) REQUIRE(class_different[0] == 0u);
+                }
             }
         }
         std::fflush(stdout);
         // Collect exposed-stage evidence before rejecting nonidentity. Only
         // explicit candidate diagnostics may continue; both controls stay exact.
-        const bool global_active = global && rows > tile && rows % tile == 0u;
         if (!(numerical && schedule_arm == 1u && (!global || global_active)))
             REQUIRE(exact);
+        if (global_active && schedule_arm == 0u) {
+            // Keep every original M256 occupancy unchanged, but reverse row
+            // positions. Settle the old row-position sensitivity claim before
+            // treating already-hot rows as a bit-exact global invariant.
+            std::vector<float> px(x.size()), pw(weights.size()), permuted(actual.size());
+            std::vector<int32_t> ps(selected.size());
+            for (unsigned r=0; r<rows; ++r) {
+                const unsigned old = (r/tile)*tile + tile-1u-r%tile;
+                std::memcpy(px.data()+r*width,x.data()+old*width,width*sizeof(float));
+                std::memcpy(pw.data()+r*used,weights.data()+old*used,used*sizeof(float));
+                std::memcpy(ps.data()+r*used,selected.data()+old*used,used*sizeof(int32_t));
+            }
+            REQUIRE(ds4_gpu_tensor_write(t[7],0,px.data(),rows*strides[7]));
+            REQUIRE(ds4_gpu_tensor_write(t[5],0,ps.data(),rows*strides[5]));
+            REQUIRE(ds4_gpu_tensor_write(t[6],0,pw.data(),rows*strides[6]));
+            REQUIRE(call(t,rows));
+            REQUIRE(ds4_gpu_tensor_read(t[0],0,permuted.data(),rows*strides[0]));
+            size_t permutation_different=0;
+            for (unsigned r=0; r<rows; ++r) {
+                const unsigned old = (r/tile)*tile + tile-1u-r%tile;
+                for (unsigned k=0; k<width; ++k) {
+                    REQUIRE(std::isfinite(permuted[r*width+k]));
+                    permutation_different += std::memcmp(&permuted[r*width+k],&reference[old*width+k],sizeof(float)) != 0;
+                }
+            }
+            for (unsigned stage=0; stage<2u; ++stage) {
+                REQUIRE(ds4_gpu_tensor_read(t[stage+2],0,stage_actual.data(),rows*strides[stage+2]));
+                for (unsigned r=0; r<rows; ++r) {
+                    const unsigned old = (r/tile)*tile + tile-1u-r%tile;
+                    for (unsigned s=0; s<used; ++s) {
+                        if (selected[old*used+s] < 0 || weights[old*used+s] == 0.0f) continue;
+                        for (unsigned k=0; k<mid_width; ++k) {
+                            const size_t at=(r*used+s)*mid_width+k;
+                            const size_t before=(old*used+s)*mid_width+k;
+                            REQUIRE(std::isfinite(stage_actual[at]));
+                            permutation_different += std::memcmp(&stage_actual[at],&stage_reference[stage][before],sizeof(float)) != 0;
+                        }
+                    }
+                }
+            }
+            control_permutation_exact = permutation_different == 0u;
+            std::printf("control_permutation rank=%u different=%zu exact=%u\n",
+                        rank,permutation_different,unsigned(control_permutation_exact));
+            REQUIRE(ds4_gpu_tensor_write(t[7],0,x.data(),rows*strides[7]));
+            REQUIRE(ds4_gpu_tensor_write(t[5],0,selected.data(),rows*strides[5]));
+            REQUIRE(ds4_gpu_tensor_write(t[6],0,weights.data(),rows*strides[6]));
+        }
         if (decode_rows) {
             REQUIRE(ds4_gpu_tensor_read(t[3],0,mid_actual.data(),strides[3]));
             for (size_t i=0; i<mid_actual.size(); ++i) {
@@ -548,11 +651,6 @@ int main(int argc, char **argv) {
             REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
             for (float value:actual) REQUIRE(std::isnan(value));
             REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED","1",1) == 0);
-            REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_MIN_COUNT","7",1) == 0);
-            REQUIRE(!call(t,rows));
-            REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
-            for (float value:actual) REQUIRE(std::isnan(value));
-            REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_MIN_COUNT","6",1) == 0);
             REQUIRE(setenv(timing_selector,"0",1) == 0);
         }
         if (cold_coalesce && !candidate_experiment) {
@@ -625,7 +723,9 @@ int main(int argc, char **argv) {
     }
     for (auto *tensor:t) ds4_gpu_tensor_free(tensor);
     ds4_gpu_cleanup();
-    if (numerical)
+    if (reject_threshold)
+        std::puts("PASS global startup threshold refusal on both halves");
+    else if (numerical)
         std::puts("NUMERICAL DIAGNOSTIC complete on both halves; candidate exactness/quality not certified");
     else
         std::puts("PASS packed Q4_K batch equals independent <=M256 groups on both halves");
