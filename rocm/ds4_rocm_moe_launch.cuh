@@ -109,6 +109,22 @@ static int routed_moe_glm5_grouped_requested(void) {
     return strcmp(value, "1") == 0 ? 1 : -1;
 }
 
+static int routed_moe_glm5_prefill_schedule(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    if (strcmp(value, "2") == 0) return 2;
+    return -1;
+}
+
+static int routed_moe_glm5_prefill_workers(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_Q4K_PREFILL_WORKERS");
+    // Explicit bounded research sweep: three/six CTAs per 40-CU gfx1151.
+    if (!value || strcmp(value, "120") == 0) return 120;
+    if (strcmp(value, "240") == 0) return 240;
+    return -1;
+}
+
 static int routed_moe_glm5_grouped_cold_requested(void) {
     const char *value = getenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_COALESCE");
     if (!value || strcmp(value, "0") == 0) return 0;
@@ -1725,6 +1741,23 @@ static int routed_moe_launch(
         }
         if (glm5_grouped_cold &&
             (!glm5_grouped || routed_moe_q4k_wmma_min_count() != 6u)) return 0;
+        const int prefill_schedule = glm5_grouped ?
+            routed_moe_glm5_prefill_schedule() : 0;
+        const int prefill_workers = routed_moe_glm5_prefill_workers();
+        if (prefill_schedule < 0 || (prefill_schedule && prefill_workers < 0))
+            return 0;
+        if (prefill_schedule) {
+            static uint32_t reported_schedules;
+            const uint32_t bit = 1u << ((uint32_t)prefill_schedule +
+                                       (prefill_workers == 240 ? 3u : 0u));
+            if (!(reported_schedules & bit)) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "GLM5 Q4_K prefill schedule=%d workers=%d "
+                        "tokens=%u weights=original\n",
+                        prefill_schedule, prefill_workers, n_tokens);
+                reported_schedules |= bit;
+            }
+        }
         const uint32_t use_gate_row2048 = !q4k_path && use_expert_tiles && n_tokens >= 128u;
         const uint32_t use_down_tile16 = !q4k_path && use_atomic_down && n_tokens >= 128u;
         const uint32_t use_decode_lut_gate =
@@ -1976,6 +2009,13 @@ static int routed_moe_launch(
                 tile16_experts = use_down_tile16 ? (uint32_t *)(scratch + tile16_experts_off) : NULL;
                 tile16_starts = use_down_tile16 ? (uint32_t *)(scratch + tile16_starts_off) : NULL;
                 iq2_gate_hot_dev = (uint32_t *)(scratch + iq2_gate_hot_off);
+                // This IQ2-only metadata is unused by the Q4_K grouped path.
+                // Three independent counters live until down completes; all
+                // consumers and the initial clear use the same stream.
+                if (prefill_schedule == 2 &&
+                    !cuda_ok(cudaMemsetAsync(iq2_gate_hot_dev, 0,
+                                            3u * sizeof(uint32_t), 0),
+                             "GLM5 prefill job counters clear")) return 0;
                 uint32_t *cold_tile_offsets = NULL;
                 if (glm5_grouped_cold) {
                     cold_counts = (uint32_t *)((uint8_t *)down->ptr + cold_metadata_off);
@@ -2296,7 +2336,22 @@ static int routed_moe_launch(
                                         n_tokens);
                             }
                         } else {
-                            if (glm5_grouped) {
+                            if (prefill_schedule == 1) {
+                                moe_q4K_routed_wmma_kernel<16, 288u, 1><<<prefill_workers, 256, wmma_smem>>>(
+                                    gate_w, q4k_q81, (float *)gate->ptr,
+                                    sorted_pairs, sorted_offsets, sorted_counts,
+                                    tile_total, tile_experts, tile_starts,
+                                    n_tokens, xq_blocks, expert_mid_dim, n_expert,
+                                    gate_expert_bytes, gate_row_bytes, wmma_min_count);
+                            } else if (prefill_schedule == 2) {
+                                moe_q4K_routed_wmma_kernel<16, 288u, 2><<<prefill_workers, 256, wmma_smem>>>(
+                                    gate_w, q4k_q81, (float *)gate->ptr,
+                                    sorted_pairs, sorted_offsets, sorted_counts,
+                                    tile_total, tile_experts, tile_starts,
+                                    n_tokens, xq_blocks, expert_mid_dim, n_expert,
+                                    gate_expert_bytes, gate_row_bytes, wmma_min_count,
+                                    iq2_gate_hot_dev);
+                            } else if (glm5_grouped) {
                                 moe_q4K_routed_wmma_kernel<16, 288u><<<wgrid, 256, wmma_smem>>>(
                                     gate_w, q4k_q81,
                                     (float *)gate->ptr, sorted_pairs, sorted_offsets,
@@ -2319,7 +2374,22 @@ static int routed_moe_launch(
                                         n_tokens);
                             }
                             if (ok) {
-                                if (glm5_grouped) {
+                                if (prefill_schedule == 1) {
+                                    moe_q4K_routed_wmma_kernel<16, 288u, 1><<<prefill_workers, 256, wmma_smem>>>(
+                                        up_w, q4k_q81, (float *)up->ptr,
+                                        sorted_pairs, sorted_offsets, sorted_counts,
+                                        tile_total, tile_experts, tile_starts,
+                                        n_tokens, xq_blocks, expert_mid_dim, n_expert,
+                                        gate_expert_bytes, gate_row_bytes, wmma_min_count);
+                                } else if (prefill_schedule == 2) {
+                                    moe_q4K_routed_wmma_kernel<16, 288u, 2><<<prefill_workers, 256, wmma_smem>>>(
+                                        up_w, q4k_q81, (float *)up->ptr,
+                                        sorted_pairs, sorted_offsets, sorted_counts,
+                                        tile_total, tile_experts, tile_starts,
+                                        n_tokens, xq_blocks, expert_mid_dim, n_expert,
+                                        gate_expert_bytes, gate_row_bytes, wmma_min_count,
+                                        iq2_gate_hot_dev + 1u);
+                                } else if (glm5_grouped) {
                                     moe_q4K_routed_wmma_kernel<16, 288u>
                                         <<<wgrid, 256, wmma_smem>>>(
                                             up_w, q4k_q81,
@@ -3176,6 +3246,21 @@ static int routed_moe_launch(
                                 down_tile_experts, down_tile_starts, pair_count,
                                 midq_blocks, out_dim, n_expert, down_expert_bytes,
                                 down_row_bytes, down_wmma_min_count);
+                        } else if (prefill_schedule == 1) {
+                            moe_down_q4K_routed_wmma_kernel<16, false, 288u, 1><<<prefill_workers, 256, down_wmma_smem>>>(
+                                (float *)down->ptr, down_w, down_q81, sorted_pairs,
+                                sorted_offsets, sorted_counts, down_tile_total,
+                                down_tile_experts, down_tile_starts, pair_count,
+                                midq_blocks, out_dim, n_expert, down_expert_bytes,
+                                down_row_bytes, down_wmma_min_count);
+                        } else if (prefill_schedule == 2) {
+                            moe_down_q4K_routed_wmma_kernel<16, false, 288u, 2><<<prefill_workers, 256, down_wmma_smem>>>(
+                                (float *)down->ptr, down_w, down_q81, sorted_pairs,
+                                sorted_offsets, sorted_counts, down_tile_total,
+                                down_tile_experts, down_tile_starts, pair_count,
+                                midq_blocks, out_dim, n_expert, down_expert_bytes,
+                                down_row_bytes, down_wmma_min_count,
+                                iq2_gate_hot_dev + 2u);
                         } else if (glm5_grouped) {
                             moe_down_q4K_routed_wmma_kernel<16, false, 288u><<<wgrid, 256, down_wmma_smem>>>(
                                 (float *)down->ptr, down_w, down_q81, sorted_pairs,
@@ -4697,6 +4782,9 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     if (routed_moe_glm5_grouped_requested() < 0 ||
+        routed_moe_glm5_prefill_schedule() < 0 ||
+        (routed_moe_glm5_prefill_schedule() != 0 &&
+         routed_moe_glm5_prefill_workers() < 0) ||
         routed_moe_glm5_grouped_cold_requested() < 0 ||
         routed_moe_glm5_grouped_cold_i8_requested() < 0 ||
         routed_moe_glm5_cold_lds5_requested() < 0 ||
@@ -4727,6 +4815,8 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
     if (partition && strcmp(partition, "0") != 0 &&
         strcmp(partition, "256") != 0) return 0;
     const bool grouped_requested = routed_moe_glm5_grouped_requested() == 1;
+    if (routed_moe_glm5_prefill_schedule() != 0 && !grouped_requested)
+        return 0;
     const bool cold_requested = routed_moe_glm5_grouped_cold_requested() == 1;
     if (routed_moe_glm5_grouped_cold_i8_requested() == 1 && !cold_requested)
         return 0;

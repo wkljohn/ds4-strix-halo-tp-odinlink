@@ -4813,9 +4813,8 @@ ds4_q4k_unpack_scales(const int32_t *scales, int32_t ksc) {
  * because production launches by scratch capacity rather than copying the
  * tile count back to the host.
  */
-template <int J, uint32_t PhysicalExperts = 0u>
-__launch_bounds__(256)
-__global__ static void moe_q4K_routed_wmma_kernel(
+template <int J, uint32_t PhysicalExperts>
+__device__ __forceinline__ static void moe_q4K_routed_wmma_tile(
         const char *weight_base,
         const ds4_q8_1_mmq_block *acts,
         float *out,
@@ -4831,11 +4830,10 @@ __global__ static void moe_q4K_routed_wmma_kernel(
         uint32_t n_expert,
         uint64_t weight_expert_bytes,
         uint64_t weight_row_bytes,
-        uint32_t min_count) {
+        uint32_t min_count, uint32_t tile, uint32_t row0) {
     static_assert(J == 16,
                   "moe_q4K_routed_wmma_kernel is validated only for J=16");
 
-    constexpr int I = 64;
     constexpr int XS = 76;
     constexpr int YS = 36;
 
@@ -4846,8 +4844,6 @@ __global__ static void moe_q4K_routed_wmma_kernel(
     const int tid = (int)threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;
-    const uint32_t tile = (uint32_t)blockIdx.y;
-
     if (tile >= *tile_total) return;
 
     const uint32_t expert = tile_experts[tile];
@@ -4855,7 +4851,6 @@ __global__ static void moe_q4K_routed_wmma_kernel(
     const uint32_t count = counts[expert];
     if (count < min_count) return;
 
-    const uint32_t row0 = (uint32_t)blockIdx.x * (uint32_t)I;
     float acc[J / 16][8] = {};
 
     const char *expert_weight_base =
@@ -5017,6 +5012,53 @@ __global__ static void moe_q4K_routed_wmma_kernel(
                         acc[j0 / 16][l];
                 }
             }
+        }
+    }
+}
+
+/* Scheduling changes only job ownership. Each job still writes disjoint
+ * pair/output elements and uses the original per-output arithmetic above.
+ * Schedule0 retains the capacity grid;1 strides actual jobs;2 claims jobs
+ * from a caller-owned, stream-cleared counter. Never use an atomic output
+ * reduction with a different schedule under an exactness claim. */
+template <int J, uint32_t PhysicalExperts = 0u, int Schedule = 0>
+__launch_bounds__(256)
+__global__ static void moe_q4K_routed_wmma_kernel(
+        const char *weight_base, const ds4_q8_1_mmq_block *acts, float *out,
+        const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total,
+        const uint32_t *tile_experts, const uint32_t *tile_starts,
+        uint32_t ntokens, uint32_t xq_blocks, uint32_t nrows,
+        uint32_t n_expert, uint64_t weight_expert_bytes,
+        uint64_t weight_row_bytes, uint32_t min_count,
+        uint32_t *job_counter = nullptr) {
+    static_assert(Schedule >= 0 && Schedule <= 2, "invalid prefill schedule");
+    static_assert(Schedule == 0 || PhysicalExperts == 288u,
+                  "persistent scheduling is GLM grouped only");
+    if constexpr (Schedule == 0) {
+        moe_q4K_routed_wmma_tile<J, PhysicalExperts>(weight_base, acts, out,
+            sorted_pairs, offsets, counts, tile_total, tile_experts, tile_starts,
+            ntokens, xq_blocks, nrows, n_expert, weight_expert_bytes,
+            weight_row_bytes, min_count, blockIdx.y, blockIdx.x * 64u);
+    } else {
+        const uint32_t columns = (nrows + 63u) / 64u;
+        const uint32_t jobs = *tile_total * columns;
+        if (jobs == 0u) return;
+        __shared__ uint32_t claimed_job;
+        for (uint32_t next = blockIdx.x; ; next += gridDim.x) {
+            uint32_t job = next;
+            if constexpr (Schedule == 2) {
+                if (threadIdx.x == 0) claimed_job = atomicAdd(job_counter, 1u);
+                __syncthreads();
+                job = claimed_job;
+            }
+            if (job >= jobs) break;
+            moe_q4K_routed_wmma_tile<J, PhysicalExperts>(weight_base, acts, out,
+                sorted_pairs, offsets, counts, tile_total, tile_experts, tile_starts,
+                ntokens, xq_blocks, nrows, n_expert, weight_expert_bytes,
+                weight_row_bytes, min_count, job / columns, (job % columns) * 64u);
+            // Protect tile LDS and the shared job ID before the next claim.
+            __syncthreads();
         }
     }
 }
@@ -5576,9 +5618,8 @@ __global__ static void moe_gate_up_mid_iq2_i8_hotlist_wmma_kernel(
 
 /* Q4_K down projection over the same 16-pair routing descriptors as gate/up.
  * Activations are pair-major, unlike moe_q4K_routed_wmma_kernel above. */
-template <int J, bool ATOMIC_OUT, uint32_t PhysicalExperts = 0u>
-__launch_bounds__(256)
-__global__ static void moe_down_q4K_routed_wmma_kernel(
+template <int J, bool ATOMIC_OUT, uint32_t PhysicalExperts>
+__device__ __forceinline__ static void moe_down_q4K_routed_wmma_tile(
         float *out, const char *weight_base,
         const ds4_q8_1_mmq_block *acts,
         const uint32_t *sorted_pairs, const uint32_t *offsets,
@@ -5586,18 +5627,17 @@ __global__ static void moe_down_q4K_routed_wmma_kernel(
         const uint32_t *tile_experts, const uint32_t *tile_starts,
         uint32_t activation_rows, uint32_t xq_blocks, uint32_t nrows,
         uint32_t n_expert, uint64_t weight_expert_bytes,
-        uint64_t weight_row_bytes, uint32_t min_count) {
+        uint64_t weight_row_bytes, uint32_t min_count,
+        uint32_t tile, uint32_t row0) {
     static_assert(J == 16, "Q4_K down WMMA is validated only for J=16");
-    constexpr int I = 64, XS = 76, YS = 36;
+    constexpr int XS = 76, YS = 36;
     extern __shared__ int32_t smem[];
     int32_t *sy = smem, *sx = sy + J * YS;
     const int tid = (int)threadIdx.x, wave = tid >> 5, lane = tid & 31;
-    const uint32_t tile = (uint32_t)blockIdx.y;
     if (tile >= *tile_total) return;
     const uint32_t expert = tile_experts[tile], start = tile_starts[tile];
     const uint32_t count = counts[expert];
     if (count < min_count) return;
-    const uint32_t row0 = (uint32_t)blockIdx.x * I;
     float acc[J / 16][8] = {};
     const char *expert_base = weight_base +
         (uint64_t)moe_weight_expert<PhysicalExperts>(expert) * weight_expert_bytes;
@@ -5687,6 +5727,49 @@ __global__ static void moe_down_q4K_routed_wmma_kernel(
                 if (ATOMIC_OUT) atomicAdd(out + (uint64_t)(pair / n_expert) * nrows + row, acc[0][l]);
                 else out[(uint64_t)pair * nrows + row] = acc[0][l];
             }
+        }
+    }
+}
+
+template <int J, bool ATOMIC_OUT, uint32_t PhysicalExperts = 0u, int Schedule = 0>
+__launch_bounds__(256)
+__global__ static void moe_down_q4K_routed_wmma_kernel(
+        float *out, const char *weight_base, const ds4_q8_1_mmq_block *acts,
+        const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total,
+        const uint32_t *tile_experts, const uint32_t *tile_starts,
+        uint32_t activation_rows, uint32_t xq_blocks, uint32_t nrows,
+        uint32_t n_expert, uint64_t weight_expert_bytes,
+        uint64_t weight_row_bytes, uint32_t min_count,
+        uint32_t *job_counter = nullptr) {
+    static_assert(Schedule >= 0 && Schedule <= 2, "invalid prefill schedule");
+    static_assert(Schedule == 0 || (!ATOMIC_OUT && PhysicalExperts == 288u),
+                  "persistent scheduling requires grouped pair-major output");
+    if constexpr (Schedule == 0) {
+        moe_down_q4K_routed_wmma_tile<J, ATOMIC_OUT, PhysicalExperts>(out,
+            weight_base, acts, sorted_pairs, offsets, counts, tile_total,
+            tile_experts, tile_starts, activation_rows, xq_blocks, nrows,
+            n_expert, weight_expert_bytes, weight_row_bytes, min_count,
+            blockIdx.y, blockIdx.x * 64u);
+    } else {
+        const uint32_t columns = (nrows + 63u) / 64u;
+        const uint32_t jobs = *tile_total * columns;
+        if (jobs == 0u) return;
+        __shared__ uint32_t claimed_job;
+        for (uint32_t next = blockIdx.x; ; next += gridDim.x) {
+            uint32_t job = next;
+            if constexpr (Schedule == 2) {
+                if (threadIdx.x == 0) claimed_job = atomicAdd(job_counter, 1u);
+                __syncthreads();
+                job = claimed_job;
+            }
+            if (job >= jobs) break;
+            moe_down_q4K_routed_wmma_tile<J, false, PhysicalExperts>(out,
+                weight_base, acts, sorted_pairs, offsets, counts, tile_total,
+                tile_experts, tile_starts, activation_rows, xq_blocks, nrows,
+                n_expert, weight_expert_bytes, weight_row_bytes, min_count,
+                job / columns, (job % columns) * 64u);
+            __syncthreads();
         }
     }
 }

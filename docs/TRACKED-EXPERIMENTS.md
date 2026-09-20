@@ -125,6 +125,18 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+`DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE=0/1/2` is a default-off Lane A
+grouped-prefill scheduling experiment: incumbent capacity grid, static
+grid-stride or atomic job queue. `DS4_ROCM_GLM5_Q4K_PREFILL_WORKERS=120/240`
+bounds workgroups (default120). It requires the existing packed Q4_K grouped
+and M256 partition recipe; only full outer M512/768/1024 groups change.
+Smaller/tail groups use the incumbent. Arithmetic, hot/cold thresholds, ordered
+route sums, original weights and transport are unchanged. Three atomic counters
+reuse otherwise-unused IQ2 metadata in the existing Q4_K scratch allocation.
+Malformed settings and incompatible admission refuse. No default changes or
+performance claims precede correctness and model gates. The active dossier's
+`q4k-prefill-scheduling-plan.md` records the CIRU donor and bounded test plan.
+
 `scripts/build-glm53-research.sh` accepts `DS4_RESEARCH_PROFILE=1` for a
 separate `glm53-profile-REV` frozen artifact. It explicitly enables the
 existing CPU and HIP profiling hooks; unset/0 keeps the ordinary full build.
