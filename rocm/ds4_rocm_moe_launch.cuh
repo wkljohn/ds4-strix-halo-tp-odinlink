@@ -117,6 +117,12 @@ static int routed_moe_glm5_prefill_schedule(void) {
     return -1;
 }
 
+static int routed_moe_glm5_prefill_wide(void) {
+    const char *value = getenv("DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128");
+    if (!value || strcmp(value, "0") == 0) return 0;
+    return strcmp(value, "1") == 0 ? 1 : -1;
+}
+
 static int routed_moe_glm5_prefill_workers(void) {
     const char *value = getenv("DS4_ROCM_GLM5_Q4K_PREFILL_WORKERS");
     // Explicit bounded research sweep: three/six CTAs per 40-CU gfx1151.
@@ -1743,6 +1749,17 @@ static int routed_moe_launch(
             (!glm5_grouped || routed_moe_q4k_wmma_min_count() != 6u)) return 0;
         const int prefill_schedule = glm5_grouped ?
             routed_moe_glm5_prefill_schedule() : 0;
+        const int prefill_wide = glm5_grouped ? routed_moe_glm5_prefill_wide() : 0;
+        if (prefill_wide < 0 || (prefill_wide && prefill_schedule != 0)) return 0;
+        if (prefill_wide) {
+            static int reported_wide;
+            if (!reported_wide) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "GLM5 Q4_K wide128 gate/up active tokens=%u "
+                        "lds_bytes=20736 weights=original\n", n_tokens);
+                reported_wide = 1;
+            }
+        }
         const int prefill_workers = routed_moe_glm5_prefill_workers();
         if (prefill_schedule < 0 || (prefill_schedule && prefill_workers < 0))
             return 0;
@@ -2336,7 +2353,15 @@ static int routed_moe_launch(
                                         n_tokens);
                             }
                         } else {
-                            if (prefill_schedule == 1) {
+                            if (prefill_wide) {
+                                constexpr size_t wide_smem = (16u * 36u + 128u * 36u) * sizeof(int32_t);
+                                moe_q4K_grouped_wide128_kernel<<<dim3((expert_mid_dim + 127u) / 128u, tile_capacity), 256, wide_smem>>>(
+                                    gate_w, q4k_q81, (float *)gate->ptr,
+                                    sorted_pairs, sorted_offsets, sorted_counts,
+                                    tile_total, tile_experts, tile_starts,
+                                    n_tokens, xq_blocks, expert_mid_dim, n_expert,
+                                    gate_expert_bytes, gate_row_bytes, wmma_min_count);
+                            } else if (prefill_schedule == 1) {
                                 moe_q4K_routed_wmma_scheduled_kernel<16, 288u, 1><<<prefill_workers, 256, wmma_smem>>>(
                                     gate_w, q4k_q81, (float *)gate->ptr,
                                     sorted_pairs, sorted_offsets, sorted_counts,
@@ -2374,7 +2399,15 @@ static int routed_moe_launch(
                                         n_tokens);
                             }
                             if (ok) {
-                                if (prefill_schedule == 1) {
+                                if (prefill_wide) {
+                                    constexpr size_t wide_smem = (16u * 36u + 128u * 36u) * sizeof(int32_t);
+                                    moe_q4K_grouped_wide128_kernel<<<dim3((expert_mid_dim + 127u) / 128u, tile_capacity), 256, wide_smem>>>(
+                                        up_w, q4k_q81, (float *)up->ptr,
+                                        sorted_pairs, sorted_offsets, sorted_counts,
+                                        tile_total, tile_experts, tile_starts,
+                                        n_tokens, xq_blocks, expert_mid_dim, n_expert,
+                                        gate_expert_bytes, gate_row_bytes, wmma_min_count);
+                                } else if (prefill_schedule == 1) {
                                     moe_q4K_routed_wmma_scheduled_kernel<16, 288u, 1><<<prefill_workers, 256, wmma_smem>>>(
                                         up_w, q4k_q81, (float *)up->ptr,
                                         sorted_pairs, sorted_offsets, sorted_counts,
@@ -4782,6 +4815,8 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
         bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     if (routed_moe_glm5_grouped_requested() < 0 ||
+        routed_moe_glm5_prefill_wide() < 0 ||
+        (routed_moe_glm5_prefill_wide() != 0 && routed_moe_glm5_prefill_schedule() != 0) ||
         routed_moe_glm5_prefill_schedule() < 0 ||
         (routed_moe_glm5_prefill_schedule() != 0 &&
          routed_moe_glm5_prefill_workers() < 0) ||
@@ -4815,6 +4850,7 @@ extern "C" int ds4_gpu_routed_moe_batch_packed_q4k_tensor(
     if (partition && strcmp(partition, "0") != 0 &&
         strcmp(partition, "256") != 0) return 0;
     const bool grouped_requested = routed_moe_glm5_grouped_requested() == 1;
+    if (routed_moe_glm5_prefill_wide() != 0 && !grouped_requested) return 0;
     if (routed_moe_glm5_prefill_schedule() != 0 && !grouped_requested)
         return 0;
     const bool cold_requested = routed_moe_glm5_grouped_cold_requested() == 1;

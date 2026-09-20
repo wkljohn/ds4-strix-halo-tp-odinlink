@@ -4815,8 +4815,10 @@ ds4_q4k_unpack_scales(const int32_t *scales, int32_t ksc) {
  */
 // Keep the incumbent kernel body and signature intact: wrapping it in an
 // inlined device helper increased compiled VGPR use on pinned SDK10. The
-// experimental helper below intentionally mirrors this arithmetic so the
+// experimental kernels below intentionally mirror this arithmetic so the
 // default kernel remains a stable compiled control.
+#include "ds4_rocm_q4k_wide_prefill.cuh"
+
 template <int J, uint32_t PhysicalExperts = 0u>
 __launch_bounds__(256)
 __global__ static void moe_q4K_routed_wmma_kernel(

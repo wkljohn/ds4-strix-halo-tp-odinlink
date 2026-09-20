@@ -125,6 +125,15 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+`DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128=1` is a separate default-off grouped
+gate/up tile experiment. Eight waves share a J16 activation panel across128
+output columns, staging oneK128half at a time in20,736bytes LDS. Original
+packed Q4_K, M256 expert domains, thresholds and down projection are unchanged.
+It requires the grouped/partition recipe and schedule0; invalid or conflicting
+selectors refuse. Smaller/tail groups retain incumbent dispatch. The original
+kernel stays intact for same-build and independentM256exactness controls.
+See `q4k-wide-activation-plan.md` in the active ROCm10 dossier.
+
 `DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE=0/1/2` is a default-off Lane A
 grouped-prefill scheduling experiment: incumbent capacity grid, static
 grid-stride or atomic job queue. `DS4_ROCM_GLM5_Q4K_PREFILL_WORKERS=120/240`

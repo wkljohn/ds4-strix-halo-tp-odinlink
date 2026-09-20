@@ -23,7 +23,8 @@ int main(int argc, char **argv) {
     constexpr uint32_t width = 4096, mid_width = 1024;
     uint32_t rows = 1024;
     REQUIRE(argc <= 3);
-    const unsigned schedule = argc != 3 ? 0u :
+    const bool wide = argc == 3 && std::strcmp(argv[2], "--prefill-wide128") == 0;
+    const unsigned schedule = wide ? 1u : argc != 3 ? 0u :
         std::strcmp(argv[2], "--prefill-schedule1") == 0 ? 1u :
         std::strcmp(argv[2], "--prefill-schedule2") == 0 ? 2u : 0u;
     const bool cold_i8 = schedule || (argc == 3 && std::strcmp(argv[2], "--grouped-cold-i8") == 0);
@@ -39,7 +40,8 @@ int main(int argc, char **argv) {
     const bool cold_padding = cold_lds5 &&
         std::strcmp(argv[2], "--cold-lds5-pad") == 0;
     if (cold_lds5) REQUIRE(cold_padding || std::strcmp(argv[2], "--cold-lds5") == 0);
-    const char *timing_selector = schedule ? "DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE" :
+    const char *timing_selector = wide ? "DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128" :
+        schedule ? "DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE" :
         cold_i8 ? "DS4_ROCM_GLM5_Q4K_GROUPED_COLD_I8" :
         cold_coalesce ? "DS4_ROCM_GLM5_Q4K_GROUPED_COLD_COALESCE" :
         dot_lanes ? "DS4_ROCM_GLM5_Q4K_DECODE_DOT_LANES" :
@@ -85,6 +87,7 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_COALESCE", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_I8", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS", "0", 1) == 0);
@@ -244,6 +247,7 @@ int main(int argc, char **argv) {
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE", "0", 1) == 0);
+        REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_COALESCE", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_I8", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_DECODE_GATE_ROWS", "0", 1) == 0);
@@ -288,7 +292,7 @@ int main(int argc, char **argv) {
             REQUIRE(ds4_gpu_tensor_fill_f32(t[0],NAN,rows*width));
             for (unsigned stage=1; stage<=3; ++stage)
                 REQUIRE(ds4_gpu_tensor_fill_f32(t[stage],NAN,rows*used*mid_width));
-            std::printf("schedule oracle mode=%s workers=%s fixture=%u\n",
+            std::printf("schedule oracle selector=%s mode=%s workers=%s fixture=%u\n",timing_selector,
                 schedule_arm ? candidate_mode : "0",
                 std::getenv("DS4_ROCM_GLM5_Q4K_PREFILL_WORKERS") ?
                 std::getenv("DS4_ROCM_GLM5_Q4K_PREFILL_WORKERS") : "120",fixture);
@@ -354,7 +358,7 @@ int main(int argc, char **argv) {
                     REQUIRE(hipEventElapsedTime(&ms, begin, end) == hipSuccess);
                     REQUIRE(std::isfinite(ms) && ms > 0.0f);
                     std::printf("microbench rank=%u rows=%u pair=%u %s=%u moe_ms=%.6f\n",
-                                rank, rows, pair, schedule ? "schedule_candidate" : decode_rows ? "decode_rows" : cold_i8 ? "cold_i8" : cold_coalesce ? "cold_coalesce" : grouped ? "grouped" : cold_padding ? "pad" : "lds5", mode, ms / 5.0f);
+                                rank, rows, pair, wide ? "wide128" : schedule ? "schedule_candidate" : decode_rows ? "decode_rows" : cold_i8 ? "cold_i8" : cold_coalesce ? "cold_coalesce" : grouped ? "grouped" : cold_padding ? "pad" : "lds5", mode, ms / 5.0f);
                 }
             }
             REQUIRE(hipEventDestroy(begin) == hipSuccess);
@@ -424,6 +428,7 @@ int main(int argc, char **argv) {
             REQUIRE(setenv(timing_selector,candidate_mode,1) == 0);
             const char *worker_env = std::getenv("DS4_ROCM_GLM5_Q4K_PREFILL_WORKERS");
             const unsigned saved_workers = worker_env ? unsigned(std::atoi(worker_env)) : 120u;
+            if (!wide) {
             for (const char *invalid_workers : {"0", "-1", "121", "invalid", ""}) {
                 REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_WORKERS",invalid_workers,1) == 0);
                 REQUIRE(!call(t,rows));
@@ -431,6 +436,16 @@ int main(int argc, char **argv) {
                 for (float value:actual) REQUIRE(std::isnan(value));
             }
             REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_WORKERS",saved_workers == 240u ? "240" : "120",1) == 0);
+            } else {
+                REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE","1",1) == 0);
+                REQUIRE(!call(t,rows));
+                REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+                for (float value:actual) REQUIRE(std::isnan(value));
+                REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE","0",1) == 0);
+                REQUIRE(setenv(timing_selector,"2",1) == 0);
+                REQUIRE(!call(t,rows));
+                REQUIRE(setenv(timing_selector,"1",1) == 0);
+            }
             REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED","0",1) == 0);
             REQUIRE(!call(t,rows));
             REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
