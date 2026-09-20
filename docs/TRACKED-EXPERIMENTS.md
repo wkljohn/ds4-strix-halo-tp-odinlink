@@ -135,6 +135,11 @@ dump inventories, clean terminal proof, RoCE v2 and zero fallback/cache.
 Quality/threshold bypasses refuse. Fixture content is hashed at comparison,
 not misrepresented as capture-time proof. Existing modes and tolerances stay
 unchanged. See the active dossier's `global-long-quality-plan.md`.
+Legacy GLM scorer dumps can report `quant_bits=0` because the engine's public
+query inspects the DeepSeek weight table. Only these global diagnostics may
+accept that sentinel, after independently reading the original model's GGUF
+architecture and Q4_K routed tensor family and matching its recorded size.
+The dump remains unchanged; DeepSeek capture validation still rejects zero.
 
 `DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL=1` is a default-off Lane B experiment
 within the grouped/partition256 recipe. Complete M512/768/1024 use one expert

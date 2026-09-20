@@ -16,6 +16,7 @@ import math
 import re
 import runpy
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -95,7 +96,7 @@ def score_fixture(path: Path, root: Path, start: int, count: int) -> tuple[list,
 
 
 def validate_score_capture(directory: Path, scores_path: Path, model: str,
-                           case_ids: list[str] | None = None) -> None:
+                           case_ids: list[str] | None = None, *, legacy_glm_metadata: bool = False) -> None:
     with scores_path.open() as stream:
         scores = list(csv.DictReader(stream, delimiter='\t'))
     ids = [row['id'] for row in scores]
@@ -124,7 +125,8 @@ def validate_score_capture(directory: Path, scores_path: Path, model: str,
         logits, vocab = value['logits'], value['vocab']
         require(type(vocab) is int and vocab > 1 and
                 all(type(x) in (int, float) for x in logits), 'invalid vocabulary/logits')
-        require(type(value['quant_bits']) is int and value['quant_bits'] in (2, 4), 'invalid quantization')
+        allowed_bits = (0, 4) if legacy_glm_metadata else (2, 4)
+        require(type(value['quant_bits']) is int and value['quant_bits'] in allowed_bits, 'invalid quantization')
         current = (vocab, value['quant_bits'])
         require(signature is None or signature == current, 'inconsistent vocabulary/quantization')
         signature = current
@@ -168,7 +170,8 @@ def capture_main(argv: list[str]) -> int:
         return 1
 
 
-def verify_score_capture_artifacts(directory: Path, meta: dict, *, fixture_bound: bool = True) -> Path:
+def verify_score_capture_artifacts(directory: Path, meta: dict, *, fixture_bound: bool = True,
+                                   legacy_glm_metadata: bool = False) -> Path:
     """Reopen shared score, terminal and complete teacher-dump evidence."""
     terminal = runpy.run_path(str(Path(__file__).with_name('compare-quality-scores.py')))['terminal_proof']
     identity_keys = ('ds4_sha256', 'scorer_sha256', 'files_sha256')
@@ -189,7 +192,7 @@ def verify_score_capture_artifacts(directory: Path, meta: dict, *, fixture_bound
     require(inventory == [p.name for p in sorted(directory.glob('decode_*.logits.json'))],
             'dump inventory coverage differs')
     require(len(inventory) == int(meta['teacher_positions']), 'wrong teacher position count')
-    validate_score_capture(directory, scores, meta['model'])
+    validate_score_capture(directory, scores, meta['model'], legacy_glm_metadata=legacy_glm_metadata)
     with scores.open() as stream:
         require(len(list(csv.DictReader(stream, delimiter='\t'))) == int(meta['cases']),
                 'wrong case count')
@@ -236,8 +239,23 @@ def verify_global_captures(directories: tuple[Path, Path], manifests: tuple[dict
         require(meta['cases'] == '1', 'global diagnostic requires one case per process for engagement proof')
         require(sha256(fixture) == meta['quality_input_sha256'], 'global fixture manifest differs')
         rows, content_digest = score_fixture(fixture, source_root, int(meta['start_case']), 1)
-        scores = verify_score_capture_artifacts(directory, meta, fixture_bound=False)
-        validate_score_capture(directory, scores, meta['model'], [rows[0][0]])
+        first = load(directory / 'decode_000000.logits.json')
+        legacy_zero = first['quant_bits'] == 0
+        if legacy_zero:
+            # Older GLM engines leave DeepSeek's weights.layer array empty;
+            # ds4_engine_routed_quant_bits therefore emits an unknown0 sentinel.
+            # Inspect the original GGUF rather than rewriting those captures
+            # or admitting unknown quantization in the DeepSeek checker.
+            model = Path(meta['model'])
+            require(model.stat().st_size == int(meta['model_size']), 'legacy GLM model size differs')
+            inspector = Path(__file__).with_name('gguf_tensor_types.py')
+            for flag, expected in (('--architecture', 'glm5-next'), ('--routed-family', 'Q4_K')):
+                actual = subprocess.check_output([sys.executable, str(inspector), flag, str(model)], text=True).strip()
+                require(actual == expected, 'legacy GLM quant metadata requires original Q4_K routed tensors')
+        scores = verify_score_capture_artifacts(directory, meta, fixture_bound=False,
+                                               legacy_glm_metadata=legacy_zero)
+        validate_score_capture(directory, scores, meta['model'], [rows[0][0]],
+                               legacy_glm_metadata=legacy_zero)
         rank_modes = []
         for rank, index in (('coordinator', 0), ('worker', 1)):
             items = [item.split('=', 1) for item in shlex.split(meta[rank + '_env'])]
@@ -673,8 +691,8 @@ def main() -> int:
         first_pair = (load(reference_files[0], reference=True),
                       load(candidate_files[0]))
         if global_capture:
-            require(all(value['quant_bits'] == 4 for value in first_pair),
-                    'global grouping diagnostic requires Q4 captures')
+            require(all(value['quant_bits'] in (0, 4) for value in first_pair),
+                    'global grouping diagnostic requires Q4 or independently checked legacy GLM captures')
         score_official_source = any(
             value.get("source") == "ds4-score-official-frozen-teacher"
             for value in first_pair)
@@ -962,7 +980,7 @@ def main() -> int:
                                       load(cand_path), thresholds,
                                       args.allow_quality_difference,
                                       global_capture or args.score_arm_mode == "q8-decode-tile"))
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         print(f"teacher-logits: FAIL {error}", file=sys.stderr)
         return 1
 
@@ -1121,6 +1139,7 @@ def main() -> int:
         "score_arm_mode": args.score_arm_mode,
         "fixture_content_sha256_at_comparison": global_fixture_digest,
         "capture_time_fixture_bound": False if global_capture else None,
+        "legacy_glm_zero_quant_bits": global_capture and first_pair[0]['quant_bits'] == 0,
         "steps": len(steps),
         "argmax_mismatches": len(mismatches),
         "far_margin_inversions": len(far_margin) if thresholds else None,

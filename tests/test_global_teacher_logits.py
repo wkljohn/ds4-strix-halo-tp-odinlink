@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import runpy
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -199,6 +200,37 @@ class GlobalTeacher(unittest.TestCase):
         self.assertNotEqual(first['fixture_content_sha256_at_comparison'],
                             second['fixture_content_sha256_at_comparison'])
         self.assertFalse(second['capture_time_fixture_bound'])
+
+    def test_legacy_glm_zero_requires_original_q4_metadata(self):
+        def string(value):
+            data = value.encode()
+            return struct.pack('<Q', len(data)) + data
+
+        model = self.root / 'model.gguf'
+
+        def write_model(tensor_type):
+            data = b'GGUF' + struct.pack('<IQQ', 3, 3, 1)
+            data += string('general.architecture') + struct.pack('<I', 8) + string('glm5-next')
+            for kind in ('gate', 'up', 'down'):
+                data += string(f'blk.0.ffn_{kind}_exps.weight')
+                data += struct.pack('<IQIQ', 1, 256, tensor_type, 0)
+            model.write_bytes(data)
+
+        write_model(12)
+        for directory, meta in zip(self.dirs, self.meta):
+            meta['model'] = str(model)
+            meta['model_size'] = str(model.stat().st_size)
+            path = directory / 'decode_000000.logits.json'
+            value = json.loads(path.read_text())
+            value.update(model=str(model), quant_bits=0)
+            path.write_text(json.dumps(value))
+        for i in (0, 1):
+            self.inventory(i)
+        result = self.run_tool()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)['legacy_glm_zero_quant_bits'])
+        write_model(10)
+        self.assertIn('original Q4_K routed tensors', self.run_tool().stderr)
 
 
 if __name__ == '__main__':
