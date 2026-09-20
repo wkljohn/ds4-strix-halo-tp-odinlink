@@ -65,6 +65,7 @@
 /tests/test_glm5_expert_pairs
 /tests/test_glm5_native_session
 /tests/test_glm5_shared_route_order
+/tests/test_glm5_mla_capture
 /tests/test_glm5_target_commit
 /tests/test_tp_native_cycle
 /tests/test_rocm_glm5_expert_pairs
