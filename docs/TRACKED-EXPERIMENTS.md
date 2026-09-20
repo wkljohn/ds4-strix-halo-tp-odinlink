@@ -125,6 +125,18 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+`DS4_GLM5_MLA_OUTPUT_CAPTURE_PREFIX` with explicit capture position3072/7168
+records production MLA heads and local output at layers3/23/43, M1024,
+full-head stride16384. Exclusive files bind rank/layer/position/weight offset
+and run ID; reads synchronize without enabling graph/quality mode or changing
+arithmetic. Enabled runs are diagnostic only. The MLA fixture's
+`--replay PREFIX 3072|7168` requires exact reproduction of captured incumbent
+output before reporting original-Q8 and FP16-rounded dot errors. Explicit
+MLA_OUTPUT_WMMA0/1 also reports successful candidate/incumbent launch counts
+at process exit; these counts require separate clean completion proof.
+See `mla-output-production-plan.md` in the active ROCm10 dossier. This
+capture/replay does not provide Lane B quality admission or change defaults.
+
 The existing original-Q8 MLA-output WMMA fixture accepts explicit
 `--rows 256|1024` (default256), with output guards, both rank slices and all11
 MLA layers. It retains strided/gathered exactness, sampled original-Q8 dots,

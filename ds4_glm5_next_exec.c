@@ -11,6 +11,7 @@
 #include "ds4_tp.h"
 #include "ds4_glm5_route_profile.h"
 #include "ds4_glm5_expert_pairs.h"
+#include "ds4_glm5_mla_capture.h"
 #ifdef DS4_ROCM_BUILD
 #include "ds4_gpu_mgpu.h"
 #endif
@@ -3238,6 +3239,7 @@ static int mla_output_project_rows_batch(
         const ds4_glm5_next_mla_offsets *offsets,
         ds4_glm5_next_workspace *w,
         uint32_t n_tokens,
+        uint32_t layer, uint32_t pos0,
         int force_serial) {
     const uint64_t full_heads =
         (uint64_t)GLM5_HEADS * GLM5_HEAD_DIM;
@@ -3271,7 +3273,10 @@ static int mla_output_project_rows_batch(
             ctx->tp_big_out, ctx->model_map, ctx->model_size,
             offsets->output, full_heads, GLM5_WIDTH, in_start, half_heads,
             w->mla_heads, activation_start, n_tokens, activation_stride);
-    if (batch >= 0) return batch;
+    if (batch >= 0) return batch && glm5_mla_output_capture(
+        ctx->tp_rank, layer, pos0, n_tokens, offsets->output,
+        activation_stride, w->mla_heads, ctx->tp_big_out);
+    if (getenv("DS4_GLM5_MLA_OUTPUT_CAPTURE_PREFIX")) return 0;
     /* Preserve the exact one-row implementation on backends without the
      * strided token-tile entry point. */
     for (uint32_t t = 0u; t < n_tokens; ++t) {
@@ -3428,7 +3433,7 @@ static int mla_dense_selection_attention_rows(
             1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f) &&
         mla_value_project_rows_batch(ctx, m, owned ? &owned_w : w, n_tokens) &&
         mla_output_project_rows_batch(
-            ctx, m, owned ? &owned_w : w, n_tokens,
+            ctx, m, owned ? &owned_w : w, n_tokens, il, pos0,
             !(layer->ffn_weight.gate_exps_type == 16u &&
               layer->ffn_weight.up_exps_type == 16u &&
               layer->ffn_weight.down_exps_type == 10u));
@@ -6027,7 +6032,7 @@ int ds4_glm5_next_layer_forward_batch_sparse_bridge(
         }
     }
     if (batch_output && !mla_output_project_rows_batch(
-            ctx, &layer->mla, batch_w, n_tokens, 0)) {
+            ctx, &layer->mla, batch_w, n_tokens, il, token_ordinal, 0)) {
         ds4_glm5_next_state_invalidate(state);
         return 0;
     }

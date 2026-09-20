@@ -3638,6 +3638,15 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
                    "matmul_q8_0 kslice rows launch");
 }
 
+static uint64_t glm5_mla_output_wmma_calls = 0;
+static uint64_t glm5_mla_output_tile_calls = 0;
+static void glm5_mla_output_dispatch_report() {
+    fprintf(stderr, "ds4: GLM5 MLA output dispatch wmma_calls=%llu "
+            "tile_calls=%llu weight_cache=0\n",
+            (unsigned long long)glm5_mla_output_wmma_calls,
+            (unsigned long long)glm5_mla_output_tile_calls);
+}
+
 /* GLM-5.3 MLA produces full-width head rows but each TP rank owns one
  * contiguous half. Reuse the existing strided F32xQ8 token-tile kernel so
  * prompt rows share weight loads without introducing Q8 activation rounding. */
@@ -3683,6 +3692,11 @@ extern "C" int ds4_rocm_q8_kslice_f32_rows_strided(
     const char *mla_wmma = getenv("DS4_ROCM_GLM5_MLA_OUTPUT_WMMA");
     if (mla_wmma && strcmp(mla_wmma, "0") != 0 &&
         strcmp(mla_wmma, "1") != 0) return 0;
+    static bool report_registered = false;
+    if (mla_wmma && !report_registered) {
+        if (atexit(glm5_mla_output_dispatch_report) != 0) return 0;
+        report_registered = true;
+    }
     // Only the GLM MLA output shape is eligible. The weight-row stride stays
     // full-width while each rank reads its original Q8 half; no packing cache.
     // Contiguous activation rows are also accepted for the gathered oracle.
@@ -3702,6 +3716,7 @@ extern "C" int ds4_rocm_q8_kslice_f32_rows_strided(
             (uint32_t)x_token_stride);
         if (!cuda_ok(cudaGetLastError(), "GLM5 MLA output strided WMMA"))
             return 0;
+        ++glm5_mla_output_wmma_calls;
         static bool logged = false;
         if (!logged) {
             fprintf(stderr, "ds4: GLM5 MLA output strided Q8 WMMA engaged "
@@ -3720,8 +3735,11 @@ extern "C" int ds4_rocm_q8_kslice_f32_rows_strided(
         (uint32_t)slice_blocks, (uint32_t)out_dim,
         (uint32_t)x_token_stride, 0u, row_bytes,
         32u, 32u, 16u);
-    return cuda_ok(cudaGetLastError(),
-                   "q8_0 kslice strided F32 rows launch");
+    if (!cuda_ok(cudaGetLastError(),
+                 "q8_0 kslice strided F32 rows launch")) return 0;
+    if (mla_wmma && full_in_dim == 16384u && out_dim == 4096u &&
+        in_count == 8192u) ++glm5_mla_output_tile_calls;
+    return 1;
 }
 
 /* Thin wrapper: slices x by x_elem_off, then defers. Mirrors
