@@ -125,6 +125,18 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+`DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL=1` is a default-off Lane B experiment
+within the grouped/partition256 recipe. Complete M512/768/1024 use one expert
+domain, original I64/J16 kernels and packed weights, threshold6 gate/up and
+threshold1 down, absolute route IDs and ordered output sums. It changes
+hot/cold arithmetic selection, not model quantization or transport. M256 and
+irregular tails retain the incumbent. Malformed flags, missing prerequisites,
+and schedule/wide conflicts refuse. Metadata shrinks; no weight cache grows.
+The fixture's `--prefill-global-numerical` retains exact M256/grouped controls
+and reports candidate errors/timing without certifying quality. See the active
+ROCm10 dossier's `q4k-global-domain-plan.md`; formal promotion still needs the
+matching baseline and engaged numerical/quality evidence.
+
 The Q4_K partition fixture accepts `--prefill-wide128-numerical` for explicitly
 unqualified error/timing diagnostics. Independent M256 and same-build controls
 remain exact; nonfinite values and failed admission checks still fail. The

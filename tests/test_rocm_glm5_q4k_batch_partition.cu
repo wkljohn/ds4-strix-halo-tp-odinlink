@@ -1,6 +1,7 @@
 // Compare the real packed-half production entry with independent <=M256
 // calls, including the final partial group. Rare routes change hot/cold
-// occupancy if an outer batch is accidentally treated as one group.
+// occupancy if an outer batch is treated as one group. The explicit global
+// diagnostic measures that Lane-B change without certifying numerical quality.
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 extern "C" {
@@ -19,20 +20,34 @@ extern "C" void ds4_tp_set_devcopy(ds4_tp_devcopy_fn) {}
     std::fprintf(stderr, "FAIL line=%d: %s\n", __LINE__, #x); \
     std::exit(1); } } while (0)
 
+// Output identity for comparing the unchanged off path across frozen runtime
+// objects. These hashes impose no quality requirement on the Lane-B arm.
+static uint64_t hash_float(uint64_t hash, float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    for (unsigned shift=0; shift<32; shift+=8)
+        hash = (hash ^ ((bits >> shift) & 255u)) * UINT64_C(1099511628211);
+    return hash;
+}
+
 int main(int argc, char **argv) {
     constexpr uint32_t width = 4096, mid_width = 1024;
     uint32_t rows = 1024;
     REQUIRE(argc <= 3);
-    const bool numerical = argc == 3 &&
+    const bool global = argc == 3 &&
+        std::strcmp(argv[2], "--prefill-global-numerical") == 0;
+    const bool wide_numerical = argc == 3 &&
         std::strcmp(argv[2], "--prefill-wide128-numerical") == 0;
-    const bool wide = numerical ||
+    const bool numerical = global || wide_numerical;
+    const bool wide = wide_numerical ||
         (argc == 3 && std::strcmp(argv[2], "--prefill-wide128") == 0);
     if (numerical)
         std::puts("NUMERICAL DIAGNOSTIC: candidate error and timing only; exact controls required; quality unassessed");
     const unsigned schedule = wide ? 1u : argc != 3 ? 0u :
         std::strcmp(argv[2], "--prefill-schedule1") == 0 ? 1u :
         std::strcmp(argv[2], "--prefill-schedule2") == 0 ? 2u : 0u;
-    const bool cold_i8 = schedule || (argc == 3 && std::strcmp(argv[2], "--grouped-cold-i8") == 0);
+    const bool candidate_experiment = schedule || global;
+    const bool cold_i8 = candidate_experiment || (argc == 3 && std::strcmp(argv[2], "--grouped-cold-i8") == 0);
     const bool cold_coalesce = cold_i8 || (argc == 3 && std::strcmp(argv[2], "--grouped-cold") == 0);
     const bool grouped = cold_coalesce || (argc == 3 && std::strcmp(argv[2], "--grouped") == 0);
     const bool dot_unroll = argc == 3 && std::strcmp(argv[2], "--decode-dot2") == 0;
@@ -45,7 +60,8 @@ int main(int argc, char **argv) {
     const bool cold_padding = cold_lds5 &&
         std::strcmp(argv[2], "--cold-lds5-pad") == 0;
     if (cold_lds5) REQUIRE(cold_padding || std::strcmp(argv[2], "--cold-lds5") == 0);
-    const char *timing_selector = wide ? "DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128" :
+    const char *timing_selector = global ? "DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL" :
+        wide ? "DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128" :
         schedule ? "DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE" :
         cold_i8 ? "DS4_ROCM_GLM5_Q4K_GROUPED_COLD_I8" :
         cold_coalesce ? "DS4_ROCM_GLM5_Q4K_GROUPED_COLD_COALESCE" :
@@ -61,7 +77,8 @@ int main(int argc, char **argv) {
     if (input_case) {
         REQUIRE(std::strcmp(input_case,"0") == 0 || std::strcmp(input_case,"1") == 0 ||
                 std::strcmp(input_case,"2") == 0 ||
-                (schedule && (std::strcmp(input_case,"3") == 0 || std::strcmp(input_case,"4") == 0 || std::strcmp(input_case,"5") == 0)));
+                (candidate_experiment && (std::strcmp(input_case,"3") == 0 || std::strcmp(input_case,"4") == 0 || std::strcmp(input_case,"5") == 0)) ||
+                (global && std::strcmp(input_case,"6") == 0));
         fixture = unsigned(input_case[0]-'0');
     }
     if (argc >= 2) {
@@ -91,6 +108,7 @@ int main(int argc, char **argv) {
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
+    REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128", "0", 1) == 0);
     REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_COALESCE", "0", 1) == 0);
@@ -133,6 +151,14 @@ int main(int argc, char **argv) {
     for (size_t i=0; i<x.size(); ++i)
         x[i] = float(std::sin(double(i)*0.013+fixture)*0.17 +
                      std::cos(double(i)*0.031+fixture*2)*0.11);
+    if (global && fixture == 6u) {
+        // Sparse nonzero input rows straddle all M256 boundaries. Zero rows
+        // must stay zero: this tests routing/token isolation independently
+        // of the incumbent's FP arithmetic and hot/cold classification.
+        for (unsigned r=0; r<rows; ++r)
+            if (r % tile != 0u && r % tile != 255u)
+                for (unsigned k=0; k<width; ++k) x[r*width+k] = 0.0f;
+    }
     for (unsigned r=0; r<rows; ++r) for (unsigned s=0; s<used; ++s) {
         selected[r*used+s] = s<7 ? int(s) : 7+int(r%128);
         if ((cold_lds5 || grouped) && s == 7u) {
@@ -170,23 +196,25 @@ int main(int argc, char **argv) {
             }
             if (fixture == 2u && s == 7u) weights[r*used+s] = 0.0f;
         }
-        if (schedule && fixture == 3u) {
+        if (candidate_experiment && fixture == 3u) {
             selected[r*used+s] = -1;
             weights[r*used+s] = 0.0f;
         }
-        if (schedule && fixture == 4u)
+        if (candidate_experiment && fixture == 4u)
             selected[r*used+s] = int((r*used+s+(r/tile)*7u) % experts);
-        if (schedule && fixture == 5u && s == 7u) {
+        if (candidate_experiment && fixture == 5u && s == 7u) {
             const unsigned within = r % tile;
             selected[r*used+s] = within < 17u ? 7 : within < 33u ? 8 :
                                  int(9u + (within-33u) / 2u);
         }
     }
-    if (schedule) {
+    if (candidate_experiment) {
+      for (const unsigned domain_rows : {tile, rows}) {
+        if (!global && domain_rows != tile) continue;
         unsigned nonempty=0, hot=0, tiles=0, hot_tiles=0;
-        for (unsigned first=0; first<rows; first+=tile) {
+        for (unsigned first=0; first<rows; first+=domain_rows) {
             unsigned counts[experts] = {};
-            for (unsigned r=first; r<rows && r<first+tile; ++r)
+            for (unsigned r=first; r<rows && r<first+domain_rows; ++r)
                 for (unsigned s=0; s<used; ++s)
                     if (selected[r*used+s] >= 0)
                         ++counts[unsigned(selected[r*used+s])];
@@ -197,9 +225,10 @@ int main(int argc, char **argv) {
                 if (count >= 6u) hot_tiles += (count+15u)/16u;
             }
         }
-        std::printf("synthetic_routes fixture=%u rows=%u nonempty=%u hot=%u tiles=%u hot_tiles=%u capacity=%u\n",
-                    fixture,rows,nonempty,hot,tiles,hot_tiles,
-                    (rows*used+15u)/16u+experts*((rows+tile-1u)/tile));
+        std::printf("synthetic_routes fixture=%u rows=%u domain_rows=%u nonempty=%u hot=%u tiles=%u hot_tiles=%u capacity=%u\n",
+                    fixture,rows,domain_rows,nonempty,hot,tiles,hot_tiles,
+                    (rows*used+15u)/16u+experts*((rows+domain_rows-1u)/domain_rows));
+      }
     }
     REQUIRE(ds4_gpu_tensor_write(t[7],0,x.data(),rows*strides[7]));
     REQUIRE(ds4_gpu_tensor_write(t[5],0,selected.data(),rows*strides[5]));
@@ -251,6 +280,7 @@ int main(int argc, char **argv) {
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5", cold_padding ? "1" : "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_COLD_LDS5_PAD", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED", "0", 1) == 0);
+        REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GLOBAL", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128", "0", 1) == 0);
         REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_COALESCE", "0", 1) == 0);
@@ -291,8 +321,8 @@ int main(int argc, char **argv) {
         if (decode_rows) REQUIRE(setenv(timing_selector,candidate_mode,1) == 0);
         // Establish both the grouped control and the scheduling candidate
         // against the independent M256 oracle, including exposed up/mid.
-        for (unsigned schedule_arm=0; schedule_arm<(schedule ? 2u : 1u); ++schedule_arm) {
-        if (schedule) {
+        for (unsigned schedule_arm=0; schedule_arm<(candidate_experiment ? 2u : 1u); ++schedule_arm) {
+        if (candidate_experiment) {
             REQUIRE(setenv(timing_selector,schedule_arm ? candidate_mode : "0",1) == 0);
             REQUIRE(ds4_gpu_tensor_fill_f32(t[0],NAN,rows*width));
             for (unsigned stage=1; stage<=3; ++stage)
@@ -305,10 +335,18 @@ int main(int argc, char **argv) {
         REQUIRE(call(t,rows));
         REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
         size_t different=0;
+        uint64_t reference_hash=UINT64_C(14695981039346656037);
+        uint64_t actual_hash=reference_hash;
         double max_abs=0;
         double error_sq=0, reference_sq=0;
         for (size_t i=0; i<actual.size(); ++i) {
             REQUIRE(std::isfinite(reference[i]) && std::isfinite(actual[i]));
+            if (global && fixture == 6u &&
+                (i/width) % tile != 0u && (i/width) % tile != 255u)
+                REQUIRE(actual[i] == 0.0f);
+            if (global && fixture == 3u) REQUIRE(actual[i] == 0.0f);
+            reference_hash = hash_float(reference_hash, reference[i]);
+            actual_hash = hash_float(actual_hash, actual[i]);
             different += std::memcmp(&reference[i],&actual[i],sizeof(float)) != 0;
             const double error = double(reference[i])-actual[i];
             max_abs = std::fmax(max_abs,std::fabs(error));
@@ -317,6 +355,8 @@ int main(int argc, char **argv) {
         }
         std::printf("rank=%u rows=%u values=%zu different=%zu max_abs=%.9g\n",
                     rank,rows,actual.size(),different,max_abs);
+        std::printf("identity rank=%u stage=final reference=%016llx actual=%016llx\n",
+                    rank,(unsigned long long)reference_hash,(unsigned long long)actual_hash);
         std::printf("numerical rank=%u stage=final rms_error=%.9g relative_l2=%.9g reference_l2=%.9g\n",
                     rank,std::sqrt(error_sq/actual.size()),
                     reference_sq > 0 ? std::sqrt(error_sq/reference_sq) :
@@ -327,11 +367,14 @@ int main(int argc, char **argv) {
             for (unsigned stage=0; stage<2u; ++stage) {
                 REQUIRE(ds4_gpu_tensor_read(t[stage+2],0,stage_actual.data(),rows*strides[stage+2]));
                 size_t live_values=0, stage_different=0;
+                reference_hash=actual_hash=UINT64_C(14695981039346656037);
                 double stage_max=0, stage_error_sq=0, stage_reference_sq=0;
                 for (size_t i=0; i<stage_actual.size(); ++i) {
                     const size_t pair = i/mid_width;
                     if (selected[pair] < 0 || weights[pair] == 0.0f) continue;
                     REQUIRE(std::isfinite(stage_reference[stage][i]) && std::isfinite(stage_actual[i]));
+                    reference_hash=hash_float(reference_hash,stage_reference[stage][i]);
+                    actual_hash=hash_float(actual_hash,stage_actual[i]);
                     stage_different += std::memcmp(&stage_reference[stage][i],&stage_actual[i],sizeof(float)) != 0;
                     const double error = double(stage_reference[stage][i])-stage_actual[i];
                     stage_max = std::fmax(stage_max,std::fabs(error));
@@ -340,6 +383,8 @@ int main(int argc, char **argv) {
                     ++live_values;
                 }
                 exact = exact && stage_different == 0;
+                std::printf("identity rank=%u stage=%u reference=%016llx actual=%016llx\n",
+                    rank,stage,(unsigned long long)reference_hash,(unsigned long long)actual_hash);
                 std::printf("rank=%u stage=%u live_values=%zu bit_exact=%u different=%zu max_abs=%.9g rms_error=%.9g relative_l2=%.9g\n",
                     rank,stage,live_values,unsigned(stage_different == 0),stage_different,stage_max,
                     live_values ? std::sqrt(stage_error_sq/live_values) : 0.0,
@@ -350,7 +395,9 @@ int main(int argc, char **argv) {
         std::fflush(stdout);
         // Collect exposed-stage evidence before rejecting nonidentity. Only
         // explicit candidate diagnostics may continue; both controls stay exact.
-        if (!(numerical && schedule_arm == 1u)) REQUIRE(exact);
+        const bool global_active = global && rows > tile && rows % tile == 0u;
+        if (!(numerical && schedule_arm == 1u && (!global || global_active)))
+            REQUIRE(exact);
         if (decode_rows) {
             REQUIRE(ds4_gpu_tensor_read(t[3],0,mid_actual.data(),strides[3]));
             for (size_t i=0; i<mid_actual.size(); ++i) {
@@ -385,7 +432,7 @@ int main(int argc, char **argv) {
                     REQUIRE(hipEventElapsedTime(&ms, begin, end) == hipSuccess);
                     REQUIRE(std::isfinite(ms) && ms > 0.0f);
                     std::printf("microbench rank=%u rows=%u pair=%u %s=%u moe_ms=%.6f\n",
-                                rank, rows, pair, wide ? "wide128" : schedule ? "schedule_candidate" : decode_rows ? "decode_rows" : cold_i8 ? "cold_i8" : cold_coalesce ? "cold_coalesce" : grouped ? "grouped" : cold_padding ? "pad" : "lds5", mode, ms / 5.0f);
+                                rank, rows, pair, global ? "global_domain" : wide ? "wide128" : schedule ? "schedule_candidate" : decode_rows ? "decode_rows" : cold_i8 ? "cold_i8" : cold_coalesce ? "cold_coalesce" : grouped ? "grouped" : cold_padding ? "pad" : "lds5", mode, ms / 5.0f);
                 }
             }
             REQUIRE(hipEventDestroy(begin) == hipSuccess);
@@ -480,7 +527,35 @@ int main(int argc, char **argv) {
             REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED","1",1) == 0);
             REQUIRE(setenv(timing_selector,"0",1) == 0);
         }
-        if (cold_coalesce && !schedule) {
+        if (global) {
+            for (const char *invalid_mode : {"invalid", "2", ""}) {
+                REQUIRE(setenv(timing_selector,invalid_mode,1) == 0);
+                REQUIRE(!call(t,rows));
+                REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+                for (float value:actual) REQUIRE(std::isnan(value));
+            }
+            REQUIRE(setenv(timing_selector,"1",1) == 0);
+            for (const char *conflict : {"DS4_ROCM_GLM5_Q4K_PREFILL_SCHEDULE",
+                                        "DS4_ROCM_GLM5_Q4K_PREFILL_WIDE128"}) {
+                REQUIRE(setenv(conflict,"1",1) == 0);
+                REQUIRE(!call(t,rows));
+                REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+                for (float value:actual) REQUIRE(std::isnan(value));
+                REQUIRE(setenv(conflict,"0",1) == 0);
+            }
+            REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED","0",1) == 0);
+            REQUIRE(!call(t,rows));
+            REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+            for (float value:actual) REQUIRE(std::isnan(value));
+            REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_PREFILL_GROUPED","1",1) == 0);
+            REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_MIN_COUNT","7",1) == 0);
+            REQUIRE(!call(t,rows));
+            REQUIRE(ds4_gpu_tensor_read(t[0],0,actual.data(),rows*strides[0]));
+            for (float value:actual) REQUIRE(std::isnan(value));
+            REQUIRE(setenv("DS4_ROCM_Q4K_WMMA_MIN_COUNT","6",1) == 0);
+            REQUIRE(setenv(timing_selector,"0",1) == 0);
+        }
+        if (cold_coalesce && !candidate_experiment) {
             if (cold_i8) {
                 REQUIRE(setenv(timing_selector,"1",1) == 0);
                 REQUIRE(setenv("DS4_ROCM_GLM5_Q4K_GROUPED_COLD_COALESCE","0",1) == 0);
