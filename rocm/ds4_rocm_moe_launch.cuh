@@ -2337,14 +2337,14 @@ static int routed_moe_launch(
                             }
                         } else {
                             if (prefill_schedule == 1) {
-                                moe_q4K_routed_wmma_kernel<16, 288u, 1><<<prefill_workers, 256, wmma_smem>>>(
+                                moe_q4K_routed_wmma_scheduled_kernel<16, 288u, 1><<<prefill_workers, 256, wmma_smem>>>(
                                     gate_w, q4k_q81, (float *)gate->ptr,
                                     sorted_pairs, sorted_offsets, sorted_counts,
                                     tile_total, tile_experts, tile_starts,
                                     n_tokens, xq_blocks, expert_mid_dim, n_expert,
                                     gate_expert_bytes, gate_row_bytes, wmma_min_count);
                             } else if (prefill_schedule == 2) {
-                                moe_q4K_routed_wmma_kernel<16, 288u, 2><<<prefill_workers, 256, wmma_smem>>>(
+                                moe_q4K_routed_wmma_scheduled_kernel<16, 288u, 2><<<prefill_workers, 256, wmma_smem>>>(
                                     gate_w, q4k_q81, (float *)gate->ptr,
                                     sorted_pairs, sorted_offsets, sorted_counts,
                                     tile_total, tile_experts, tile_starts,
@@ -2375,14 +2375,14 @@ static int routed_moe_launch(
                             }
                             if (ok) {
                                 if (prefill_schedule == 1) {
-                                    moe_q4K_routed_wmma_kernel<16, 288u, 1><<<prefill_workers, 256, wmma_smem>>>(
+                                    moe_q4K_routed_wmma_scheduled_kernel<16, 288u, 1><<<prefill_workers, 256, wmma_smem>>>(
                                         up_w, q4k_q81, (float *)up->ptr,
                                         sorted_pairs, sorted_offsets, sorted_counts,
                                         tile_total, tile_experts, tile_starts,
                                         n_tokens, xq_blocks, expert_mid_dim, n_expert,
                                         gate_expert_bytes, gate_row_bytes, wmma_min_count);
                                 } else if (prefill_schedule == 2) {
-                                    moe_q4K_routed_wmma_kernel<16, 288u, 2><<<prefill_workers, 256, wmma_smem>>>(
+                                    moe_q4K_routed_wmma_scheduled_kernel<16, 288u, 2><<<prefill_workers, 256, wmma_smem>>>(
                                         up_w, q4k_q81, (float *)up->ptr,
                                         sorted_pairs, sorted_offsets, sorted_counts,
                                         tile_total, tile_experts, tile_starts,
@@ -3247,14 +3247,14 @@ static int routed_moe_launch(
                                 midq_blocks, out_dim, n_expert, down_expert_bytes,
                                 down_row_bytes, down_wmma_min_count);
                         } else if (prefill_schedule == 1) {
-                            moe_down_q4K_routed_wmma_kernel<16, false, 288u, 1><<<prefill_workers, 256, down_wmma_smem>>>(
+                            moe_down_q4K_routed_wmma_scheduled_kernel<16, false, 288u, 1><<<prefill_workers, 256, down_wmma_smem>>>(
                                 (float *)down->ptr, down_w, down_q81, sorted_pairs,
                                 sorted_offsets, sorted_counts, down_tile_total,
                                 down_tile_experts, down_tile_starts, pair_count,
                                 midq_blocks, out_dim, n_expert, down_expert_bytes,
                                 down_row_bytes, down_wmma_min_count);
                         } else if (prefill_schedule == 2) {
-                            moe_down_q4K_routed_wmma_kernel<16, false, 288u, 2><<<prefill_workers, 256, down_wmma_smem>>>(
+                            moe_down_q4K_routed_wmma_scheduled_kernel<16, false, 288u, 2><<<prefill_workers, 256, down_wmma_smem>>>(
                                 (float *)down->ptr, down_w, down_q81, sorted_pairs,
                                 sorted_offsets, sorted_counts, down_tile_total,
                                 down_tile_experts, down_tile_starts, pair_count,
