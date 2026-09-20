@@ -22,7 +22,7 @@ __global__ static void moe_q4K_grouped_wide128_kernel(
     const uint32_t row0 = blockIdx.x * I;
     const char *expert_base = weight_base +
         uint64_t(moe_weight_expert<288u>(expert)) * weight_expert_bytes;
-    float acc[8] = {};
+    float acc[J / 16][8] = {};
     for (uint32_t kb = 0; kb < xq_blocks; ++kb) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
@@ -40,7 +40,13 @@ __global__ static void moe_q4K_grouped_wide128_kernel(
                     sx[r * XS + col] = value & 0x0f0f0f0f;
                     sx[r * XS + col + 8] = (value >> 4) & 0x0f0f0f0f;
                 }
-                if ((lane & 1) == 0) {
+            }
+            if (wave < 4) {
+                const int scale_row = wave * 32 + lane;
+                const uint32_t row = row0 + uint32_t(scale_row);
+                if (row < nrows) {
+                    const auto &w = reinterpret_cast<const cuda_block_q4_K *>(
+                        expert_base + uint64_t(row) * weight_row_bytes)[kb];
                     const int32_t sc32 = ds4_q4k_unpack_scales(
                         reinterpret_cast<const int32_t *>(w.scales), h);
                     const int32_t mn32 = ds4_q4k_unpack_scales(
@@ -51,7 +57,7 @@ __global__ static void moe_q4K_grouped_wide128_kernel(
                     const float wm = __half2float(*reinterpret_cast<const half *>(&w.dmin));
 #pragma unroll
                     for (int l = 0; l < 4; ++l)
-                        reinterpret_cast<half2 *>(sx + r * XS + 32)[l] =
+                        reinterpret_cast<half2 *>(sx + scale_row * XS + 32)[l] =
                             __floats2half2_rn(wd * float(sc[l]), -wm * float(mn[l]));
                 }
             }
@@ -68,20 +74,27 @@ __global__ static void moe_q4K_grouped_wide128_kernel(
             }
             __syncthreads();
 #pragma unroll
-            for (int kk = 0; kk < 4; ++kk) {
-                const auto a = ds4_q4k_load_rdna3_mirrored_16x8(
-                    sx + wave * 16 * XS + kk * 8, XS);
-                const auto b = ds4_q4k_load_rdna3_mirrored_16x8(sy + 4 + kk * 8, YS);
-                ds4_q4k_i32x8 c = {};
-                c = ds4_q4k_wmma_i8_16x16x16(a, b, c);
+            for (int kk = 0; kk < 4; kk++) {
+                const ds4_q4k_wmma_ab_frag a =
+                    ds4_q4k_load_rdna3_mirrored_16x8(
+                        sx + wave * 16 * XS + kk * 8, XS);
+                for (int j0 = 0; j0 < J; j0 += 16) {
+                    const ds4_q4k_wmma_ab_frag b =
+                        ds4_q4k_load_rdna3_mirrored_16x8(
+                            sy + j0 * YS + 4 + kk * 8, YS);
+                    ds4_q4k_i32x8 c = {};
+                    c = ds4_q4k_wmma_i8_16x16x16(a, b, c);
 #pragma unroll
-                for (int l = 0; l < 8; ++l) {
-                    const int i = 2 * l + lane / 16, j = lane % 16;
-                    const float2 bd = __half22float2(
-                        reinterpret_cast<const half2 *>(sy + j * YS)[kk]);
-                    const float2 ad = __half22float2(
-                        reinterpret_cast<const half2 *>(sx + (wave * 16 + i) * XS + 32)[kk]);
-                    acc[l] += ad.x * bd.x * float(c[l]) + ad.y * bd.y;
+                    for (int l = 0; l < 8; l++) {
+                        const int i = 2 * l + lane / 16;
+                        const int j = j0 + lane % 16;
+                        const float2 bd = __half22float2(
+                            reinterpret_cast<const half2 *>(sy + j * YS)[kk]);
+                        const float2 ad = __half22float2(
+                            reinterpret_cast<const half2 *>(sx + (wave * 16 + i) * XS + 32)[kk]);
+                        acc[j0 / 16][l] +=
+                            ad.x * bd.x * (float)c[l] + ad.y * bd.y;
+                    }
                 }
             }
             __syncthreads();
@@ -93,7 +106,7 @@ __global__ static void moe_q4K_grouped_wide128_kernel(
         const uint32_t lp = start + uint32_t(lane % 16);
         if (row < nrows && lp < count) {
             const uint32_t pair = sorted_pairs[offsets[expert] + lp];
-            out[uint64_t(pair) * nrows + row] = acc[l];
+            out[uint64_t(pair) * nrows + row] = acc[0][l];
         }
     }
 }
