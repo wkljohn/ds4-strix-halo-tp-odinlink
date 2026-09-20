@@ -1119,7 +1119,7 @@ static void matmul_bf16_f32_wmma_hilo_qkv_shared_a_m256_n1_kernel(
  * NativeQkv is a default-off Lane B probe: QKV uses BF16-rounded input,
  * while the skinny gates below retain their original F32 arithmetic. */
 template <bool CoalescedWeights = false, bool SkinnyOnly = false,
-          bool NativeQkv = false>
+          bool NativeQkv = false, uint32_t NTilesN = 2u>
 __global__ __launch_bounds__(16u * 32u, 1)
 static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
         float *out_q, float *out_k, float *out_v,
@@ -1131,14 +1131,15 @@ static void matmul_bf16_f32_wmma_hilo_kda_six_multiptr_kernel(
         uint32_t low_rows, uint32_t beta_rows, uint32_t tokens) {
     static_assert(!NativeQkv || (!SkinnyOnly && !CoalescedWeights),
                   "native QKV probe cannot combine geometry experiments");
+    static_assert(NTilesN == 2u || (NTilesN == 4u && NativeQkv),
+                  "wide N geometry is a native-QKV-only component probe");
     constexpr uint32_t BM = 16u;
     constexpr uint32_t BN = 16u;
     constexpr uint32_t BK = 16u;
     constexpr uint32_t MTile = 256u;
     constexpr uint32_t MTiles = MTile / BM;
-    constexpr uint32_t NTilesN = 2u;
     constexpr uint32_t NThreads = MTiles * 32u;
-    const uint32_t q_blocks = (q_rows + 31u) / 32u;
+    const uint32_t q_blocks = (q_rows + NTilesN * BN - 1u) / (NTilesN * BN);
     const uint32_t low_blocks = (low_rows + 1u) / 2u;
     const uint32_t beta_blocks = (beta_rows + 1u) / 2u;
     // The standalone split-scheduling probe launches only the small gates

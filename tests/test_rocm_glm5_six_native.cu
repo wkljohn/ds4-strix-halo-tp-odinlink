@@ -8,6 +8,8 @@
 
 extern "C" hipError_t glm5_six_native(float *const *,const uint16_t *const *,
     const float *,unsigned,unsigned,unsigned,unsigned);
+extern "C" hipError_t glm5_six_native_geometry(float *const *,const uint16_t *const *,
+    const float *,unsigned,unsigned,unsigned,unsigned);
 extern "C" hipError_t glm5_six_rounding(uint32_t *,const float *,uint64_t);
 // Compile the unmodified parent geometry TU with this external symbol name.
 extern "C" hipError_t glm5_six_incumbent(float *const *,const uint16_t *const *,
@@ -34,8 +36,12 @@ static float round_bf16(float value) {
 }
 
 int main(int argc,char **argv) {
-    REQUIRE(argc==1 || (argc==2 && !std::strcmp(argv[1],"--stream")));
-    const bool stream = argc==2;
+    bool stream=false, geometry=false;
+    for (int arg=1; arg<argc; ++arg) {
+        if (!std::strcmp(argv[arg],"--stream") && !stream) stream=true;
+        else if (!std::strcmp(argv[arg],"--geometry") && !geometry) geometry=true;
+        else REQUIRE(false);
+    }
     const char *model = std::getenv("DS4_GLM5_MODEL");
     REQUIRE(model);
     Glm5TestGGUF gguf;
@@ -55,7 +61,7 @@ int main(int argc,char **argv) {
     }
     // Stream mode walks all matrices, not a persistent matrix cache. Each
     // layer is copied once and reused only for its own correctness/timing.
-    for (unsigned layer : layers) for (unsigned layout=0; layout<(stream?2u:3u); ++layout) {
+    for (unsigned layer : layers) for (unsigned layout=0; layout<((stream||geometry)?2u:3u); ++layout) {
         const unsigned n = layout<2u ? 4096u : 8192u;
         const unsigned beta = layout<2u ? 32u : 64u;
         const unsigned rows[] = {n,n,n,128,128,beta};
@@ -74,7 +80,7 @@ int main(int argc,char **argv) {
             REQUIRE(hipMemcpy(weight[i],host_w[i],bytes,hipMemcpyHostToDevice)==hipSuccess);
             w[i] = weight[i];
         }
-        const std::vector<unsigned> batches = stream ? std::vector<unsigned>{1024u} :
+        const std::vector<unsigned> batches = (stream||geometry) ? std::vector<unsigned>{1024u} :
                                                        std::vector<unsigned>{256u,1024u};
         for (unsigned m : batches) {
             std::vector<float> x(size_t(m)*k), rounded(x.size());
@@ -83,7 +89,8 @@ int main(int argc,char **argv) {
                              std::cos(double(i)*0.037+layout)*0.19);
                 rounded[i] = round_bf16(x[i]);
             }
-            float *dx, *dr, *allocation[4][6], *out[4][6];
+            const unsigned arms = geometry ? 7u : 4u;
+            float *dx, *dr, *allocation[7][6], *out[7][6];
             REQUIRE(hipMalloc(&dx,x.size()*4u)==hipSuccess);
             REQUIRE(hipMalloc(&dr,x.size()*4u)==hipSuccess);
             REQUIRE(hipMemcpy(dx,x.data(),x.size()*4u,hipMemcpyHostToDevice)==hipSuccess);
@@ -98,7 +105,7 @@ int main(int argc,char **argv) {
                 REQUIRE(std::memcmp(&device_round,&rounded[i],4)==0);
             }
             REQUIRE(hipFree(pairs)==hipSuccess);
-            for (unsigned arm=0; arm<4; ++arm) for (unsigned i=0; i<6; ++i) {
+            for (unsigned arm=0; arm<arms; ++arm) for (unsigned i=0; i<6; ++i) {
                 const size_t count = size_t(m)*rows[i];
                 std::vector<float> init(count+2*guard,sentinel);
                 std::fill(init.begin()+guard,init.end()-guard,NAN);
@@ -168,6 +175,53 @@ int main(int argc,char **argv) {
                     max_parent_error,max_error_over_sumabs);
                 total += count;
             }
+            if (geometry) {
+                for (unsigned mode=1; mode<4; ++mode) {
+                    const unsigned arm=mode+3u;
+                    REQUIRE(glm5_six_native_geometry(out[arm],w,dx,n,beta,m,mode)==hipSuccess);
+                    for (unsigned i=0; i<6; ++i) {
+                        const size_t count=size_t(m)*rows[i];
+                        std::vector<float> observed(count+2u*guard), reference(count);
+                        REQUIRE(hipMemcpy(observed.data(),allocation[arm][i],observed.size()*4u,hipMemcpyDeviceToHost)==hipSuccess);
+                        for (size_t j=0; j<guard; ++j)
+                            REQUIRE(observed[j]==sentinel && observed[count+guard+j]==sentinel);
+                        if (mode==2u && i<3u) {
+                            // Standalone skinny must never touch the QKV outputs.
+                            for (size_t j=guard; j<count+guard; ++j) REQUIRE(std::isnan(observed[j]));
+                        } else {
+                            const unsigned ref_arm=i<3u ? 2u : 0u;
+                            REQUIRE(hipMemcpy(reference.data(),out[ref_arm][i],count*4u,hipMemcpyDeviceToHost)==hipSuccess);
+                            size_t differences=0;
+                            for (size_t j=0; j<count; ++j) {
+                                REQUIRE(std::isfinite(observed[guard+j]));
+                                differences += std::memcmp(&observed[guard+j],&reference[j],4u)!=0;
+                            }
+                            std::printf("six_geometry layer=%u layout=%u M=%u mode=%u role=%u values=%zu differences=%zu\n",
+                                layer,layout,m,mode,i,count,differences);
+                            REQUIRE(differences==0);
+                            total += count;
+                        }
+                    }
+                }
+                REQUIRE(glm5_six_native_geometry(nullptr,w,dx,n,beta,m,0)==hipErrorInvalidValue);
+                REQUIRE(glm5_six_native_geometry(out[4],nullptr,dx,n,beta,m,0)==hipErrorInvalidValue);
+                REQUIRE(glm5_six_native_geometry(out[4],w,nullptr,n,beta,m,0)==hipErrorInvalidValue);
+                REQUIRE(glm5_six_native_geometry(out[4],w,dx,n,beta,m,4)==hipErrorInvalidValue);
+                REQUIRE(glm5_six_native_geometry(out[4],w,dx,n,beta,m-1u,1)==hipErrorInvalidValue);
+                REQUIRE(glm5_six_native_geometry(out[4],w,dx,n,beta,256u,3)==hipErrorInvalidValue);
+                REQUIRE(glm5_six_native_geometry(out[4],w,dx,8192u,64u,m,3)==hipErrorInvalidValue);
+                REQUIRE(glm5_six_native_geometry(out[4],w,dx,n,beta+1u,m,2)==hipErrorInvalidValue);
+                for (unsigned i=0; i<6; ++i) {
+                    float *saved_out=out[4][i];
+                    const uint16_t *saved_w=w[i];
+                    out[4][i]=nullptr;
+                    REQUIRE(glm5_six_native_geometry(out[4],w,dx,n,beta,m,1)==hipErrorInvalidValue);
+                    out[4][i]=saved_out;
+                    w[i]=nullptr;
+                    REQUIRE(glm5_six_native_geometry(out[4],w,dx,n,beta,m,1)==hipErrorInvalidValue);
+                    w[i]=saved_w;
+                }
+            }
             REQUIRE(glm5_six_native(out[2],w,dx,n,beta,m-1u,1)==hipErrorInvalidValue);
             REQUIRE(glm5_six_native(out[2],w,dx,n,beta,m,2)==hipErrorInvalidValue);
             REQUIRE(glm5_six_native(out[2],w,dx,n,beta+1u,m,1)==hipErrorInvalidValue);
@@ -198,9 +252,32 @@ int main(int argc,char **argv) {
                 std::printf("six_native_time layer=%u layout=%u M=%u pair=%u mode=%u device_ms=%.6f wall_ms=%.6f\n",
                     layer,layout,m,pair,mode,ms/3,wall);
             }
+            if (geometry) {
+                auto geometry_launch = [&](unsigned mode) {
+                    REQUIRE(glm5_six_native_geometry(out[mode?mode+3u:2u],w,dx,n,beta,m,mode)==hipSuccess);
+                };
+                for (unsigned mode=0; mode<4; ++mode) geometry_launch(mode);
+                REQUIRE(hipDeviceSynchronize()==hipSuccess);
+                // Six sweeps give each arm three forward/reverse positions.
+                // This is component timing; standalone skinny is not additive.
+                for (unsigned sweep=0; sweep<6; ++sweep) for (unsigned index=0; index<4; ++index) {
+                    const unsigned mode=(sweep&1u) ? 3u-index : index;
+                    const auto start=std::chrono::steady_clock::now();
+                    REQUIRE(hipEventRecord(begin,nullptr)==hipSuccess);
+                    for (unsigned repeat=0; repeat<3; ++repeat) geometry_launch(mode);
+                    REQUIRE(hipEventRecord(end,nullptr)==hipSuccess);
+                    REQUIRE(hipEventSynchronize(end)==hipSuccess);
+                    const double wall=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()/3;
+                    float ms=0;
+                    REQUIRE(hipEventElapsedTime(&ms,begin,end)==hipSuccess);
+                    REQUIRE(std::isfinite(ms) && ms>0);
+                    std::printf("six_geometry_time layer=%u layout=%u M=%u sweep=%u mode=%u device_ms=%.6f wall_ms=%.6f\n",
+                        layer,layout,m,sweep,mode,ms/3,wall);
+                }
+            }
             REQUIRE(hipEventDestroy(begin)==hipSuccess);
             REQUIRE(hipEventDestroy(end)==hipSuccess);
-            for (unsigned arm=0; arm<4; ++arm) for (unsigned i=0; i<6; ++i)
+            for (unsigned arm=0; arm<arms; ++arm) for (unsigned i=0; i<6; ++i)
                 REQUIRE(hipFree(allocation[arm][i])==hipSuccess);
             REQUIRE(hipFree(dr)==hipSuccess);
             REQUIRE(hipFree(dx)==hipSuccess);
@@ -209,5 +286,5 @@ int main(int argc,char **argv) {
         }
         for (unsigned i=0; i<6; ++i) REQUIRE(hipFree(weight[i])==hipSuccess);
     }
-    std::printf("PASS six native cases=%zu values=%zu stream=%d; arithmetic diagnostic only, no quality or model-speed claim\n",cases,total,stream);
+    std::printf("PASS six native cases=%zu values=%zu stream=%d geometry=%d; arithmetic diagnostic only, no quality or model-speed claim\n",cases,total,stream,geometry);
 }

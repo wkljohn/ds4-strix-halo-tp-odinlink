@@ -125,6 +125,16 @@ pins; retain the stale-build check and original build dossier. See
 
 ## Active uncensored-model verifier track
 
+The component fixture's `--geometry` comparison tests native N32/N64 at
+M256/K16, existing SkinnyOnly and fused-shared-A native using a separate
+component API; the older native mode0/1 contract stays unchanged. N64 is a
+template-only probe with the original low LDS panel, exact F32 skinny gates,
+original weights and no production dispatch switch. Both real rank slices at
+M1024 must match native N32 QKV and independently compiled parent skinny
+outputs, with poison/canaries and argument refusals. Standalone skinny time
+is not an additive decomposition of the complete kernel. See
+`bf16-six-native-geometry-plan.md` in the active ROCm10 dossier.
+
 The default-off `NativeQkv` specialization of the live six-pointer BF16
 kernel drops the residual QKV product, retaining original weights and exact
 F32 skinny gates. `DS4_ROCM_GLM5_BF16_KDA_SIX_LIVE_NATIVE_QKV=1` selects it
